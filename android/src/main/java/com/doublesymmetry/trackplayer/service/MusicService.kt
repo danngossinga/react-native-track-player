@@ -34,6 +34,15 @@ import com.facebook.react.HeadlessJsTaskService
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import com.google.android.exoplayer2.C
+import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.MediaMetadata
+import com.google.android.exoplayer2.Player
+import com.google.android.exoplayer2.audio.AudioAttributes
+import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
+import com.google.android.exoplayer2.upstream.DefaultDataSource
+import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.ui.R as ExoPlayerR
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flow
@@ -48,42 +57,33 @@ import timber.log.Timber
 
 @MainThread
 class MusicService : HeadlessJsTaskService() {
-    private lateinit var primaryPlayer: QueuedAudioPlayer
-    private lateinit var secondaryPlayer: QueuedAudioPlayer
+    private lateinit var player: QueuedAudioPlayer
+    private var crossfadePlayer: ExoPlayer? = null
+    private var crossfadeHttpDataSourceFactory: DefaultHttpDataSource.Factory? = null
     private val binder = MusicBinder()
     private val scope = MainScope()
     private var progressUpdateJob: Job? = null
     private var crossfadeEnabled = false
-    private var activePlayerSlot = 0
     private var crossfadeRunId = 0
     private var activeCrossfadeFromIndex: Int? = null
     private var activeCrossfadeToIndex: Int? = null
+    private var preparedCrossfadeFromIndex: Int? = null
+    private var preparedCrossfadeToIndex: Int? = null
+    private var preparedCrossfadeSeekToMs: Long = 0L
     private var latestNotificationConfig: NotificationConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
 
-    private val player: QueuedAudioPlayer
-        get() = activePlayer
+    private fun isPrimaryPlayerInitialized(): Boolean = this::player.isInitialized
 
-    private val activePlayer: QueuedAudioPlayer
-        get() = if (activePlayerSlot == 0) primaryPlayer else secondaryPlayer
-
-    private val standbyPlayer: QueuedAudioPlayer
-        get() = if (activePlayerSlot == 0) secondaryPlayer else primaryPlayer
-
-    private fun isPrimaryPlayerInitialized(): Boolean = this::primaryPlayer.isInitialized
-
-    private fun isSecondaryPlayerInitialized(): Boolean = this::secondaryPlayer.isInitialized
-
-    private fun isCrossfadeReady(): Boolean = crossfadeEnabled && isSecondaryPlayerInitialized()
+    private fun isCrossfadeReady(): Boolean = crossfadeEnabled && crossfadePlayer != null
 
     private fun allPlayers(): List<QueuedAudioPlayer> = when {
-        isPrimaryPlayerInitialized() && isSecondaryPlayerInitialized() -> listOf(primaryPlayer, secondaryPlayer)
-        isPrimaryPlayerInitialized() -> listOf(primaryPlayer)
+        isPrimaryPlayerInitialized() -> listOf(player)
         else -> emptyList()
     }
 
     private fun isActivePlayer(source: QueuedAudioPlayer): Boolean =
-        isPrimaryPlayerInitialized() && source === activePlayer
+        isPrimaryPlayerInitialized() && source === player
 
     /**
      * Use [appKilledPlaybackBehavior] instead.
@@ -200,13 +200,11 @@ class MusicService : HeadlessJsTaskService() {
         crossfadeEnabled = playerOptions?.getBoolean(CROSSFADE_KEY, false) ?: false
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
-        primaryPlayer = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
-        primaryPlayer.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
-        activePlayerSlot = 0
+        player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
+        player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
         if (crossfadeEnabled) {
-            secondaryPlayer = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
-            secondaryPlayer.automaticallyUpdateNotificationMetadata = false
-            secondaryPlayer.volume = 0f
+            crossfadePlayer = createCrossfadePlayer(playerConfig)
+            Timber.tag("RNTP-Crossfade").d("engine=rntp-single-session")
         }
         observeEvents()
         setupForegrounding()
@@ -341,14 +339,113 @@ class MusicService : HeadlessJsTaskService() {
         add(listOf(track))
     }
 
-    @MainThread
-    private fun resetStandbyToActive(volume: Float = 0f) {
-        if (!isCrossfadeReady() || player.currentIndex < 0 || player.currentIndex >= standbyPlayer.items.size) {
-            return
+    private fun createCrossfadePlayer(playerConfig: PlayerConfig): ExoPlayer {
+        val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+        crossfadeHttpDataSourceFactory = httpDataSourceFactory
+        val dataSourceFactory = DefaultDataSource.Factory(this, httpDataSourceFactory)
+        val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+        return ExoPlayer.Builder(this)
+            .setMediaSourceFactory(mediaSourceFactory)
+            .build()
+            .apply {
+                volume = 0f
+                playWhenReady = false
+                setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(C.USAGE_MEDIA)
+                        .setContentType(playerConfig.audioContentType.toExoAudioContentType())
+                        .build(),
+                    false
+                )
+            }
+    }
+
+    private fun AudioContentType.toExoAudioContentType(): Int {
+        return when (this) {
+            AudioContentType.MUSIC -> C.AUDIO_CONTENT_TYPE_MUSIC
+            AudioContentType.SPEECH -> C.AUDIO_CONTENT_TYPE_SPEECH
+            AudioContentType.SONIFICATION -> C.AUDIO_CONTENT_TYPE_SONIFICATION
+            AudioContentType.MOVIE -> C.AUDIO_CONTENT_TYPE_MOVIE
+            AudioContentType.UNKNOWN -> C.AUDIO_CONTENT_TYPE_UNKNOWN
         }
-        standbyPlayer.pause()
-        standbyPlayer.jumpToItem(player.currentIndex, false)
-        standbyPlayer.volume = volume
+    }
+
+    private fun buildCrossfadeMediaItem(item: TrackAudioItem): MediaItem {
+        val metadataBuilder = MediaMetadata.Builder()
+            .setTitle(item.title)
+            .setArtist(item.artist)
+            .setAlbumTitle(item.albumTitle)
+        item.artwork?.takeIf { it.isNotBlank() && it != "null" }?.let {
+            metadataBuilder.setArtworkUri(Uri.parse(it))
+        }
+        return MediaItem.Builder()
+            .setUri(Uri.parse(item.audioUrl))
+            .setMediaMetadata(metadataBuilder.build())
+            .build()
+    }
+
+    private fun configureCrossfadeRequestOptions(item: TrackAudioItem) {
+        val options = item.options
+        val factory = crossfadeHttpDataSourceFactory ?: return
+        factory.setDefaultRequestProperties(options?.headers ?: emptyMap())
+        options?.userAgent?.takeIf { it.isNotBlank() }?.let {
+            factory.setUserAgent(it)
+        }
+    }
+
+    @MainThread
+    private fun resetCrossfadePlayer() {
+        crossfadePlayer?.let {
+            it.playWhenReady = false
+            it.pause()
+            it.stop()
+            it.clearMediaItems()
+            it.volume = 0f
+        }
+    }
+
+    @MainThread
+    private suspend fun prepareOutgoingCrossfadePlayer(
+        outgoing: TrackAudioItem,
+        positionMs: Long,
+        runId: Int
+    ) {
+        val overlapPlayer = crossfadePlayer
+            ?: throw RejectionException("Crossfade player is unavailable.", "crossfade_player_unavailable")
+        configureCrossfadeRequestOptions(outgoing)
+        overlapPlayer.playWhenReady = false
+        overlapPlayer.stop()
+        overlapPlayer.clearMediaItems()
+        overlapPlayer.setMediaItem(buildCrossfadeMediaItem(outgoing))
+        overlapPlayer.prepare()
+        overlapPlayer.seekTo(max(0L, positionMs))
+
+        val startedAt = System.currentTimeMillis()
+        while (overlapPlayer.playbackState != Player.STATE_READY) {
+            ensureCrossfadeRunActive(runId)
+            if (overlapPlayer.playbackState == Player.STATE_ENDED) {
+                throw RejectionException("Crossfade outgoing player ended before it was ready.", "crossfade_outgoing_ended")
+            }
+            if (System.currentTimeMillis() - startedAt > CROSSFADE_PREPARE_TIMEOUT_MS) {
+                throw RejectionException("Crossfade outgoing player did not become ready.", "crossfade_prepare_timeout")
+            }
+            delay(25)
+        }
+    }
+
+    @MainThread
+    private suspend fun resyncOutgoingCrossfadePosition(positionMs: Long, runId: Int) {
+        val overlapPlayer = crossfadePlayer
+            ?: throw RejectionException("Crossfade player is unavailable.", "crossfade_player_unavailable")
+        overlapPlayer.seekTo(max(0L, positionMs))
+        val startedAt = System.currentTimeMillis()
+        while (overlapPlayer.playbackState == Player.STATE_BUFFERING) {
+            ensureCrossfadeRunActive(runId)
+            if (System.currentTimeMillis() - startedAt > CROSSFADE_PREPARE_TIMEOUT_MS) {
+                throw RejectionException("Crossfade outgoing player did not resync.", "crossfade_resync_timeout")
+            }
+            delay(25)
+        }
     }
 
     @MainThread
@@ -358,6 +455,9 @@ class MusicService : HeadlessJsTaskService() {
         crossfadeRunId += 1
         activeCrossfadeFromIndex = null
         activeCrossfadeToIndex = null
+        preparedCrossfadeFromIndex = null
+        preparedCrossfadeToIndex = null
+        preparedCrossfadeSeekToMs = 0L
         if (fromIndex != null && toIndex != null) {
             emitCrossfadeState(
                 state = "cancelled",
@@ -367,8 +467,8 @@ class MusicService : HeadlessJsTaskService() {
             )
         }
         if (isCrossfadeReady()) {
-            standbyPlayer.pause()
-            standbyPlayer.volume = 0f
+            resetCrossfadePlayer()
+            player.volume = 1f
         }
     }
 
@@ -376,38 +476,22 @@ class MusicService : HeadlessJsTaskService() {
     fun add(tracks: List<Track>) {
         val items = tracks.map { it.toAudioItem() }
         player.add(items)
-        if (isCrossfadeReady()) {
-            standbyPlayer.add(items)
-            standbyPlayer.volume = 0f
-        }
     }
 
     @MainThread
     fun add(tracks: List<Track>, atIndex: Int) {
         val items = tracks.map { it.toAudioItem() }
         player.add(items, atIndex)
-        if (isCrossfadeReady()) {
-            standbyPlayer.add(items, atIndex)
-            standbyPlayer.volume = 0f
-        }
     }
 
     @MainThread
     fun load(track: Track) {
         player.load(track.toAudioItem())
-        if (isCrossfadeReady()) {
-            standbyPlayer.clear()
-            standbyPlayer.add(track.toAudioItem())
-            standbyPlayer.volume = 0f
-        }
     }
 
     @MainThread
     fun move(fromIndex: Int, toIndex: Int) {
         player.move(fromIndex, toIndex);
-        if (isCrossfadeReady()) {
-            standbyPlayer.move(fromIndex, toIndex)
-        }
     }
 
     @MainThread
@@ -418,19 +502,12 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     fun remove(indexes: List<Int>) {
         player.remove(indexes)
-        if (isCrossfadeReady()) {
-            standbyPlayer.remove(indexes)
-            standbyPlayer.volume = 0f
-        }
     }
 
     @MainThread
     fun clear() {
         player.clear()
-        if (isCrossfadeReady()) {
-            standbyPlayer.clear()
-            standbyPlayer.volume = 0f
-        }
+        resetCrossfadePlayer()
     }
 
     @MainThread
@@ -447,47 +524,36 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     fun stop() {
         cancelCrossfadeWork()
-        allPlayers().forEach {
-            it.stop()
-            it.volume = if (it === activePlayer) 1f else 0f
-        }
+        player.stop()
+        player.volume = 1f
     }
 
     @MainThread
     fun removeUpcomingTracks() {
         player.removeUpcomingItems()
-        if (isCrossfadeReady()) {
-            standbyPlayer.removeUpcomingItems()
-        }
     }
 
     @MainThread
     fun removePreviousTracks() {
         player.removePreviousItems()
-        if (isCrossfadeReady()) {
-            standbyPlayer.removePreviousItems()
-        }
     }
 
     @MainThread
     fun skip(index: Int) {
         cancelCrossfadeWork()
         player.jumpToItem(index)
-        resetStandbyToActive()
     }
 
     @MainThread
     fun skipToNext() {
         cancelCrossfadeWork()
         player.next()
-        resetStandbyToActive()
     }
 
     @MainThread
     fun skipToPrevious() {
         cancelCrossfadeWork()
         player.previous()
-        resetStandbyToActive()
     }
 
     @MainThread
@@ -515,7 +581,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun setRate(value: Float) {
-        allPlayers().forEach { it.playbackSpeed = value }
+        player.playbackSpeed = value
+        crossfadePlayer?.setPlaybackSpeed(value)
     }
 
     @MainThread
@@ -523,7 +590,7 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun setRepeatMode(value: RepeatMode) {
-        allPlayers().forEach { it.playerOptions.repeatMode = value }
+        player.playerOptions.repeatMode = value
     }
 
     @MainThread
@@ -546,10 +613,9 @@ class MusicService : HeadlessJsTaskService() {
             throw RejectionException("No crossfade target track is available.", "crossfade_target_unavailable")
         }
 
-        standbyPlayer.pause()
-        standbyPlayer.volume = 0f
-        standbyPlayer.jumpToItem(toIndex, false)
-        standbyPlayer.seek((max(0.0, seekTo) * 1000).toLong(), TimeUnit.MILLISECONDS)
+        preparedCrossfadeFromIndex = fromIndex
+        preparedCrossfadeToIndex = toIndex
+        preparedCrossfadeSeekToMs = (max(0.0, seekTo) * 1000).toLong()
 
         emitCrossfadeState(
             state = "prepared",
@@ -557,7 +623,7 @@ class MusicService : HeadlessJsTaskService() {
             toIndex = toIndex,
             elapsedMs = 0,
             fromVolume = player.volume,
-            toVolume = standbyPlayer.volume
+            toVolume = 0f
         )
     }
 
@@ -570,11 +636,13 @@ class MusicService : HeadlessJsTaskService() {
     ) {
         if (!isCrossfadeReady()) return
 
-        val outgoing = player
-        val incoming = standbyPlayer
-        val fromIndex = outgoing.currentIndex
-        val toIndex = incoming.currentIndex
-        if (fromIndex < 0 || toIndex < 0 || toIndex >= incoming.items.size) {
+        val fromIndex = player.currentIndex
+        val toIndex = if (preparedCrossfadeFromIndex == fromIndex && preparedCrossfadeToIndex != null) {
+            preparedCrossfadeToIndex!!
+        } else {
+            fromIndex + 1
+        }
+        if (fromIndex < 0 || toIndex < 0 || toIndex >= player.items.size) {
             emitCrossfadeState("error", fromIndex, toIndex, errorCode = "crossfade_target_unavailable")
             throw RejectionException("No prepared crossfade target track is available.", "crossfade_target_unavailable")
         }
@@ -588,15 +656,15 @@ class MusicService : HeadlessJsTaskService() {
         val rampDurationMs = max(1L, durationMs)
         val intervalMs = max(10.0, fadeInterval).toLong()
         val targetVolume = min(1.0, max(0.0, fadeToVolume)).toFloat()
-        val waitDelayMs = max(0L, waitUntil.toLong() - outgoing.position)
+        val waitDelayMs = max(0L, waitUntil.toLong() - player.position)
 
         emitCrossfadeState(
             state = "scheduled",
             fromIndex = fromIndex,
             toIndex = toIndex,
             elapsedMs = 0,
-            fromVolume = outgoing.volume,
-            toVolume = incoming.volume
+            fromVolume = player.volume,
+            toVolume = 0f
         )
 
         if (waitDelayMs > 0) {
@@ -604,58 +672,90 @@ class MusicService : HeadlessJsTaskService() {
         }
         ensureCrossfadeRunActive(runId)
 
-        incoming.volume = 0f
-        incoming.play()
-        activePlayerSlot = if (incoming === primaryPlayer) 0 else 1
-        latestNotificationConfig?.let { incoming.notificationManager.createNotification(it) }
-        emitPlaybackTrackChangedEvents(toIndex, fromIndex, outgoing.position.toSeconds())
-        emitCrossfadeState(
-            state = "started",
-            fromIndex = fromIndex,
-            toIndex = toIndex,
-            elapsedMs = 0,
-            fromVolume = outgoing.volume,
-            toVolume = incoming.volume
-        )
-
-        var elapsedMs = 0L
-        while (true) {
-            ensureCrossfadeRunActive(runId)
-            val progress = min(1.0, elapsedMs.toDouble() / rampDurationMs.toDouble())
-            val angle = progress * PI / 2.0
-            val fromVolume = cos(angle).toFloat()
-            val toVolume = (targetVolume.toDouble() * sin(angle)).toFloat()
-            outgoing.volume = fromVolume
-            incoming.volume = toVolume
+        val outgoingPositionMs = player.position
+        val outgoingVolume = player.volume
+        val outgoingItem = player.items[fromIndex] as TrackAudioItem
+        val overlapPlayer = crossfadePlayer
+            ?: throw RejectionException("Crossfade player is unavailable.", "crossfade_player_unavailable")
+        try {
+            prepareOutgoingCrossfadePlayer(outgoingItem, outgoingPositionMs, runId)
+            resyncOutgoingCrossfadePosition(player.position, runId)
+            overlapPlayer.volume = outgoingVolume
+            overlapPlayer.play()
+            player.volume = 0f
+            player.jumpToItem(toIndex, true)
+            if (preparedCrossfadeSeekToMs > 0) {
+                player.seek(preparedCrossfadeSeekToMs, TimeUnit.MILLISECONDS)
+            }
+            player.play()
             emitCrossfadeState(
-                state = "running",
+                state = "started",
                 fromIndex = fromIndex,
                 toIndex = toIndex,
-                elapsedMs = elapsedMs.toInt(),
-                fromVolume = fromVolume,
-                toVolume = toVolume
+                elapsedMs = 0,
+                fromVolume = overlapPlayer.volume,
+                toVolume = player.volume
             )
 
-            if (elapsedMs >= durationMs) {
-                break
-            }
-            delay(intervalMs)
-            elapsedMs = min(durationMs, elapsedMs + intervalMs)
-        }
+            var elapsedMs = 0L
+            var lastRunningEmitMs = -CROSSFADE_RUNNING_EVENT_INTERVAL_MS
+            while (true) {
+                ensureCrossfadeRunActive(runId)
+                val progress = min(1.0, elapsedMs.toDouble() / rampDurationMs.toDouble())
+                val angle = progress * PI / 2.0
+                val fromVolume = (outgoingVolume.toDouble() * cos(angle)).toFloat()
+                val toVolume = (targetVolume.toDouble() * sin(angle)).toFloat()
+                overlapPlayer.volume = fromVolume
+                player.volume = toVolume
+                if (elapsedMs - lastRunningEmitMs >= CROSSFADE_RUNNING_EVENT_INTERVAL_MS || elapsedMs >= durationMs) {
+                    emitCrossfadeState(
+                        state = "running",
+                        fromIndex = fromIndex,
+                        toIndex = toIndex,
+                        elapsedMs = elapsedMs.toInt(),
+                        fromVolume = fromVolume,
+                        toVolume = toVolume
+                    )
+                    lastRunningEmitMs = elapsedMs
+                }
 
-        outgoing.pause()
-        outgoing.volume = 0f
-        incoming.volume = targetVolume
-        activeCrossfadeFromIndex = null
-        activeCrossfadeToIndex = null
-        emitCrossfadeState(
-            state = "completed",
-            fromIndex = fromIndex,
-            toIndex = toIndex,
-            elapsedMs = durationMs.toInt(),
-            fromVolume = 0f,
-            toVolume = targetVolume
-        )
+                if (elapsedMs >= durationMs) {
+                    break
+                }
+                delay(intervalMs)
+                elapsedMs = min(durationMs, elapsedMs + intervalMs)
+            }
+
+            resetCrossfadePlayer()
+            player.volume = targetVolume
+            activeCrossfadeFromIndex = null
+            activeCrossfadeToIndex = null
+            preparedCrossfadeFromIndex = null
+            preparedCrossfadeToIndex = null
+            preparedCrossfadeSeekToMs = 0L
+            emitCrossfadeState(
+                state = "completed",
+                fromIndex = fromIndex,
+                toIndex = toIndex,
+                elapsedMs = durationMs.toInt(),
+                fromVolume = 0f,
+                toVolume = targetVolume
+            )
+        } catch (error: RejectionException) {
+            resetCrossfadePlayer()
+            activeCrossfadeFromIndex = null
+            activeCrossfadeToIndex = null
+            if (error.code != "cancelled") {
+                emitCrossfadeState("error", fromIndex, toIndex, errorCode = error.code)
+            }
+            throw error
+        } catch (error: Exception) {
+            resetCrossfadePlayer()
+            activeCrossfadeFromIndex = null
+            activeCrossfadeToIndex = null
+            emitCrossfadeState("error", fromIndex, toIndex, errorCode = "crossfade_unexpected_error")
+            throw error
+        }
     }
 
     private fun ensureCrossfadeRunActive(runId: Int) {
@@ -717,9 +817,6 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     fun updateMetadataForTrack(index: Int, track: Track) {
         player.replaceItem(index, track.toAudioItem())
-        if (isCrossfadeReady()) {
-            standbyPlayer.replaceItem(index, track.toAudioItem())
-        }
     }
 
     @MainThread
@@ -1082,12 +1179,11 @@ class MusicService : HeadlessJsTaskService() {
         if (!isPrimaryPlayerInitialized()) return
 
         when (appKilledPlaybackBehavior) {
-            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> allPlayers().forEach { it.pause() }
+            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> pause()
             AppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> {
-                allPlayers().forEach {
-                    it.clear()
-                    it.stop()
-                }
+                resetCrossfadePlayer()
+                player.clear()
+                player.stop()
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -1114,6 +1210,8 @@ class MusicService : HeadlessJsTaskService() {
         if (isPrimaryPlayerInitialized()) {
             allPlayers().forEach { it.destroy() }
         }
+        crossfadePlayer?.release()
+        crossfadePlayer = null
 
         progressUpdateJob?.cancel()
     }
@@ -1163,5 +1261,7 @@ class MusicService : HeadlessJsTaskService() {
 
         const val DEFAULT_JUMP_INTERVAL = 15.0
         const val DEFAULT_STOP_FOREGROUND_GRACE_PERIOD = 5
+        const val CROSSFADE_PREPARE_TIMEOUT_MS = 2500L
+        const val CROSSFADE_RUNNING_EVENT_INTERVAL_MS = 250L
     }
 }
