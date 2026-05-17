@@ -105,7 +105,7 @@ export interface PlayerOptions {
   autoHandleInterruptions?: boolean;
   /**
    * Enables native two-player crossfade support when available.
-   * Currently implemented on iOS in this fork.
+   * Currently implemented on Android and iOS in this fork.
    * Defaults to `false`.
    */
   crossfade?: boolean;
