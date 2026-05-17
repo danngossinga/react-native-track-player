@@ -4,6 +4,7 @@ export * from './PlaybackErrorEvent';
 export * from './PlaybackMetadataReceivedEvent';
 export * from './PlaybackPlayWhenReadyChangedEvent';
 export * from './PlaybackProgressUpdatedEvent';
+export * from './PlaybackCrossfadeStateEvent';
 export * from './PlaybackQueueEndedEvent';
 export * from './PlaybackTrackChangedEvent';
 export * from './RemoteDuckEvent';

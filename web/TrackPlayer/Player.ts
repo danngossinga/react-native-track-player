@@ -5,7 +5,7 @@ import { SetupNotCalledError } from './SetupNotCalledError';
 export class Player {
   protected hasInitialized: boolean = false;
   protected element?: HTMLMediaElement;
-  protected player?: shaka.Player;
+  protected player?: any;
   protected _current?: Track = undefined;
   protected _playWhenReady: boolean = false;
   protected _state: PlaybackState = { state: State.None };

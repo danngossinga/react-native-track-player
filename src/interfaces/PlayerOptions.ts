@@ -103,4 +103,10 @@ export interface PlayerOptions {
    * Defaults to `false`.
    */
   autoHandleInterruptions?: boolean;
+  /**
+   * Enables native two-player crossfade support when available.
+   * Currently implemented on iOS in this fork.
+   * Defaults to `false`.
+   */
+  crossfade?: boolean;
 }

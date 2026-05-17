@@ -357,6 +357,39 @@ export async function setVolume(level: number): Promise<void> {
 }
 
 /**
+ * Prepares the alternate native player for a crossfade.
+ *
+ * @param previous Prepare the previous track instead of the next track.
+ * @param seekTo Optional start position in seconds for the prepared track.
+ */
+export async function crossFadePrepare(
+  previous = false,
+  seekTo = 0
+): Promise<void> {
+  return TrackPlayer.crossFadePrepare(previous, seekTo);
+}
+
+/**
+ * Performs a native two-player crossfade.
+ *
+ * Durations and waitUntil are in milliseconds. waitUntil is an absolute
+ * playback position on the outgoing player.
+ */
+export async function crossFade(
+  fadeDuration = 2000,
+  fadeInterval = 20,
+  fadeToVolume = 1,
+  waitUntil = 0
+): Promise<void> {
+  return TrackPlayer.crossFade(
+    fadeDuration,
+    fadeInterval,
+    fadeToVolume,
+    waitUntil
+  );
+}
+
+/**
  * Sets the playback rate.
  *
  * @param rate The playback rate to change to, where 0.5 would be half speed,

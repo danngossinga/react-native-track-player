@@ -35,6 +35,10 @@ export enum Event {
    **/
   PlaybackProgressUpdated = 'playback-progress-updated',
   /**
+   * Fired when the native crossfade engine changes state.
+   **/
+  PlaybackCrossfadeState = 'playback-crossfade-state',
+  /**
    * Fired when the user presses the play button.
    * See https://rntp.dev/docs/api/events#remoteplay
    **/

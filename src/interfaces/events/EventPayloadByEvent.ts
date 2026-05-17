@@ -8,6 +8,7 @@ import type { AudioMetadataReceivedEvent } from './AudioMetadataReceivedEvent';
 import type { AudioCommonMetadataReceivedEvent } from './AudioMetadataReceivedEvent';
 import type { PlaybackPlayWhenReadyChangedEvent } from './PlaybackPlayWhenReadyChangedEvent';
 import type { PlaybackProgressUpdatedEvent } from './PlaybackProgressUpdatedEvent';
+import type { PlaybackCrossfadeStateEvent } from './PlaybackCrossfadeStateEvent';
 import type { PlaybackQueueEndedEvent } from './PlaybackQueueEndedEvent';
 import type { PlaybackTrackChangedEvent } from './PlaybackTrackChangedEvent';
 import { PlayerErrorEvent } from './PlayerErrorEvent';
@@ -30,6 +31,7 @@ export type EventPayloadByEvent = {
   [Event.PlaybackMetadataReceived]: PlaybackMetadataReceivedEvent;
   [Event.PlaybackPlayWhenReadyChanged]: PlaybackPlayWhenReadyChangedEvent;
   [Event.PlaybackProgressUpdated]: PlaybackProgressUpdatedEvent;
+  [Event.PlaybackCrossfadeState]: PlaybackCrossfadeStateEvent;
   [Event.RemotePlay]: never;
   [Event.RemotePlayId]: RemotePlayIdEvent;
   [Event.RemotePlaySearch]: RemotePlaySearchEvent;

@@ -97,6 +97,18 @@ RCT_EXTERN_METHOD(setVolume:(float)volume
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject);
 
+RCT_EXTERN_METHOD(crossFadePrepare:(BOOL)previous
+                  seekTo:(double)seekTo
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject);
+
+RCT_EXTERN_METHOD(crossFade:(double)fadeDuration
+                  fadeInterval:(double)fadeInterval
+                  fadeToVolume:(double)fadeToVolume
+                  waitUntil:(double)waitUntil
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject);
+
 RCT_EXTERN_METHOD(getVolume:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject);
 
