@@ -5,17 +5,39 @@
 
 import AVFoundation
 import Foundation
+import QuartzCore
 
-private final class IOSCrossfadeEngine {
+enum IOSPlaybackLog {
+    static func log(_ message: String) {
+        let time = CACurrentMediaTime()
+        print("[XF-ORCH][\(String(format: "%.6f", time))] \(message)")
+    }
+}
+
+enum IOSCrossfadeEngineState {
+    case idle
+    case loading
+    case ready
+    case playing
+    case paused
+    case ended
+    case failed
+}
+
+final class IOSCrossfadeEngine {
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
     private var timeControlObservation: NSKeyValueObservation?
     private var timeoutWorkItem: DispatchWorkItem?
     private var generation = 0
+    private let name: String
+    private(set) var state: IOSCrossfadeEngineState = .idle
 
-    init() {
+    init(name: String = "engine") {
+        self.name = name
         player.automaticallyWaitsToMinimizeStalling = false
+        player.actionAtItemEnd = .pause
         player.volume = 0
     }
 
@@ -43,9 +65,32 @@ private final class IOSCrossfadeEngine {
         return end.isFinite ? end : currentTime
     }
 
+    var isReady: Bool {
+        return player.currentItem?.status == .readyToPlay
+    }
+
+    var rate: Float {
+        get { return player.rate }
+        set {
+            if player.rate > 0 {
+                player.rate = max(newValue, 0.1)
+            }
+        }
+    }
+
+    var timeControlStatus: AVPlayer.TimeControlStatus {
+        return player.timeControlStatus
+    }
+
+    func setVolume(_ volume: Float) {
+        player.volume = max(0, min(1, volume))
+    }
+
     func prepare(track: Track, position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+        IOSPlaybackLog.log("\(name) prepare start title=\(track.title ?? "unknown") position=\(position)")
         reset()
         generation += 1
+        state = .loading
         let currentGeneration = generation
         let asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
         pendingAsset = asset
@@ -57,6 +102,8 @@ private final class IOSCrossfadeEngine {
                 var assetError: NSError?
                 let status = asset.statusOfValue(forKey: "playable", error: &assetError)
                 guard status == .loaded, asset.isPlayable else {
+                    self.state = .failed
+                    IOSPlaybackLog.log("\(self.name) prepare failed playable status=\(status.rawValue)")
                     completion(.failure(assetError ?? NSError(
                         domain: "RNTP-Crossfade",
                         code: 1,
@@ -66,7 +113,7 @@ private final class IOSCrossfadeEngine {
                 }
 
                 let item = AVPlayerItem(asset: asset)
-                item.preferredForwardBufferDuration = 1
+                item.preferredForwardBufferDuration = 2
                 self.pendingAsset = nil
                 self.player.replaceCurrentItem(with: item)
                 self.player.volume = 0
@@ -81,9 +128,17 @@ private final class IOSCrossfadeEngine {
                             guard let self = self, self.generation == currentGeneration else { return }
                             switch seekResult {
                             case .failure(let error):
+                                self.state = .failed
+                                IOSPlaybackLog.log("\(self.name) seek failed during prepare error=\(error.localizedDescription)")
                                 completion(.failure(error))
                             case .success:
-                                self.preroll(generation: currentGeneration, completion: completion)
+                                self.preroll(generation: currentGeneration) { result in
+                                    if case .success = result {
+                                        self.state = .ready
+                                        IOSPlaybackLog.log("\(self.name) prepare end duration=\(self.duration) buffered=\(self.bufferedPosition)")
+                                    }
+                                    completion(result)
+                                }
                             }
                         }
                     }
@@ -96,10 +151,12 @@ private final class IOSCrossfadeEngine {
         let currentGeneration = generation
         let time = CMTime(seconds: max(0, position), preferredTimescale: 1000)
         let tolerance = CMTime(seconds: 0.05, preferredTimescale: 1000)
+        IOSPlaybackLog.log("\(name) seek to=\(max(0, position))")
         player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
             DispatchQueue.main.async {
                 guard let self = self, self.generation == currentGeneration else { return }
                 guard finished else {
+                    self.state = .failed
                     completion?(.failure(NSError(
                         domain: "RNTP-Crossfade",
                         code: 3,
@@ -114,15 +171,34 @@ private final class IOSCrossfadeEngine {
 
     func play(rate: Float, completion: @escaping (Result<Void, Error>) -> Void) {
         let currentGeneration = generation
-        player.playImmediately(atRate: max(rate, 0.01))
+        IOSPlaybackLog.log("\(name) play rate=\(rate) volume=\(player.volume)")
+        player.playImmediately(atRate: max(rate, 0.1))
         waitForPlaying(generation: currentGeneration, completion: completion)
     }
 
+    func play(rate: Float = 1) {
+        IOSPlaybackLog.log("\(name) play fire-and-forget rate=\(rate) volume=\(player.volume)")
+        player.playImmediately(atRate: max(rate, 0.1))
+        state = .playing
+    }
+
     func pause() {
+        IOSPlaybackLog.log("\(name) pause")
         player.pause()
+        if state == .playing {
+            state = .paused
+        }
+    }
+
+    func stop() {
+        IOSPlaybackLog.log("\(name) stop")
+        player.pause()
+        player.seek(to: .zero)
+        state = .idle
     }
 
     func reset() {
+        IOSPlaybackLog.log("\(name) reset")
         generation += 1
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
@@ -135,6 +211,7 @@ private final class IOSCrossfadeEngine {
         player.pause()
         player.replaceCurrentItem(with: nil)
         player.volume = 0
+        state = .idle
     }
 
     private func preroll(
@@ -144,6 +221,7 @@ private final class IOSCrossfadeEngine {
         player.preroll(atRate: 1) { [weak self] _ in
             DispatchQueue.main.async {
                 guard let self = self, self.generation == generation else { return }
+                IOSPlaybackLog.log("\(self.name) preroll complete")
                 completion(.success(()))
             }
         }
@@ -171,8 +249,12 @@ private final class IOSCrossfadeEngine {
                 guard let self = self, self.generation == generation else { return }
                 switch observedItem.status {
                 case .readyToPlay:
+                    self.state = .ready
+                    IOSPlaybackLog.log("\(self.name) item ready")
                     finish(.success(()))
                 case .failed:
+                    self.state = .failed
+                    IOSPlaybackLog.log("\(self.name) item failed error=\(observedItem.error?.localizedDescription ?? "unknown")")
                     finish(.failure(observedItem.error ?? NSError(
                         domain: "RNTP-Crossfade",
                         code: 4,
@@ -186,6 +268,8 @@ private final class IOSCrossfadeEngine {
 
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, self.generation == generation else { return }
+            self.state = .failed
+            IOSPlaybackLog.log("\(self.name) item ready timeout")
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 5,
@@ -213,6 +297,7 @@ private final class IOSCrossfadeEngine {
         }
 
         if player.timeControlStatus == .playing {
+            state = .playing
             finish(.success(()))
             return
         }
@@ -221,6 +306,8 @@ private final class IOSCrossfadeEngine {
             DispatchQueue.main.async {
                 guard let self = self, self.generation == generation else { return }
                 if observedPlayer.timeControlStatus == .playing {
+                    self.state = .playing
+                    IOSPlaybackLog.log("\(self.name) playing")
                     finish(.success(()))
                 }
             }
@@ -228,6 +315,8 @@ private final class IOSCrossfadeEngine {
 
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, self.generation == generation else { return }
+            self.state = .failed
+            IOSPlaybackLog.log("\(self.name) playing timeout")
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 6,
@@ -235,43 +324,25 @@ private final class IOSCrossfadeEngine {
             )))
         }
         timeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(2000), execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(5000), execute: timeout)
     }
 }
 
 final class IOSCrossfadeCoordinator {
-    private let firstEngine = IOSCrossfadeEngine()
-    private let secondEngine = IOSCrossfadeEngine()
-    private var activeEngine: IOSCrossfadeEngine
-    private var standbyEngine: IOSCrossfadeEngine
+    private let outgoingEngine = IOSCrossfadeEngine(name: "legacyOutgoing")
+    private let incomingEngine = IOSCrossfadeEngine(name: "legacyIncoming")
     private var workItems: [DispatchWorkItem] = []
     private var runId = 0
-    private(set) var hasActivePlayback = false
     private(set) var isTransitioning = false
-    private(set) var activeIndex: Int?
     private(set) var preparedFromIndex: Int?
     private(set) var preparedToIndex: Int?
 
-    init() {
-        activeEngine = firstEngine
-        standbyEngine = secondEngine
+    var incomingCurrentTime: Double {
+        return incomingEngine.currentTime
     }
 
-    var currentTime: Double {
-        hasActivePlayback ? activeEngine.currentTime : 0
-    }
-
-    var duration: Double {
-        hasActivePlayback ? activeEngine.duration : 0
-    }
-
-    var bufferedPosition: Double {
-        hasActivePlayback ? activeEngine.bufferedPosition : 0
-    }
-
-    var volume: Float {
-        get { hasActivePlayback ? activeEngine.volume : 0 }
-        set { activeEngine.volume = newValue }
+    private func xfadeLog(_ message: String) {
+        IOSPlaybackLog.log("legacy \(message)")
     }
 
     func prepare(
@@ -283,18 +354,10 @@ final class IOSCrossfadeCoordinator {
         toIndex: Int,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        cancelTransition(keepActivePlayback: hasActivePlayback)
+        cancelTransition(keepActivePlayback: false)
         preparedFromIndex = fromIndex
         preparedToIndex = toIndex
-
-        let needsOutgoingPrepare = !hasActivePlayback || activeIndex != fromIndex
-        if needsOutgoingPrepare {
-            hasActivePlayback = false
-            activeIndex = fromIndex
-        }
-
         prepareEngines(
-            needsOutgoingPrepare: needsOutgoingPrepare,
             outgoingTrack: outgoingTrack,
             outgoingPosition: outgoingPosition,
             incomingTrack: incomingTrack,
@@ -314,7 +377,7 @@ final class IOSCrossfadeCoordinator {
         currentPublicPosition: @escaping () -> Double,
         onStarted: @escaping (_ fromVolume: Float, _ toVolume: Float) -> Void,
         onRunning: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void,
-        onCompleted: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void,
+        onCompleted: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float, _ incomingPosition: Double) -> Void,
         onError: @escaping (Error) -> Void
     ) {
         guard preparedFromIndex == fromIndex, preparedToIndex == toIndex else {
@@ -330,52 +393,39 @@ final class IOSCrossfadeCoordinator {
         let currentRunId = runId
         isTransitioning = true
 
-        let startPlayback = { [weak self] in
+        xfadeLog("start: before outgoing seek")
+        outgoingEngine.seek(to: currentPublicPosition()) { [weak self] result in
             guard let self = self, self.runId == currentRunId else { return }
-            self.activeEngine.volume = max(0, publicVolume)
-            self.standbyEngine.volume = 0
-
-            if !self.hasActivePlayback {
-                self.activeEngine.seek(to: currentPublicPosition()) { [weak self] result in
+            switch result {
+            case .failure(let error):
+                self.fail(error: error, onError: onError)
+            case .success:
+                self.xfadeLog("start: after outgoing seek")
+                self.outgoingEngine.volume = max(0, publicVolume)
+                self.incomingEngine.volume = 0
+                self.playBoth(runId: currentRunId, rate: rate) { [weak self] playResult in
                     guard let self = self, self.runId == currentRunId else { return }
-                    switch result {
+                    switch playResult {
                     case .failure(let error):
                         self.fail(error: error, onError: onError)
                     case .success:
-                        self.playBoth(
+                        self.xfadeLog("playBoth: completed")
+                        onStarted(self.outgoingEngine.volume, self.incomingEngine.volume)
+                        self.runRamp(
                             runId: currentRunId,
-                            rate: rate,
-                            fromIndex: fromIndex,
-                            toIndex: toIndex,
-                            durationMs: durationMs,
-                            intervalMs: intervalMs,
+                            durationMs: max(1, durationMs),
+                            intervalMs: max(10, intervalMs),
+                            outgoingStartVolume: self.outgoingEngine.volume,
                             targetVolume: targetVolume,
-                            onStarted: onStarted,
+                            elapsedMs: 0,
+                            lastRunningEmitMs: -250,
                             onRunning: onRunning,
-                            onCompleted: onCompleted,
-                            onError: onError
+                            onCompleted: onCompleted
                         )
                     }
                 }
-                return
             }
-
-            self.playBoth(
-                runId: currentRunId,
-                rate: rate,
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                durationMs: durationMs,
-                intervalMs: intervalMs,
-                targetVolume: targetVolume,
-                onStarted: onStarted,
-                onRunning: onRunning,
-                onCompleted: onCompleted,
-                onError: onError
-            )
         }
-
-        startPlayback()
     }
 
     func cancelTransition(keepActivePlayback: Bool) {
@@ -385,46 +435,47 @@ final class IOSCrossfadeCoordinator {
         isTransitioning = false
         preparedFromIndex = nil
         preparedToIndex = nil
-        standbyEngine.reset()
-        if !keepActivePlayback {
-            activeEngine.reset()
-            hasActivePlayback = false
-            activeIndex = nil
-        }
+        outgoingEngine.reset()
+        incomingEngine.reset()
     }
 
     func reset() {
         cancelTransition(keepActivePlayback: false)
-        firstEngine.reset()
-        secondEngine.reset()
-        activeEngine = firstEngine
-        standbyEngine = secondEngine
     }
 
     func pause() {
-        activeEngine.pause()
-        standbyEngine.pause()
+        outgoingEngine.pause()
+        incomingEngine.pause()
     }
 
-    func play(rate: Float, completion: ((Result<Void, Error>) -> Void)? = nil) {
-        activeEngine.play(rate: rate) { result in
-            completion?(result)
-        }
-    }
-
-    func seek(to position: Double, completion: ((Result<Void, Error>) -> Void)? = nil) {
-        activeEngine.seek(to: position, completion: completion)
+    func handbackToPublicPlayer(
+        durationMs: Int,
+        targetVolume: Float,
+        setPublicVolume: @escaping (Float) -> Void,
+        completion: @escaping () -> Void
+    ) {
+        let currentRunId = runId
+        let durationMs = max(1, durationMs)
+        isTransitioning = true
+        xfadeLog("handback: start")
+        runHandbackRamp(
+            runId: currentRunId,
+            durationMs: durationMs,
+            targetVolume: targetVolume,
+            elapsedMs: 0,
+            setPublicVolume: setPublicVolume,
+            completion: completion
+        )
     }
 
     private func prepareEngines(
-        needsOutgoingPrepare: Bool,
         outgoingTrack: Track,
         outgoingPosition: Double,
         incomingTrack: Track,
         incomingPosition: Double,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        var remaining = needsOutgoingPrepare ? 2 : 1
+        var remaining = 2
         var firstError: Error?
 
         func finish(_ result: Result<Void, Error>) {
@@ -446,24 +497,14 @@ final class IOSCrossfadeCoordinator {
             }
         }
 
-        standbyEngine.prepare(track: incomingTrack, position: incomingPosition, completion: finish)
-        if needsOutgoingPrepare {
-            activeEngine.prepare(track: outgoingTrack, position: outgoingPosition, completion: finish)
-        }
+        outgoingEngine.prepare(track: outgoingTrack, position: outgoingPosition, completion: finish)
+        incomingEngine.prepare(track: incomingTrack, position: incomingPosition, completion: finish)
     }
 
     private func playBoth(
         runId: Int,
         rate: Float,
-        fromIndex: Int,
-        toIndex: Int,
-        durationMs: Int,
-        intervalMs: Int,
-        targetVolume: Float,
-        onStarted: @escaping (_ fromVolume: Float, _ toVolume: Float) -> Void,
-        onRunning: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void,
-        onCompleted: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void,
-        onError: @escaping (Error) -> Void
+        completion: @escaping (Result<Void, Error>) -> Void
     ) {
         var remaining = 2
         var firstError: Error?
@@ -480,35 +521,15 @@ final class IOSCrossfadeCoordinator {
 
             remaining -= 1
             guard remaining == 0 else { return }
-            if let error = firstError {
-                self.fail(error: error, onError: onError)
-                return
-            }
-
-            onStarted(self.activeEngine.volume, self.standbyEngine.volume)
-            self.runRamp(
-                runId: runId,
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                durationMs: max(1, durationMs),
-                intervalMs: max(10, intervalMs),
-                outgoingStartVolume: self.activeEngine.volume,
-                targetVolume: targetVolume,
-                elapsedMs: 0,
-                lastRunningEmitMs: -250,
-                onRunning: onRunning,
-                onCompleted: onCompleted
-            )
+            completion(firstError.map { .failure($0) } ?? .success(()))
         }
 
-        activeEngine.play(rate: rate, completion: finish)
-        standbyEngine.play(rate: rate, completion: finish)
+        outgoingEngine.play(rate: rate, completion: finish)
+        incomingEngine.play(rate: rate, completion: finish)
     }
 
     private func runRamp(
         runId: Int,
-        fromIndex: Int,
-        toIndex: Int,
         durationMs: Int,
         intervalMs: Int,
         outgoingStartVolume: Float,
@@ -516,7 +537,7 @@ final class IOSCrossfadeCoordinator {
         elapsedMs: Int,
         lastRunningEmitMs: Int,
         onRunning: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void,
-        onCompleted: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float) -> Void
+        onCompleted: @escaping (_ elapsedMs: Int, _ fromVolume: Float, _ toVolume: Float, _ incomingPosition: Double) -> Void
     ) {
         guard self.runId == runId else { return }
 
@@ -524,27 +545,25 @@ final class IOSCrossfadeCoordinator {
         let angle = progress * Double.pi / 2
         let fromVolume = outgoingStartVolume * Float(cos(angle))
         let toVolume = targetVolume * Float(sin(angle))
-        activeEngine.volume = max(0, fromVolume)
-        standbyEngine.volume = max(0, toVolume)
+        outgoingEngine.volume = max(0, fromVolume)
+        incomingEngine.volume = max(0, toVolume)
 
         let shouldEmitRunning = elapsedMs - lastRunningEmitMs >= 250 || elapsedMs >= durationMs
         if shouldEmitRunning {
-            onRunning(min(elapsedMs, durationMs), activeEngine.volume, standbyEngine.volume)
+            onRunning(min(elapsedMs, durationMs), outgoingEngine.volume, incomingEngine.volume)
         }
 
         if elapsedMs >= durationMs {
-            activeEngine.pause()
-            activeEngine.volume = 0
-            standbyEngine.volume = targetVolume
-            swap(&activeEngine, &standbyEngine)
-            standbyEngine.reset()
-            hasActivePlayback = true
+            xfadeLog("ramp: completed, incomingPosition=\(incomingEngine.currentTime)")
+            outgoingEngine.pause()
+            outgoingEngine.volume = 0
+            outgoingEngine.reset()
+            incomingEngine.volume = targetVolume
             isTransitioning = false
-            activeIndex = toIndex
             preparedFromIndex = nil
             preparedToIndex = nil
             workItems.removeAll()
-            onCompleted(durationMs, 0, targetVolume)
+            onCompleted(durationMs, 0, targetVolume, incomingEngine.currentTime)
             return
         }
 
@@ -554,8 +573,6 @@ final class IOSCrossfadeCoordinator {
             guard let self = self else { return }
             self.runRamp(
                 runId: runId,
-                fromIndex: fromIndex,
-                toIndex: toIndex,
                 durationMs: durationMs,
                 intervalMs: intervalMs,
                 outgoingStartVolume: outgoingStartVolume,
@@ -570,8 +587,56 @@ final class IOSCrossfadeCoordinator {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(intervalMs), execute: next)
     }
 
+    private func runHandbackRamp(
+        runId: Int,
+        durationMs: Int,
+        targetVolume: Float,
+        elapsedMs: Int,
+        setPublicVolume: @escaping (Float) -> Void,
+        completion: @escaping () -> Void
+    ) {
+        guard self.runId == runId else { return }
+
+        let progress = min(1, max(0, Double(elapsedMs) / Double(durationMs)))
+        let angle = progress * Double.pi / 2
+        let publicVolume = targetVolume * Float(sin(angle))
+        let incomingVolume = targetVolume * Float(cos(angle))
+
+        setPublicVolume(max(0, publicVolume))
+        incomingEngine.volume = max(0, incomingVolume)
+
+        if elapsedMs >= durationMs {
+            incomingEngine.pause()
+            incomingEngine.volume = 0
+            incomingEngine.reset()
+            setPublicVolume(targetVolume)
+            isTransitioning = false
+            preparedFromIndex = nil
+            preparedToIndex = nil
+            workItems.removeAll()
+            xfadeLog("handback: completed")
+            completion()
+            return
+        }
+
+        let nextElapsedMs = min(durationMs, elapsedMs + 16)
+        let next = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            self.runHandbackRamp(
+                runId: runId,
+                durationMs: durationMs,
+                targetVolume: targetVolume,
+                elapsedMs: nextElapsedMs,
+                setPublicVolume: setPublicVolume,
+                completion: completion
+            )
+        }
+        workItems.append(next)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(16), execute: next)
+    }
+
     private func fail(error: Error, onError: @escaping (Error) -> Void) {
-        cancelTransition(keepActivePlayback: hasActivePlayback)
+        cancelTransition(keepActivePlayback: false)
         onError(error)
     }
 }
