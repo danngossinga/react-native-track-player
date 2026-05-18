@@ -10,33 +10,24 @@ import Foundation
 import MediaPlayer
 import SwiftAudioEx
 
-private final class NoopNowPlayingInfoController: NowPlayingInfoControllerProtocol {
-    required init() {}
-    required init(infoCenter: NowPlayingInfoCenter) {}
-    func set(keyValue: NowPlayingInfoKeyValue) {}
-    func set(keyValues: [NowPlayingInfoKeyValue]) {}
-    func setWithoutUpdate(keyValues: [NowPlayingInfoKeyValue]) {}
-    func clear() {}
-}
-
 @objc(RNTrackPlayer)
 public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
     // MARK: - Attributes
 
     private var hasInitialized = false
-    private let primaryPlayer = QueuedAudioPlayer()
-    private let secondaryPlayer = QueuedAudioPlayer(nowPlayingInfoController: NoopNowPlayingInfoController())
+    private let player = QueuedAudioPlayer()
+    private let crossfadeCoordinator = IOSCrossfadeCoordinator()
     private let audioSessionController = AudioSessionController.shared
     private var shouldEmitProgressEvent: Bool = false
     private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
     private var crossfadeEnabled: Bool = false
-    private var activePlayerSlot: Int = 0
-    private var crossfadeWorkItems: [DispatchWorkItem] = []
+    private var crossfadeStartWorkItem: DispatchWorkItem? = nil
     private var crossfadeRunId: Int = 0
     private var crossfadePendingReject: RCTPromiseRejectBlock? = nil
     private var crossfadePendingFromIndex: Int? = nil
     private var crossfadePendingToIndex: Int? = nil
+    private var preparedCrossfadeSeekTo: Double = 0
     private var autoUpdateNowPlayingInfo: Bool = true
     private var forwardJumpInterval: NSNumber? = nil;
     private var backwardJumpInterval: NSNumber? = nil;
@@ -44,15 +35,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
     private var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
-    private var player: QueuedAudioPlayer {
-        return activePlayer
-    }
-    private var activePlayer: QueuedAudioPlayer {
-        return activePlayerSlot == 0 ? primaryPlayer : secondaryPlayer
-    }
-    private var standbyPlayer: QueuedAudioPlayer {
-        return activePlayerSlot == 0 ? secondaryPlayer : primaryPlayer
-    }
 
     // MARK: - Lifecycle Methods
 
@@ -60,40 +42,37 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
         audioSessionController.delegate = self
-        configurePlayerEvents(primaryPlayer)
-        configurePlayerEvents(secondaryPlayer)
-        primaryPlayer.playWhenReady = false;
-        secondaryPlayer.playWhenReady = false;
-        secondaryPlayer.automaticallyUpdateNowPlayingInfo = false
+        configurePlayerEvents()
+        player.playWhenReady = false;
     }
 
     deinit {
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
-    private func configurePlayerEvents(_ source: QueuedAudioPlayer) {
-        source.event.receiveChapterMetadata.addListener(self) { [weak self, weak source] metadata in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+    private func configurePlayerEvents() {
+        player.event.receiveChapterMetadata.addListener(self) { [weak self] metadata in
+            guard let self = self else { return }
             self.handleAudioPlayerChapterMetadataReceived(metadata: metadata)
         }
-        source.event.receiveTimedMetadata.addListener(self) { [weak self, weak source] metadata in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.receiveTimedMetadata.addListener(self) { [weak self] metadata in
+            guard let self = self else { return }
             self.handleAudioPlayerTimedMetadataReceived(metadata: metadata)
         }
-        source.event.receiveCommonMetadata.addListener(self) { [weak self, weak source] metadata in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.receiveCommonMetadata.addListener(self) { [weak self] metadata in
+            guard let self = self else { return }
             self.handleAudioPlayerCommonMetadataReceived(metadata: metadata)
         }
-        source.event.stateChange.addListener(self) { [weak self, weak source] state in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.stateChange.addListener(self) { [weak self] state in
+            guard let self = self else { return }
             self.handleAudioPlayerStateChange(state: state)
         }
-        source.event.fail.addListener(self) { [weak self, weak source] error in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.fail.addListener(self) { [weak self] error in
+            guard let self = self else { return }
             self.handleAudioPlayerFailed(error: error)
         }
-        source.event.currentItem.addListener(self) { [weak self, weak source] data in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.currentItem.addListener(self) { [weak self] data in
+            guard let self = self else { return }
             self.handleAudioPlayerCurrentItemChange(
                 item: data.item,
                 index: data.index,
@@ -102,18 +81,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                 lastPosition: data.lastPosition
             )
         }
-        source.event.secondElapse.addListener(self) { [weak self, weak source] seconds in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.secondElapse.addListener(self) { [weak self] seconds in
+            guard let self = self else { return }
             self.handleAudioPlayerSecondElapse(seconds: seconds)
         }
-        source.event.playWhenReadyChange.addListener(self) { [weak self, weak source] playWhenReady in
-            guard let self = self, let source = source, self.isActivePlayer(source) else { return }
+        player.event.playWhenReadyChange.addListener(self) { [weak self] playWhenReady in
+            guard let self = self else { return }
             self.handlePlayWhenReadyChange(playWhenReady: playWhenReady)
         }
-    }
-
-    private func isActivePlayer(_ source: QueuedAudioPlayer) -> Bool {
-        return source === activePlayer
     }
 
     // MARK: - RCTEventEmitter
@@ -238,8 +213,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
         // configure buffer size
         if let bufferDuration = config["minBuffer"] as? TimeInterval {
-            primaryPlayer.bufferDuration = bufferDuration
-            secondaryPlayer.bufferDuration = bufferDuration
+            player.bufferDuration = bufferDuration
         }
 
         if let autoHandleInterruptions = config["autoHandleInterruptions"] as? Bool {
@@ -248,14 +222,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
         // configure wether player waits to play (deprecated)
         if let waitForBuffer = config["waitForBuffer"] as? Bool {
-            primaryPlayer.automaticallyWaitsToMinimizeStalling = waitForBuffer
-            secondaryPlayer.automaticallyWaitsToMinimizeStalling = waitForBuffer
+            player.automaticallyWaitsToMinimizeStalling = waitForBuffer
         }
 
         // configure wether control center metdata should auto update
         autoUpdateNowPlayingInfo = config["autoUpdateMetadata"] as? Bool ?? true
-        primaryPlayer.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
-        secondaryPlayer.automaticallyUpdateNowPlayingInfo = false
+        player.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
 
         // configure audio session - category, options & mode
         if
@@ -415,8 +387,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
                     bookmarkOptions: options["bookmarkOptions"] as? [String: Any]
                 )
             }
-        primaryPlayer.remoteCommands = remoteCommands
-        secondaryPlayer.remoteCommands = []
+        player.remoteCommands = remoteCommands
 
         configureProgressUpdateEvent(
             interval: ((options["progressUpdateEventInterval"] as? NSNumber) ?? 0).doubleValue
@@ -430,29 +401,32 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         self.player.timeEventFrequency = shouldEmitProgressEvent
             ? .custom(time: CMTime(seconds: interval, preferredTimescale: 1000))
             : .everySecond
-        if crossfadeEnabled {
-            self.standbyPlayer.timeEventFrequency = self.player.timeEventFrequency
-        }
     }
 
-    private func cancelCrossfadeWork() {
+    private func cancelCrossfadeWork(errorCode: String = "cancelled", resetActivePlayback: Bool = false) {
         crossfadeRunId += 1
-        crossfadeWorkItems.forEach { $0.cancel() }
-        crossfadeWorkItems.removeAll()
+        crossfadeStartWorkItem?.cancel()
+        crossfadeStartWorkItem = nil
+        crossfadeCoordinator.cancelTransition(keepActivePlayback: crossfadeCoordinator.hasActivePlayback && !resetActivePlayback)
         if let reject = crossfadePendingReject {
             if let fromIndex = crossfadePendingFromIndex, let toIndex = crossfadePendingToIndex {
                 emitCrossfadeState(
                     state: "cancelled",
                     fromIndex: fromIndex,
                     toIndex: toIndex,
-                    errorCode: "cancelled"
+                    errorCode: errorCode
                 )
             }
-            reject("cancelled", "Crossfade was cancelled.", nil)
+            reject(errorCode, "Crossfade was cancelled.", nil)
         }
+        clearCrossfadePromise()
+    }
+
+    private func clearCrossfadePromise() {
         crossfadePendingReject = nil
         crossfadePendingFromIndex = nil
         crossfadePendingToIndex = nil
+        preparedCrossfadeSeekTo = 0
     }
 
     private func emitCrossfadeState(
@@ -484,131 +458,55 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         emit(event: EventType.PlaybackCrossfadeState, body: body)
     }
 
-    private func startCrossfadeRun(
-        runId: Int,
-        outgoing: QueuedAudioPlayer,
-        incoming: QueuedAudioPlayer,
-        fromIndex: Int,
-        toIndex: Int,
-        durationMs: Int,
-        intervalMs: Int,
-        targetVolume: Float,
-        resolve: @escaping RCTPromiseResolveBlock
-    ) {
-        guard crossfadeRunId == runId else { return }
-        outgoing.automaticallyUpdateNowPlayingInfo = false
-        incoming.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
-        activePlayerSlot = incoming === primaryPlayer ? 0 : 1
-        incoming.volume = 0
-        incoming.play()
-        configureAudioSession()
-        emitActiveTrackChangeForCrossfade(outgoing: outgoing, incoming: incoming)
-        emitCrossfadeState(
-            state: "started",
-            fromIndex: fromIndex,
-            toIndex: toIndex,
-            elapsedMs: 0,
-            fromVolume: outgoing.volume,
-            toVolume: incoming.volume
-        )
-        runCrossfadeStep(
-            runId: runId,
-            outgoing: outgoing,
-            incoming: incoming,
-            fromIndex: fromIndex,
-            toIndex: toIndex,
-            durationMs: max(1, durationMs),
-            intervalMs: intervalMs,
-            targetVolume: targetVolume,
-            elapsedMs: 0,
-            resolve: resolve
-        )
+    private func cancelCrossfadeForManualAction() {
+        if crossfadeEnabled {
+            cancelCrossfadeWork(resetActivePlayback: true)
+            crossfadeCoordinator.reset()
+            player.volume = 1
+        }
     }
 
-    private func runCrossfadeStep(
-        runId: Int,
-        outgoing: QueuedAudioPlayer,
-        incoming: QueuedAudioPlayer,
-        fromIndex: Int,
-        toIndex: Int,
-        durationMs: Int,
-        intervalMs: Int,
-        targetVolume: Float,
-        elapsedMs: Int,
-        resolve: @escaping RCTPromiseResolveBlock
-    ) {
-        guard crossfadeRunId == runId else { return }
-        let progress = min(1, max(0, Float(elapsedMs) / Float(durationMs)))
-        let angle = progress * Float.pi / 2
-        let fromVolume = max(0, cos(angle))
-        let toVolume = targetVolume * sin(angle)
-        outgoing.volume = fromVolume
-        incoming.volume = toVolume
-        emitCrossfadeState(
-            state: "running",
-            fromIndex: fromIndex,
-            toIndex: toIndex,
-            elapsedMs: min(elapsedMs, durationMs),
-            fromVolume: fromVolume,
-            toVolume: toVolume
-        )
+    private func syncPublicPlayerToCrossfadeTarget(toIndex: Int, position: Double) {
+        guard toIndex >= 0, toIndex < player.items.count else { return }
+        let lastItem = player.currentItem
+        let lastIndex = player.currentIndex == -1 ? nil : player.currentIndex
+        let lastPosition = player.currentTime
 
-        if elapsedMs >= durationMs {
-            outgoing.pause()
-            outgoing.volume = 0
-            incoming.volume = targetVolume
-            outgoing.automaticallyUpdateNowPlayingInfo = false
-            incoming.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
-            emitCrossfadeState(
-                state: "completed",
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                elapsedMs: durationMs,
-                fromVolume: 0,
-                toVolume: targetVolume
-            )
-            crossfadeWorkItems.removeAll()
-            crossfadePendingReject = nil
-            crossfadePendingFromIndex = nil
-            crossfadePendingToIndex = nil
-            resolve(NSNull())
-            return
-        }
+        player.volume = 0
+        try? player.jumpToItem(atIndex: toIndex, playWhenReady: false)
+        player.seek(to: max(0, position))
+        player.pause()
 
-        let nextElapsedMs = min(durationMs, elapsedMs + intervalMs)
-        let next = DispatchWorkItem { [weak self, weak outgoing, weak incoming] in
-            guard let self = self, let outgoing = outgoing, let incoming = incoming else { return }
-            self.runCrossfadeStep(
-                runId: runId,
-                outgoing: outgoing,
-                incoming: incoming,
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                durationMs: durationMs,
-                intervalMs: intervalMs,
-                targetVolume: targetVolume,
-                elapsedMs: nextElapsedMs,
-                resolve: resolve
-            )
-        }
-        crossfadeWorkItems.append(next)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(intervalMs), execute: next)
-    }
-
-    private func emitActiveTrackChangeForCrossfade(outgoing: QueuedAudioPlayer, incoming: QueuedAudioPlayer) {
-        let item = incoming.currentItem
-        if let track = (item as? Track)?.toObject() {
+        if let track = (player.currentItem as? Track)?.toObject() {
             var metadata = track
-            metadata["elapsedTime"] = incoming.currentTime
-            Metadata.update(for: incoming, with: metadata)
+            metadata["elapsedTime"] = position
+            Metadata.update(for: player, with: metadata)
         }
+
         handleAudioPlayerCurrentItemChange(
-            item: item,
-            index: incoming.currentIndex == -1 ? nil : incoming.currentIndex,
-            lastItem: outgoing.currentItem,
-            lastIndex: outgoing.currentIndex == -1 ? nil : outgoing.currentIndex,
-            lastPosition: outgoing.currentTime
+            item: player.currentItem,
+            index: player.currentIndex == -1 ? nil : player.currentIndex,
+            lastItem: lastItem,
+            lastIndex: lastIndex,
+            lastPosition: lastPosition
         )
+        player.volume = 0
+    }
+
+    private func publicPlaybackPosition() -> Double {
+        return crossfadeCoordinator.hasActivePlayback ? crossfadeCoordinator.currentTime : player.currentTime
+    }
+
+    private func publicPlaybackDuration() -> Double {
+        return crossfadeCoordinator.hasActivePlayback ? crossfadeCoordinator.duration : player.duration
+    }
+
+    private func publicBufferedPosition() -> Double {
+        return crossfadeCoordinator.hasActivePlayback ? crossfadeCoordinator.bufferedPosition : player.bufferedPosition
+    }
+
+    private func publicPlaybackVolume() -> Float {
+        return crossfadeCoordinator.hasActivePlayback ? crossfadeCoordinator.volume : player.volume
     }
 
     @objc(add:before:resolver:rejecter:)
@@ -641,12 +539,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             items: tracks,
             at: index
         )
-        if crossfadeEnabled {
-            try? standbyPlayer.add(
-                items: tracks,
-                at: index
-            )
-        }
         resolve(index)
     }
 
@@ -663,12 +555,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             return
         }
 
+        cancelCrossfadeForManualAction()
         player.load(item: track)
-        if crossfadeEnabled {
-            standbyPlayer.clear()
-            standbyPlayer.add(item: track)
-            standbyPlayer.volume = 0
-        }
         resolve(player.currentIndex)
     }
 
@@ -683,11 +571,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
         // Sort the indexes in descending order so we can safely remove them one by one
         // without having the next index possibly newly pointing to another item than intended:
+        cancelCrossfadeForManualAction()
         for index in indexes.sorted().reversed() {
             try? player.removeItem(at: index)
-            if crossfadeEnabled {
-                try? standbyPlayer.removeItem(at: index)
-            }
         }
 
         resolve(NSNull())
@@ -712,10 +598,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             message: "The toIndex is out of bounds",
             reject: reject)
         ) { return }
+        cancelCrossfadeForManualAction()
         try? player.moveItem(fromIndex: fromIndex.intValue, toIndex: toIndex.intValue)
-        if crossfadeEnabled {
-            try? standbyPlayer.moveItem(fromIndex: fromIndex.intValue, toIndex: toIndex.intValue)
-        }
         resolve(NSNull())
     }
 
@@ -724,10 +608,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func removeUpcomingTracks(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        cancelCrossfadeForManualAction()
         player.removeUpcomingItems()
-        if crossfadeEnabled {
-            standbyPlayer.removeUpcomingItems()
-        }
         resolve(NSNull())
     }
 
@@ -744,11 +626,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         print("Skipping to track:", index)
+        cancelCrossfadeForManualAction()
         try? player.jumpToItem(atIndex: index, playWhenReady: player.playerState == .playing)
-        if crossfadeEnabled {
-            try? standbyPlayer.jumpToItem(atIndex: index, playWhenReady: false)
-            standbyPlayer.volume = 0
-        }
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
@@ -766,11 +645,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        cancelCrossfadeForManualAction()
         player.next()
-        if crossfadeEnabled {
-            standbyPlayer.next()
-            standbyPlayer.volume = 0
-        }
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
@@ -788,11 +664,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        cancelCrossfadeForManualAction()
         player.previous()
-        if crossfadeEnabled {
-            standbyPlayer.previous()
-            standbyPlayer.volume = 0
-        }
 
         // if an initialTime is passed the seek to it
         if (initialTime >= 0) {
@@ -806,22 +679,26 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func reset(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        if crossfadeEnabled {
+            cancelCrossfadeWork(resetActivePlayback: true)
+            crossfadeCoordinator.reset()
+        }
         player.stop()
         player.clear()
-        if crossfadeEnabled {
-            cancelCrossfadeWork()
-            standbyPlayer.stop()
-            standbyPlayer.clear()
-            activePlayerSlot = 0
-            primaryPlayer.volume = 1
-            secondaryPlayer.volume = 0
-        }
+        player.volume = 1
         resolve(NSNull())
     }
 
     @objc(play:rejecter:)
     public func play(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        if crossfadeEnabled && crossfadeCoordinator.hasActivePlayback {
+            crossfadeCoordinator.play(rate: player.rate) { _ in }
+            player.volume = 0
+            player.play()
+            resolve(NSNull())
+            return
+        }
         player.play()
         resolve(NSNull())
     }
@@ -832,8 +709,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
         if crossfadeEnabled {
             cancelCrossfadeWork()
-            primaryPlayer.pause()
-            secondaryPlayer.pause()
+            crossfadeCoordinator.pause()
+            player.pause()
             resolve(NSNull())
             return
         }
@@ -847,8 +724,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
         if crossfadeEnabled && !playWhenReady {
             cancelCrossfadeWork()
-            primaryPlayer.playWhenReady = false
-            secondaryPlayer.playWhenReady = false
+            crossfadeCoordinator.pause()
+            player.pause()
+            resolve(NSNull())
+            return
+        }
+        if crossfadeEnabled && playWhenReady && crossfadeCoordinator.hasActivePlayback {
+            crossfadeCoordinator.play(rate: player.rate) { _ in }
+            player.volume = 0
+            player.play()
             resolve(NSNull())
             return
         }
@@ -866,13 +750,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func stop(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.stop()
         if crossfadeEnabled {
-            cancelCrossfadeWork()
-            standbyPlayer.stop()
-            primaryPlayer.volume = activePlayerSlot == 0 ? player.volume : 0
-            secondaryPlayer.volume = activePlayerSlot == 1 ? player.volume : 0
+            cancelCrossfadeWork(resetActivePlayback: true)
+            crossfadeCoordinator.reset()
+            player.volume = 1
         }
+        player.stop()
         resolve(NSNull())
     }
 
@@ -881,7 +764,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         if crossfadeEnabled {
-            cancelCrossfadeWork()
+            cancelCrossfadeWork(resetActivePlayback: false)
+            if crossfadeCoordinator.hasActivePlayback {
+                crossfadeCoordinator.seek(to: time)
+                player.seek(to: time)
+                resolve(NSNull())
+                return
+            }
         }
         player.seek(to: time)
         resolve(NSNull())
@@ -891,6 +780,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func seekBy(offset: Double, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
+        if crossfadeEnabled {
+            cancelCrossfadeWork(resetActivePlayback: false)
+            if crossfadeCoordinator.hasActivePlayback {
+                crossfadeCoordinator.seek(to: crossfadeCoordinator.currentTime + offset)
+                player.seek(by: offset)
+                resolve(NSNull())
+                return
+            }
+        }
         player.seek(by: offset)
         resolve(NSNull())
     }
@@ -922,6 +820,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         player.volume = level
+        if crossfadeEnabled && crossfadeCoordinator.hasActivePlayback {
+            crossfadeCoordinator.volume = level
+        }
         resolve(NSNull())
     }
 
@@ -929,8 +830,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func crossFadePrepare(
         previous: Bool,
         seekTo: Double,
-        resolve: RCTPromiseResolveBlock,
-        reject: RCTPromiseRejectBlock
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
         guard crossfadeEnabled else {
@@ -946,25 +847,40 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             return
         }
 
-        let incoming = standbyPlayer
-        incoming.automaticallyUpdateNowPlayingInfo = false
-        incoming.pause()
-        incoming.volume = 0
-        do {
-            try incoming.jumpToItem(atIndex: toIndex, playWhenReady: false)
-            incoming.seek(to: max(0, seekTo))
-            emitCrossfadeState(
-                state: "prepared",
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                elapsedMs: 0,
-                fromVolume: player.volume,
-                toVolume: incoming.volume
-            )
-            resolve(NSNull())
-        } catch {
-            emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
-            reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
+        guard let outgoingTrack = player.items[fromIndex] as? Track,
+              let incomingTrack = player.items[toIndex] as? Track else {
+            reject("crossfade_target_unavailable", "No crossfade target track is available.", nil)
+            return
+        }
+
+        let prepareRunId = crossfadeRunId
+        preparedCrossfadeSeekTo = max(0, seekTo)
+        crossfadeCoordinator.prepare(
+            outgoingTrack: outgoingTrack,
+            outgoingPosition: publicPlaybackPosition(),
+            fromIndex: fromIndex,
+            incomingTrack: incomingTrack,
+            incomingPosition: preparedCrossfadeSeekTo,
+            toIndex: toIndex
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self, self.crossfadeRunId == prepareRunId else { return }
+                switch result {
+                case .success:
+                    self.emitCrossfadeState(
+                        state: "prepared",
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        elapsedMs: 0,
+                        fromVolume: self.publicPlaybackVolume(),
+                        toVolume: 0
+                    )
+                    resolve(NSNull())
+                case .failure(let error):
+                    self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
+                    reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
+                }
+            }
         }
     }
 
@@ -983,59 +899,150 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
             return
         }
 
-        let outgoing = player
-        let incoming = standbyPlayer
-        let fromIndex = outgoing.currentIndex
-        let toIndex = incoming.currentIndex
-        guard fromIndex >= 0, toIndex >= 0, toIndex < incoming.items.count else {
+        let fromIndex = player.currentIndex
+        let preparedMatchesCurrent = crossfadeCoordinator.preparedFromIndex == fromIndex
+            && crossfadeCoordinator.preparedToIndex != nil
+        let toIndex = preparedMatchesCurrent
+            ? crossfadeCoordinator.preparedToIndex!
+            : fromIndex + 1
+
+        guard fromIndex >= 0, toIndex >= 0, toIndex < player.items.count else {
+            reject("crossfade_target_unavailable", "No prepared crossfade target track is available.", nil)
+            return
+        }
+        guard let outgoingTrack = player.items[fromIndex] as? Track,
+              let incomingTrack = player.items[toIndex] as? Track else {
             reject("crossfade_target_unavailable", "No prepared crossfade target track is available.", nil)
             return
         }
 
-        cancelCrossfadeWork()
-        crossfadeRunId += 1
-        let runId = crossfadeRunId
-        crossfadePendingReject = reject
-        crossfadePendingFromIndex = fromIndex
-        crossfadePendingToIndex = toIndex
         let durationMs = max(0, Int(fadeDuration))
         let intervalMs = max(10, Int(fadeInterval))
         let targetVolume = Float(max(0, min(1, fadeToVolume)))
-        let delayMs = max(0, Int(waitUntil - outgoing.currentTime * 1000))
 
-        emitCrossfadeState(
-            state: "scheduled",
-            fromIndex: fromIndex,
-            toIndex: toIndex,
-            elapsedMs: 0,
-            fromVolume: outgoing.volume,
-            toVolume: incoming.volume
-        )
+        let scheduleCrossfade = { [weak self] in
+            guard let self = self else { return }
+            self.crossfadeRunId += 1
+            let runId = self.crossfadeRunId
+            self.crossfadePendingReject = reject
+            self.crossfadePendingFromIndex = fromIndex
+            self.crossfadePendingToIndex = toIndex
 
-        let start = DispatchWorkItem { [weak self, weak outgoing, weak incoming] in
-            guard let self = self, self.crossfadeRunId == runId else { return }
-            guard let outgoing = outgoing, let incoming = incoming else { return }
-            self.startCrossfadeRun(
-                runId: runId,
-                outgoing: outgoing,
-                incoming: incoming,
+            let delayMs = max(0, Int(waitUntil - self.publicPlaybackPosition() * 1000))
+            emitCrossfadeState(
+                state: "scheduled",
                 fromIndex: fromIndex,
                 toIndex: toIndex,
-                durationMs: durationMs,
-                intervalMs: intervalMs,
-                targetVolume: targetVolume,
-                resolve: resolve
+                elapsedMs: 0,
+                fromVolume: self.publicPlaybackVolume(),
+                toVolume: 0
             )
+
+            let start = DispatchWorkItem { [weak self] in
+                guard let self = self, self.crossfadeRunId == runId else { return }
+                self.crossfadeCoordinator.start(
+                    fromIndex: fromIndex,
+                    toIndex: toIndex,
+                    durationMs: durationMs,
+                    intervalMs: intervalMs,
+                    targetVolume: targetVolume,
+                    rate: self.player.rate,
+                    publicVolume: self.publicPlaybackVolume(),
+                    currentPublicPosition: { [weak self] in self?.player.currentTime ?? 0 },
+                    onStarted: { [weak self] fromVolume, toVolume in
+                        guard let self = self, self.crossfadeRunId == runId else { return }
+                        self.player.volume = 0
+                        self.syncPublicPlayerToCrossfadeTarget(toIndex: toIndex, position: self.preparedCrossfadeSeekTo)
+                        self.player.play()
+                        self.player.volume = 0
+                        self.emitCrossfadeState(
+                            state: "started",
+                            fromIndex: fromIndex,
+                            toIndex: toIndex,
+                            elapsedMs: 0,
+                            fromVolume: fromVolume,
+                            toVolume: toVolume
+                        )
+                    },
+                    onRunning: { [weak self] elapsedMs, fromVolume, toVolume in
+                        guard let self = self, self.crossfadeRunId == runId else { return }
+                        self.emitCrossfadeState(
+                            state: "running",
+                            fromIndex: fromIndex,
+                            toIndex: toIndex,
+                            elapsedMs: elapsedMs,
+                            fromVolume: fromVolume,
+                            toVolume: toVolume
+                        )
+                    },
+                    onCompleted: { [weak self] elapsedMs, fromVolume, toVolume in
+                        guard let self = self, self.crossfadeRunId == runId else { return }
+                        self.player.volume = 0
+                        self.emitCrossfadeState(
+                            state: "completed",
+                            fromIndex: fromIndex,
+                            toIndex: toIndex,
+                            elapsedMs: elapsedMs,
+                            fromVolume: fromVolume,
+                            toVolume: toVolume
+                        )
+                        self.clearCrossfadePromise()
+                        resolve(NSNull())
+                    },
+                    onError: { [weak self] error in
+                        guard let self = self, self.crossfadeRunId == runId else { return }
+                        self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_failed")
+                        self.clearCrossfadePromise()
+                        reject("crossfade_failed", "Unable to complete crossfade.", error)
+                    }
+                )
+            }
+            self.crossfadeStartWorkItem = start
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: start)
         }
-        crossfadeWorkItems.append(start)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: start)
+
+        if preparedMatchesCurrent {
+            scheduleCrossfade()
+            return
+        }
+
+        cancelCrossfadeWork()
+        let prepareRunId = crossfadeRunId
+        preparedCrossfadeSeekTo = 0
+        crossfadeCoordinator.prepare(
+            outgoingTrack: outgoingTrack,
+            outgoingPosition: publicPlaybackPosition(),
+            fromIndex: fromIndex,
+            incomingTrack: incomingTrack,
+            incomingPosition: 0,
+            toIndex: toIndex
+        ) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self, self.crossfadeRunId == prepareRunId else { return }
+                switch result {
+                case .success:
+                    self.emitCrossfadeState(
+                        state: "prepared",
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        elapsedMs: 0,
+                        fromVolume: self.publicPlaybackVolume(),
+                        toVolume: 0
+                    )
+                    scheduleCrossfade()
+                case .failure(let error):
+                    self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
+                    reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
+                }
+            }
+        }
     }
 
     @objc(getVolume:rejecter:)
     public func getVolume(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        resolve(player.volume)
+        resolve(publicPlaybackVolume())
     }
 
     @objc(setRate:resolver:rejecter:)
@@ -1043,6 +1050,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         player.rate = rate
+        if crossfadeEnabled && crossfadeCoordinator.hasActivePlayback {
+            crossfadeCoordinator.play(rate: rate) { _ in }
+        }
         resolve(NSNull())
     }
 
@@ -1090,13 +1100,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
 
             tracks.append(track)
         }
+        cancelCrossfadeForManualAction()
         player.clear()
         try? player.add(items: tracks)
-        if crossfadeEnabled {
-            standbyPlayer.clear()
-            try? standbyPlayer.add(items: tracks)
-            standbyPlayer.volume = 0
-        }
         resolve(NSNull())
     }
 
@@ -1129,30 +1135,30 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
     public func getDuration(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        resolve(player.duration)
+        resolve(publicPlaybackDuration())
     }
 
     @objc(getBufferedPosition:rejecter:)
     public func getBufferedPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        resolve(player.bufferedPosition)
+        resolve(publicBufferedPosition())
     }
 
     @objc(getPosition:rejecter:)
     public func getPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        resolve(player.currentTime)
+        resolve(publicPlaybackPosition())
     }
 
     @objc(getProgress:rejecter:)
     public func getProgress(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
         resolve([
-            "position": player.currentTime,
-            "duration": player.duration,
-            "buffered": player.bufferedPosition
+            "position": publicPlaybackPosition(),
+            "duration": publicPlaybackDuration(),
+            "buffered": publicBufferedPosition()
         ])
     }
 
@@ -1334,9 +1340,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate {
         emit(
             event: EventType.PlaybackProgressUpdated,
             body: [
-                "position": player.currentTime,
-                "duration": player.duration,
-                "buffered": player.bufferedPosition,
+                "position": publicPlaybackPosition(),
+                "duration": publicPlaybackDuration(),
+                "buffered": publicBufferedPosition(),
                 "track": player.currentIndex,
             ]
         )
