@@ -604,17 +604,22 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
     @ReactMethod
     fun getActiveTrackIndex(callback: Promise) = scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
+        val index = musicService.getCurrentTrackIndex()
         callback.resolve(
-            if (musicService.tracks.isEmpty()) null else musicService.getCurrentTrackIndex()
+            if (index in musicService.tracks.indices) index else null
         )
     }
 
     @ReactMethod
     fun getActiveTrack(callback: Promise) = scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
+        val index = musicService.getCurrentTrackIndex()
         callback.resolve(
-            if (musicService.tracks.isEmpty()) null
-            else musicService.tracks[musicService.getCurrentTrackIndex()].originalItem?.let { Arguments.fromBundle(it) }
+            if (index in musicService.tracks.indices) {
+                musicService.tracks[index].originalItem?.let { Arguments.fromBundle(it) }
+            } else {
+                null
+            }
         )
     }
 
