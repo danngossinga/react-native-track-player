@@ -48,6 +48,47 @@ Not sure where to start?
 2. Peruse the [API Docs](https://rntp.dev/docs/api/events).
 3. Run the [Example Project](/example).
 
+## BFace PingPong Crossfade Fork
+
+This checkout is an internally maintained `react-native-track-player` fork for
+PingPong crossfade on iOS and Android. It keeps the upstream package name so
+React Native autolinking and existing app imports continue to resolve as
+`react-native-track-player`.
+
+Internal version: `4.1.2-bface-pingpong.0`
+
+Local release tag: `v4.1.2-bface-pingpong.0`
+
+Added fork surface:
+
+- `setupPlayer({ crossfade: true })` enables the fork crossfade path.
+- `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
+- `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
+  the two-player overlap transition.
+- `playback-crossfade-state` reports sanitized native crossfade state.
+
+Current validated scope:
+
+- iOS physical manual GO.
+- Android physical manual GO.
+- `example-itunes-lites` integration GO through the local file dependency.
+
+Current limits:
+
+- The fork is maintained internally; upstream RNTP does not own this surface.
+- New Architecture compatibility audit is pending.
+- Long background-duration and edge-case playback coverage is pending.
+
+Consumer apps should pin both the local tag and the exact commit SHA in their
+own docs or dependency lock strategy. Until this fork is published to an
+internal registry or a remote Git repository, local apps should consume it with
+a checked-out `file:` dependency and verify:
+
+```bash
+git -C /Users/danngossinga/workspace/bface007/react-native-track-player-ios-crossfade rev-parse HEAD
+git -C /Users/danngossinga/workspace/bface007/react-native-track-player-ios-crossfade rev-parse v4.1.2-bface-pingpong.0
+```
+
 ## Commerical Usage
 
 **Are you using RNTP for a personal project?** Great! Sponsor us if you're able but otherwise you can support us by reporting any bugs you find, sending us screenshots of your projects and starring us on Github 🌟
