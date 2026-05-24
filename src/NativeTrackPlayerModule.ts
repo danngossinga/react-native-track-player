@@ -41,7 +41,7 @@ export type TrackPlayerConstants = {
   REPEAT_QUEUE: number;
 };
 
-export interface Spec extends TurboModule, TrackPlayerConstants {
+export interface Spec extends TurboModule {
   getConstants: () => TrackPlayerConstants;
   addListener: (eventName: string) => void;
   removeListeners: (count: Double) => void;

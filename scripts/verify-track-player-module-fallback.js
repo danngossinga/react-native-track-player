@@ -32,7 +32,7 @@ try {
   testModule.paths = Module._nodeModulePaths(path.dirname(sourcePath));
   testModule._compile(output, sourcePath);
 
-  if (testModule.exports.default !== legacyModule) {
+  if (testModule.exports.default.marker !== legacyModule.marker) {
     throw new Error('TrackPlayerModule did not fall back to NativeModules.');
   }
 } finally {

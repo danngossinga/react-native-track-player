@@ -1,14 +1,34 @@
 import { NativeModules } from 'react-native';
 
 import NativeTrackPlayerModule, {
+  type TrackPlayerConstants,
   type Spec,
 } from './NativeTrackPlayerModule';
 
-const { TrackPlayerModule: LegacyTrackPlayerModule } = NativeModules;
-const TrackPlayerModule = NativeTrackPlayerModule ?? LegacyTrackPlayerModule;
+type TrackPlayerModuleShape = Spec & TrackPlayerConstants;
 
-if (!TrackPlayerModule) {
+const { TrackPlayerModule: LegacyTrackPlayerModule } = NativeModules;
+const NativeModule = NativeTrackPlayerModule ?? LegacyTrackPlayerModule;
+
+if (!NativeModule) {
   throw new Error('Native module TrackPlayerModule was not found.');
 }
 
-export default TrackPlayerModule as Spec;
+const constants =
+  typeof NativeModule.getConstants === 'function'
+    ? NativeModule.getConstants()
+    : {};
+
+const TrackPlayerModule = new Proxy(NativeModule, {
+  get(target, property, receiver) {
+    if (
+      typeof property === 'string' &&
+      Object.prototype.hasOwnProperty.call(constants, property)
+    ) {
+      return constants[property as keyof TrackPlayerConstants];
+    }
+    return Reflect.get(target, property, receiver);
+  },
+});
+
+export default TrackPlayerModule as TrackPlayerModuleShape;

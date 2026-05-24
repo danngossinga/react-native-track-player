@@ -37,6 +37,26 @@ android {
     }
 }
 
+def fallbackCodegenJniDir = file("$projectDir/src/main/jni/RNTrackPlayerSpec")
+def generatedCodegenJniDir = file("$buildDir/generated/source/codegen/jni")
+
+tasks.register('prepareFallbackCodegenJni') {
+    inputs.dir(fallbackCodegenJniDir)
+    outputs.dir(generatedCodegenJniDir)
+
+    doLast {
+        def generatedCMake = file("$generatedCodegenJniDir/CMakeLists.txt")
+        if (!generatedCMake.exists()) {
+            copy {
+                from fallbackCodegenJniDir
+                into generatedCodegenJniDir
+            }
+        }
+    }
+}
+
+preBuild.dependsOn(prepareFallbackCodegenJni)
+
 repositories {
     mavenLocal()
     maven {
