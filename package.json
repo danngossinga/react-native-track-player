@@ -9,6 +9,7 @@
   "scripts": {
     "build": "rimraf lib && tsc",
     "dev": "tsc --watch",
+    "test:module-fallback": "node scripts/verify-track-player-module-fallback.js",
     "lint": "eslint src",
     "format": "prettier --write src",
     "types": "tsc --noEmit true",
@@ -36,6 +37,14 @@
     "web/**/*",
     "*.podspec"
   ],
+  "codegenConfig": {
+    "name": "RNTrackPlayerSpec",
+    "type": "modules",
+    "jsSrcsDir": "src",
+    "android": {
+      "javaPackageName": "com.doublesymmetry.trackplayer"
+    }
+  },
   "contributors": [
     {
       "name": "David Chavez",
