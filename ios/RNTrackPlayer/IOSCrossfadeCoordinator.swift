@@ -36,7 +36,7 @@ final class IOSCrossfadeEngine {
 
     init(name: String = "engine") {
         self.name = name
-        player.automaticallyWaitsToMinimizeStalling = false
+        player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         player.volume = 0
     }
@@ -113,7 +113,8 @@ final class IOSCrossfadeEngine {
                 }
 
                 let item = AVPlayerItem(asset: asset)
-                item.preferredForwardBufferDuration = 2
+                item.preferredForwardBufferDuration = 6
+                item.canUseNetworkResourcesForLiveStreamingWhilePaused = true
                 self.pendingAsset = nil
                 self.player.replaceCurrentItem(with: item)
                 self.player.volume = 0
