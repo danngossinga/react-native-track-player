@@ -151,7 +151,12 @@ final class IOSPlaybackOrchestrator {
     }
 
     private var logicalEngine: IOSCrossfadeEngine {
-        return activeEngine
+        switch state {
+        case .crossfading, .pausedDuringCrossfade:
+            return standbyEngine
+        default:
+            return activeEngine
+        }
     }
 
     func setQueue(_ tracks: [Track]) {
@@ -525,7 +530,15 @@ final class IOSPlaybackOrchestrator {
                 guard let self = self, self.runId == runId else { return }
                 switch result {
                 case .success:
+                    let lastPosition = self.activeEngine.currentTime
+                    self.currentIndex = toIndex
                     self.state = .crossfading
+                    self.delegate?.playbackOrchestrator(
+                        self,
+                        didChangeActiveTrack: toIndex,
+                        lastIndex: fromIndex,
+                        lastPosition: lastPosition
+                    )
                     self.refreshNowPlaying()
                     self.emitStateIfNeeded()
                     self.emitCrossfadeState(
@@ -639,14 +652,12 @@ final class IOSPlaybackOrchestrator {
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         IOSPlaybackLog.log("crossfade completed from=\(context.fromIndex) to=\(context.toIndex)")
-        let lastPosition = activeEngine.currentTime
         activeEngine.pause()
         activeEngine.reset()
 
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
         standbyEngine = outgoingEngine
-        currentIndex = context.toIndex
         activeEngineIndex = context.toIndex
         standbyEngineIndex = nil
         activeEngine.setVolume(context.targetVolume)
@@ -658,12 +669,6 @@ final class IOSPlaybackOrchestrator {
         crossfadeContext = nil
         crossfadeWorkItem = nil
         IOSPlaybackLog.log("active/standby swap activeIndex=\(activeEngineIndex ?? -1)")
-        delegate?.playbackOrchestrator(
-            self,
-            didChangeActiveTrack: context.toIndex,
-            lastIndex: context.fromIndex,
-            lastPosition: lastPosition
-        )
         emitCrossfadeState(
             "completed",
             fromIndex: context.fromIndex,
