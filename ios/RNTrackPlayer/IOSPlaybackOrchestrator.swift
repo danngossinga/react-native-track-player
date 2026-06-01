@@ -50,6 +50,7 @@ private final class IOSCrossfadeContext {
     let intervalMs: Int
     let targetVolume: Float
     let outgoingStartVolume: Float
+    let incomingStartTime: Double
     var elapsedMs: Int
     var lastRunningEmitMs: Int
 
@@ -60,7 +61,8 @@ private final class IOSCrossfadeContext {
         durationMs: Int,
         intervalMs: Int,
         targetVolume: Float,
-        outgoingStartVolume: Float
+        outgoingStartVolume: Float,
+        incomingStartTime: Double
     ) {
         self.runId = runId
         self.fromIndex = fromIndex
@@ -69,6 +71,7 @@ private final class IOSCrossfadeContext {
         self.intervalMs = intervalMs
         self.targetVolume = targetVolume
         self.outgoingStartVolume = outgoingStartVolume
+        self.incomingStartTime = incomingStartTime
         self.elapsedMs = 0
         self.lastRunningEmitMs = -250
     }
@@ -148,12 +151,7 @@ final class IOSPlaybackOrchestrator {
     }
 
     private var logicalEngine: IOSCrossfadeEngine {
-        switch state {
-        case .crossfading, .pausedDuringCrossfade:
-            return standbyEngine
-        default:
-            return activeEngine
-        }
+        return activeEngine
     }
 
     func setQueue(_ tracks: [Track]) {
@@ -527,15 +525,7 @@ final class IOSPlaybackOrchestrator {
                 guard let self = self, self.runId == runId else { return }
                 switch result {
                 case .success:
-                    let lastPosition = self.activeEngine.currentTime
-                    self.currentIndex = toIndex
                     self.state = .crossfading
-                    self.delegate?.playbackOrchestrator(
-                        self,
-                        didChangeActiveTrack: toIndex,
-                        lastIndex: fromIndex,
-                        lastPosition: lastPosition
-                    )
                     self.refreshNowPlaying()
                     self.emitStateIfNeeded()
                     self.emitCrossfadeState(
@@ -554,7 +544,8 @@ final class IOSPlaybackOrchestrator {
                         durationMs: durationMs,
                         intervalMs: intervalMs,
                         targetVolume: targetVolume,
-                        outgoingStartVolume: outgoingStartVolume
+                        outgoingStartVolume: outgoingStartVolume,
+                        incomingStartTime: self.standbyEngine.currentTime
                     )
                     self.crossfadeContext = context
                     self.runCrossfadeRamp(context: context, completion: completion)
@@ -587,6 +578,23 @@ final class IOSPlaybackOrchestrator {
     ) {
         guard runId == context.runId else { return }
         guard state == .crossfading else { return }
+
+        if context.elapsedMs >= 2000,
+           standbyEngine.currentTime <= context.incomingStartTime + 0.2 {
+            fallbackToTargetAfterStalledCrossfade(context: context, completion: completion)
+            return
+        }
+
+        if activeEngine.duration > 0,
+           activeEngine.currentTime >= max(0, activeEngine.duration - 0.15) {
+            if standbyEngine.currentTime > context.incomingStartTime + 0.2 {
+                context.elapsedMs = context.durationMs
+                finishCrossfade(context: context, completion: completion)
+            } else {
+                fallbackToTargetAfterStalledCrossfade(context: context, completion: completion)
+            }
+            return
+        }
 
         let progress = min(1, max(0, Double(context.elapsedMs) / Double(context.durationMs)))
         let angle = progress * Double.pi / 2
@@ -631,12 +639,14 @@ final class IOSPlaybackOrchestrator {
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         IOSPlaybackLog.log("crossfade completed from=\(context.fromIndex) to=\(context.toIndex)")
+        let lastPosition = activeEngine.currentTime
         activeEngine.pause()
         activeEngine.reset()
 
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
         standbyEngine = outgoingEngine
+        currentIndex = context.toIndex
         activeEngineIndex = context.toIndex
         standbyEngineIndex = nil
         activeEngine.setVolume(context.targetVolume)
@@ -648,6 +658,12 @@ final class IOSPlaybackOrchestrator {
         crossfadeContext = nil
         crossfadeWorkItem = nil
         IOSPlaybackLog.log("active/standby swap activeIndex=\(activeEngineIndex ?? -1)")
+        delegate?.playbackOrchestrator(
+            self,
+            didChangeActiveTrack: context.toIndex,
+            lastIndex: context.fromIndex,
+            lastPosition: lastPosition
+        )
         emitCrossfadeState(
             "completed",
             fromIndex: context.fromIndex,
@@ -664,14 +680,38 @@ final class IOSPlaybackOrchestrator {
         completion(.success(()))
     }
 
+    private func fallbackToTargetAfterStalledCrossfade(
+        context: IOSCrossfadeContext,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        IOSPlaybackLog.log("crossfade incoming stalled from=\(context.fromIndex) to=\(context.toIndex) incomingStart=\(context.incomingStartTime) incomingNow=\(standbyEngine.currentTime)")
+        emitCrossfadeState(
+            "error",
+            fromIndex: context.fromIndex,
+            toIndex: context.toIndex,
+            elapsedMs: context.elapsedMs,
+            fromVolume: activeEngine.volume,
+            toVolume: standbyEngine.volume,
+            errorCode: "incoming_stalled"
+        )
+        crossfadeWorkItem?.cancel()
+        crossfadeWorkItem = nil
+        crossfadeContext = nil
+        standbyEngine.pause()
+        standbyEngine.reset()
+        skip(to: context.toIndex, initialTime: 0, completion: completion)
+    }
+
     private func resumeCrossfadeRamp() {
         guard let context = crossfadeContext else { return }
         runCrossfadeRamp(context: context) { _ in }
     }
 
     private func promoteLogicalEngineAfterCrossfadeCancellation(errorCode: String) {
-        guard state == .crossfading || state == .pausedDuringCrossfade else { return }
+        guard let context = crossfadeContext,
+              state == .crossfading || state == .pausedDuringCrossfade else { return }
         IOSPlaybackLog.log("crossfade cancel promote logical engine currentIndex=\(currentIndex)")
+        let lastPosition = activeEngine.currentTime
         emitCrossfadeCancellationIfNeeded(errorCode: errorCode)
         crossfadeWorkItem?.cancel()
         crossfadeWorkItem = nil
@@ -680,10 +720,17 @@ final class IOSPlaybackOrchestrator {
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
         standbyEngine = outgoingEngine
+        currentIndex = context.toIndex
         activeEngineIndex = currentIndex
         standbyEngineIndex = nil
         crossfadeContext = nil
         state = playWhenReady ? .playingSingle : .paused
+        delegate?.playbackOrchestrator(
+            self,
+            didChangeActiveTrack: context.toIndex,
+            lastIndex: context.fromIndex,
+            lastPosition: lastPosition
+        )
     }
 
     private func prepareStandby(

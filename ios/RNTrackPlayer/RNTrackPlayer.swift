@@ -266,7 +266,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         // configure wether control center metdata should auto update
         autoUpdateNowPlayingInfo = config["autoUpdateMetadata"] as? Bool ?? true
-        player.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
+        player.automaticallyUpdateNowPlayingInfo = useOrchestratedCrossfade
+            ? false
+            : autoUpdateNowPlayingInfo
         if useOrchestratedCrossfade {
             player.volume = 0
         }
@@ -483,10 +485,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private func startOrchestratedProgressUpdates() {
         orchestratedProgressWorkItem?.cancel()
         orchestratedProgressWorkItem = nil
-        guard useOrchestratedCrossfade, shouldEmitProgressEvent, playbackOrchestrator.hasCurrentItem else { return }
+        guard useOrchestratedCrossfade, playbackOrchestrator.hasCurrentItem else { return }
         guard playbackOrchestrator.playbackState == .playing else { return }
 
-        let interval = max(0.25, progressUpdateInterval)
+        let interval = shouldEmitProgressEvent ? max(0.25, progressUpdateInterval) : 1
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
             self.emitOrchestratedProgress()
@@ -502,7 +504,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     private func emitOrchestratedProgress() {
-        guard useOrchestratedCrossfade, shouldEmitProgressEvent, playbackOrchestrator.hasCurrentItem else { return }
+        guard useOrchestratedCrossfade, playbackOrchestrator.hasCurrentItem else { return }
+        updateNowPlayingForOrchestrator()
+        guard shouldEmitProgressEvent else { return }
         emit(
             event: EventType.PlaybackProgressUpdated,
             body: [
@@ -512,7 +516,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 "track": playbackOrchestrator.currentIndex,
             ]
         )
-        updateNowPlayingForOrchestrator()
     }
 
     private func cancelCrossfadeWork(errorCode: String = "cancelled", resetActivePlayback: Bool = false) {
@@ -834,9 +837,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         reject: @escaping RCTPromiseRejectBlock
     ) {
         let index = trackIndex.intValue;
-        if (rejectWhenTrackIndexOutOfBounds(index: index, reject: reject)) { return }
-
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        if (rejectWhenTrackIndexOutOfBounds(index: index, reject: reject)) { return }
 
         print("Skipping to track:", index)
         if useOrchestratedCrossfade {
@@ -1819,6 +1821,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     private func updateNowPlayingForOrchestrator() {
         guard useOrchestratedCrossfade else { return }
+        guard autoUpdateNowPlayingInfo else { return }
         let index = playbackOrchestrator.currentIndex
         guard index >= 0 && index < player.items.count,
               let track = player.items[index] as? Track else { return }
