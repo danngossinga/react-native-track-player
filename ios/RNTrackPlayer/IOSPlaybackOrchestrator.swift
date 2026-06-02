@@ -361,6 +361,11 @@ final class IOSPlaybackOrchestrator {
     ) {
         let fromIndex = currentIndex
         let toIndex = previous ? fromIndex - 1 : fromIndex + 1
+        guard state != .crossfading && state != .pausedDuringCrossfade else {
+            emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_in_progress")
+            completion(.failure(makeError("crossfade_in_progress", "A crossfade is already in progress.")))
+            return
+        }
         guard canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: 1) else {
             emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_target_unavailable")
             completion(.failure(makeError("crossfade_target_unavailable", "No crossfade target track is available.")))
