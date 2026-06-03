@@ -50,10 +50,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         playbackOrchestrator.delegate = self
         audioSessionController.delegate = self
         configurePlayerEvents()
+        configureSystemLifecycleEvents()
         player.playWhenReady = false;
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self)
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
@@ -96,6 +98,90 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             guard let self = self else { return }
             self.handlePlayWhenReadyChange(playWhenReady: playWhenReady)
         }
+    }
+
+    private func configureSystemLifecycleEvents() {
+        let center = NotificationCenter.default
+        center.addObserver(
+            self,
+            selector: #selector(handleApplicationWillResignActive),
+            name: UIApplication.willResignActiveNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleApplicationDidEnterBackground),
+            name: UIApplication.didEnterBackgroundNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleApplicationWillEnterForeground),
+            name: UIApplication.willEnterForegroundNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleApplicationDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleAudioSessionInterruption),
+            name: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleAudioSessionRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+        center.addObserver(
+            self,
+            selector: #selector(handleAudioSessionMediaServicesWereReset),
+            name: AVAudioSession.mediaServicesWereResetNotification,
+            object: AVAudioSession.sharedInstance()
+        )
+    }
+
+    @objc private func handleApplicationWillResignActive() {
+        checkpointOrchestratorForSystemEvent("willResignActive")
+    }
+
+    @objc private func handleApplicationDidEnterBackground() {
+        checkpointOrchestratorForSystemEvent("didEnterBackground")
+    }
+
+    @objc private func handleApplicationWillEnterForeground() {
+        checkpointOrchestratorForSystemEvent("willEnterForeground")
+    }
+
+    @objc private func handleApplicationDidBecomeActive() {
+        checkpointOrchestratorForSystemEvent("didBecomeActive")
+    }
+
+    @objc private func handleAudioSessionInterruption(notification: Notification) {
+        let rawType = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt
+        let reason = rawType.flatMap { AVAudioSession.InterruptionType(rawValue: $0) } == .ended
+            ? "audioInterruptionEnded"
+            : "audioInterruptionBegan"
+        checkpointOrchestratorForSystemEvent(reason)
+    }
+
+    @objc private func handleAudioSessionRouteChange(notification: Notification) {
+        checkpointOrchestratorForSystemEvent("audioRouteChange")
+    }
+
+    @objc private func handleAudioSessionMediaServicesWereReset() {
+        checkpointOrchestratorForSystemEvent("mediaServicesWereReset")
+    }
+
+    private func checkpointOrchestratorForSystemEvent(_ reason: String) {
+        guard useOrchestratedCrossfade else { return }
+        IOSPlaybackLog.log("system event \(reason)")
+        playbackOrchestrator.checkpointForSystemEvent(reason)
     }
 
     // MARK: - RCTEventEmitter
@@ -1838,9 +1924,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if playbackOrchestrator.duration > 0 {
             nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = playbackOrchestrator.duration
         }
-        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = playbackOrchestrator.playWhenReady
-            ? Double(playbackOrchestrator.rate)
-            : 0
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = Double(playbackOrchestrator.nowPlayingPlaybackRate)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
         IOSPlaybackLog.log("nowPlaying center index=\(index) elapsed=\(playbackOrchestrator.currentTime)")
     }

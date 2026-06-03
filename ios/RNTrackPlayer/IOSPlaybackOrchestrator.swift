@@ -95,7 +95,9 @@ final class IOSPlaybackOrchestrator {
     private var preparedSeekTo: Double = 0
     private var activeEngineIndex: Int?
     private var standbyEngineIndex: Int?
+    private let checkpointStore = PlaybackCheckpointStore()
     private var lastKnownState: State = .none
+    private var pendingRecoveryPosition: Double?
     private(set) var state: IOSPlaybackOrchestratorState = .idle
     private(set) var currentIndex: Int = -1
     private(set) var playWhenReady: Bool = false
@@ -117,7 +119,16 @@ final class IOSPlaybackOrchestrator {
     }
 
     var currentTime: Double {
-        return logicalEngine.currentTime
+        let livePosition = logicalEngine.currentTime
+        if livePosition > 0 {
+            pendingRecoveryPosition = nil
+            return livePosition
+        }
+        if let pendingRecoveryPosition,
+           state == .loading || state == .seeking || state == .skipping {
+            return pendingRecoveryPosition
+        }
+        return checkpointForCurrentIndex()?.position ?? livePosition
     }
 
     var duration: Double {
@@ -147,6 +158,15 @@ final class IOSPlaybackOrchestrator {
             return .ended
         case .error:
             return .error
+        }
+    }
+
+    var nowPlayingPlaybackRate: Float {
+        switch state {
+        case .playingSingle, .preloadingNext, .crossfading:
+            return playWhenReady && logicalEngine.isPlaying ? rate : 0
+        default:
+            return 0
         }
     }
 
@@ -212,12 +232,8 @@ final class IOSPlaybackOrchestrator {
             resumeCrossfadeRamp()
             completion?(.success(()))
         case .paused:
-            activeEngine.setVolume(volume)
-            activeEngine.play(rate: rate)
-            state = .playingSingle
-            emitStateIfNeeded()
-            scheduleEndObserver()
-            completion?(.success(()))
+            let resumePosition = resumePositionForCurrentIndex()
+            recoverCurrentItem(position: resumePosition, reason: "play_from_paused", completion: completion)
         case .idle, .ended:
             let indexToPlay = queue.indices.contains(currentIndex) ? currentIndex : 0
             guard queue.indices.contains(indexToPlay) else {
@@ -225,18 +241,33 @@ final class IOSPlaybackOrchestrator {
                 return
             }
             loadIndex(indexToPlay, position: 0, autoPlay: true, completion: completion)
-        case .loading, .seeking, .skipping, .preloadingNext:
+        case .loading:
+            guard queue.indices.contains(currentIndex) else {
+                completion?(.failure(makeError("empty_queue", "No track is available to play.")))
+                return
+            }
+            let resumePosition = resumePositionForCurrentIndex()
+            IOSPlaybackLog.log("play reload from loading index=\(currentIndex) position=\(resumePosition)")
+            recoverCurrentItem(position: resumePosition, reason: "play_from_loading", completion: completion)
+        case .seeking, .skipping, .preloadingNext:
             completion?(.success(()))
         case .playingSingle, .crossfading:
             completion?(.success(()))
         case .error:
-            completion?(.failure(makeError("player_error", "The orchestrator is in an error state.")))
+            guard queue.indices.contains(currentIndex) else {
+                completion?(.failure(makeError("player_error", "The orchestrator is in an error state.")))
+                return
+            }
+            let resumePosition = resumePositionForCurrentIndex()
+            IOSPlaybackLog.log("play recover from error index=\(currentIndex) position=\(resumePosition)")
+            recoverCurrentItem(position: resumePosition, reason: "play_from_error", completion: completion)
         }
         refreshNowPlaying()
     }
 
     func pause() {
         IOSPlaybackLog.log("pause state=\(state)")
+        checkpoint(reason: "pause")
         playWhenReady = false
         switch state {
         case .crossfading:
@@ -254,6 +285,17 @@ final class IOSPlaybackOrchestrator {
         refreshNowPlaying()
     }
 
+    func checkpointForSystemEvent(_ reason: String) {
+        checkpoint(reason: reason)
+        if !playWhenReady {
+            scheduledStartWorkItem?.cancel()
+            scheduledStartWorkItem = nil
+            endObserverWorkItem?.cancel()
+            endObserverWorkItem = nil
+        }
+        refreshNowPlaying()
+    }
+
     func stop() {
         IOSPlaybackLog.log("stop")
         playWhenReady = false
@@ -261,6 +303,7 @@ final class IOSPlaybackOrchestrator {
         cancelAllWork()
         resetEngines()
         currentIndex = -1
+        checkpointStore.clear()
         state = .idle
         emitStateIfNeeded()
         refreshNowPlaying()
@@ -308,6 +351,7 @@ final class IOSPlaybackOrchestrator {
             guard let self = self else { return }
             switch result {
             case .success:
+                self.checkpoint(position: position, reason: "seek")
                 self.state = self.playWhenReady ? .playingSingle : .paused
                 if self.playWhenReady {
                     self.activeEngine.play(rate: self.rate)
@@ -361,6 +405,11 @@ final class IOSPlaybackOrchestrator {
     ) {
         let fromIndex = currentIndex
         let toIndex = previous ? fromIndex - 1 : fromIndex + 1
+        guard playWhenReady, (state == .playingSingle || state == .preloadingNext) else {
+            emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
+            completion(.failure(makeError("crossfade_not_playing", "Crossfade cannot prepare while playback is not active.")))
+            return
+        }
         guard state != .crossfading && state != .pausedDuringCrossfade else {
             emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_in_progress")
             completion(.failure(makeError("crossfade_in_progress", "A crossfade is already in progress.")))
@@ -408,6 +457,11 @@ final class IOSPlaybackOrchestrator {
             ? preparedToIndex!
             : fromIndex + 1
         let durationMs = max(1, Int(fadeDuration))
+        guard playWhenReady, (state == .playingSingle || state == .preloadingNext) else {
+            emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
+            completion(.failure(makeError("crossfade_not_playing", "Crossfade cannot start while playback is not active.")))
+            return
+        }
         guard canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: durationMs) else {
             emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_unavailable")
             completion(.failure(makeError("crossfade_unavailable", "Crossfade is not available for this transition.")))
@@ -430,6 +484,11 @@ final class IOSPlaybackOrchestrator {
 
         func scheduleStartCheck() {
             guard self.runId == currentRunId else { return }
+            guard self.playWhenReady else {
+                self.emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
+                completion(.failure(self.makeError("crossfade_not_playing", "Crossfade was cancelled because playback is paused.")))
+                return
+            }
             let remainingMs = Int(waitUntil - self.currentTime * 1000)
             if remainingMs <= 0 {
                 self.startCrossfade(
@@ -485,6 +544,7 @@ final class IOSPlaybackOrchestrator {
             switch result {
             case .success:
                 self.currentIndex = index
+                self.checkpoint(position: position, reason: "load")
                 self.delegate?.playbackOrchestrator(
                     self,
                     didChangeActiveTrack: index,
@@ -494,10 +554,25 @@ final class IOSPlaybackOrchestrator {
                 if autoPlay {
                     self.playWhenReady = true
                     self.activeEngine.setVolume(self.volume)
-                    self.activeEngine.play(rate: self.rate)
-                    self.state = .playingSingle
-                    self.scheduleEndObserver()
-                    self.preloadNextIfPossible()
+                    self.activeEngine.play(rate: self.rate) { playResult in
+                        switch playResult {
+                        case .success:
+                            self.state = .playingSingle
+                            self.scheduleEndObserver()
+                            self.preloadNextIfPossible()
+                            self.emitStateIfNeeded()
+                            self.refreshNowPlaying()
+                            completion?(.success(()))
+                        case .failure(let error):
+                            IOSPlaybackLog.log("loadIndex autoplay failed index=\(index) error=\(error.localizedDescription)")
+                            self.playWhenReady = false
+                            self.state = .paused
+                            self.emitStateIfNeeded()
+                            self.refreshNowPlaying()
+                            completion?(.failure(error))
+                        }
+                    }
+                    return
                 } else {
                     self.playWhenReady = false
                     self.state = .paused
@@ -537,6 +612,7 @@ final class IOSPlaybackOrchestrator {
                 case .success:
                     let lastPosition = self.activeEngine.currentTime
                     self.currentIndex = toIndex
+                    self.checkpoint(position: self.standbyEngine.currentTime, reason: "crossfade_start")
                     self.state = .crossfading
                     self.delegate?.playbackOrchestrator(
                         self,
@@ -665,6 +741,7 @@ final class IOSPlaybackOrchestrator {
         standbyEngine = outgoingEngine
         activeEngineIndex = context.toIndex
         standbyEngineIndex = nil
+        checkpoint(position: activeEngine.currentTime, reason: "crossfade_complete")
         activeEngine.setVolume(context.targetVolume)
         volume = context.targetVolume
         state = playWhenReady ? .playingSingle : .paused
@@ -733,6 +810,7 @@ final class IOSPlaybackOrchestrator {
         currentIndex = context.toIndex
         activeEngineIndex = currentIndex
         standbyEngineIndex = nil
+        checkpoint(position: activeEngine.currentTime, reason: "crossfade_cancel")
         crossfadeContext = nil
         state = playWhenReady ? .playingSingle : .paused
         delegate?.playbackOrchestrator(
@@ -849,6 +927,93 @@ final class IOSPlaybackOrchestrator {
         preparedSeekTo = 0
     }
 
+    private func checkpoint(reason: String) {
+        guard hasCurrentItem else { return }
+        checkpoint(position: currentTime, reason: reason)
+    }
+
+    private func checkpoint(position: Double, reason: String) {
+        guard hasCurrentItem else { return }
+        let safePosition = max(0, position.isFinite ? position : 0)
+        if safePosition == 0,
+           let existing = checkpointForCurrentIndex(),
+           existing.position > 0,
+           state == .loading || state == .seeking || state == .skipping {
+            IOSPlaybackLog.log("checkpoint skip transient zero reason=\(reason) index=\(currentIndex) existing=\(existing.position)")
+            return
+        }
+        let safeDuration = max(0, duration.isFinite ? duration : 0)
+        let checkpoint = PlaybackCheckpoint(
+            version: 1,
+            updatedAt: Date().timeIntervalSince1970,
+            queueHash: queueHash(),
+            currentIndex: currentIndex,
+            position: safePosition,
+            duration: safeDuration,
+            playWhenReady: playWhenReady,
+            state: playbackState.rawValue
+        )
+        checkpointStore.save(checkpoint)
+        IOSPlaybackLog.log("checkpoint reason=\(reason) index=\(currentIndex) position=\(safePosition) duration=\(safeDuration)")
+    }
+
+    private func resumePositionForCurrentIndex() -> Double {
+        guard let checkpoint = checkpointForCurrentIndex() else {
+            return max(0, currentTime)
+        }
+        return max(checkpoint.position, currentTime)
+    }
+
+    private func checkpointForCurrentIndex() -> PlaybackCheckpoint? {
+        guard hasCurrentItem else { return nil }
+        return checkpointStore.load(queueHash: queueHash(), currentIndex: currentIndex)
+    }
+
+    private func recoverCurrentItem(
+        position: Double,
+        reason: String,
+        completion: ((Result<Void, Error>) -> Void)?
+    ) {
+        guard queue.indices.contains(currentIndex) else {
+            completion?(.failure(makeError("empty_queue", "No track is available to play.")))
+            return
+        }
+        IOSPlaybackLog.log("recover current reason=\(reason) index=\(currentIndex) position=\(position)")
+        cancelScheduledPlaybackWork()
+        pendingRecoveryPosition = max(0, position)
+        loadIndex(currentIndex, position: max(0, position), autoPlay: true, completion: completion)
+    }
+
+    private func cancelScheduledPlaybackWork() {
+        runId += 1
+        crossfadeWorkItem?.cancel()
+        crossfadeWorkItem = nil
+        scheduledStartWorkItem?.cancel()
+        scheduledStartWorkItem = nil
+        endObserverWorkItem?.cancel()
+        endObserverWorkItem = nil
+        crossfadeContext = nil
+        preparedFromIndex = nil
+        preparedToIndex = nil
+        preparedSeekTo = 0
+        pendingRecoveryPosition = nil
+        standbyEngine.pause()
+        standbyEngine.reset()
+        standbyEngineIndex = nil
+    }
+
+    private func queueHash() -> String {
+        let raw = queue.map { track in
+            "\(track.getSourceUrl())#\(track.duration ?? 0)"
+        }.joined(separator: "|")
+        var hash: UInt64 = 1469598103934665603
+        for byte in raw.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 1099511628211
+        }
+        return String(format: "%016llx", hash)
+    }
+
     private func emitCrossfadeCancellationIfNeeded(errorCode: String) {
         guard let context = crossfadeContext else { return }
         emitCrossfadeState(
@@ -906,7 +1071,7 @@ final class IOSPlaybackOrchestrator {
     }
 
     private func refreshNowPlaying() {
-        IOSPlaybackLog.log("nowPlaying update index=\(currentIndex) position=\(currentTime) rate=\(playWhenReady ? rate : 0)")
+        IOSPlaybackLog.log("nowPlaying update index=\(currentIndex) position=\(currentTime) rate=\(nowPlayingPlaybackRate)")
         delegate?.playbackOrchestratorDidUpdateNowPlaying(self)
     }
 

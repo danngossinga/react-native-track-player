@@ -69,6 +69,10 @@ final class IOSCrossfadeEngine {
         return player.currentItem?.status == .readyToPlay
     }
 
+    var isPlaying: Bool {
+        return player.timeControlStatus == .playing && player.rate > 0
+    }
+
     var rate: Float {
         get { return player.rate }
         set {
@@ -170,11 +174,15 @@ final class IOSCrossfadeEngine {
         }
     }
 
-    func play(rate: Float, completion: @escaping (Result<Void, Error>) -> Void) {
+    func play(
+        rate: Float,
+        timeoutMs: Int = 5000,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
         let currentGeneration = generation
         IOSPlaybackLog.log("\(name) play rate=\(rate) volume=\(player.volume)")
         player.playImmediately(atRate: max(rate, 0.1))
-        waitForPlaying(generation: currentGeneration, completion: completion)
+        waitForPlaying(generation: currentGeneration, timeoutMs: timeoutMs, completion: completion)
     }
 
     func play(rate: Float = 1) {
@@ -283,6 +291,7 @@ final class IOSCrossfadeEngine {
 
     private func waitForPlaying(
         generation: Int,
+        timeoutMs: Int = 5000,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         var didComplete = false
@@ -325,7 +334,7 @@ final class IOSCrossfadeEngine {
             )))
         }
         timeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(5000), execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeout)
     }
 }
 
