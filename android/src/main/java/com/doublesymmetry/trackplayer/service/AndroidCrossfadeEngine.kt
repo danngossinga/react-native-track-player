@@ -38,7 +38,8 @@ internal fun androidXfadeLog(message: String) {
 internal class AndroidCrossfadeEngine(
     context: Context,
     val name: String,
-    audioContentType: Int
+    audioContentType: Int,
+    handleAudioFocus: Boolean
 ) {
     private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
     private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
@@ -57,7 +58,7 @@ internal class AndroidCrossfadeEngine(
                     .setUsage(C.USAGE_MEDIA)
                     .setContentType(audioContentType)
                     .build(),
-                false
+                handleAudioFocus
             )
         }
 

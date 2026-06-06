@@ -9,6 +9,7 @@
   "scripts": {
     "build": "rimraf lib && tsc",
     "dev": "tsc --watch",
+    "test:android-crossfade-contracts": "node scripts/verify-android-crossfade-contracts.js",
     "test:module-fallback": "node scripts/verify-track-player-module-fallback.js",
     "lint": "eslint src",
     "format": "prettier --write src",

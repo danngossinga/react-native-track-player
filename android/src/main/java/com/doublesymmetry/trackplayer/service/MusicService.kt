@@ -13,6 +13,7 @@ import android.support.v4.media.RatingCompat
 import androidx.annotation.MainThread
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationCompat.PRIORITY_LOW
+import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.models.NotificationButton.*
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
@@ -32,7 +33,6 @@ import com.doublesymmetry.trackplayer.utils.BundleUtils.setRating
 import com.facebook.react.HeadlessJsTaskService
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.jstasks.HeadlessJsTaskConfig
-import com.facebook.react.modules.core.DeviceEventManagerModule
 import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.ui.R as ExoPlayerR
 import kotlinx.coroutines.*
@@ -43,7 +43,8 @@ import timber.log.Timber
 
 @MainThread
 class MusicService : HeadlessJsTaskService() {
-    private lateinit var player: QueuedAudioPlayer
+    private var player: QueuedAudioPlayer? = null
+    private val crossfadeQueue = AndroidTrackQueue()
     private var playbackOrchestrator: AndroidPlaybackOrchestrator? = null
     private var orchestratedMediaSurface: AndroidOrchestratedMediaSurface? = null
     private val binder = MusicBinder()
@@ -52,18 +53,21 @@ class MusicService : HeadlessJsTaskService() {
     private var crossfadeEnabled = false
     private var latestNotificationConfig: NotificationConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
+    private var configuredRatingType: Int = RatingCompat.RATING_NONE
+    private var configuredRepeatMode: RepeatMode = RepeatMode.OFF
 
-    private fun isPrimaryPlayerInitialized(): Boolean = this::player.isInitialized
+    private fun isPrimaryPlayerInitialized(): Boolean = player != null || playbackOrchestrator != null
 
     private fun useOrchestratedCrossfade(): Boolean = crossfadeEnabled && playbackOrchestrator != null
 
-    private fun allPlayers(): List<QueuedAudioPlayer> = when {
-        isPrimaryPlayerInitialized() -> listOf(player)
-        else -> emptyList()
+    private fun requireKotlinAudioPlayer(): QueuedAudioPlayer {
+        return player ?: throw IllegalStateException("KotlinAudio player is not initialized for this playback mode.")
     }
 
+    private fun allPlayers(): List<QueuedAudioPlayer> = player?.let { listOf(it) } ?: emptyList()
+
     private fun isActivePlayer(source: QueuedAudioPlayer): Boolean =
-        isPrimaryPlayerInitialized() && source === player
+        player === source
 
     /**
      * Use [appKilledPlaybackBehavior] instead.
@@ -80,28 +84,29 @@ class MusicService : HeadlessJsTaskService() {
     private var stopForegroundGracePeriod: Int = DEFAULT_STOP_FOREGROUND_GRACE_PERIOD
 
     val tracks: List<Track>
-        get() = player.items.map { (it as TrackAudioItem).track }
+        get() = playerItems().map { it.track }
 
     val currentTrack
-        get() = playbackOrchestrator?.currentTrack?.track ?: (player.currentItem as TrackAudioItem).track
+        get() = playbackOrchestrator?.currentTrack?.track ?: (requireKotlinAudioPlayer().currentItem as TrackAudioItem).track
 
     val state
-        get() = playbackOrchestrator?.playbackState ?: player.playerState
+        get() = playbackOrchestrator?.playbackState ?: requireKotlinAudioPlayer().playerState
 
     var ratingType: Int
-        get() = player.ratingType
+        get() = configuredRatingType
         set(value) {
+            configuredRatingType = value
             allPlayers().forEach { it.ratingType = value }
         }
 
     val playbackError
-        get() = player.playbackError
+        get() = player?.playbackError
 
     val event
-        get() = player.event
+        get() = requireKotlinAudioPlayer().event
 
     var playWhenReady: Boolean
-        get() = playbackOrchestrator?.playWhenReady ?: player.playWhenReady
+        get() = playbackOrchestrator?.playWhenReady ?: requireKotlinAudioPlayer().playWhenReady
         set(value) {
             val orchestrator = playbackOrchestrator
             if (orchestrator != null) {
@@ -114,9 +119,8 @@ class MusicService : HeadlessJsTaskService() {
                     orchestrator.pause()
                     refreshOrchestratedMediaSurface(reason = "play-when-ready")
                 }
-                player.volume = 0f
             } else {
-                player.playWhenReady = value
+                requireKotlinAudioPlayer().playWhenReady = value
             }
         }
 
@@ -175,27 +179,26 @@ class MusicService : HeadlessJsTaskService() {
         )
 
         val cacheConfig = CacheConfig(playerOptions?.getDouble(MAX_CACHE_SIZE_KEY)?.toLong())
+        val handleAudioFocus = playerOptions?.getBoolean(AUTO_HANDLE_INTERRUPTIONS) ?: false
+        val audioContentType = when(playerOptions?.getString(ANDROID_AUDIO_CONTENT_TYPE)) {
+            "music" -> AudioContentType.MUSIC
+            "speech" -> AudioContentType.SPEECH
+            "sonification" -> AudioContentType.SONIFICATION
+            "movie" -> AudioContentType.MOVIE
+            "unknown" -> AudioContentType.UNKNOWN
+            else -> AudioContentType.MUSIC
+        }
         val playerConfig = PlayerConfig(
             interceptPlayerActionsTriggeredExternally = true,
             handleAudioBecomingNoisy = true,
-            handleAudioFocus = playerOptions?.getBoolean(AUTO_HANDLE_INTERRUPTIONS) ?: false,
-            audioContentType = when(playerOptions?.getString(ANDROID_AUDIO_CONTENT_TYPE)) {
-                "music" -> AudioContentType.MUSIC
-                "speech" -> AudioContentType.SPEECH
-                "sonification" -> AudioContentType.SONIFICATION
-                "movie" -> AudioContentType.MOVIE
-                "unknown" -> AudioContentType.UNKNOWN
-                else -> AudioContentType.MUSIC
-            }
+            handleAudioFocus = handleAudioFocus,
+            audioContentType = audioContentType
         )
 
         crossfadeEnabled = playerOptions?.getBoolean(CROSSFADE_KEY, false) ?: false
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
-        player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
-        player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
         if (crossfadeEnabled) {
-            player.volume = 0f
             orchestratedMediaSurface = AndroidOrchestratedMediaSurface(
                 service = this@MusicService,
                 scope = scope,
@@ -257,6 +260,7 @@ class MusicService : HeadlessJsTaskService() {
                 context = this@MusicService,
                 scope = scope,
                 audioContentType = playerConfig.audioContentType.toExoAudioContentType(),
+                handleAudioFocus = handleAudioFocus,
                 delegate = object : AndroidPlaybackOrchestratorDelegate {
                     override fun onPlaybackStateChanged(state: AudioPlayerState) {
                         emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state))
@@ -300,6 +304,12 @@ class MusicService : HeadlessJsTaskService() {
                 }
             )
             Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
+        } else {
+            player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig).apply {
+                automaticallyUpdateNotificationMetadata = this@MusicService.automaticallyUpdateNotificationMetadata
+                ratingType = configuredRatingType
+                (playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
+            }
         }
         observeEvents()
         setupForegrounding()
@@ -324,8 +334,9 @@ class MusicService : HeadlessJsTaskService() {
 
         ratingType = BundleUtils.getInt(options, "ratingType", RatingCompat.RATING_NONE)
 
+        val alwaysPauseOnInterruption = androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
         allPlayers().forEach {
-            it.playerOptions.alwaysPauseOnInterruption = androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
+            it.playerOptions.alwaysPauseOnInterruption = alwaysPauseOnInterruption
         }
 
         capabilities = options.getIntegerArrayList("capabilities")?.map { Capability.values()[it] } ?: emptyList()
@@ -404,7 +415,7 @@ class MusicService : HeadlessJsTaskService() {
             )
             refreshOrchestratedMediaSurface(reason = "options")
         } else {
-            player.notificationManager.createNotification(notificationConfig)
+            requireKotlinAudioPlayer().notificationManager.createNotification(notificationConfig)
         }
 
         // setup progress update events if configured
@@ -420,7 +431,7 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     private fun progressUpdateEventFlow(interval: Double) = flow {
         while (true) {
-            val shouldEmit = playbackOrchestrator?.playbackState == AudioPlayerState.PLAYING || player.isPlaying
+            val shouldEmit = playbackOrchestrator?.playbackState == AudioPlayerState.PLAYING || player?.isPlaying == true
             if (shouldEmit) {
                 val bundle = progressUpdateEvent()
                 emit(bundle)
@@ -469,7 +480,13 @@ class MusicService : HeadlessJsTaskService() {
         }
     }
 
-    private fun playerItems(): List<TrackAudioItem> = player.items.map { it as TrackAudioItem }
+    private fun playerItems(): List<TrackAudioItem> {
+        return if (useOrchestratedCrossfade()) {
+            crossfadeQueue.snapshot()
+        } else {
+            requireKotlinAudioPlayer().items.map { it as TrackAudioItem }
+        }
+    }
 
     private fun syncOrchestratorQueue() {
         playbackOrchestrator?.setQueue(playerItems())
@@ -480,6 +497,7 @@ class MusicService : HeadlessJsTaskService() {
         if (useOrchestratedCrossfade()) {
             refreshOrchestratedMediaSurface(reason = "current-track", itemOverride = item)
         } else {
+            val player = requireKotlinAudioPlayer()
             player.notificationManager.overrideMetadata(item)
             player.notificationManager.invalidate()
         }
@@ -492,7 +510,6 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator ?: return
         val snapshot = orchestrator.snapshot()
         val surface = orchestratedMediaSurface ?: return
-        player.volume = 0f
         if (itemOverride != null) {
             surface.publish(snapshot.copy(currentItem = itemOverride), reason)
         } else {
@@ -531,15 +548,23 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     fun add(tracks: List<Track>) {
         val items = tracks.map { it.toAudioItem() }
-        player.add(items)
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.add(items)
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().add(items)
+        }
     }
 
     @MainThread
     fun add(tracks: List<Track>, atIndex: Int) {
         val items = tracks.map { it.toAudioItem() }
-        player.add(items, atIndex)
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.add(items, atIndex)
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().add(items, atIndex)
+        }
     }
 
     @MainThread
@@ -547,22 +572,26 @@ class MusicService : HeadlessJsTaskService() {
         val item = track.toAudioItem()
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
-            val existingIndex = playerItems().indexOfFirst { it.track.queueId == item.track.queueId }
+            val existingIndex = crossfadeQueue.indexOfQueueId(item.track.queueId)
             if (existingIndex < 0) {
-                player.load(item)
+                crossfadeQueue.replaceWith(listOf(item))
             }
-            player.volume = 0f
+            syncOrchestratorQueue()
             orchestrator.load(item)
             refreshOrchestratedMediaSurface(reason = "load")
         } else {
-            player.load(item)
+            requireKotlinAudioPlayer().load(item)
         }
     }
 
     @MainThread
     fun move(fromIndex: Int, toIndex: Int) {
-        player.move(fromIndex, toIndex);
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.move(fromIndex, toIndex)
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().move(fromIndex, toIndex)
+        }
     }
 
     @MainThread
@@ -572,16 +601,25 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun remove(indexes: List<Int>) {
-        player.remove(indexes)
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.remove(indexes)
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().remove(indexes)
+        }
     }
 
     @MainThread
     fun clear() {
-        player.clear()
-        playbackOrchestrator?.stop()
-        orchestratedMediaSurface?.hide()
-        syncOrchestratorQueue()
+        val orchestrator = playbackOrchestrator
+        if (orchestrator != null) {
+            crossfadeQueue.clear()
+            orchestrator.stop()
+            orchestratedMediaSurface?.hide()
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().clear()
+        }
     }
 
     @MainThread
@@ -589,11 +627,10 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
             syncOrchestratorQueue()
-            player.volume = 0f
             orchestrator.play()
             refreshOrchestratedMediaSurface(reason = "play")
         } else {
-            player.play()
+            requireKotlinAudioPlayer().play()
         }
     }
 
@@ -613,10 +650,9 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
             orchestrator.stop()
-            player.stop()
-            player.volume = 0f
             orchestratedMediaSurface?.hide()
         } else {
+            val player = requireKotlinAudioPlayer()
             player.stop()
             player.volume = 1f
         }
@@ -624,14 +660,22 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun removeUpcomingTracks() {
-        player.removeUpcomingItems()
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.removeUpcoming(getCurrentTrackIndex())
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().removeUpcomingItems()
+        }
     }
 
     @MainThread
     fun removePreviousTracks() {
-        player.removePreviousItems()
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.removePrevious(getCurrentTrackIndex())
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().removePreviousItems()
+        }
     }
 
     @MainThread
@@ -639,11 +683,10 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
             syncOrchestratorQueue()
-            player.volume = 0f
             orchestrator.skip(index)
             refreshOrchestratedMediaSurface(reason = "skip")
         } else {
-            player.jumpToItem(index)
+            requireKotlinAudioPlayer().jumpToItem(index)
         }
     }
 
@@ -652,11 +695,10 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
             syncOrchestratorQueue()
-            player.volume = 0f
             orchestrator.skipToNext()
             refreshOrchestratedMediaSurface(reason = "skip-next")
         } else {
-            player.next()
+            requireKotlinAudioPlayer().next()
         }
     }
 
@@ -665,11 +707,10 @@ class MusicService : HeadlessJsTaskService() {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
             syncOrchestratorQueue()
-            player.volume = 0f
             orchestrator.skipToPrevious()
             refreshOrchestratedMediaSurface(reason = "skip-previous")
         } else {
-            player.previous()
+            requireKotlinAudioPlayer().previous()
         }
     }
 
@@ -680,7 +721,7 @@ class MusicService : HeadlessJsTaskService() {
             orchestrator.seekTo((seconds * 1000).toLong())
             refreshOrchestratedMediaSurface(reason = "seek-to")
         } else {
-            player.seek((seconds * 1000).toLong(), TimeUnit.MILLISECONDS)
+            requireKotlinAudioPlayer().seek((seconds * 1000).toLong(), TimeUnit.MILLISECONDS)
         }
     }
 
@@ -691,7 +732,7 @@ class MusicService : HeadlessJsTaskService() {
             orchestrator.seekBy((offset * 1000).toLong())
             refreshOrchestratedMediaSurface(reason = "seek-by")
         } else {
-            player.seekBy((offset.toLong()), TimeUnit.SECONDS)
+            requireKotlinAudioPlayer().seekBy((offset.toLong()), TimeUnit.SECONDS)
         }
     }
 
@@ -702,43 +743,43 @@ class MusicService : HeadlessJsTaskService() {
             orchestrator.play()
             refreshOrchestratedMediaSurface(reason = "retry")
         } else {
-            player.prepare()
+            requireKotlinAudioPlayer().prepare()
         }
     }
 
     @MainThread
-    fun getCurrentTrackIndex(): Int = playbackOrchestrator?.currentIndex ?: player.currentIndex
+    fun getCurrentTrackIndex(): Int = playbackOrchestrator?.currentIndex ?: requireKotlinAudioPlayer().currentIndex
 
     @MainThread
-    fun getRate(): Float = playbackOrchestrator?.rate ?: player.playbackSpeed
+    fun getRate(): Float = playbackOrchestrator?.rate ?: requireKotlinAudioPlayer().playbackSpeed
 
     @MainThread
     fun setRate(value: Float) {
         playbackOrchestrator?.setRate(value) ?: run {
-            player.playbackSpeed = value
+            requireKotlinAudioPlayer().playbackSpeed = value
         }
     }
 
     @MainThread
-    fun getRepeatMode(): RepeatMode = player.playerOptions.repeatMode
+    fun getRepeatMode(): RepeatMode = configuredRepeatMode
 
     @MainThread
     fun setRepeatMode(value: RepeatMode) {
-        player.playerOptions.repeatMode = value
+        configuredRepeatMode = value
+        (player?.playerOptions as? QueuedPlayerOptions)?.repeatMode = value
         playbackOrchestrator?.setRepeatMode(value)
     }
 
     @MainThread
-    fun getVolume(): Float = playbackOrchestrator?.volume ?: player.volume
+    fun getVolume(): Float = playbackOrchestrator?.volume ?: requireKotlinAudioPlayer().volume
 
     @MainThread
     fun setVolume(value: Float) {
         val orchestrator = playbackOrchestrator
         if (orchestrator != null) {
-            player.volume = 0f
             orchestrator.setVolume(value)
         } else {
-            player.volume = value
+            requireKotlinAudioPlayer().volume = value
         }
     }
 
@@ -793,13 +834,13 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getDurationInSeconds(): Double = playbackOrchestrator?.durationMs?.toSeconds() ?: player.duration.toSeconds()
+    fun getDurationInSeconds(): Double = playbackOrchestrator?.durationMs?.toSeconds() ?: requireKotlinAudioPlayer().duration.toSeconds()
 
     @MainThread
-    fun getPositionInSeconds(): Double = playbackOrchestrator?.positionMs?.toSeconds() ?: player.position.toSeconds()
+    fun getPositionInSeconds(): Double = playbackOrchestrator?.positionMs?.toSeconds() ?: requireKotlinAudioPlayer().position.toSeconds()
 
     @MainThread
-    fun getBufferedPositionInSeconds(): Double = playbackOrchestrator?.bufferedMs?.toSeconds() ?: player.bufferedPosition.toSeconds()
+    fun getBufferedPositionInSeconds(): Double = playbackOrchestrator?.bufferedMs?.toSeconds() ?: requireKotlinAudioPlayer().bufferedPosition.toSeconds()
 
     @MainThread
     fun getPlayerStateBundle(state: AudioPlayerState): Bundle {
@@ -813,8 +854,12 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun updateMetadataForTrack(index: Int, track: Track) {
-        player.replaceItem(index, track.toAudioItem())
-        syncOrchestratorQueue()
+        if (useOrchestratedCrossfade()) {
+            crossfadeQueue.replace(index, track.toAudioItem())
+            syncOrchestratorQueue()
+        } else {
+            requireKotlinAudioPlayer().replaceItem(index, track.toAudioItem())
+        }
         if (playbackOrchestrator?.currentIndex == index) {
             updateNotificationMetadataForIndex(index)
         }
@@ -826,7 +871,7 @@ class MusicService : HeadlessJsTaskService() {
         if (useOrchestratedCrossfade()) {
             playbackOrchestrator?.setNowPlayingOverride(item)
         } else {
-            player.notificationManager.overrideMetadata(item)
+            requireKotlinAudioPlayer().notificationManager.overrideMetadata(item)
         }
     }
 
@@ -836,7 +881,7 @@ class MusicService : HeadlessJsTaskService() {
             playbackOrchestrator?.setNowPlayingOverride(null)
             refreshOrchestratedMediaSurface(reason = "clear-metadata")
         } else {
-            player.notificationManager.hideNotification()
+            requireKotlinAudioPlayer().notificationManager.hideNotification()
         }
     }
 
@@ -1022,7 +1067,7 @@ class MusicService : HeadlessJsTaskService() {
                 if (useOrchestratedCrossfade()) return@collect
                 emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
 
-                if (it == AudioPlayerState.ENDED && player.nextItem == null) {
+                if (it == AudioPlayerState.ENDED && source.nextItem == null) {
                     emitQueueEndedEvent()
                 }
             }
@@ -1034,8 +1079,8 @@ class MusicService : HeadlessJsTaskService() {
                 if (useOrchestratedCrossfade()) return@collect
                 if (it !is AudioItemTransitionReason.REPEAT) {
                     emitPlaybackTrackChangedEvents(
-                        player.currentIndex,
-                        player.previousIndex,
+                        source.currentIndex,
+                        source.previousIndex,
                         (it?.oldPosition ?: 0).toSeconds()
                     )
                 }
@@ -1173,19 +1218,11 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     private fun emit(event: String, data: Bundle? = null) {
-        reactNativeHost.reactInstanceManager.currentReactContext
-            ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            ?.emit(event, data?.let { Arguments.fromBundle(it) })
-    }
-
-    @MainThread
-    private fun emitList(event: String, data: List<Bundle> = emptyList()) {
-        val payload = Arguments.createArray()
-        data.forEach { payload.pushMap(Arguments.fromBundle(it)) }
-
-        reactNativeHost.reactInstanceManager.currentReactContext
-            ?.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            ?.emit(event, payload)
+        val intent = Intent(MusicEvents.EVENT_INTENT).apply {
+            putExtra("event", event)
+            data?.let { putExtra("data", it) }
+        }
+        LocalBroadcastManager.getInstance(this).sendBroadcast(intent)
     }
 
     override fun getTaskConfig(intent: Intent?): HeadlessJsTaskConfig {
@@ -1208,8 +1245,9 @@ class MusicService : HeadlessJsTaskService() {
             AppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> {
                 playbackOrchestrator?.stop()
                 orchestratedMediaSurface?.hide()
-                player.clear()
-                player.stop()
+                crossfadeQueue.clear()
+                player?.clear()
+                player?.stop()
 
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
                     stopForeground(STOP_FOREGROUND_REMOVE)
@@ -1233,9 +1271,7 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     override fun onDestroy() {
         super.onDestroy()
-        if (isPrimaryPlayerInitialized()) {
-            allPlayers().forEach { it.destroy() }
-        }
+        allPlayers().forEach { it.destroy() }
         playbackOrchestrator?.release()
         playbackOrchestrator = null
 

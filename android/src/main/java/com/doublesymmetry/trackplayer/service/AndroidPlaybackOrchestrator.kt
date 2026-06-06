@@ -71,10 +71,11 @@ internal class AndroidPlaybackOrchestrator(
     context: Context,
     private val scope: CoroutineScope,
     audioContentType: Int,
+    handleAudioFocus: Boolean,
     private val delegate: AndroidPlaybackOrchestratorDelegate
 ) {
-    private val engineA = AndroidCrossfadeEngine(context, "engineA", audioContentType)
-    private val engineB = AndroidCrossfadeEngine(context, "engineB", audioContentType)
+    private val engineA = AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus)
+    private val engineB = AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus)
     private var activeEngine = engineA
     private var standbyEngine = engineB
     private var queue: List<TrackAudioItem> = emptyList()
@@ -353,6 +354,16 @@ internal class AndroidPlaybackOrchestrator(
     suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) {
         val fromIndex = currentIndex
         val toIndex = if (previous) previousIndexFor(fromIndex) else nextIndexFor(fromIndex)
+        if (!isPlaybackActiveForCrossfade()) {
+            emitCrossfade("cancelled", fromIndex, toIndex ?: -1, errorCode = "not_playing")
+            throw RejectionException("Crossfade cannot prepare while playback is not active.", "crossfade_not_playing")
+        }
+        if (state == AndroidPlaybackOrchestratorState.CROSSFADING ||
+            state == AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE
+        ) {
+            emitCrossfade("error", fromIndex, toIndex ?: -1, errorCode = "crossfade_in_progress")
+            throw RejectionException("A crossfade is already in progress.", "crossfade_in_progress")
+        }
         if (fromIndex !in queue.indices || toIndex == null || toIndex !in queue.indices) {
             emitCrossfade("error", fromIndex, toIndex ?: -1, errorCode = "crossfade_target_unavailable")
             throw RejectionException("No crossfade target track is available.", "crossfade_target_unavailable")
@@ -390,6 +401,10 @@ internal class AndroidPlaybackOrchestrator(
         }
 
         val durationMs = max(0.0, fadeDuration).toLong()
+        if (!isPlaybackActiveForCrossfade()) {
+            emitCrossfade("cancelled", fromIndex, toIndex, errorCode = "not_playing")
+            throw RejectionException("Crossfade cannot start while playback is not active.", "crossfade_not_playing")
+        }
         if (!canCrossfade(fromIndex, toIndex, durationMs)) {
             emitCrossfade("error", fromIndex, toIndex, errorCode = "crossfade_not_supported")
             throw RejectionException("Crossfade is not supported for this transition.", "crossfade_not_supported")
@@ -412,9 +427,11 @@ internal class AndroidPlaybackOrchestrator(
                 delayChecked(waitDelayMs, runId)
             }
             ensureCrossfadeRunActive(runId)
+            ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
             preloadJob?.cancelAndJoin()
             ensureActivePrepared(fromIndex, activeEngine.positionMs)
             prepareStandby(toIndex, preparedCrossfadeSeekToMs)
+            ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
             val outgoingEngine = activeEngine
             val incomingEngine = standbyEngine
             val oldPositionMs = outgoingEngine.positionMs
@@ -430,6 +447,7 @@ internal class AndroidPlaybackOrchestrator(
             setState(AndroidPlaybackOrchestratorState.CROSSFADING)
             emitCrossfade("started", fromIndex, toIndex, elapsedMs = 0, fromVolume = outgoingStartVolume, toVolume = 0f)
 
+            val incomingStartMs = incomingEngine.positionMs
             var elapsedMs = 0L
             var lastRunningEmitMs = -CROSSFADE_RUNNING_EVENT_INTERVAL_MS
             while (elapsedMs < durationMs) {
@@ -437,6 +455,38 @@ internal class AndroidPlaybackOrchestrator(
                 if (state == AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE) {
                     delay(intervalMs)
                     continue
+                }
+                if (!playWhenReady) {
+                    ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
+                }
+                if (elapsedMs >= INCOMING_STALL_GRACE_MS &&
+                    incomingEngine.positionMs <= incomingStartMs + INCOMING_STALL_TOLERANCE_MS
+                ) {
+                    fallbackToTargetAfterStalledCrossfade(
+                        fromIndex = fromIndex,
+                        toIndex = toIndex,
+                        elapsedMs = elapsedMs,
+                        oldPositionMs = oldPositionMs,
+                        errorCode = "incoming_stalled"
+                    )
+                    return
+                }
+                if (outgoingEngine.durationMs > 0L &&
+                    outgoingEngine.positionMs >= max(0L, outgoingEngine.durationMs - OUTGOING_END_TOLERANCE_MS)
+                ) {
+                    if (incomingEngine.positionMs > incomingStartMs + INCOMING_STALL_TOLERANCE_MS) {
+                        elapsedMs = durationMs
+                    } else {
+                        fallbackToTargetAfterStalledCrossfade(
+                            fromIndex = fromIndex,
+                            toIndex = toIndex,
+                            elapsedMs = elapsedMs,
+                            oldPositionMs = oldPositionMs,
+                            errorCode = "incoming_stalled"
+                        )
+                        return
+                    }
+                    break
                 }
                 val progress = min(1.0, elapsedMs.toDouble() / rampDurationMs.toDouble())
                 val angle = progress * PI / 2.0
@@ -464,11 +514,17 @@ internal class AndroidPlaybackOrchestrator(
             activeCrossfadeFromIndex = null
             activeCrossfadeToIndex = null
             volume = targetVolume
-            setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
+            if (playWhenReady) {
+                activeEngine.play(rate)
+                setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
+            } else {
+                activeEngine.pause()
+                setState(AndroidPlaybackOrchestratorState.PAUSED)
+            }
             emitCrossfade("completed", fromIndex, toIndex, elapsedMs = durationMs.toInt(), fromVolume = 0f, toVolume = targetVolume)
             preloadNextIfPossible()
         } catch (error: RejectionException) {
-            if (error.code != "cancelled") {
+            if (error.code != "cancelled" && error.code != "crossfade_not_playing") {
                 emitCrossfade("error", fromIndex, toIndex, errorCode = error.code)
                 setState(AndroidPlaybackOrchestratorState.ERROR)
             }
@@ -478,6 +534,44 @@ internal class AndroidPlaybackOrchestrator(
             setState(AndroidPlaybackOrchestratorState.ERROR)
             throw error
         }
+    }
+
+    private fun isPlaybackActiveForCrossfade(): Boolean {
+        return playWhenReady &&
+            (state == AndroidPlaybackOrchestratorState.PLAYING_SINGLE ||
+                state == AndroidPlaybackOrchestratorState.PRELOADING_NEXT)
+    }
+
+    private fun ensurePlaybackStillActiveForCrossfade(fromIndex: Int, toIndex: Int, message: String) {
+        if (playWhenReady) return
+        emitCrossfade("cancelled", fromIndex, toIndex, errorCode = "not_playing")
+        throw RejectionException(message, "crossfade_not_playing")
+    }
+
+    private suspend fun fallbackToTargetAfterStalledCrossfade(
+        fromIndex: Int,
+        toIndex: Int,
+        elapsedMs: Long,
+        oldPositionMs: Long,
+        errorCode: String
+    ) {
+        androidXfadeLog("crossfade fallback to target fromIndex=$fromIndex toIndex=$toIndex error=$errorCode")
+        emitCrossfade(
+            "error",
+            fromIndex,
+            toIndex,
+            elapsedMs = elapsedMs.toInt(),
+            fromVolume = activeEngine.player.volume,
+            toVolume = standbyEngine.player.volume,
+            errorCode = errorCode
+        )
+        activeCrossfadeFromIndex = null
+        activeCrossfadeToIndex = null
+        preparedCrossfadeFromIndex = null
+        preparedCrossfadeToIndex = null
+        preparedCrossfadeSeekToMs = 0L
+        preloadTargetIndex = null
+        startTrackAt(toIndex, 0L, emitTrackChange = true, oldPositionMs = oldPositionMs)
     }
 
     fun release() {
@@ -712,5 +806,8 @@ internal class AndroidPlaybackOrchestrator(
         const val PREVIOUS_RESTART_THRESHOLD_MS = 3000L
         const val CROSSFADE_RUNNING_EVENT_INTERVAL_MS = 250L
         const val PREPARED_POSITION_TOLERANCE_MS = 250L
+        const val INCOMING_STALL_GRACE_MS = 2000L
+        const val INCOMING_STALL_TOLERANCE_MS = 200L
+        const val OUTGOING_END_TOLERANCE_MS = 150L
     }
 }
