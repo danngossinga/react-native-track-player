@@ -10,6 +10,8 @@
     "build": "rimraf lib && tsc",
     "dev": "tsc --watch",
     "test:android-crossfade-contracts": "node scripts/verify-android-crossfade-contracts.js",
+    "test:ios-crossfade-contracts": "node scripts/verify-ios-crossfade-contracts.js",
+    "test:player-lifecycle-contracts": "node scripts/verify-player-lifecycle-contracts.js",
     "test:module-fallback": "node scripts/verify-track-player-module-fallback.js",
     "lint": "eslint src",
     "format": "prettier --write src",

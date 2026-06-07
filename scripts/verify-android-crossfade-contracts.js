@@ -35,6 +35,11 @@ const crossFade = section(
   'suspend fun crossFade(',
   'private suspend fun fallbackToTargetAfterStalledCrossfade('
 );
+const postCrossfadeMaintenance = section(
+  orchestrator,
+  'private fun schedulePostCrossfadeStandbyMaintenance(',
+  'fun release()'
+);
 const setupPlayer = section(
   musicService,
   'fun setupPlayer(playerOptions: Bundle?)',
@@ -49,6 +54,11 @@ const refreshOrchestratedMediaSurface = section(
   musicService,
   'private fun refreshOrchestratedMediaSurface(',
   'private fun runOrchestratedRemoteCommand('
+);
+const startTrackAt = section(
+  orchestrator,
+  'private suspend fun startTrackAt(',
+  'private suspend fun ensureActivePrepared('
 );
 
 assert(
@@ -78,6 +88,26 @@ assert(
   'Android crossFade must publish the active track change before refreshing now-playing metadata.'
 );
 assert(
+  orchestrator.includes('private var standbyMaintenanceJob: Job? = null'),
+  'Android orchestrator must track deferred standby maintenance work.'
+);
+assert(
+  crossFade.includes('outgoingEngine.setVolume(0f)') &&
+    crossFade.includes('outgoingEngine.pause()') &&
+    !crossFade.includes('outgoingEngine.reset()'),
+  'Android crossFade completion must mute/pause the outgoing ExoPlayer without resetting it synchronously.'
+);
+assert(
+  crossFade.includes('schedulePostCrossfadeStandbyMaintenance(crossfadeDurationMs = durationMs)') &&
+    !crossFade.includes('preloadNextIfPossible()'),
+  'Android crossFade completion must defer next standby preload off the audible completion path.'
+);
+assert(
+  postCrossfadeMaintenance.includes('standbyEngine.reset()') &&
+    postCrossfadeMaintenance.includes('preloadNextIfPossible()'),
+  'Android post-crossfade maintenance must own standby reset and next preload.'
+);
+assert(
   musicService.includes('LocalBroadcastManager.getInstance(this).sendBroadcast(intent)'),
   'MusicService events must go through MusicEvents local broadcast transport.'
 );
@@ -102,6 +132,12 @@ assert(
   !crossfadeSetupBranch.includes('notificationManager') &&
     !refreshOrchestratedMediaSurface.includes('notificationManager'),
   'Crossfade publication must use AndroidOrchestratedMediaSurface, not KotlinAudio notificationManager.'
+);
+assert(
+  startTrackAt.indexOf('delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)') >= 0 &&
+    startTrackAt.indexOf('delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)') <
+      startTrackAt.indexOf('activeEngine.play(rate)'),
+  'Direct Android crossfade skips must publish the active track before starting audible playback.'
 );
 
 console.log('Android crossfade contracts OK');
