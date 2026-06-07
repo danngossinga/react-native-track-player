@@ -853,6 +853,32 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
+    fun getPlayerLifecycleBundle(
+        serviceBound: Boolean,
+        playerInitialized: Boolean,
+        setupInProgress: Boolean
+    ): Bundle {
+        val items = playerItems()
+        val activeIndex = getCurrentTrackIndex()
+        return Bundle().apply {
+            putString("phase", if (setupInProgress) "settingUp" else "ready")
+            putBoolean("serviceBound", serviceBound)
+            putBoolean("playerInitialized", playerInitialized)
+            putBoolean("setupInProgress", setupInProgress)
+            putBoolean("canAcceptCommands", serviceBound && playerInitialized && !setupInProgress)
+            putString("playbackState", state.asLibState.state)
+            putBoolean("playWhenReady", playWhenReady)
+            putString("backend", if (useOrchestratedCrossfade()) "crossfade" else "standard")
+            putInt("queueSize", items.size)
+            if (activeIndex in items.indices) {
+                putInt("activeTrackIndex", activeIndex)
+            } else {
+                putString("activeTrackIndex", null)
+            }
+        }
+    }
+
+    @MainThread
     fun updateMetadataForTrack(index: Int, track: Track) {
         if (useOrchestratedCrossfade()) {
             crossfadeQueue.replace(index, track.toAudioItem())

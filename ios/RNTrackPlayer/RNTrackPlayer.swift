@@ -17,6 +17,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     // MARK: - Attributes
 
     private var hasInitialized = false
+    private var setupInProgress = false
     private let player = QueuedAudioPlayer()
     private let crossfadeCoordinator = IOSCrossfadeCoordinator()
     private let playbackOrchestrator = IOSPlaybackOrchestrator()
@@ -332,6 +333,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             reject("player_already_initialized", "The player has already been initialized via setupPlayer.", nil)
             return
         }
+        setupInProgress = true
+        defer { setupInProgress = false }
 
         crossfadeEnabled = config["crossfade"] as? Bool ?? false
         crossfadeEngineMode = config["crossfadeEngineMode"] as? String ?? "orchestratedDualEngine"
@@ -503,8 +506,35 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     @objc(isServiceRunning:rejecter:)
     public func isServiceRunning(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        // TODO That is probably always true
-        resolve(player != nil)
+        resolve(hasInitialized)
+    }
+
+    @objc(getPlayerLifecycle:rejecter:)
+    public func getPlayerLifecycle(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+        let playbackState: State = {
+            if !hasInitialized { return .none }
+            return useOrchestratedCrossfade ? playbackOrchestrator.playbackState : State.fromPlayerState(state: player.playerState)
+        }()
+        let activeIndex = useOrchestratedCrossfade ? playbackOrchestrator.currentIndex : player.currentIndex
+        let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < player.items.count ? activeIndex : NSNull()
+        let phase = setupInProgress ? "settingUp" : (hasInitialized ? "ready" : "uninitialized")
+        let backend = hasInitialized ? (useOrchestratedCrossfade ? "crossfade" : "standard") : "none"
+        let playWhenReady = hasInitialized
+            ? (useOrchestratedCrossfade ? playbackOrchestrator.playWhenReady : player.playWhenReady)
+            : false
+
+        resolve([
+            "phase": phase,
+            "serviceBound": hasInitialized,
+            "playerInitialized": hasInitialized,
+            "setupInProgress": setupInProgress,
+            "canAcceptCommands": hasInitialized,
+            "playbackState": playbackState.rawValue,
+            "playWhenReady": playWhenReady,
+            "backend": backend,
+            "queueSize": player.items.count,
+            "activeTrackIndex": normalizedActiveIndex
+        ])
     }
 
     @objc(updateOptions:resolver:rejecter:)

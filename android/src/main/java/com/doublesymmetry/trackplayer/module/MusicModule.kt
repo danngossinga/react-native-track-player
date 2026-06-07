@@ -57,6 +57,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
                 musicService = binder.service
                 musicService.setupPlayer(playerOptions)
                 playerSetUpPromise?.resolve(null)
+                playerSetUpPromise = null
             }
 
             isServiceBound = true
@@ -259,6 +260,34 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
     @Deprecated("Backwards compatible function from the old android implementation. Should be removed in the next major release.")
     fun isServiceRunning(callback: Promise) {
         callback.resolve(isServiceBound)
+    }
+
+    @ReactMethod
+    fun getPlayerLifecycle(callback: Promise) {
+        scope.launch {
+            val setupInProgress = playerSetUpPromise != null && !isServiceBound
+            val bundle = if (isServiceBound && ::musicService.isInitialized) {
+                musicService.getPlayerLifecycleBundle(
+                    serviceBound = true,
+                    playerInitialized = true,
+                    setupInProgress = setupInProgress
+                )
+            } else {
+                Bundle().apply {
+                    putString("phase", if (setupInProgress) "settingUp" else "uninitialized")
+                    putBoolean("serviceBound", false)
+                    putBoolean("playerInitialized", false)
+                    putBoolean("setupInProgress", setupInProgress)
+                    putBoolean("canAcceptCommands", false)
+                    putString("playbackState", State.None.state)
+                    putBoolean("playWhenReady", false)
+                    putString("backend", "none")
+                    putInt("queueSize", 0)
+                    putString("activeTrackIndex", null)
+                }
+            }
+            callback.resolve(Arguments.fromBundle(bundle))
+        }
     }
 
     @ReactMethod

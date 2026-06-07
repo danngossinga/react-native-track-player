@@ -13,6 +13,7 @@
 
 - (void)setupPlayer:(NSDictionary *)data resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)isServiceRunning:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
+- (void)getPlayerLifecycle:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)updateOptions:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)add:(NSArray *)objects before:(NSNumber *)trackIndex resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)move:(NSNumber *)fromIndex toIndex:(NSNumber *)toIndex resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
@@ -79,6 +80,11 @@
 - (void)isServiceRunning:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
 {
   [self isServiceRunning:resolve rejecter:reject];
+}
+
+- (void)getPlayerLifecycle:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+  [self getPlayerLifecycle:resolve rejecter:reject];
 }
 
 - (void)updateOptions:(NSDictionary *)options resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject

@@ -6,7 +6,12 @@ import type {
   UnsafeObject,
 } from 'react-native/Libraries/Types/CodegenTypes';
 
-import type { PlaybackState, Progress, Track } from './interfaces';
+import type {
+  PlaybackState,
+  PlayerLifecycleState,
+  Progress,
+  Track,
+} from './interfaces';
 
 type NullableUnsafeObject = UnsafeObject | null | undefined;
 type NullableUnsafeObjectArray = UnsafeObject[] | null | undefined;
@@ -48,6 +53,7 @@ export interface Spec extends TurboModule {
 
   setupPlayer(data?: NullableUnsafeObject): Promise<void>;
   isServiceRunning(): Promise<boolean>;
+  getPlayerLifecycle(): Promise<PlayerLifecycleState>;
   updateOptions(options?: NullableUnsafeObject): Promise<void>;
   add(
     objects?: NullableUnsafeObjectArray,

@@ -31,6 +31,7 @@ TRACK_PLAYER_VOID_METHOD(addListener, "(Ljava/lang/String;)V")
 TRACK_PLAYER_VOID_METHOD(removeListeners, "(D)V")
 TRACK_PLAYER_PROMISE_METHOD(setupPlayer, "(Lcom/facebook/react/bridge/ReadableMap;Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(isServiceRunning, "(Lcom/facebook/react/bridge/Promise;)V")
+TRACK_PLAYER_PROMISE_METHOD(getPlayerLifecycle, "(Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(updateOptions, "(Lcom/facebook/react/bridge/ReadableMap;Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(add, "(Lcom/facebook/react/bridge/ReadableArray;Ljava/lang/Double;Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(load, "(Lcom/facebook/react/bridge/ReadableMap;Lcom/facebook/react/bridge/Promise;)V")
@@ -79,6 +80,7 @@ NativeTrackPlayerModuleSpecJSI::NativeTrackPlayerModuleSpecJSI(
   methodMap_["removeListeners"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_removeListeners};
   methodMap_["setupPlayer"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_setupPlayer};
   methodMap_["isServiceRunning"] = MethodMetadata {0, __hostFunction_NativeTrackPlayerModuleSpecJSI_isServiceRunning};
+  methodMap_["getPlayerLifecycle"] = MethodMetadata {0, __hostFunction_NativeTrackPlayerModuleSpecJSI_getPlayerLifecycle};
   methodMap_["updateOptions"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_updateOptions};
   methodMap_["add"] = MethodMetadata {2, __hostFunction_NativeTrackPlayerModuleSpecJSI_add};
   methodMap_["load"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_load};

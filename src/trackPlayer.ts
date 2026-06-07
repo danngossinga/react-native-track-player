@@ -12,6 +12,7 @@ import type {
   EventPayloadByEvent,
   NowPlayingMetadata,
   PlaybackState,
+  PlayerLifecycleState,
   PlayerOptions,
   Progress,
   ServiceHandler,
@@ -88,6 +89,16 @@ export function addEventListener<T extends Event>(
  */
 export function isServiceRunning(): Promise<boolean> {
   return TrackPlayer.isServiceRunning();
+}
+
+/**
+ * Returns the native player lifecycle state.
+ *
+ * Use this to decide whether the player has completed setup and can accept
+ * playback or queue commands. Use getPlaybackState() for media playback state.
+ */
+export function getPlayerLifecycle(): Promise<PlayerLifecycleState> {
+  return TrackPlayer.getPlayerLifecycle();
 }
 
 // MARK: - Queue API
