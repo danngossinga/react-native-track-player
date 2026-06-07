@@ -85,8 +85,8 @@ internal registry or a remote Git repository, local apps should consume it with
 a checked-out `file:` dependency and verify:
 
 ```bash
-git -C /Users/danngossinga/workspace/bface007/react-native-track-player-ios-crossfade rev-parse HEAD
-git -C /Users/danngossinga/workspace/bface007/react-native-track-player-ios-crossfade rev-parse v4.1.2-bface-pingpong.0
+git -C <path-to-react-native-track-player-ios-crossfade> rev-parse HEAD
+git -C <path-to-react-native-track-player-ios-crossfade> rev-parse v4.1.2-bface-pingpong.0
 ```
 
 ## Commerical Usage
