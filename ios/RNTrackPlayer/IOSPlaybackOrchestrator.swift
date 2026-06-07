@@ -90,6 +90,7 @@ final class IOSPlaybackOrchestrator {
     private var crossfadeWorkItem: DispatchWorkItem?
     private var scheduledStartWorkItem: DispatchWorkItem?
     private var endObserverWorkItem: DispatchWorkItem?
+    private var standbyMaintenanceWorkItem: DispatchWorkItem?
     private var preparedFromIndex: Int?
     private var preparedToIndex: Int?
     private var preparedSeekTo: Double = 0
@@ -733,8 +734,8 @@ final class IOSPlaybackOrchestrator {
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         IOSPlaybackLog.log("crossfade completed from=\(context.fromIndex) to=\(context.toIndex)")
+        activeEngine.setVolume(0)
         activeEngine.pause()
-        activeEngine.reset()
 
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
@@ -763,8 +764,35 @@ final class IOSPlaybackOrchestrator {
         emitStateIfNeeded()
         refreshNowPlaying()
         scheduleEndObserver()
-        preloadNextIfPossible()
+        schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs: context.durationMs)
         completion(.success(()))
+    }
+
+    private func schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs crossfadeDurationMs: Int) {
+        standbyMaintenanceWorkItem?.cancel()
+        guard playWhenReady, state == .playingSingle, nextIndex(after: currentIndex) != nil else { return }
+
+        let currentRunId = runId
+        let activeDuration = duration
+        let activePosition = currentTime
+        let preloadLeadSeconds = 8.0
+        let settleSeconds = 1.5
+        let crossfadeSeconds = max(0.001, Double(crossfadeDurationMs) / 1000)
+        let targetPreloadPosition = activeDuration > 0
+            ? max(activePosition + settleSeconds, activeDuration - crossfadeSeconds - preloadLeadSeconds)
+            : activePosition + settleSeconds
+        let delaySeconds = max(settleSeconds, targetPreloadPosition - activePosition)
+
+        IOSPlaybackLog.log("post-crossfade standby maintenance scheduled delay=\(delaySeconds)")
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self = self, self.runId == currentRunId else { return }
+            guard self.playWhenReady, self.state == .playingSingle else { return }
+            self.standbyEngine.reset()
+            self.standbyEngineIndex = nil
+            self.preloadNextIfPossible()
+        }
+        standbyMaintenanceWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds, execute: workItem)
     }
 
     private func fallbackToTargetAfterStalledCrossfade(
@@ -921,6 +949,8 @@ final class IOSPlaybackOrchestrator {
         scheduledStartWorkItem = nil
         endObserverWorkItem?.cancel()
         endObserverWorkItem = nil
+        standbyMaintenanceWorkItem?.cancel()
+        standbyMaintenanceWorkItem = nil
         crossfadeContext = nil
         preparedFromIndex = nil
         preparedToIndex = nil
@@ -992,6 +1022,8 @@ final class IOSPlaybackOrchestrator {
         scheduledStartWorkItem = nil
         endObserverWorkItem?.cancel()
         endObserverWorkItem = nil
+        standbyMaintenanceWorkItem?.cancel()
+        standbyMaintenanceWorkItem = nil
         crossfadeContext = nil
         preparedFromIndex = nil
         preparedToIndex = nil

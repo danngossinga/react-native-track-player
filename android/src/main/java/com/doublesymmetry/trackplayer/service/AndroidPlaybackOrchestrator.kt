@@ -81,6 +81,7 @@ internal class AndroidPlaybackOrchestrator(
     private var queue: List<TrackAudioItem> = emptyList()
     private var lastEmittedPlaybackState: AudioPlayerState? = null
     private var preloadJob: Job? = null
+    private var standbyMaintenanceJob: Job? = null
     private var preloadTargetIndex: Int? = null
     private var monitorJob: Job? = null
     private var crossfadeRunId = 0
@@ -208,6 +209,8 @@ internal class AndroidPlaybackOrchestrator(
 
     suspend fun load(item: TrackAudioItem) {
         cancelCrossfade("load", promoteIncoming = false)
+        standbyMaintenanceJob?.cancelAndJoin()
+        standbyMaintenanceJob = null
         preloadJob?.cancelAndJoin()
         nowPlayingOverride = null
         val existingIndex = queue.indexOfFirst { it.track.queueId == item.track.queueId }
@@ -282,6 +285,8 @@ internal class AndroidPlaybackOrchestrator(
         playWhenReady = false
         cancelCrossfade("stop", promoteIncoming = false)
         preloadJob?.cancel()
+        standbyMaintenanceJob?.cancel()
+        standbyMaintenanceJob = null
         preloadTargetIndex = null
         activeEngine.reset()
         standbyEngine.reset()
@@ -428,6 +433,8 @@ internal class AndroidPlaybackOrchestrator(
             }
             ensureCrossfadeRunActive(runId)
             ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
+            standbyMaintenanceJob?.cancelAndJoin()
+            standbyMaintenanceJob = null
             preloadJob?.cancelAndJoin()
             ensureActivePrepared(fromIndex, activeEngine.positionMs)
             prepareStandby(toIndex, preparedCrossfadeSeekToMs)
@@ -504,7 +511,7 @@ internal class AndroidPlaybackOrchestrator(
 
             outgoingEngine.setVolume(0f)
             incomingEngine.setVolume(targetVolume)
-            outgoingEngine.reset()
+            outgoingEngine.pause()
             activeEngine = incomingEngine
             standbyEngine = outgoingEngine
             preloadTargetIndex = null
@@ -522,7 +529,7 @@ internal class AndroidPlaybackOrchestrator(
                 setState(AndroidPlaybackOrchestratorState.PAUSED)
             }
             emitCrossfade("completed", fromIndex, toIndex, elapsedMs = durationMs.toInt(), fromVolume = 0f, toVolume = targetVolume)
-            preloadNextIfPossible()
+            schedulePostCrossfadeStandbyMaintenance(crossfadeDurationMs = durationMs)
         } catch (error: RejectionException) {
             if (error.code != "cancelled" && error.code != "crossfade_not_playing") {
                 emitCrossfade("error", fromIndex, toIndex, errorCode = error.code)
@@ -574,8 +581,40 @@ internal class AndroidPlaybackOrchestrator(
         startTrackAt(toIndex, 0L, emitTrackChange = true, oldPositionMs = oldPositionMs)
     }
 
+    private fun schedulePostCrossfadeStandbyMaintenance(crossfadeDurationMs: Long) {
+        standbyMaintenanceJob?.cancel()
+        if (!playWhenReady || state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE) return
+        if (nextIndexFor(currentIndex) == null) return
+
+        val runId = crossfadeRunId
+        val activeDurationMs = durationMs
+        val activePositionMs = positionMs
+        val settleMs = POST_CROSSFADE_SETTLE_MS
+        val targetPreloadPositionMs = if (activeDurationMs > 0L) {
+            max(
+                activePositionMs + settleMs,
+                activeDurationMs - max(1L, crossfadeDurationMs) - POST_CROSSFADE_PRELOAD_LEAD_MS
+            )
+        } else {
+            activePositionMs + settleMs
+        }
+        val delayMs = max(settleMs, targetPreloadPositionMs - activePositionMs)
+
+        androidXfadeLog("post-crossfade standby maintenance scheduled delayMs=$delayMs")
+        standbyMaintenanceJob = scope.launch {
+            delay(delayMs)
+            ensureCrossfadeRunActive(runId)
+            if (!playWhenReady || state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE) return@launch
+            standbyEngine.reset()
+            preloadTargetIndex = null
+            preloadNextIfPossible()
+        }
+    }
+
     fun release() {
         preloadJob?.cancel()
+        standbyMaintenanceJob?.cancel()
+        standbyMaintenanceJob = null
         preloadTargetIndex = null
         monitorJob?.cancel()
         engineA.release()
@@ -589,6 +628,8 @@ internal class AndroidPlaybackOrchestrator(
         oldPositionMs: Long
     ) {
         val previousIndex = currentIndex.takeIf { it in queue.indices }
+        standbyMaintenanceJob?.cancelAndJoin()
+        standbyMaintenanceJob = null
         preloadJob?.cancelAndJoin()
         preloadTargetIndex = null
         activeEngine.reset()
@@ -596,6 +637,11 @@ internal class AndroidPlaybackOrchestrator(
         currentIndex = index
         nowPlayingOverride = null
         setState(AndroidPlaybackOrchestratorState.LOADING)
+        if (emitTrackChange) {
+            delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)
+        }
+        delegate.onNowPlayingChanged(index)
+        notifySnapshotChanged()
         activeEngine.prepare(queue[index], positionMs)
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
@@ -604,10 +650,6 @@ internal class AndroidPlaybackOrchestrator(
         } else {
             setState(AndroidPlaybackOrchestratorState.PAUSED)
         }
-        if (emitTrackChange) {
-            delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)
-        }
-        delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
         preloadNextIfPossible()
     }
@@ -725,6 +767,8 @@ internal class AndroidPlaybackOrchestrator(
         val toIndex = activeCrossfadeToIndex
         val wasCrossfading = fromIndex != null && toIndex != null
         crossfadeRunId += 1
+        standbyMaintenanceJob?.cancel()
+        standbyMaintenanceJob = null
         if (wasCrossfading) {
             emitCrossfade("cancelled", fromIndex!!, toIndex!!, errorCode = errorCode)
         }
@@ -809,5 +853,7 @@ internal class AndroidPlaybackOrchestrator(
         const val INCOMING_STALL_GRACE_MS = 2000L
         const val INCOMING_STALL_TOLERANCE_MS = 200L
         const val OUTGOING_END_TOLERANCE_MS = 150L
+        const val POST_CROSSFADE_SETTLE_MS = 1500L
+        const val POST_CROSSFADE_PRELOAD_LEAD_MS = 8000L
     }
 }
