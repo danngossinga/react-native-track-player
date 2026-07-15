@@ -17,6 +17,8 @@ jobs:
           node-version: 16.x
       - name: Install dependencies
         run: yarn install --frozen-lockfile
+      - name: Guard Release
+        run: yarn release:guard
       - name: Build Library
         run: yarn build
       - name: Extract Version
