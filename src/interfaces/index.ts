@@ -3,6 +3,7 @@ export * from './FeedbackOptions';
 export * from './MetadataOptions';
 export * from './NowPlayingMetadata';
 export * from './PlaybackState';
+export * from './PlaybackBackendConfig';
 export * from './PlayerLifecycleState';
 export * from './PlayerOptions';
 export * from './Progress';

@@ -12,6 +12,7 @@
 - (NSDictionary *)constantsToExport;
 
 - (void)setupPlayer:(NSDictionary *)data resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
+- (void)setPlaybackBackend:(NSDictionary *)config resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)isServiceRunning:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)getPlayerLifecycle:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)updateOptions:(NSDictionary *)options resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
@@ -75,6 +76,11 @@
 - (void)setupPlayer:(NSDictionary *)data resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
 {
   [self setupPlayer:data ?: @{} resolver:resolve rejecter:reject];
+}
+
+- (void)setPlaybackBackend:(NSDictionary *)config resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+  [self setPlaybackBackend:config ?: @{} resolver:resolve rejecter:reject];
 }
 
 - (void)isServiceRunning:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject

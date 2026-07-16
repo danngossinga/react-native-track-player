@@ -7,12 +7,19 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A80000000000000000000007 /* PlaybackBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000005 /* PlaybackBackend.swift */; };
+		A80000000000000000000008 /* PlaybackBackendTransactionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000006 /* PlaybackBackendTransactionTests.swift */; };
+		A80000000000000000000009 /* libRNTrackPlayerBackendCore.a in Frameworks */ = {isa = PBXBuildFile; fileRef = A80000000000000000000003 /* libRNTrackPlayerBackendCore.a */; };
+		A8000000000000000000000B /* XCTest.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = A8000000000000000000000A /* XCTest.framework */; };
+		A80000000000000000000020 /* PlaybackBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000005 /* PlaybackBackend.swift */; };
+		A80000000000000000000021 /* StandardPlaybackBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000023 /* StandardPlaybackBackend.swift */; };
+		A80000000000000000000022 /* PingPongPlaybackBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000024 /* PingPongPlaybackBackend.swift */; };
 		9A0CF10E2046E5AC0093A5DF /* PitchAlgorithms.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9A0CF10D2046E5AC0093A5DF /* PitchAlgorithms.swift */; };
 		9B0E282E1F07D76F00B71D2A /* RNTrackPlayerBridge.m in Sources */ = {isa = PBXBuildFile; fileRef = 9B0E282D1F07D76F00B71D2A /* RNTrackPlayerBridge.m */; };
 		9B0E282F1F07D76F00B71D2A /* RNTrackPlayerBridge.h in CopyFiles */ = {isa = PBXBuildFile; fileRef = 9B0E282C1F07D76F00B71D2A /* RNTrackPlayerBridge.h */; };
 		9B18C2FA226356560019375A /* SessionCategories.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B18C2F9226356560019375A /* SessionCategories.swift */; };
 		9B58DF3B1F40C0F000C2105E /* RNTrackPlayer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B58DF3A1F40C0F000C2105E /* RNTrackPlayer.swift */; };
-		9B58DF3D1F40C0F000C2105E /* IOSCrossfadeCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B58DF3C1F40C0F000C2105E /* IOSCrossfadeCoordinator.swift */; };
+		9B58DF3D1F40C0F000C2105E /* IOSCrossfadeEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B58DF3C1F40C0F000C2105E /* IOSCrossfadeEngine.swift */; };
 		9B78A2461F3F12BC002B5E3C /* Track.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B78A2451F3F12BC002B5E3C /* Track.swift */; };
 		9B78A2481F3F12C9002B5E3C /* MediaURL.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9B78A2471F3F12C9002B5E3C /* MediaURL.swift */; };
 		9BFC1FDD1F61A8E8008795BF /* Capabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BFC1FDC1F61A8E8008795BF /* Capabilities.swift */; };
@@ -22,6 +29,15 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		A8000000000000000000000E /* CopyFiles */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "include/$(PRODUCT_NAME)";
+			dstSubfolderSpec = 16;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		9B0E28271F07D76F00B71D2A /* CopyFiles */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -35,13 +51,20 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A80000000000000000000003 /* libRNTrackPlayerBackendCore.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libRNTrackPlayerBackendCore.a; sourceTree = BUILT_PRODUCTS_DIR; };
+		A80000000000000000000004 /* RNTrackPlayerTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RNTrackPlayerTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		A80000000000000000000005 /* PlaybackBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackBackend.swift; sourceTree = "<group>"; };
+		A80000000000000000000006 /* PlaybackBackendTransactionTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackBackendTransactionTests.swift; sourceTree = "<group>"; };
+		A8000000000000000000000A /* XCTest.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = XCTest.framework; path = System/Library/Frameworks/XCTest.framework; sourceTree = SDKROOT; };
+		A80000000000000000000023 /* StandardPlaybackBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StandardPlaybackBackend.swift; sourceTree = "<group>"; };
+		A80000000000000000000024 /* PingPongPlaybackBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PingPongPlaybackBackend.swift; sourceTree = "<group>"; };
 		9A0CF10D2046E5AC0093A5DF /* PitchAlgorithms.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PitchAlgorithms.swift; sourceTree = "<group>"; };
 		9B0E28291F07D76F00B71D2A /* libRNTrackPlayer.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = libRNTrackPlayer.a; sourceTree = BUILT_PRODUCTS_DIR; };
 		9B0E282C1F07D76F00B71D2A /* RNTrackPlayerBridge.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = RNTrackPlayerBridge.h; sourceTree = "<group>"; };
 		9B0E282D1F07D76F00B71D2A /* RNTrackPlayerBridge.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = RNTrackPlayerBridge.m; sourceTree = "<group>"; };
 		9B18C2F9226356560019375A /* SessionCategories.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = SessionCategories.swift; sourceTree = "<group>"; };
 		9B58DF3A1F40C0F000C2105E /* RNTrackPlayer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RNTrackPlayer.swift; sourceTree = "<group>"; };
-		9B58DF3C1F40C0F000C2105E /* IOSCrossfadeCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSCrossfadeCoordinator.swift; sourceTree = "<group>"; };
+		9B58DF3C1F40C0F000C2105E /* IOSCrossfadeEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IOSCrossfadeEngine.swift; sourceTree = "<group>"; };
 		9B70466422BFFDEE00065A77 /* Metadata.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Metadata.swift; sourceTree = "<group>"; };
 		9B78A2451F3F12BC002B5E3C /* Track.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Track.swift; sourceTree = "<group>"; };
 		9B78A2471F3F12C9002B5E3C /* MediaURL.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaURL.swift; sourceTree = "<group>"; };
@@ -52,6 +75,22 @@
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
+		A8000000000000000000000D /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A80000000000000000000010 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A8000000000000000000000B /* XCTest.framework in Frameworks */,
+				A80000000000000000000009 /* libRNTrackPlayerBackendCore.a in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		9B0E28261F07D76F00B71D2A /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
@@ -66,6 +105,8 @@
 			isa = PBXGroup;
 			children = (
 				9B0E282B1F07D76F00B71D2A /* RNTrackPlayer */,
+				A8000000000000000000001A /* RNTrackPlayerTests */,
+				A8000000000000000000000A /* XCTest.framework */,
 				9B0E282A1F07D76F00B71D2A /* Products */,
 			);
 			sourceTree = "<group>";
@@ -74,6 +115,8 @@
 			isa = PBXGroup;
 			children = (
 				9B0E28291F07D76F00B71D2A /* libRNTrackPlayer.a */,
+				A80000000000000000000003 /* libRNTrackPlayerBackendCore.a */,
+				A80000000000000000000004 /* RNTrackPlayerTests.xctest */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -86,10 +129,21 @@
 				9B0E287A1F0831A400B71D2A /* Models */,
 				9B0E282C1F07D76F00B71D2A /* RNTrackPlayerBridge.h */,
 				9B0E282D1F07D76F00B71D2A /* RNTrackPlayerBridge.m */,
-				9B58DF3C1F40C0F000C2105E /* IOSCrossfadeCoordinator.swift */,
+				9B58DF3C1F40C0F000C2105E /* IOSCrossfadeEngine.swift */,
+				A80000000000000000000005 /* PlaybackBackend.swift */,
+				A80000000000000000000023 /* StandardPlaybackBackend.swift */,
+				A80000000000000000000024 /* PingPongPlaybackBackend.swift */,
 				9B58DF3A1F40C0F000C2105E /* RNTrackPlayer.swift */,
 			);
 			path = RNTrackPlayer;
+			sourceTree = "<group>";
+		};
+		A8000000000000000000001A /* RNTrackPlayerTests */ = {
+			isa = PBXGroup;
+			children = (
+				A80000000000000000000006 /* PlaybackBackendTransactionTests.swift */,
+			);
+			path = RNTrackPlayerTests;
 			sourceTree = "<group>";
 		};
 		9B0E287A1F0831A400B71D2A /* Models */ = {
@@ -125,6 +179,41 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
+		A80000000000000000000001 /* RNTrackPlayerBackendCore */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A80000000000000000000016 /* Build configuration list for PBXNativeTarget "RNTrackPlayerBackendCore" */;
+			buildPhases = (
+				A8000000000000000000000C /* Sources */,
+				A8000000000000000000000D /* Frameworks */,
+				A8000000000000000000000E /* CopyFiles */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RNTrackPlayerBackendCore;
+			productName = RNTrackPlayerBackendCore;
+			productReference = A80000000000000000000003 /* libRNTrackPlayerBackendCore.a */;
+			productType = "com.apple.product-type.library.static";
+		};
+		A80000000000000000000002 /* RNTrackPlayerTests */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A80000000000000000000019 /* Build configuration list for PBXNativeTarget "RNTrackPlayerTests" */;
+			buildPhases = (
+				A8000000000000000000000F /* Sources */,
+				A80000000000000000000010 /* Frameworks */,
+				A80000000000000000000011 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				A80000000000000000000013 /* PBXTargetDependency */,
+			);
+			name = RNTrackPlayerTests;
+			productName = RNTrackPlayerTests;
+			productReference = A80000000000000000000004 /* RNTrackPlayerTests.xctest */;
+			productType = "com.apple.product-type.bundle.unit-test";
+		};
 		9B0E28281F07D76F00B71D2A /* RNTrackPlayer */ = {
 			isa = PBXNativeTarget;
 			buildConfigurationList = 9B0E28321F07D76F00B71D2A /* Build configuration list for PBXNativeTarget "RNTrackPlayer" */;
@@ -151,6 +240,13 @@
 				LastUpgradeCheck = 0900;
 				ORGANIZATIONNAME = "David Chavez";
 				TargetAttributes = {
+					A80000000000000000000001 = {
+						CreatedOnToolsVersion = 17.0;
+					};
+					A80000000000000000000002 = {
+						CreatedOnToolsVersion = 17.0;
+						TestTargetID = A80000000000000000000001;
+					};
 					9B0E28281F07D76F00B71D2A = {
 						CreatedOnToolsVersion = 9.0;
 						LastSwiftMigration = 0900;
@@ -170,11 +266,29 @@
 			projectRoot = "";
 			targets = (
 				9B0E28281F07D76F00B71D2A /* RNTrackPlayer */,
+				A80000000000000000000001 /* RNTrackPlayerBackendCore */,
+				A80000000000000000000002 /* RNTrackPlayerTests */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXSourcesBuildPhase section */
+		A8000000000000000000000C /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A80000000000000000000007 /* PlaybackBackend.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A8000000000000000000000F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A80000000000000000000008 /* PlaybackBackendTransactionTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		9B0E28251F07D76F00B71D2A /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
@@ -183,19 +297,108 @@
 				9B18C2FA226356560019375A /* SessionCategories.swift in Sources */,
 				BF227390244F344D00A9893D /* Metadata.swift in Sources */,
 				F03B44982912BCA50035FE01 /* EventEmitter.swift in Sources */,
-				9B58DF3D1F40C0F000C2105E /* IOSCrossfadeCoordinator.swift in Sources */,
+				9B58DF3D1F40C0F000C2105E /* IOSCrossfadeEngine.swift in Sources */,
 				9B78A2481F3F12C9002B5E3C /* MediaURL.swift in Sources */,
 				F03B44972912BCA50035FE01 /* EventType.swift in Sources */,
 				9BFC1FDD1F61A8E8008795BF /* Capabilities.swift in Sources */,
 				9B78A2461F3F12BC002B5E3C /* Track.swift in Sources */,
 				9A0CF10E2046E5AC0093A5DF /* PitchAlgorithms.swift in Sources */,
+				A80000000000000000000020 /* PlaybackBackend.swift in Sources */,
+				A80000000000000000000021 /* StandardPlaybackBackend.swift in Sources */,
+				A80000000000000000000022 /* PingPongPlaybackBackend.swift in Sources */,
 				9B58DF3B1F40C0F000C2105E /* RNTrackPlayer.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
+/* Begin PBXResourcesBuildPhase section */
+		A80000000000000000000011 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXContainerItemProxy section */
+		A80000000000000000000012 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 9B0E28211F07D76E00B71D2A /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A80000000000000000000001;
+			remoteInfo = RNTrackPlayerBackendCore;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXTargetDependency section */
+		A80000000000000000000013 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A80000000000000000000001 /* RNTrackPlayerBackendCore */;
+			targetProxy = A80000000000000000000012 /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
 /* Begin XCBuildConfiguration section */
+		A80000000000000000000014 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				DEFINES_MODULE = YES;
+				ENABLE_TESTABILITY = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 12.0;
+				PRODUCT_MODULE_NAME = RNTrackPlayerBackendCore;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 4.2;
+			};
+			name = Debug;
+		};
+		A80000000000000000000015 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CLANG_ENABLE_MODULES = YES;
+				DEFINES_MODULE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 12.0;
+				PRODUCT_MODULE_NAME = RNTrackPlayerBackendCore;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 4.2;
+			};
+			name = Release;
+		};
+		A80000000000000000000017 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "";
+				CLANG_ENABLE_MODULES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 12.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.doublesymmetry.trackplayer.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 4.2;
+				TEST_HOST = "";
+			};
+			name = Debug;
+		};
+		A80000000000000000000018 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				BUNDLE_LOADER = "";
+				CLANG_ENABLE_MODULES = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 12.0;
+				LD_RUNPATH_SEARCH_PATHS = "$(inherited) @executable_path/Frameworks @loader_path/Frameworks";
+				PRODUCT_BUNDLE_IDENTIFIER = com.doublesymmetry.trackplayer.tests;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SWIFT_VERSION = 4.2;
+				TEST_HOST = "";
+			};
+			name = Release;
+		};
 		9B0E28301F07D76F00B71D2A /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
@@ -350,6 +553,24 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
+		A80000000000000000000016 /* Build configuration list for PBXNativeTarget "RNTrackPlayerBackendCore" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A80000000000000000000014 /* Debug */,
+				A80000000000000000000015 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A80000000000000000000019 /* Build configuration list for PBXNativeTarget "RNTrackPlayerTests" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A80000000000000000000017 /* Debug */,
+				A80000000000000000000018 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 		9B0E28241F07D76E00B71D2A /* Build configuration list for PBXProject "RNTrackPlayer" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (

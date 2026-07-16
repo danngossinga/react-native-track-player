@@ -105,6 +105,10 @@ final class IOSPlaybackOrchestrator {
     private(set) var volume: Float = 1
     private(set) var rate: Float = 1
 
+    var transitionGeneration: Int {
+        return runId
+    }
+
     init() {
         activeEngine = engineA
         standbyEngine = engineB
@@ -295,6 +299,13 @@ final class IOSPlaybackOrchestrator {
             endObserverWorkItem = nil
         }
         refreshNowPlaying()
+    }
+
+    func settleActiveTransition() {
+        if state == .crossfading || state == .pausedDuringCrossfade {
+            promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "backend_swap")
+        }
+        cancelScheduledPlaybackWork()
     }
 
     func stop() {

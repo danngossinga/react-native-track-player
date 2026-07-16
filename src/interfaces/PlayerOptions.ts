@@ -110,10 +110,9 @@ export interface PlayerOptions {
    */
   crossfade?: boolean;
   /**
-   * Selects the iOS crossfade engine used by this fork.
-   * `orchestratedDualEngine` keeps native AVPlayer engines as the audible source.
-   * `legacyHybrid` keeps the previous SwiftAudioEx handoff path for debugging.
-   * Defaults to `orchestratedDualEngine` when `crossfade` is true.
+   * Compatibility alias for selecting the iOS crossfade engine.
+   * Both values now use the RNTP-owned orchestrated dual engine.
+   * @deprecated RNTP owns a single crossfade engine; omit this option.
    */
   crossfadeEngineMode?: 'orchestratedDualEngine' | 'legacyHybrid';
 }

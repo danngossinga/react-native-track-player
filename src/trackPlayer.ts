@@ -11,6 +11,7 @@ import type {
   AddTrack,
   EventPayloadByEvent,
   NowPlayingMetadata,
+  PlaybackBackendConfig,
   PlaybackState,
   PlayerLifecycleState,
   PlayerOptions,
@@ -20,6 +21,7 @@ import type {
   TrackMetadataBase,
   UpdateOptions,
 } from './interfaces';
+import { setPlaybackBackendOn } from './playbackBackend';
 import resolveAssetSource from './resolveAssetSource';
 
 const emitter =
@@ -99,6 +101,16 @@ export function isServiceRunning(): Promise<boolean> {
  */
 export function getPlayerLifecycle(): Promise<PlayerLifecycleState> {
   return TrackPlayer.getPlayerLifecycle();
+}
+
+/**
+ * Atomically replaces the native playback backend while preserving playback
+ * state. setupPlayer remains a one-time lifecycle operation.
+ */
+export function setPlaybackBackend(
+  config: PlaybackBackendConfig
+): Promise<PlayerLifecycleState> {
+  return setPlaybackBackendOn(TrackPlayer, config);
 }
 
 // MARK: - Queue API

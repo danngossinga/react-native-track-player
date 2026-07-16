@@ -107,6 +107,9 @@ internal class AndroidPlaybackOrchestrator(
     var repeatMode: RepeatMode = RepeatMode.OFF
         private set
 
+    val transitionGeneration: Long
+        get() = crossfadeRunId.toLong()
+
     var state: AndroidPlaybackOrchestratorState = AndroidPlaybackOrchestratorState.IDLE
         private set
 
@@ -171,6 +174,10 @@ internal class AndroidPlaybackOrchestrator(
             hasPrevious = previousIndexFor(currentIndex) != null || positionMs > PREVIOUS_RESTART_THRESHOLD_MS,
             hasNext = nextIndexFor(currentIndex) != null
         )
+    }
+
+    suspend fun settleActiveTransition() {
+        cancelCrossfade("backend_swap", promoteIncoming = true)
     }
 
     init {
@@ -263,6 +270,33 @@ internal class AndroidPlaybackOrchestrator(
         activeEngine.play(rate)
         setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
         preloadNextIfPossible()
+    }
+
+    /**
+     * Activates state that was fully prepared by restore(). This is the
+     * transaction's non-suspending commit hook; it must not perform I/O or
+     * prepare a media source.
+     */
+    fun activatePreparedPlayback(playWhenReady: Boolean, restoredVolume: Float) {
+        volume = restoredVolume.coerceIn(0f, 1f)
+        this.playWhenReady = playWhenReady
+        if (queue.isEmpty() || currentIndex !in queue.indices) {
+            activeEngine.setVolume(0f)
+            setState(AndroidPlaybackOrchestratorState.IDLE)
+            return
+        }
+        if (playWhenReady) {
+            activeEngine.setVolume(volume)
+            activeEngine.play(rate)
+            setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
+            preloadNextIfPossible()
+        } else {
+            activeEngine.setVolume(0f)
+            activeEngine.pause()
+            standbyEngine.pause()
+            setState(AndroidPlaybackOrchestratorState.PAUSED)
+        }
+        notifySnapshotChanged()
     }
 
     fun pause() {

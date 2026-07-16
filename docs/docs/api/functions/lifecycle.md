@@ -8,6 +8,8 @@ These options are different than the ones set using `updateOptions()`. Options o
 
 You should always call this function (even without any options set) before using the player to make sure everything is initialized. Do not call this more than once in the lifetime of your app.
 
+`setupPlayer()` remains a one-time lifecycle operation. To change the playback backend at runtime, use `setPlaybackBackend()` instead of calling `setupPlayer()` again.
+
 Note that on Android this method must only be called while the app is in the foreground, otherwise it will throw an error with code `'android_cannot_setup_player_in_background'`. In this case you can wait for the app to be in the foreground and try again.
 
 **Returns:** `Promise`
@@ -26,6 +28,22 @@ Note that on Android this method must only be called while the app is in the for
 | options.iosCategoryMode  | `IOSCategoryMode` | [AVAudioSession.Mode](https://developer.apple.com/documentation/avfoundation/avaudiosession/1616508-mode) for iOS. Sets on `play()` | `default` | ❌ | ✅ | ❌ |
 | options.autoHandleInterruptions   | `boolean` | Indicates whether the player should automatically handle audio interruptions. | false | ✅ | ✅  | ❌ |
 | options.autoUpdateMetadata   | `boolean` | Indicates whether the player should automatically update now playing metadata data in control center / notification. | true | ✅ | ✅ | ❌ |
+
+## `setPlaybackBackend(config: PlaybackBackendConfig)`
+
+Atomically changes the native playback backend at runtime. This is the only runtime backend mutation API.
+
+```ts
+type PlaybackBackendConfig =
+  | { type: 'standard' }
+  | { type: 'pingPong'; engineMode?: 'orchestratedDualEngine' };
+```
+
+RNTP owns both ping-pong playback engines and their crossfade orchestration. During a backend change, RNTP preserves the full queue, active index and track, position, play intent, volume, rate, repeat mode, and transition generation.
+
+If any work before the atomic commit fails, the promise rejects and the previous backend remains authoritative. After commit, a failure while disposing the previous backend does not reject: the promise resolves normally and RNTP emits a sanitized cleanup diagnostic. Concurrent calls are serialized, and the last successfully committed call determines the active backend.
+
+**Returns:** `Promise<PlayerLifecycleState>`
 
 ## `registerPlaybackService(serviceProvider)`
 

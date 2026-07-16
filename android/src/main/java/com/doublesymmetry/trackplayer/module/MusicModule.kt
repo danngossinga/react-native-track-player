@@ -13,6 +13,7 @@ import com.doublesymmetry.trackplayer.model.State
 import com.doublesymmetry.trackplayer.model.Track
 import com.doublesymmetry.trackplayer.module.MusicEvents.Companion.EVENT_INTENT
 import com.doublesymmetry.trackplayer.service.MusicService
+import com.doublesymmetry.trackplayer.service.PlaybackBackendType
 import com.doublesymmetry.trackplayer.utils.AppForegroundTracker
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.facebook.react.bridge.*
@@ -20,7 +21,6 @@ import com.facebook.react.turbomodule.core.interfaces.TurboModule
 import com.google.android.exoplayer2.DefaultLoadControl.*
 import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.MainScope
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import timber.log.Timber
 import java.util.*
@@ -291,6 +291,60 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
     }
 
     @ReactMethod
+    fun setPlaybackBackend(config: ReadableMap?, callback: Promise) {
+        scope.launch {
+            if (verifyServiceBoundOrReject(callback)) return@launch
+            val backendType = try {
+                if (config == null || !config.hasKey("type") ||
+                    config.getType("type") != ReadableType.String
+                ) {
+                    null
+                } else {
+                    val keys = mutableSetOf<String>()
+                    val iterator = config.keySetIterator()
+                    while (iterator.hasNextKey()) keys += iterator.nextKey()
+                    when (config.getString("type")) {
+                        "standard" -> PlaybackBackendType.STANDARD.takeIf {
+                            keys == setOf("type")
+                        }
+                        "pingPong" -> PlaybackBackendType.PING_PONG.takeIf {
+                            keys.all { key -> key == "type" || key == "engineMode" } &&
+                                (!config.hasKey("engineMode") ||
+                                    (config.getType("engineMode") == ReadableType.String &&
+                                        config.getString("engineMode") == "orchestratedDualEngine"))
+                        }
+                        else -> null
+                    }
+                }
+            } catch (_: Exception) {
+                null
+            }
+            if (backendType == null) {
+                callback.reject(
+                    "invalid_playback_backend_config",
+                    "Invalid playback backend config."
+                )
+                return@launch
+            }
+
+            try {
+                musicService.setPlaybackBackend(backendType)
+                callback.resolve(Arguments.fromBundle(musicService.getPlayerLifecycleBundle(
+                    serviceBound = true,
+                    playerInitialized = true,
+                    setupInProgress = false
+                )))
+            } catch (exception: Exception) {
+                callback.reject(
+                    "playback_backend_swap_failed",
+                    "Unable to change playback backend.",
+                    exception
+                )
+            }
+        }
+    }
+
+    @ReactMethod
     fun updateOptions(data: ReadableMap?, callback: Promise) {
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
@@ -490,9 +544,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.stop()
-        delay(300) // Allow playback to stop
-        musicService.clear()
+        musicService.reset()
 
         callback.resolve(null)
     }
@@ -654,7 +706,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.playWhenReady = playWhenReady
+        musicService.setPlayWhenReady(playWhenReady)
         callback.resolve(null)
     }
     }
@@ -702,8 +754,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         if (verifyServiceBoundOrReject(callback)) return@launch
 
         try {
-            musicService.clear()
-            musicService.add(readableArrayToTrackList(data))
+            musicService.setQueue(readableArrayToTrackList(data))
             callback.resolve(null)
         } catch (exception: Exception) {
             rejectWithException(callback, exception)

@@ -37,37 +37,107 @@ import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.ui.R as ExoPlayerR
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.flow
-import java.util.concurrent.TimeUnit
 import kotlin.system.exitProcess
 import timber.log.Timber
 
 @MainThread
 class MusicService : HeadlessJsTaskService() {
+    private data class StandardPlayerBinding(
+        val player: QueuedAudioPlayer,
+        val identity: Any,
+        val ownerJob: Job
+    )
+
     private var player: QueuedAudioPlayer? = null
+    private var standardPlayerBinding: StandardPlayerBinding? = null
+    private var standardPlayerFactory: (() -> QueuedAudioPlayer)? = null
     private val crossfadeQueue = AndroidTrackQueue()
+    private val transitionGenerationSidecar = PlaybackTransitionGenerationSidecar()
+    private val playbackBackendAuthority = AndroidPlaybackBackendAuthority()
     private var playbackOrchestrator: AndroidPlaybackOrchestrator? = null
+    private var playbackOrchestratorIdentity: Any? = null
+    private var orchestratorAudioContentType: Int = C.AUDIO_CONTENT_TYPE_MUSIC
+    private var orchestratorHandlesAudioFocus: Boolean = false
+    private var playbackBackendFacade: PlaybackBackendFacade? = null
     private var orchestratedMediaSurface: AndroidOrchestratedMediaSurface? = null
+    private val playbackControlOwnerRegistry = PlaybackControlOwnerRegistry()
     private val binder = MusicBinder()
     private val scope = MainScope()
     private var progressUpdateJob: Job? = null
     private var crossfadeEnabled = false
     private var latestNotificationConfig: NotificationConfig? = null
+    private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
     private var configuredRatingType: Int = RatingCompat.RATING_NONE
     private var configuredRepeatMode: RepeatMode = RepeatMode.OFF
 
-    private fun isPrimaryPlayerInitialized(): Boolean = player != null || playbackOrchestrator != null
+    private fun isPrimaryPlayerInitialized(): Boolean = playbackBackendFacade != null
 
-    private fun useOrchestratedCrossfade(): Boolean = crossfadeEnabled && playbackOrchestrator != null
+    private fun useOrchestratedCrossfade(): Boolean =
+        playbackOrchestratorIdentity?.let {
+            playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, it)
+        } == true
+
+    private fun activePlaybackBackend(): AndroidPlaybackBackendRouting {
+        return playbackBackendFacade?.currentBackend() as? AndroidPlaybackBackendRouting
+            ?: throw IllegalStateException("Playback backend is not initialized. Call setupPlayer first.")
+    }
+
+    private suspend fun <T> withActivePlaybackBackend(
+        operation: suspend (AndroidPlaybackBackendRouting) -> T
+    ): T {
+        return playbackBackendFacade!!.withCurrentBackend { backend ->
+            operation(backend as AndroidPlaybackBackendRouting)
+        }
+    }
 
     private fun requireKotlinAudioPlayer(): QueuedAudioPlayer {
         return player ?: throw IllegalStateException("KotlinAudio player is not initialized for this playback mode.")
     }
 
+    private fun createStandardPlayerBinding(): StandardPlayerBinding {
+        val identity = Any()
+        val created = try {
+            playbackControlOwnerRegistry.activate(identity) {
+                standardPlayerFactory?.invoke()
+                    ?: throw IllegalStateException("Standard playback backend is not configured.")
+            }
+        } catch (error: Exception) {
+            throw error
+        }
+        val ownerJob = SupervisorJob(scope.coroutineContext[Job])
+        val ownerScope = CoroutineScope(scope.coroutineContext + ownerJob)
+        return try {
+            created.automaticallyUpdateNotificationMetadata = false
+            created.ratingType = configuredRatingType
+            (created.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
+            observeEvents(created, identity, ownerScope)
+            setupForegrounding(created, identity, ownerScope)
+            StandardPlayerBinding(created, identity, ownerJob)
+        } catch (error: Exception) {
+            ownerJob.cancel()
+            playbackControlOwnerRegistry.deactivate(identity) { created.destroy() }
+            throw error
+        }
+    }
+
     private fun allPlayers(): List<QueuedAudioPlayer> = player?.let { listOf(it) } ?: emptyList()
 
-    private fun isActivePlayer(source: QueuedAudioPlayer): Boolean =
-        player === source
+    private fun isActivePlayer(source: QueuedAudioPlayer, identity: Any): Boolean =
+        standardPlayerBinding?.let { it.player === source && it.identity === identity } == true &&
+            playbackBackendAuthority.isAuthoritative(PlaybackBackendType.STANDARD, identity)
+
+    private fun commitStandardPlayerBinding(binding: StandardPlayerBinding) {
+        player = binding.player
+        standardPlayerBinding = binding
+        binding.player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
+        binding.player.ratingType = configuredRatingType
+        (binding.player.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
+        val androidOptions = latestOptions?.getBundle(ANDROID_OPTIONS_KEY)
+        binding.player.playerOptions.alwaysPauseOnInterruption =
+            androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
+        latestNotificationConfig?.let { binding.player.notificationManager.createNotification(it) }
+    }
 
     /**
      * Use [appKilledPlaybackBehavior] instead.
@@ -84,13 +154,13 @@ class MusicService : HeadlessJsTaskService() {
     private var stopForegroundGracePeriod: Int = DEFAULT_STOP_FOREGROUND_GRACE_PERIOD
 
     val tracks: List<Track>
-        get() = playerItems().map { it.track }
+        get() = activePlaybackBackend().queueItems.map { it.track }
 
     val currentTrack
-        get() = playbackOrchestrator?.currentTrack?.track ?: (requireKotlinAudioPlayer().currentItem as TrackAudioItem).track
+        get() = activePlaybackBackend().queueItems[activePlaybackBackend().currentIndex].track
 
     val state
-        get() = playbackOrchestrator?.playbackState ?: requireKotlinAudioPlayer().playerState
+        get() = activePlaybackBackend().playbackState
 
     var ratingType: Int
         get() = configuredRatingType
@@ -106,21 +176,15 @@ class MusicService : HeadlessJsTaskService() {
         get() = requireKotlinAudioPlayer().event
 
     var playWhenReady: Boolean
-        get() = playbackOrchestrator?.playWhenReady ?: requireKotlinAudioPlayer().playWhenReady
+        get() = activePlaybackBackend().playWhenReady
         set(value) {
-            val orchestrator = playbackOrchestrator
-            if (orchestrator != null) {
-                if (value) {
-                    scope.launch {
-                        orchestrator.play()
+            scope.launch {
+                withActivePlaybackBackend { backend ->
+                    if (value) backend.play() else backend.pause()
+                    if (backend.type == PlaybackBackendType.PING_PONG) {
                         refreshOrchestratedMediaSurface(reason = "play-when-ready")
                     }
-                } else {
-                    orchestrator.pause()
-                    refreshOrchestratedMediaSurface(reason = "play-when-ready")
                 }
-            } else {
-                requireKotlinAudioPlayer().playWhenReady = value
             }
         }
 
@@ -164,6 +228,210 @@ class MusicService : HeadlessJsTaskService() {
         stopForeground(true)
     }
 
+    private fun createPlaybackOrchestrator(identity: Any): AndroidPlaybackOrchestrator {
+        lateinit var created: AndroidPlaybackOrchestrator
+        fun isAuthoritative(): Boolean =
+            playbackOrchestrator === created &&
+                playbackOrchestratorIdentity === identity &&
+                playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)
+
+        created = AndroidPlaybackOrchestrator(
+            context = this@MusicService,
+            scope = scope,
+            audioContentType = orchestratorAudioContentType,
+            handleAudioFocus = orchestratorHandlesAudioFocus,
+            delegate = object : AndroidPlaybackOrchestratorDelegate {
+                override fun onPlaybackStateChanged(state: AudioPlayerState) {
+                    if (!isAuthoritative()) return
+                    emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state))
+                }
+
+                override fun onActiveTrackChanged(index: Int?, previousIndex: Int?, oldPositionMs: Long) {
+                    if (!isAuthoritative()) return
+                    emitPlaybackTrackChangedEvents(index, previousIndex, oldPositionMs.toSeconds())
+                }
+
+                override fun onQueueEnded(index: Int, positionMs: Long) {
+                    if (!isAuthoritative()) return
+                    emitQueueEndedEvent(index, positionMs)
+                }
+
+                override fun onCrossfadeState(
+                    state: String,
+                    fromIndex: Int,
+                    toIndex: Int,
+                    elapsedMs: Int?,
+                    fromVolume: Float?,
+                    toVolume: Float?,
+                    errorCode: String?
+                ) {
+                    if (!isAuthoritative()) return
+                    emitCrossfadeState(state, fromIndex, toIndex, elapsedMs, fromVolume, toVolume, errorCode)
+                    refreshOrchestratedMediaSurface(reason = "crossfade-$state")
+                }
+
+                override fun onNowPlayingChanged(index: Int) {
+                    if (!isAuthoritative()) return
+                    updateNotificationMetadataForIndex(index)
+                }
+
+                override fun onPlaybackError(code: String, message: String?) {
+                    if (!isAuthoritative()) return
+                    emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {
+                        putString("code", code)
+                        putString("message", message)
+                    })
+                }
+
+                override fun onSnapshotChanged(snapshot: AndroidPlaybackSnapshot) {
+                    if (!isAuthoritative()) return
+                    orchestratedMediaSurface?.publish(snapshot, "orchestrator")
+                }
+            }
+        )
+        Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
+        return created
+    }
+
+    private fun createOrchestratedMediaSurface(identity: Any): AndroidOrchestratedMediaSurface {
+        lateinit var created: AndroidOrchestratedMediaSurface
+        created = AndroidOrchestratedMediaSurface(
+            service = this@MusicService,
+            scope = scope,
+            activateExclusiveControlSurface = { physicalActivation ->
+                playbackControlOwnerRegistry.activate(identity, physicalActivation)
+            },
+            deactivateExclusiveControlSurface = { physicalDeactivation ->
+                playbackControlOwnerRegistry.deactivate(identity, physicalDeactivation)
+            },
+            delegate = object : AndroidOrchestratedMediaSurfaceDelegate {
+                override fun onRemotePlay() =
+                    runOrchestratedRemoteCommand(identity, "play", MusicEvents.BUTTON_PLAY) { it.play() }
+                override fun onRemotePause() =
+                    runOrchestratedRemoteCommand(identity, "pause", MusicEvents.BUTTON_PAUSE) { it.pause() }
+                override fun onRemoteStop() = runOrchestratedRemoteCommand(
+                    identity,
+                    "stop",
+                    MusicEvents.BUTTON_STOP,
+                    refreshAfter = false
+                ) {
+                    it.stop()
+                    created.hide()
+                }
+                override fun onRemoteNext() =
+                    runOrchestratedRemoteCommand(identity, "next", MusicEvents.BUTTON_SKIP_NEXT) { it.skipToNext() }
+                override fun onRemotePrevious() =
+                    runOrchestratedRemoteCommand(identity, "previous", MusicEvents.BUTTON_SKIP_PREVIOUS) { it.skipToPrevious() }
+                override fun onRemoteSeekTo(positionMs: Long) =
+                    runOrchestratedRemoteCommand(
+                        identity,
+                        "seek",
+                        MusicEvents.BUTTON_SEEK_TO,
+                        Bundle().apply { putDouble("position", positionMs.toSeconds()) }
+                    ) { it.seekTo(positionMs) }
+                override fun onRemoteJumpForward(interval: Int) =
+                    runOrchestratedRemoteCommand(
+                        identity,
+                        "jump-forward",
+                        MusicEvents.BUTTON_JUMP_FORWARD,
+                        Bundle().apply { putInt("interval", interval) }
+                    ) { it.seekBy(interval * 1000L) }
+                override fun onRemoteJumpBackward(interval: Int) =
+                    runOrchestratedRemoteCommand(
+                        identity,
+                        "jump-backward",
+                        MusicEvents.BUTTON_JUMP_BACKWARD,
+                        Bundle().apply { putInt("interval", interval) }
+                    ) { it.seekBy(-interval * 1000L) }
+                override fun onRemoteSetRating(rating: RatingCompat) {
+                    scope.launch {
+                        playbackBackendFacade?.routeIfAuthoritative(identity) { backend ->
+                            if (backend.type != PlaybackBackendType.PING_PONG) return@routeIfAuthoritative
+                            Bundle().apply {
+                                setRating(this, "rating", rating)
+                                putBoolean("handledByNative", true)
+                                emit(MusicEvents.BUTTON_SET_RATING, this)
+                            }
+                        }
+                    }
+                }
+                override fun onForegroundServiceStartError(error: Exception) {
+                    if (!playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)) return
+                    Timber.e(
+                        "ForegroundServiceStartNotAllowedException: App tried to start a foreground Service when it was not allowed to do so.",
+                        error
+                    )
+                    emit(MusicEvents.PLAYER_ERROR, Bundle().apply {
+                        putString("message", error.message)
+                        putString("code", "android-foreground-service-start-not-allowed")
+                    })
+                }
+            }
+        )
+        return created
+    }
+
+    private fun createPlaybackBackend(
+        type: PlaybackBackendType,
+        initiallyAuthoritative: Boolean = false
+    ): PlaybackBackend {
+        return when (type) {
+            PlaybackBackendType.STANDARD -> {
+                val binding = createStandardPlayerBinding()
+                KotlinAudioPlaybackBackend(
+                    binding.player,
+                    binding.identity,
+                    crossfadeQueue,
+                    transitionGenerationSidecar,
+                    onCommitted = { committed ->
+                        if (committed === binding.player) commitStandardPlayerBinding(binding)
+                    },
+                    onDisposed = { disposed ->
+                        binding.ownerJob.cancel()
+                        playbackControlOwnerRegistry.deactivate(binding.identity) { disposed.destroy() }
+                        if (standardPlayerBinding === binding) standardPlayerBinding = null
+                        if (player === disposed) player = null
+                    },
+                    initiallyAuthoritative = initiallyAuthoritative
+                )
+            }
+            PlaybackBackendType.PING_PONG -> {
+                val identity = Any()
+                val orchestrator = createPlaybackOrchestrator(identity)
+                val surface = createOrchestratedMediaSurface(identity)
+                fun publishSurface(reason: String) {
+                    latestOrchestratedMediaSurfaceConfig?.let(surface::updateConfig)
+                    surface.publish(orchestrator.snapshot(), reason)
+                }
+                PingPongPlaybackBackend(
+                    orchestrator,
+                    identity,
+                    crossfadeQueue,
+                    transitionGenerationSidecar,
+                    suspendControlSurface = surface::hide,
+                    resumeControlSurface = { publishSurface("backend-rollback") },
+                    activateControlSurface = { publishSurface("backend-commit") },
+                    onCommitted = { committed ->
+                        if (committed === orchestrator) {
+                            playbackOrchestrator = orchestrator
+                            playbackOrchestratorIdentity = identity
+                            orchestratedMediaSurface = surface
+                        }
+                    },
+                    onDisposed = { disposed ->
+                        surface.release()
+                        if (playbackOrchestrator === disposed && playbackOrchestratorIdentity === identity) {
+                            playbackOrchestrator = null
+                            playbackOrchestratorIdentity = null
+                            if (orchestratedMediaSurface === surface) orchestratedMediaSurface = null
+                        }
+                    },
+                    initiallyAuthoritative = initiallyAuthoritative
+                )
+            }
+        }
+    }
+
     @MainThread
     fun setupPlayer(playerOptions: Bundle?) {
         if (isPrimaryPlayerInitialized()) {
@@ -198,121 +466,25 @@ class MusicService : HeadlessJsTaskService() {
         crossfadeEnabled = playerOptions?.getBoolean(CROSSFADE_KEY, false) ?: false
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
-        if (crossfadeEnabled) {
-            orchestratedMediaSurface = AndroidOrchestratedMediaSurface(
-                service = this@MusicService,
-                scope = scope,
-                delegate = object : AndroidOrchestratedMediaSurfaceDelegate {
-                    override fun onRemotePlay() =
-                        runOrchestratedRemoteCommand("play", MusicEvents.BUTTON_PLAY) { it.play() }
-                    override fun onRemotePause() =
-                        runOrchestratedRemoteCommand("pause", MusicEvents.BUTTON_PAUSE) { it.pause() }
-                    override fun onRemoteStop() = runOrchestratedRemoteCommand(
-                        "stop",
-                        MusicEvents.BUTTON_STOP,
-                        refreshAfter = false
-                    ) {
-                        it.stop()
-                        orchestratedMediaSurface?.hide()
-                    }
-                    override fun onRemoteNext() =
-                        runOrchestratedRemoteCommand("next", MusicEvents.BUTTON_SKIP_NEXT) { it.skipToNext() }
-                    override fun onRemotePrevious() =
-                        runOrchestratedRemoteCommand("previous", MusicEvents.BUTTON_SKIP_PREVIOUS) { it.skipToPrevious() }
-                    override fun onRemoteSeekTo(positionMs: Long) =
-                        runOrchestratedRemoteCommand(
-                            "seek",
-                            MusicEvents.BUTTON_SEEK_TO,
-                            Bundle().apply { putDouble("position", positionMs.toSeconds()) }
-                        ) { it.seekTo(positionMs) }
-                    override fun onRemoteJumpForward(interval: Int) =
-                        runOrchestratedRemoteCommand(
-                            "jump-forward",
-                            MusicEvents.BUTTON_JUMP_FORWARD,
-                            Bundle().apply { putInt("interval", interval) }
-                        ) { it.seekBy(interval * 1000L) }
-                    override fun onRemoteJumpBackward(interval: Int) =
-                        runOrchestratedRemoteCommand(
-                            "jump-backward",
-                            MusicEvents.BUTTON_JUMP_BACKWARD,
-                            Bundle().apply { putInt("interval", interval) }
-                        ) { it.seekBy(-interval * 1000L) }
-                    override fun onRemoteSetRating(rating: RatingCompat) {
-                        Bundle().apply {
-                            setRating(this, "rating", rating)
-                            putBoolean("handledByNative", true)
-                            emit(MusicEvents.BUTTON_SET_RATING, this)
-                        }
-                    }
-                    override fun onForegroundServiceStartError(error: Exception) {
-                        Timber.e(
-                            "ForegroundServiceStartNotAllowedException: App tried to start a foreground Service when it was not allowed to do so.",
-                            error
-                        )
-                        emit(MusicEvents.PLAYER_ERROR, Bundle().apply {
-                            putString("message", error.message)
-                            putString("code", "android-foreground-service-start-not-allowed")
-                        })
-                    }
-                }
-            )
-            playbackOrchestrator = AndroidPlaybackOrchestrator(
-                context = this@MusicService,
-                scope = scope,
-                audioContentType = playerConfig.audioContentType.toExoAudioContentType(),
-                handleAudioFocus = handleAudioFocus,
-                delegate = object : AndroidPlaybackOrchestratorDelegate {
-                    override fun onPlaybackStateChanged(state: AudioPlayerState) {
-                        emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state))
-                    }
-
-                    override fun onActiveTrackChanged(index: Int?, previousIndex: Int?, oldPositionMs: Long) {
-                        emitPlaybackTrackChangedEvents(index, previousIndex, oldPositionMs.toSeconds())
-                    }
-
-                    override fun onQueueEnded(index: Int, positionMs: Long) {
-                        emitQueueEndedEvent(index, positionMs)
-                    }
-
-                    override fun onCrossfadeState(
-                        state: String,
-                        fromIndex: Int,
-                        toIndex: Int,
-                        elapsedMs: Int?,
-                        fromVolume: Float?,
-                        toVolume: Float?,
-                        errorCode: String?
-                    ) {
-                        emitCrossfadeState(state, fromIndex, toIndex, elapsedMs, fromVolume, toVolume, errorCode)
-                        refreshOrchestratedMediaSurface(reason = "crossfade-$state")
-                    }
-
-                    override fun onNowPlayingChanged(index: Int) {
-                        updateNotificationMetadataForIndex(index)
-                    }
-
-                    override fun onPlaybackError(code: String, message: String?) {
-                        emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {
-                            putString("code", code)
-                            putString("message", message)
-                        })
-                    }
-
-                    override fun onSnapshotChanged(snapshot: AndroidPlaybackSnapshot) {
-                        orchestratedMediaSurface?.publish(snapshot, "orchestrator")
-                    }
-                }
-            )
-            Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
-        } else {
-            player = QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig).apply {
-                automaticallyUpdateNotificationMetadata = this@MusicService.automaticallyUpdateNotificationMetadata
-                ratingType = configuredRatingType
-                (playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
-            }
+        standardPlayerFactory = {
+            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
         }
-        observeEvents()
-        setupForegrounding()
+        orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
+        orchestratorHandlesAudioFocus = handleAudioFocus
+
+        val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD
+        val backendFactory = PlaybackBackendFactory { type -> createPlaybackBackend(type) }
+        playbackBackendFacade = PlaybackBackendFacade(
+            initialBackend = createPlaybackBackend(initialType, initiallyAuthoritative = true),
+            factory = backendFactory,
+            onCleanupDiagnostic = { diagnostic ->
+                emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {
+                    putString("code", diagnostic.code)
+                    putString("message", diagnostic.message)
+                })
+            },
+            authority = playbackBackendAuthority
+        )
     }
 
     @MainThread
@@ -392,27 +564,26 @@ class MusicService : HeadlessJsTaskService() {
         val notificationConfig = NotificationConfig(buttonsList, accentColor, smallIcon, pendingIntent)
 
         latestNotificationConfig = notificationConfig
+        latestOrchestratedMediaSurfaceConfig = AndroidOrchestratedMediaSurfaceConfig(
+            notificationCapabilities = notificationCapabilities,
+            compactCapabilities = compactCapabilities,
+            accentColor = accentColor,
+            smallIcon = smallIcon,
+            playIcon = BundleUtils.getIconOrNull(this, options, "playIcon"),
+            pauseIcon = BundleUtils.getIconOrNull(this, options, "pauseIcon"),
+            stopIcon = BundleUtils.getIconOrNull(this, options, "stopIcon"),
+            nextIcon = BundleUtils.getIconOrNull(this, options, "nextIcon"),
+            previousIcon = BundleUtils.getIconOrNull(this, options, "previousIcon"),
+            forwardIcon = BundleUtils.getIcon(this, options, "forwardIcon", TrackPlayerR.drawable.forward),
+            rewindIcon = BundleUtils.getIcon(this, options, "rewindIcon", TrackPlayerR.drawable.rewind),
+            contentIntent = pendingIntent,
+            forwardJumpInterval = (latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL)
+                ?: DEFAULT_JUMP_INTERVAL).toInt(),
+            backwardJumpInterval = (latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL)
+                ?: DEFAULT_JUMP_INTERVAL).toInt()
+        )
         if (useOrchestratedCrossfade()) {
-            orchestratedMediaSurface?.updateConfig(
-                AndroidOrchestratedMediaSurfaceConfig(
-                    notificationCapabilities = notificationCapabilities,
-                    compactCapabilities = compactCapabilities,
-                    accentColor = accentColor,
-                    smallIcon = smallIcon,
-                    playIcon = BundleUtils.getIconOrNull(this, options, "playIcon"),
-                    pauseIcon = BundleUtils.getIconOrNull(this, options, "pauseIcon"),
-                    stopIcon = BundleUtils.getIconOrNull(this, options, "stopIcon"),
-                    nextIcon = BundleUtils.getIconOrNull(this, options, "nextIcon"),
-                    previousIcon = BundleUtils.getIconOrNull(this, options, "previousIcon"),
-                    forwardIcon = BundleUtils.getIcon(this, options, "forwardIcon", TrackPlayerR.drawable.forward),
-                    rewindIcon = BundleUtils.getIcon(this, options, "rewindIcon", TrackPlayerR.drawable.rewind),
-                    contentIntent = pendingIntent,
-                    forwardJumpInterval = (latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL)
-                        ?: DEFAULT_JUMP_INTERVAL).toInt(),
-                    backwardJumpInterval = (latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL)
-                        ?: DEFAULT_JUMP_INTERVAL).toInt()
-                )
-            )
+            orchestratedMediaSurface?.updateConfig(latestOrchestratedMediaSurfaceConfig!!)
             refreshOrchestratedMediaSurface(reason = "options")
         } else {
             requireKotlinAudioPlayer().notificationManager.createNotification(notificationConfig)
@@ -431,24 +602,25 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     private fun progressUpdateEventFlow(interval: Double) = flow {
         while (true) {
-            val shouldEmit = playbackOrchestrator?.playbackState == AudioPlayerState.PLAYING || player?.isPlaying == true
-            if (shouldEmit) {
-                val bundle = progressUpdateEvent()
-                emit(bundle)
-            }
+            progressUpdateEvent()?.let { emit(it) }
 
             delay((interval * 1000).toLong())
         }
     }
 
     @MainThread
-    private suspend fun progressUpdateEvent(): Bundle {
+    private suspend fun progressUpdateEvent(): Bundle? {
         return withContext(Dispatchers.Main) {
-            Bundle().apply {
-                putDouble(POSITION_KEY, getPositionInSeconds())
-                putDouble(DURATION_KEY, getDurationInSeconds())
-                putDouble(BUFFERED_POSITION_KEY, getBufferedPositionInSeconds())
-                putInt(TRACK_KEY, getCurrentTrackIndex())
+            withActivePlaybackBackend { backend ->
+                if (backend.playbackState != AudioPlayerState.PLAYING) {
+                    return@withActivePlaybackBackend null
+                }
+                Bundle().apply {
+                    putDouble(POSITION_KEY, backend.positionMs.toSeconds())
+                    putDouble(DURATION_KEY, backend.durationMs.toSeconds())
+                    putDouble(BUFFERED_POSITION_KEY, backend.bufferedMs.toSeconds())
+                    putInt(TRACK_KEY, backend.currentIndex)
+                }
             }
         }
     }
@@ -466,7 +638,7 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun add(track: Track) {
+    suspend fun add(track: Track) {
         add(listOf(track))
     }
 
@@ -481,15 +653,7 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     private fun playerItems(): List<TrackAudioItem> {
-        return if (useOrchestratedCrossfade()) {
-            crossfadeQueue.snapshot()
-        } else {
-            requireKotlinAudioPlayer().items.map { it as TrackAudioItem }
-        }
-    }
-
-    private fun syncOrchestratorQueue() {
-        playbackOrchestrator?.setQueue(playerItems())
+        return activePlaybackBackend().queueItems
     }
 
     private fun updateNotificationMetadataForIndex(index: Int) {
@@ -508,6 +672,8 @@ class MusicService : HeadlessJsTaskService() {
         itemOverride: TrackAudioItem? = null
     ) {
         val orchestrator = playbackOrchestrator ?: return
+        val identity = playbackOrchestratorIdentity ?: return
+        if (!playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)) return
         val snapshot = orchestrator.snapshot()
         val surface = orchestratedMediaSurface ?: return
         if (itemOverride != null) {
@@ -518,16 +684,24 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     private fun runOrchestratedRemoteCommand(
+        identity: Any,
         reason: String,
         event: String,
         eventData: Bundle? = null,
         refreshAfter: Boolean = true,
-        command: suspend (AndroidPlaybackOrchestrator) -> Unit
+        command: suspend (AndroidPlaybackBackendRouting) -> Unit
     ) {
-        val orchestrator = playbackOrchestrator ?: return
         scope.launch {
             try {
-                command(orchestrator)
+                var executed = false
+                playbackBackendFacade?.routeIfAuthoritative(identity) { backend ->
+                    if (backend.type != PlaybackBackendType.PING_PONG) return@routeIfAuthoritative
+                    command(backend as AndroidPlaybackBackendRouting)
+                    executed = true
+                }
+                if (!executed ||
+                    !playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)
+                ) return@launch
                 if (refreshAfter) {
                     refreshOrchestratedMediaSurface(reason = "remote-$reason")
                 }
@@ -546,248 +720,214 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun add(tracks: List<Track>) {
+    suspend fun add(tracks: List<Track>) {
         val items = tracks.map { it.toAudioItem() }
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.add(items)
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().add(items)
-        }
+        withActivePlaybackBackend { it.add(items) }
     }
 
     @MainThread
-    fun add(tracks: List<Track>, atIndex: Int) {
+    suspend fun add(tracks: List<Track>, atIndex: Int) {
         val items = tracks.map { it.toAudioItem() }
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.add(items, atIndex)
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().add(items, atIndex)
-        }
+        withActivePlaybackBackend { it.add(items, atIndex) }
     }
 
     @MainThread
     suspend fun load(track: Track) {
-        val item = track.toAudioItem()
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            val existingIndex = crossfadeQueue.indexOfQueueId(item.track.queueId)
-            if (existingIndex < 0) {
-                crossfadeQueue.replaceWith(listOf(item))
+        withActivePlaybackBackend { backend ->
+            backend.load(track.toAudioItem())
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "load")
             }
-            syncOrchestratorQueue()
-            orchestrator.load(item)
-            refreshOrchestratedMediaSurface(reason = "load")
-        } else {
-            requireKotlinAudioPlayer().load(item)
         }
     }
 
     @MainThread
-    fun move(fromIndex: Int, toIndex: Int) {
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.move(fromIndex, toIndex)
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().move(fromIndex, toIndex)
-        }
+    suspend fun move(fromIndex: Int, toIndex: Int) {
+        withActivePlaybackBackend { it.move(fromIndex, toIndex) }
     }
 
     @MainThread
-    fun remove(index: Int) {
+    suspend fun remove(index: Int) {
         remove(listOf(index))
     }
 
     @MainThread
-    fun remove(indexes: List<Int>) {
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.remove(indexes)
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().remove(indexes)
+    suspend fun remove(indexes: List<Int>) {
+        withActivePlaybackBackend { it.remove(indexes) }
+    }
+
+    @MainThread
+    suspend fun clear() {
+        withActivePlaybackBackend { backend ->
+            backend.clearQueue()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                orchestratedMediaSurface?.hide()
+            }
         }
     }
 
     @MainThread
-    fun clear() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            crossfadeQueue.clear()
-            orchestrator.stop()
-            orchestratedMediaSurface?.hide()
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().clear()
+    suspend fun reset() {
+        withActivePlaybackBackend { backend ->
+            backend.stop()
+            backend.clearQueue()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                orchestratedMediaSurface?.hide()
+            }
         }
+    }
+
+    @MainThread
+    suspend fun setQueue(tracks: List<Track>) {
+        val items = tracks.map { it.toAudioItem() }
+        withActivePlaybackBackend { it.replaceQueue(items) }
     }
 
     @MainThread
     suspend fun play() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            syncOrchestratorQueue()
-            orchestrator.play()
-            refreshOrchestratedMediaSurface(reason = "play")
-        } else {
-            requireKotlinAudioPlayer().play()
+        withActivePlaybackBackend { backend ->
+            backend.play()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "play")
+            }
         }
     }
 
     @MainThread
-    fun pause() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.pause()
-            refreshOrchestratedMediaSurface(reason = "pause")
-        } else {
-            allPlayers().forEach { it.pause() }
+    suspend fun setPlayWhenReady(value: Boolean) {
+        withActivePlaybackBackend { backend ->
+            if (value) backend.play() else backend.pause()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "play-when-ready")
+            }
         }
     }
 
     @MainThread
-    fun stop() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.stop()
-            orchestratedMediaSurface?.hide()
-        } else {
-            val player = requireKotlinAudioPlayer()
-            player.stop()
-            player.volume = 1f
+    suspend fun pause() {
+        withActivePlaybackBackend { backend ->
+            backend.pause()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "pause")
+            }
         }
     }
 
     @MainThread
-    fun removeUpcomingTracks() {
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.removeUpcoming(getCurrentTrackIndex())
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().removeUpcomingItems()
+    suspend fun stop() {
+        withActivePlaybackBackend { backend ->
+            backend.stop()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                orchestratedMediaSurface?.hide()
+            }
         }
     }
 
     @MainThread
-    fun removePreviousTracks() {
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.removePrevious(getCurrentTrackIndex())
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().removePreviousItems()
-        }
+    suspend fun removeUpcomingTracks() {
+        withActivePlaybackBackend { it.removeUpcomingTracks() }
+    }
+
+    @MainThread
+    suspend fun removePreviousTracks() {
+        withActivePlaybackBackend { it.removePreviousTracks() }
     }
 
     @MainThread
     suspend fun skip(index: Int) {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            syncOrchestratorQueue()
-            orchestrator.skip(index)
-            refreshOrchestratedMediaSurface(reason = "skip")
-        } else {
-            requireKotlinAudioPlayer().jumpToItem(index)
+        withActivePlaybackBackend { backend ->
+            backend.skip(index)
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "skip")
+            }
         }
     }
 
     @MainThread
     suspend fun skipToNext() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            syncOrchestratorQueue()
-            orchestrator.skipToNext()
-            refreshOrchestratedMediaSurface(reason = "skip-next")
-        } else {
-            requireKotlinAudioPlayer().next()
+        withActivePlaybackBackend { backend ->
+            backend.skipToNext()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "skip-next")
+            }
         }
     }
 
     @MainThread
     suspend fun skipToPrevious() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            syncOrchestratorQueue()
-            orchestrator.skipToPrevious()
-            refreshOrchestratedMediaSurface(reason = "skip-previous")
-        } else {
-            requireKotlinAudioPlayer().previous()
+        withActivePlaybackBackend { backend ->
+            backend.skipToPrevious()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "skip-previous")
+            }
         }
     }
 
     @MainThread
     suspend fun seekTo(seconds: Float) {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.seekTo((seconds * 1000).toLong())
-            refreshOrchestratedMediaSurface(reason = "seek-to")
-        } else {
-            requireKotlinAudioPlayer().seek((seconds * 1000).toLong(), TimeUnit.MILLISECONDS)
+        withActivePlaybackBackend { backend ->
+            backend.seekTo((seconds * 1000).toLong())
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "seek-to")
+            }
         }
     }
 
     @MainThread
     suspend fun seekBy(offset: Float) {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.seekBy((offset * 1000).toLong())
-            refreshOrchestratedMediaSurface(reason = "seek-by")
-        } else {
-            requireKotlinAudioPlayer().seekBy((offset.toLong()), TimeUnit.SECONDS)
+        withActivePlaybackBackend { backend ->
+            backend.seekBy((offset * 1000).toLong())
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "seek-by")
+            }
         }
     }
 
     @MainThread
     suspend fun retry() {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.play()
-            refreshOrchestratedMediaSurface(reason = "retry")
-        } else {
-            requireKotlinAudioPlayer().prepare()
+        withActivePlaybackBackend { backend ->
+            backend.retry()
+            if (backend.type == PlaybackBackendType.PING_PONG) {
+                refreshOrchestratedMediaSurface(reason = "retry")
+            }
         }
     }
 
     @MainThread
-    fun getCurrentTrackIndex(): Int = playbackOrchestrator?.currentIndex ?: requireKotlinAudioPlayer().currentIndex
+    fun getCurrentTrackIndex(): Int = activePlaybackBackend().currentIndex
 
     @MainThread
-    fun getRate(): Float = playbackOrchestrator?.rate ?: requireKotlinAudioPlayer().playbackSpeed
+    fun getRate(): Float = activePlaybackBackend().rate
 
     @MainThread
-    fun setRate(value: Float) {
-        playbackOrchestrator?.setRate(value) ?: run {
-            requireKotlinAudioPlayer().playbackSpeed = value
-        }
+    suspend fun setRate(value: Float) {
+        withActivePlaybackBackend { it.setRate(value) }
     }
 
     @MainThread
     fun getRepeatMode(): RepeatMode = configuredRepeatMode
 
     @MainThread
-    fun setRepeatMode(value: RepeatMode) {
+    suspend fun setRepeatMode(value: RepeatMode) {
         configuredRepeatMode = value
-        (player?.playerOptions as? QueuedPlayerOptions)?.repeatMode = value
-        playbackOrchestrator?.setRepeatMode(value)
+        withActivePlaybackBackend { it.setRepeatMode(value) }
     }
 
     @MainThread
-    fun getVolume(): Float = playbackOrchestrator?.volume ?: requireKotlinAudioPlayer().volume
+    fun getVolume(): Float = activePlaybackBackend().volume
 
     @MainThread
-    fun setVolume(value: Float) {
-        val orchestrator = playbackOrchestrator
-        if (orchestrator != null) {
-            orchestrator.setVolume(value)
-        } else {
-            requireKotlinAudioPlayer().volume = value
-        }
+    suspend fun setVolume(value: Float) {
+        withActivePlaybackBackend { it.setVolume(value) }
     }
 
     @MainThread
     suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) {
-        val orchestrator = playbackOrchestrator ?: return
-        syncOrchestratorQueue()
-        orchestrator.crossFadePrepare(previous, seekTo)
+        withActivePlaybackBackend {
+            if (it.type == PlaybackBackendType.PING_PONG) {
+                it.prepareCrossfade(previous, seekTo)
+            }
+        }
     }
 
     @MainThread
@@ -797,9 +937,16 @@ class MusicService : HeadlessJsTaskService() {
         fadeToVolume: Double = 1.0,
         waitUntil: Double = 0.0
     ) {
-        val orchestrator = playbackOrchestrator ?: return
-        syncOrchestratorQueue()
-        orchestrator.crossFade(fadeDuration, fadeInterval, fadeToVolume, waitUntil)
+        withActivePlaybackBackend {
+            if (it.type == PlaybackBackendType.PING_PONG) {
+                it.startTransition(PlaybackTransitionRequest(
+                    durationMs = fadeDuration.toLong(),
+                    intervalMs = fadeInterval.toLong(),
+                    targetVolume = fadeToVolume.toFloat(),
+                    waitUntilMs = waitUntil.toLong()
+                ))
+            }
+        }
     }
 
     private fun emitCrossfadeState(
@@ -834,13 +981,13 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getDurationInSeconds(): Double = playbackOrchestrator?.durationMs?.toSeconds() ?: requireKotlinAudioPlayer().duration.toSeconds()
+    fun getDurationInSeconds(): Double = activePlaybackBackend().durationMs.toSeconds()
 
     @MainThread
-    fun getPositionInSeconds(): Double = playbackOrchestrator?.positionMs?.toSeconds() ?: requireKotlinAudioPlayer().position.toSeconds()
+    fun getPositionInSeconds(): Double = activePlaybackBackend().positionMs.toSeconds()
 
     @MainThread
-    fun getBufferedPositionInSeconds(): Double = playbackOrchestrator?.bufferedMs?.toSeconds() ?: requireKotlinAudioPlayer().bufferedPosition.toSeconds()
+    fun getBufferedPositionInSeconds(): Double = activePlaybackBackend().bufferedMs.toSeconds()
 
     @MainThread
     fun getPlayerStateBundle(state: AudioPlayerState): Bundle {
@@ -850,6 +997,13 @@ class MusicService : HeadlessJsTaskService() {
             bundle.putBundle(ERROR_KEY, getPlaybackErrorBundle())
         }
         return bundle
+    }
+
+    @MainThread
+    suspend fun setPlaybackBackend(type: PlaybackBackendType) {
+        playbackBackendFacade?.setPlaybackBackend(type)
+            ?: throw IllegalStateException("Playback backend is not initialized.")
+        crossfadeEnabled = type == PlaybackBackendType.PING_PONG
     }
 
     @MainThread
@@ -868,7 +1022,7 @@ class MusicService : HeadlessJsTaskService() {
             putBoolean("canAcceptCommands", serviceBound && playerInitialized && !setupInProgress)
             putString("playbackState", state.asLibState.state)
             putBoolean("playWhenReady", playWhenReady)
-            putString("backend", if (useOrchestratedCrossfade()) "crossfade" else "standard")
+            putString("backend", if (useOrchestratedCrossfade()) "pingPong" else "standard")
             putInt("queueSize", items.size)
             if (activeIndex in items.indices) {
                 putInt("activeTrackIndex", activeIndex)
@@ -879,13 +1033,8 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun updateMetadataForTrack(index: Int, track: Track) {
-        if (useOrchestratedCrossfade()) {
-            crossfadeQueue.replace(index, track.toAudioItem())
-            syncOrchestratorQueue()
-        } else {
-            requireKotlinAudioPlayer().replaceItem(index, track.toAudioItem())
-        }
+    suspend fun updateMetadataForTrack(index: Int, track: Track) {
+        withActivePlaybackBackend { it.replace(index, track.toAudioItem()) }
         if (playbackOrchestrator?.currentIndex == index) {
             updateNotificationMetadataForIndex(index)
         }
@@ -966,9 +1115,11 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    private fun setupForegrounding() {
-        if (useOrchestratedCrossfade()) return
-
+    private fun setupForegrounding(
+        source: QueuedAudioPlayer,
+        identity: Any,
+        ownerScope: CoroutineScope
+    ) {
         // Implementation based on https://github.com/Automattic/pocket-casts-android/blob/ee8da0c095560ef64a82d3a31464491b8d713104/modules/services/repositories/src/main/java/au/com/shiftyjelly/pocketcasts/repositories/playback/PlaybackService.kt#L218
         var notificationId: Int? = null
         var notification: Notification? = null
@@ -1011,7 +1162,7 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        fun observeForegrounding(source: QueuedAudioPlayer) = scope.launch {
+        fun observeForegrounding() = ownerScope.launch {
             val BACKGROUNDABLE_STATES = listOf(
                 AudioPlayerState.IDLE,
                 AudioPlayerState.ENDED,
@@ -1031,7 +1182,7 @@ class MusicService : HeadlessJsTaskService() {
             )
             var stateCount = 0
             source.event.stateChange.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 stateCount++
                 if (it in LOADING_STATES) return@collect;
                 // Skip initial idle state, since we are only interested when
@@ -1045,9 +1196,9 @@ class MusicService : HeadlessJsTaskService() {
             return stopForegroundWhenNotOngoing && (removeNotificationWhenNotOngoing || isForegroundService())
         }
 
-        fun observeNotification(source: QueuedAudioPlayer) = scope.launch {
+        fun observeNotification() = ownerScope.launch {
             source.event.notificationStateChange.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 when (it) {
                     is NotificationState.POSTED -> {
                         Timber.d("notification posted with id=%s, ongoing=%s", it.notificationId, it.ongoing)
@@ -1063,9 +1214,9 @@ class MusicService : HeadlessJsTaskService() {
                             // For instance, queuing new media (e.g., related music) after the
                             // user's queue is complete. This prevents the service from potentially
                             // being immediately destroyed once the player finishes playing media.
-                            scope.launch {
+                            ownerScope.launch {
                                 delay(stopForegroundGracePeriod.toLong() * 1000)
-                                if (shouldStopForeground()) {
+                                if (isActivePlayer(source, identity) && shouldStopForeground()) {
                                     @Suppress("DEPRECATION")
                                     stopForeground(removeNotificationWhenNotOngoing)
                                     Timber.d("Notification has been stopped")
@@ -1078,18 +1229,19 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        allPlayers().forEach {
-            observeForegrounding(it)
-            observeNotification(it)
-        }
+        observeForegrounding()
+        observeNotification()
     }
 
     @MainThread
-    private fun observeEvents() {
-        fun observePlayerEvents(source: QueuedAudioPlayer) {
-            scope.launch {
+    private fun observeEvents(
+        source: QueuedAudioPlayer,
+        identity: Any,
+        ownerScope: CoroutineScope
+    ) {
+        ownerScope.launch {
             source.event.stateChange.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
 
@@ -1099,9 +1251,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.audioItemTransition.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 if (it !is AudioItemTransitionReason.REPEAT) {
                     emitPlaybackTrackChangedEvents(
@@ -1113,9 +1265,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.onAudioFocusChanged.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 Bundle().apply {
                     putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, it.isFocusLostPermanently)
                     putBoolean(IS_PAUSED_KEY, it.isPaused)
@@ -1124,9 +1276,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.onPlayerActionTriggeredExternally.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 when (it) {
                     is MediaSessionCallback.RATING -> {
@@ -1164,9 +1316,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.onTimedMetadata.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 val data = MetadataAdapter.fromMetadata(it)
                 val bundle = Bundle().apply {
@@ -1195,9 +1347,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.onCommonMetadata.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 val data = MetadataAdapter.fromMediaMetadata(it)
                 val bundle = Bundle().apply {
@@ -1207,9 +1359,9 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.playWhenReadyChange.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 Bundle().apply {
                     putBoolean("playWhenReady", it.playWhenReady)
@@ -1218,16 +1370,13 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        scope.launch {
+        ownerScope.launch {
             source.event.playbackError.collect {
-                if (!isActivePlayer(source)) return@collect
+                if (!isActivePlayer(source, identity)) return@collect
                 if (useOrchestratedCrossfade()) return@collect
                 emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
             }
         }
-        }
-
-        allPlayers().forEach { observePlayerEvents(it) }
     }
 
     private fun getPlaybackErrorBundle(): Bundle {
@@ -1267,7 +1416,7 @@ class MusicService : HeadlessJsTaskService() {
         if (!isPrimaryPlayerInitialized()) return
 
         when (appKilledPlaybackBehavior) {
-            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> pause()
+            AppKilledPlaybackBehavior.PAUSE_PLAYBACK -> scope.launch { pause() }
             AppKilledPlaybackBehavior.STOP_PLAYBACK_AND_REMOVE_NOTIFICATION -> {
                 playbackOrchestrator?.stop()
                 orchestratedMediaSurface?.hide()
