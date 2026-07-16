@@ -91,6 +91,8 @@ final class IOSPlaybackOrchestrator {
     private var scheduledStartWorkItem: DispatchWorkItem?
     private var endObserverWorkItem: DispatchWorkItem?
     private var standbyMaintenanceWorkItem: DispatchWorkItem?
+    private var activeCrossfadeCompletion: PlaybackBackendCommandCompletion<Void>?
+    private var activeCrossfadeCompletionRunID: Int?
     private var preparedFromIndex: Int?
     private var preparedToIndex: Int?
     private var preparedSeekTo: Double = 0
@@ -274,18 +276,14 @@ final class IOSPlaybackOrchestrator {
         IOSPlaybackLog.log("pause state=\(state)")
         checkpoint(reason: "pause")
         playWhenReady = false
-        switch state {
-        case .crossfading:
-            crossfadeWorkItem?.cancel()
-            crossfadeWorkItem = nil
-            activeEngine.pause()
-            standbyEngine.pause()
-            state = .pausedDuringCrossfade
-        default:
-            activeEngine.pause()
-            standbyEngine.pause()
-            state = hasCurrentItem ? .paused : .idle
+        if state == .crossfading || state == .pausedDuringCrossfade {
+            promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "pause")
         }
+        cancelScheduledPlaybackWork()
+        cancelActiveCrossfade(errorCode: "pause")
+        activeEngine.pause()
+        standbyEngine.pause()
+        state = hasCurrentItem ? .paused : .idle
         emitStateIfNeeded()
         refreshNowPlaying()
     }
@@ -306,6 +304,7 @@ final class IOSPlaybackOrchestrator {
             promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "backend_swap")
         }
         cancelScheduledPlaybackWork()
+        cancelActiveCrossfade(errorCode: "backend_swap")
     }
 
     func stop() {
@@ -313,6 +312,7 @@ final class IOSPlaybackOrchestrator {
         playWhenReady = false
         emitCrossfadeCancellationIfNeeded(errorCode: "stop")
         cancelAllWork()
+        cancelActiveCrossfade(errorCode: "stop")
         resetEngines()
         currentIndex = -1
         checkpointStore.clear()
@@ -356,6 +356,8 @@ final class IOSPlaybackOrchestrator {
         if state == .crossfading || state == .pausedDuringCrossfade {
             promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "seek")
         }
+        cancelScheduledPlaybackWork()
+        cancelActiveCrossfade(errorCode: "seek")
 
         state = .seeking
         emitStateIfNeeded()
@@ -393,6 +395,7 @@ final class IOSPlaybackOrchestrator {
         let wasPlaying = playWhenReady
         emitCrossfadeCancellationIfNeeded(errorCode: "skip")
         cancelAllWork()
+        cancelActiveCrossfade(errorCode: "skip")
         state = .skipping
         emitStateIfNeeded()
         loadIndex(index, position: max(0, initialTime), autoPlay: wasPlaying, completion: completion)
@@ -482,6 +485,16 @@ final class IOSPlaybackOrchestrator {
 
         runId += 1
         let currentRunId = runId
+        let completionGate = PlaybackBackendCommandCompletion<Void>(resolve: completion)
+        activeCrossfadeCompletion = completionGate
+        activeCrossfadeCompletionRunID = currentRunId
+        let transitionCompletion: (Result<Void, Error>) -> Void = { [weak self, completionGate] result in
+            if self?.activeCrossfadeCompletionRunID == currentRunId {
+                self?.activeCrossfadeCompletion = nil
+                self?.activeCrossfadeCompletionRunID = nil
+            }
+            completionGate.resolve(result)
+        }
         let intervalMs = max(10, Int(fadeInterval))
         let targetVolume = Float(max(0, min(1, fadeToVolume)))
         emitCrossfadeState(
@@ -498,7 +511,7 @@ final class IOSPlaybackOrchestrator {
             guard self.runId == currentRunId else { return }
             guard self.playWhenReady else {
                 self.emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
-                completion(.failure(self.makeError("crossfade_not_playing", "Crossfade was cancelled because playback is paused.")))
+                transitionCompletion(.failure(self.makeError("crossfade_not_playing", "Crossfade was cancelled because playback is paused.")))
                 return
             }
             let remainingMs = Int(waitUntil - self.currentTime * 1000)
@@ -510,7 +523,7 @@ final class IOSPlaybackOrchestrator {
                     durationMs: durationMs,
                     intervalMs: intervalMs,
                     targetVolume: targetVolume,
-                    completion: completion
+                    completion: transitionCompletion
                 )
                 return
             }
@@ -1043,6 +1056,16 @@ final class IOSPlaybackOrchestrator {
         standbyEngine.pause()
         standbyEngine.reset()
         standbyEngineIndex = nil
+    }
+
+    private func cancelActiveCrossfade(errorCode: String) {
+        guard let completion = activeCrossfadeCompletion else { return }
+        activeCrossfadeCompletion = nil
+        activeCrossfadeCompletionRunID = nil
+        completion.resolve(.failure(makeError(
+            "crossfade_cancelled",
+            "Crossfade was cancelled by \(errorCode)."
+        )))
     }
 
     private func queueHash() -> String {

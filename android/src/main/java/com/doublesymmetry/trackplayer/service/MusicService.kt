@@ -45,7 +45,8 @@ class MusicService : HeadlessJsTaskService() {
     private data class StandardPlayerBinding(
         val player: QueuedAudioPlayer,
         val identity: Any,
-        val ownerJob: Job
+        val ownerJob: Job,
+        val productAdmission: SharedFlowAdmissionGate
     )
 
     private var player: QueuedAudioPlayer? = null
@@ -95,8 +96,7 @@ class MusicService : HeadlessJsTaskService() {
         return player ?: throw IllegalStateException("KotlinAudio player is not initialized for this playback mode.")
     }
 
-    private fun createStandardPlayerBinding(): StandardPlayerBinding {
-        val identity = Any()
+    private fun createStandardPlayerBinding(identity: Any): StandardPlayerBinding {
         val created = try {
             playbackControlOwnerRegistry.activate(identity) {
                 standardPlayerFactory?.invoke()
@@ -107,13 +107,15 @@ class MusicService : HeadlessJsTaskService() {
         }
         val ownerJob = SupervisorJob(scope.coroutineContext[Job])
         val ownerScope = CoroutineScope(scope.coroutineContext + ownerJob)
+        val productAdmission = SharedFlowAdmissionGate()
         return try {
             created.automaticallyUpdateNotificationMetadata = false
             created.ratingType = configuredRatingType
             (created.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
-            observeEvents(created, identity, ownerScope)
-            setupForegrounding(created, identity, ownerScope)
-            StandardPlayerBinding(created, identity, ownerJob)
+            observeRemoteActions(created, identity, ownerScope)
+            observeEvents(created, identity, ownerScope, productAdmission)
+            setupForegrounding(created, identity, ownerScope, productAdmission)
+            StandardPlayerBinding(created, identity, ownerJob, productAdmission)
         } catch (error: Exception) {
             ownerJob.cancel()
             playbackControlOwnerRegistry.deactivate(identity) { created.destroy() }
@@ -136,6 +138,14 @@ class MusicService : HeadlessJsTaskService() {
         val androidOptions = latestOptions?.getBundle(ANDROID_OPTIONS_KEY)
         binding.player.playerOptions.alwaysPauseOnInterruption =
             androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
+    }
+
+    private fun activateStandardPlayerBinding(binding: StandardPlayerBinding) {
+        // Authority is already published for swaps when this hook runs. Admit
+        // the continuously subscribed product collectors first, then create a
+        // fresh canonical notification/state event that cannot be mistaken for
+        // candidate restore replay.
+        binding.productAdmission.admit()
         latestNotificationConfig?.let { binding.player.notificationManager.createNotification(it) }
     }
 
@@ -373,11 +383,12 @@ class MusicService : HeadlessJsTaskService() {
 
     private fun createPlaybackBackend(
         type: PlaybackBackendType,
-        initiallyAuthoritative: Boolean = false
+        initiallyAuthoritative: Boolean = false,
+        identity: Any = Any()
     ): PlaybackBackend {
         return when (type) {
             PlaybackBackendType.STANDARD -> {
-                val binding = createStandardPlayerBinding()
+                val binding = createStandardPlayerBinding(identity)
                 KotlinAudioPlaybackBackend(
                     binding.player,
                     binding.identity,
@@ -385,6 +396,9 @@ class MusicService : HeadlessJsTaskService() {
                     transitionGenerationSidecar,
                     onCommitted = { committed ->
                         if (committed === binding.player) commitStandardPlayerBinding(binding)
+                    },
+                    onActivated = { activated ->
+                        if (activated === binding.player) activateStandardPlayerBinding(binding)
                     },
                     onDisposed = { disposed ->
                         binding.ownerJob.cancel()
@@ -396,7 +410,6 @@ class MusicService : HeadlessJsTaskService() {
                 )
             }
             PlaybackBackendType.PING_PONG -> {
-                val identity = Any()
                 val orchestrator = createPlaybackOrchestrator(identity)
                 val surface = createOrchestratedMediaSurface(identity)
                 fun publishSurface(reason: String) {
@@ -473,7 +486,9 @@ class MusicService : HeadlessJsTaskService() {
         orchestratorHandlesAudioFocus = handleAudioFocus
 
         val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD
-        val backendFactory = PlaybackBackendFactory { type -> createPlaybackBackend(type) }
+        val backendFactory = PlaybackBackendFactory { type, identity ->
+            createPlaybackBackend(type, identity = identity)
+        }
         playbackBackendFacade = PlaybackBackendFacade(
             initialBackend = createPlaybackBackend(initialType, initiallyAuthoritative = true),
             factory = backendFactory,
@@ -1118,7 +1133,8 @@ class MusicService : HeadlessJsTaskService() {
     private fun setupForegrounding(
         source: QueuedAudioPlayer,
         identity: Any,
-        ownerScope: CoroutineScope
+        ownerScope: CoroutineScope,
+        admission: SharedFlowAdmissionGate
     ) {
         // Implementation based on https://github.com/Automattic/pocket-casts-android/blob/ee8da0c095560ef64a82d3a31464491b8d713104/modules/services/repositories/src/main/java/au/com/shiftyjelly/pocketcasts/repositories/playback/PlaybackService.kt#L218
         var notificationId: Int? = null
@@ -1162,70 +1178,67 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        fun observeForegrounding() = ownerScope.launch {
-            val BACKGROUNDABLE_STATES = listOf(
-                AudioPlayerState.IDLE,
-                AudioPlayerState.ENDED,
-                AudioPlayerState.STOPPED,
-                AudioPlayerState.ERROR,
-                AudioPlayerState.PAUSED
-            )
-            val REMOVABLE_STATES = listOf(
-                AudioPlayerState.IDLE,
-                AudioPlayerState.STOPPED,
-                AudioPlayerState.ERROR
-            )
-            val LOADING_STATES = listOf(
-                AudioPlayerState.LOADING,
-                AudioPlayerState.READY,
-                AudioPlayerState.BUFFERING
-            )
-            var stateCount = 0
-            source.event.stateChange.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                stateCount++
-                if (it in LOADING_STATES) return@collect;
-                // Skip initial idle state, since we are only interested when
-                // state becomes idle after not being idle
-                stopForegroundWhenNotOngoing = stateCount > 1 && it in BACKGROUNDABLE_STATES
-                removeNotificationWhenNotOngoing = stopForegroundWhenNotOngoing && it in REMOVABLE_STATES
-            }
+        val backgroundableStates = listOf(
+            AudioPlayerState.IDLE,
+            AudioPlayerState.ENDED,
+            AudioPlayerState.STOPPED,
+            AudioPlayerState.ERROR,
+            AudioPlayerState.PAUSED
+        )
+        val removableStates = listOf(
+            AudioPlayerState.IDLE,
+            AudioPlayerState.STOPPED,
+            AudioPlayerState.ERROR
+        )
+        val loadingStates = listOf(
+            AudioPlayerState.LOADING,
+            AudioPlayerState.READY,
+            AudioPlayerState.BUFFERING
+        )
+        var stateCount = 0
+
+        fun observeForegrounding() = ownerScope.collectWithAdmission(source.event.stateChange, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            stateCount++
+            if (it in loadingStates) return@collectWithAdmission
+            // Skip initial idle state, since we are only interested when
+            // state becomes idle after not being idle
+            stopForegroundWhenNotOngoing = stateCount > 1 && it in backgroundableStates
+            removeNotificationWhenNotOngoing = stopForegroundWhenNotOngoing && it in removableStates
         }
 
         fun shouldStopForeground(): Boolean {
             return stopForegroundWhenNotOngoing && (removeNotificationWhenNotOngoing || isForegroundService())
         }
 
-        fun observeNotification() = ownerScope.launch {
-            source.event.notificationStateChange.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                when (it) {
-                    is NotificationState.POSTED -> {
-                        Timber.d("notification posted with id=%s, ongoing=%s", it.notificationId, it.ongoing)
-                        notificationId = it.notificationId;
-                        notification = it.notification;
-                        if (it.ongoing) {
-                            if (playWhenReady) {
-                                startForegroundIfNecessary()
-                            }
-                        } else if (shouldStopForeground()) {
+        fun observeNotification() = ownerScope.collectWithAdmission(source.event.notificationStateChange, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            when (it) {
+                is NotificationState.POSTED -> {
+                    Timber.d("notification posted with id=%s, ongoing=%s", it.notificationId, it.ongoing)
+                    notificationId = it.notificationId;
+                    notification = it.notification;
+                    if (it.ongoing) {
+                        if (playWhenReady) {
+                            startForegroundIfNecessary()
+                        }
+                    } else if (shouldStopForeground()) {
                             // Allow the application a grace period to complete any actions
                             // that may necessitate keeping the service in a foreground state.
                             // For instance, queuing new media (e.g., related music) after the
                             // user's queue is complete. This prevents the service from potentially
                             // being immediately destroyed once the player finishes playing media.
-                            ownerScope.launch {
-                                delay(stopForegroundGracePeriod.toLong() * 1000)
-                                if (isActivePlayer(source, identity) && shouldStopForeground()) {
-                                    @Suppress("DEPRECATION")
-                                    stopForeground(removeNotificationWhenNotOngoing)
-                                    Timber.d("Notification has been stopped")
-                                }
+                        ownerScope.launch {
+                            delay(stopForegroundGracePeriod.toLong() * 1000)
+                            if (isActivePlayer(source, identity) && shouldStopForeground()) {
+                                @Suppress("DEPRECATION")
+                                stopForeground(removeNotificationWhenNotOngoing)
+                                Timber.d("Notification has been stopped")
                             }
                         }
                     }
-                    else -> {}
                 }
+                else -> {}
             }
         }
 
@@ -1237,77 +1250,140 @@ class MusicService : HeadlessJsTaskService() {
     private fun observeEvents(
         source: QueuedAudioPlayer,
         identity: Any,
+        ownerScope: CoroutineScope,
+        admission: SharedFlowAdmissionGate
+    ) {
+        ownerScope.collectWithAdmission(source.event.stateChange, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
+
+            if (it == AudioPlayerState.ENDED && source.nextItem == null) {
+                emitQueueEndedEvent()
+            }
+        }
+
+        ownerScope.collectWithAdmission(source.event.audioItemTransition, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            if (it !is AudioItemTransitionReason.REPEAT) {
+                emitPlaybackTrackChangedEvents(
+                    source.currentIndex,
+                    source.previousIndex,
+                    (it?.oldPosition ?: 0).toSeconds()
+                )
+            }
+        }
+
+        ownerScope.collectWithAdmission(source.event.onAudioFocusChanged, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            Bundle().apply {
+                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, it.isFocusLostPermanently)
+                putBoolean(IS_PAUSED_KEY, it.isPaused)
+                emit(MusicEvents.BUTTON_DUCK, this)
+            }
+        }
+
+        ownerScope.collectWithAdmission(source.event.onTimedMetadata, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            val data = MetadataAdapter.fromMetadata(it)
+            val bundle = Bundle().apply {
+                putParcelableArrayList(METADATA_PAYLOAD_KEY, ArrayList(data))
+            }
+            emit(MusicEvents.METADATA_TIMED_RECEIVED, bundle)
+
+            // TODO: Handle the different types of metadata and publish to new events
+            val metadata = PlaybackMetadata.fromId3Metadata(it)
+                ?: PlaybackMetadata.fromIcy(it)
+                ?: PlaybackMetadata.fromVorbisComment(it)
+                ?: PlaybackMetadata.fromQuickTime(it)
+
+            if (metadata != null) {
+                Bundle().apply {
+                    putString("source", metadata.source)
+                    putString("title", metadata.title)
+                    putString("url", metadata.url)
+                    putString("artist", metadata.artist)
+                    putString("album", metadata.album)
+                    putString("date", metadata.date)
+                    putString("genre", metadata.genre)
+                    emit(MusicEvents.PLAYBACK_METADATA, this)
+                }
+            }
+        }
+
+        ownerScope.collectWithAdmission(source.event.onCommonMetadata, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            val data = MetadataAdapter.fromMediaMetadata(it)
+            val bundle = Bundle().apply {
+                putBundle(METADATA_PAYLOAD_KEY, data)
+            }
+            emit(MusicEvents.METADATA_COMMON_RECEIVED, bundle)
+        }
+
+        ownerScope.collectWithAdmission(source.event.playWhenReadyChange, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            Bundle().apply {
+                putBoolean("playWhenReady", it.playWhenReady)
+                emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)
+            }
+        }
+
+        ownerScope.collectWithAdmission(source.event.playbackError, admission) {
+            if (!isActivePlayer(source, identity)) return@collectWithAdmission
+            if (useOrchestratedCrossfade()) return@collectWithAdmission
+            emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
+        }
+    }
+
+    @MainThread
+    private fun observeRemoteActions(
+        source: QueuedAudioPlayer,
+        identity: Any,
         ownerScope: CoroutineScope
     ) {
-        ownerScope.launch {
-            source.event.stateChange.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
-
-                if (it == AudioPlayerState.ENDED && source.nextItem == null) {
-                    emitQueueEndedEvent()
-                }
-            }
-        }
-
-        ownerScope.launch {
-            source.event.audioItemTransition.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                if (it !is AudioItemTransitionReason.REPEAT) {
-                    emitPlaybackTrackChangedEvents(
-                        source.currentIndex,
-                        source.previousIndex,
-                        (it?.oldPosition ?: 0).toSeconds()
-                    )
-                }
-            }
-        }
-
-        ownerScope.launch {
-            source.event.onAudioFocusChanged.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                Bundle().apply {
-                    putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, it.isFocusLostPermanently)
-                    putBoolean(IS_PAUSED_KEY, it.isPaused)
-                    emit(MusicEvents.BUTTON_DUCK, this)
-                }
-            }
-        }
-
-        ownerScope.launch {
-            source.event.onPlayerActionTriggeredExternally.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                when (it) {
-                    is MediaSessionCallback.RATING -> {
-                        Bundle().apply {
-                            setRating(this, "rating", it.rating)
+        val remoteAdmission = SharedFlowAdmissionGate()
+        ownerScope.collectWithAdmission(source.event.onPlayerActionTriggeredExternally, remoteAdmission) { action ->
+            // This command is deliberately launched in the service scope. If
+            // the source player is disposed during a physical handoff, an
+            // already-received remote action survives ownerJob cancellation,
+            // waits for admission to reopen, and is emitted exactly once for
+            // the new logical backend.
+            val facade = playbackBackendFacade ?: return@collectWithAdmission
+            val ticket = facade.capturePhysicalRemoteTicket(identity)
+                ?: return@collectWithAdmission
+            scope.launch {
+                facade.routePhysicalRemote(ticket) {
+                    when (action) {
+                        is MediaSessionCallback.RATING -> Bundle().apply {
+                            setRating(this, "rating", action.rating)
                             emit(MusicEvents.BUTTON_SET_RATING, this)
                         }
-                    }
-                    is MediaSessionCallback.SEEK -> {
-                        Bundle().apply {
-                            putDouble("position", it.positionMs.toSeconds())
+                        is MediaSessionCallback.SEEK -> Bundle().apply {
+                            putDouble("position", action.positionMs.toSeconds())
                             emit(MusicEvents.BUTTON_SEEK_TO, this)
                         }
-                    }
-                    MediaSessionCallback.PLAY -> emit(MusicEvents.BUTTON_PLAY)
-                    MediaSessionCallback.PAUSE -> emit(MusicEvents.BUTTON_PAUSE)
-                    MediaSessionCallback.NEXT -> emit(MusicEvents.BUTTON_SKIP_NEXT)
-                    MediaSessionCallback.PREVIOUS -> emit(MusicEvents.BUTTON_SKIP_PREVIOUS)
-                    MediaSessionCallback.STOP -> emit(MusicEvents.BUTTON_STOP)
-                    MediaSessionCallback.FORWARD -> {
-                        Bundle().apply {
-                            val interval = latestOptions?.getDouble(FORWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+                        MediaSessionCallback.PLAY -> emit(MusicEvents.BUTTON_PLAY)
+                        MediaSessionCallback.PAUSE -> emit(MusicEvents.BUTTON_PAUSE)
+                        MediaSessionCallback.NEXT -> emit(MusicEvents.BUTTON_SKIP_NEXT)
+                        MediaSessionCallback.PREVIOUS -> emit(MusicEvents.BUTTON_SKIP_PREVIOUS)
+                        MediaSessionCallback.STOP -> emit(MusicEvents.BUTTON_STOP)
+                        MediaSessionCallback.FORWARD -> Bundle().apply {
+                            val interval = latestOptions?.getDouble(
+                                FORWARD_JUMP_INTERVAL_KEY,
+                                DEFAULT_JUMP_INTERVAL
+                            ) ?: DEFAULT_JUMP_INTERVAL
                             putInt("interval", interval.toInt())
                             emit(MusicEvents.BUTTON_JUMP_FORWARD, this)
                         }
-                    }
-                    MediaSessionCallback.REWIND -> {
-                        Bundle().apply {
-                            val interval = latestOptions?.getDouble(BACKWARD_JUMP_INTERVAL_KEY, DEFAULT_JUMP_INTERVAL) ?: DEFAULT_JUMP_INTERVAL
+                        MediaSessionCallback.REWIND -> Bundle().apply {
+                            val interval = latestOptions?.getDouble(
+                                BACKWARD_JUMP_INTERVAL_KEY,
+                                DEFAULT_JUMP_INTERVAL
+                            ) ?: DEFAULT_JUMP_INTERVAL
                             putInt("interval", interval.toInt())
                             emit(MusicEvents.BUTTON_JUMP_BACKWARD, this)
                         }
@@ -1315,68 +1391,7 @@ class MusicService : HeadlessJsTaskService() {
                 }
             }
         }
-
-        ownerScope.launch {
-            source.event.onTimedMetadata.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                val data = MetadataAdapter.fromMetadata(it)
-                val bundle = Bundle().apply {
-                    putParcelableArrayList(METADATA_PAYLOAD_KEY, ArrayList(data))
-                }
-                emit(MusicEvents.METADATA_TIMED_RECEIVED, bundle)
-
-                // TODO: Handle the different types of metadata and publish to new events
-                val metadata = PlaybackMetadata.fromId3Metadata(it)
-                    ?: PlaybackMetadata.fromIcy(it)
-                    ?: PlaybackMetadata.fromVorbisComment(it)
-                    ?: PlaybackMetadata.fromQuickTime(it)
-
-                if (metadata != null) {
-                    Bundle().apply {
-                        putString("source", metadata.source)
-                        putString("title", metadata.title)
-                        putString("url", metadata.url)
-                        putString("artist", metadata.artist)
-                        putString("album", metadata.album)
-                        putString("date", metadata.date)
-                        putString("genre", metadata.genre)
-                        emit(MusicEvents.PLAYBACK_METADATA, this)
-                    }
-                }
-            }
-        }
-
-        ownerScope.launch {
-            source.event.onCommonMetadata.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                val data = MetadataAdapter.fromMediaMetadata(it)
-                val bundle = Bundle().apply {
-                    putBundle(METADATA_PAYLOAD_KEY, data)
-                }
-                emit(MusicEvents.METADATA_COMMON_RECEIVED, bundle)
-            }
-        }
-
-        ownerScope.launch {
-            source.event.playWhenReadyChange.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                Bundle().apply {
-                    putBoolean("playWhenReady", it.playWhenReady)
-                    emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)
-                }
-            }
-        }
-
-        ownerScope.launch {
-            source.event.playbackError.collect {
-                if (!isActivePlayer(source, identity)) return@collect
-                if (useOrchestratedCrossfade()) return@collect
-                emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
-            }
-        }
+        remoteAdmission.admit()
     }
 
     private fun getPlaybackErrorBundle(): Bundle {

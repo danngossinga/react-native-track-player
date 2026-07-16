@@ -28,6 +28,7 @@ const facade = read('android/src/main/java/com/doublesymmetry/trackplayer/servic
 const standardBackend = read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt');
 const pingPongBackend = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PingPongPlaybackBackend.kt');
 const mediaSurface = read('android/src/main/java/com/doublesymmetry/trackplayer/service/AndroidOrchestratedMediaSurface.kt');
+const sharedFlowAdmission = read('android/src/main/java/com/doublesymmetry/trackplayer/service/SharedFlowAdmission.kt');
 
 const prepareCrossfade = section(
   orchestrator,
@@ -69,6 +70,16 @@ const progressUpdateEvent = section(
   'private suspend fun progressUpdateEvent()',
   'private fun getPendingIntentFlags()'
 );
+const standardRelinquish = section(
+  standardBackend,
+  'override fun relinquishExclusiveControlSurfaceBeforeCommit()',
+  'override fun commitQueue('
+);
+const standardDispose = section(
+  standardBackend,
+  'override suspend fun dispose()',
+  'private fun releasePlayer()'
+);
 
 assert(
   prepareCrossfade.includes('crossfade_not_playing'),
@@ -88,18 +99,25 @@ assert(
 );
 assert(
   facade.indexOf('previous.relinquishExclusiveControlSurfaceBeforeCommit()') <
-    facade.indexOf('backend = replacement') &&
+    facade.indexOf('replacement.commitQueue(snapshot)') &&
+    facade.indexOf('replacement.commitQueue(snapshot)') < facade.indexOf('backend = replacement') &&
+    facade.indexOf('backend = replacement') < facade.indexOf('authority.publish(replacement)') &&
     facade.indexOf('backend = replacement') < facade.indexOf('replacement.activateAfterCommit(snapshot)') &&
-    standardBackend.includes('override fun relinquishExclusiveControlSurfaceBeforeCommit()') &&
-    standardBackend.includes('releasePlayer()'),
-  'Android must physically relinquish the standard player before activating PingPong.'
+    !standardRelinquish.includes('releasePlayer()') &&
+    standardDispose.includes('releasePlayer()'),
+  'Android must defer standard-player destruction until post-commit disposal, before activating PingPong.'
 );
 assert(
   facade.includes('owner?.let { it.type == type && it.identity === identity }') &&
     facade.includes('suspend fun routeIfAuthoritative(') &&
-    createPlaybackBackend.includes('val identity = Any()') &&
+    facade.includes('val identity = Any()') &&
+    facade.indexOf('candidateRemoteProxy = identity') <
+      facade.indexOf('replacement = factory.create(type, identity)') &&
+    createPlaybackBackend.includes('identity: Any = Any()') &&
+    setupPlayer.includes('PlaybackBackendFactory { type, identity ->') &&
+    setupPlayer.includes('createPlaybackBackend(type, identity = identity)') &&
     createPlaybackBackend.includes('createOrchestratedMediaSurface(identity)'),
-  'Android authority, remotes, and media surfaces must use a fresh exact identity per backend generation.'
+  'Android authority, remotes, and media surfaces must pre-admit one exact identity per backend generation.'
 );
 assert(
   progressUpdateEvent.includes('withActivePlaybackBackend { backend ->') &&
@@ -128,6 +146,12 @@ assert(
 assert(
   crossFade.includes('error.code != "crossfade_not_playing"'),
   'Android crossFade must treat pause/not-playing cancellation as non-fatal.'
+);
+assert(
+  orchestrator.includes('private var activeCrossfadeCancellation: CompletableDeferred<Unit>?') &&
+    orchestrator.includes('cancelCrossfade("pause", promoteIncoming = true)') &&
+    crossFade.includes('delayCrossfade(intervalMs, runId, cancellation)'),
+  'Android pause must cancel and release the exact active crossfade lease without waiting for its full duration.'
 );
 assert(
   crossFade.indexOf('delegate.onActiveTrackChanged(toIndex, fromIndex, oldPositionMs)') >= 0 &&
@@ -184,14 +208,30 @@ assert(
 );
 assert(
   facade.includes('suspend fun <T> withCurrentBackend(') &&
+    facade.includes('activeCommandLeases') &&
+    facade.includes('withContext(NonCancellable)') &&
     musicService.includes('withActivePlaybackBackend { backend ->'),
-  'Android playback commands must serialize through the same facade mutex as backend swaps.'
+  'Android playback commands must use cancellable operations with non-leaking facade leases.'
 );
 assert(
   standardBackend.includes('authoritativeQueue') &&
     pingPongBackend.includes('authoritativeQueue') &&
-    facade.includes('restoreAuthoritativeBackend(previous, snapshot)'),
+    facade.includes('rollbackAuthoritativeBackend(previous, snapshot)'),
   'Android backend rollback must retain full TrackAudioItem identity and restore the authoritative queue.'
+);
+assert(
+  sharedFlowAdmission.includes('CoroutineStart.UNDISPATCHED') &&
+    sharedFlowAdmission.includes('if (gate.acceptsEvents())') &&
+    musicService.includes('val productAdmission = SharedFlowAdmissionGate()') &&
+    musicService.includes('binding.productAdmission.admit()'),
+  'Android standard candidates must subscribe before restore and quarantine replayed product events until post-commit admission.'
+);
+assert(
+  facade.includes('capturePhysicalRemoteTicket(') &&
+    facade.includes('routePhysicalRemote(') &&
+    musicService.includes('facade.capturePhysicalRemoteTicket(identity)') &&
+    musicService.includes('facade.routePhysicalRemote(ticket)'),
+  'Android physical remotes must use generation tickets that survive successful handoff and reject rollback generations.'
 );
 assert(
   musicService.includes('val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD') &&

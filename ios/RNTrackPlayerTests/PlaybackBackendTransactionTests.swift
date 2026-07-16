@@ -22,26 +22,35 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let facade = PlaybackBackendFacade(initial: old, factory: factory, authority: authority)
         let queuedCommandFinished = expectation(description: "main command queued during restore")
         var queuedCommandBackend: PlaybackBackendKind?
+        let hookLock = NSLock()
+        var didQueueCommand = false
         factory.prepareHook = {
+            hookLock.lock()
+            let shouldQueueCommand = !didQueueCommand
+            didQueueCommand = true
+            hookLock.unlock()
+            guard shouldQueueCommand else { return }
             XCTAssertTrue(facade.currentBackend === old)
-            let callbackFinished = DispatchSemaphore(value: 0)
-            DispatchQueue.main.async {
-                XCTAssertNil(authority.currentKind)
-                facade.withCurrentBackendAsync({ backend, completion in
-                    backend.pause()
-                    completion(.success(backend.kind))
-                }) { result in
-                    queuedCommandBackend = try? result.get()
-                    queuedCommandFinished.fulfill()
-                }
-                callbackFinished.signal()
+            XCTAssertTrue(authority.isAuthoritative(.standard, identity: old))
+            let commandEntered = DispatchSemaphore(value: 0)
+            facade.withCurrentBackendAsync({ backend, completion in
+                queuedCommandBackend = backend.kind
+                backend.pause()
+                commandEntered.signal()
+                completion(.success(backend.kind))
+            }) { _ in
+                queuedCommandFinished.fulfill()
             }
-            XCTAssertEqual(callbackFinished.wait(timeout: .now() + 1), .success)
+            XCTAssertEqual(
+                commandEntered.wait(timeout: .now() + 0.05),
+                .success,
+                "pause must route to the old owner while candidate restore is running"
+            )
         }
 
         let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
         wait(for: [queuedCommandFinished], timeout: 1)
-        guard let replacement = factory.created.first else {
+        guard let replacement = factory.created.last else {
             XCTFail("replacement backend was not created")
             return
         }
@@ -51,7 +60,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertFalse(replacement.audible)
         XCTAssertEqual(try? result.get().backend, .pingPong)
         XCTAssertEqual(try? result.get().operationID, 1)
-        XCTAssertEqual(queuedCommandBackend, .pingPong)
+        XCTAssertEqual(queuedCommandBackend, .standard)
 
         let generationSidecar = PlaybackTransitionGenerationSidecar()
         generationSidecar.restore(paused.transitionGeneration)
@@ -116,8 +125,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         )
         let factory = FakeFactory(
             failRestore: true,
-            sharedResource: shared,
-            mutateSharedOnRestore: true
+            sharedResource: shared
         )
         let facade = PlaybackBackendFacade(initial: old, factory: factory)
 
@@ -134,19 +142,79 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func test_postCommitDisposeFailureResolvesAndEmitsCleanupDiagnostic() {
         var diagnostics: [PlaybackBackendCleanupDiagnostic] = []
+        let diagnosticReceived = expectation(description: "cleanup diagnostic received")
         let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true, failDispose: true)
         let facade = PlaybackBackendFacade(
             initial: old,
             factory: FakeFactory(),
-            onCleanupDiagnostic: { diagnostics.append($0) }
+            onCleanupDiagnostic: {
+                diagnostics.append($0)
+                diagnosticReceived.fulfill()
+            }
         )
 
         let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
 
         XCTAssertEqual(try? result.get().backend, .pingPong)
+        wait(for: [diagnosticReceived], timeout: 1)
         XCTAssertEqual(diagnostics.count, 1)
         XCTAssertEqual(diagnostics.first?.code, "playback_backend_cleanup_failed")
         XCTAssertFalse(diagnostics.first?.message.contains("secret") == true)
+    }
+
+    func test_postCommitDiagnosticObserverCannotBlockCommittedResult() {
+        let observerEntered = DispatchSemaphore(value: 0)
+        let releaseObserver = DispatchSemaphore(value: 0)
+        let observerFinished = expectation(description: "cleanup observer finished")
+        let transactionFinished = expectation(description: "transaction finished")
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true, failDispose: true)
+        let factory = FakeFactory()
+        let facade = PlaybackBackendFacade(
+            initial: old,
+            factory: factory,
+            onCleanupDiagnostic: { _ in
+                observerEntered.signal()
+                releaseObserver.wait()
+                observerFinished.fulfill()
+            }
+        )
+        var result: Result<PlaybackBackendTransactionResult, Error>?
+
+        facade.setPlaybackBackend(.pingPong) {
+            result = $0
+            transactionFinished.fulfill()
+        }
+
+        let observerStatus = observerEntered.wait(timeout: .now() + 1)
+        let transactionStatus = XCTWaiter.wait(for: [transactionFinished], timeout: 0.2)
+        releaseObserver.signal()
+        wait(for: [observerFinished], timeout: 1)
+
+        XCTAssertEqual(observerStatus, .success)
+        XCTAssertEqual(transactionStatus, .completed)
+        XCTAssertEqual(try? result?.get().backend, .pingPong)
+        XCTAssertTrue(facade.currentBackend === factory.created.first)
+    }
+
+    func test_commitQueueRunsBeforeFacadePointerAndAuthorityPublication() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let authority = PlaybackBackendAuthority()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory, authority: authority)
+        var facadeBackendAtCommit: PlaybackBackend?
+        var authorityWasOldAtCommit = false
+        factory.commitHook = {
+            facadeBackendAtCommit = facade.currentBackend
+            authorityWasOldAtCommit = authority.isAuthoritative(.standard, identity: old)
+        }
+
+        let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
+
+        XCTAssertEqual(try? result.get().backend, .pingPong)
+        XCTAssertTrue(facadeBackendAtCommit === old)
+        XCTAssertTrue(authorityWasOldAtCommit)
+        XCTAssertTrue(facade.currentBackend === factory.created.first)
+        XCTAssertTrue(authority.isAuthoritative(.pingPong, identity: factory.created.first!))
     }
 
     func test_concurrentCallsCommitInSerializedOrder() {
@@ -176,23 +244,143 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(barrier.maxInFlight, 1)
         XCTAssertEqual(barrier.trace, ["enter:pingPong", "exit:pingPong", "enter:standard", "exit:standard"])
 
-        let timedOut = expectation(description: "routed command timeout")
+        let transitionFinished = expectation(description: "long transition finished")
+        let pauseFinished = expectation(description: "interruptive pause finished")
+        let transitionStarted = DispatchSemaphore(value: 0)
         var deferredCompletion: ((Result<Void, Error>) -> Void)?
-        var routedCompletionCount = 0
-        var routedCommandTimedOut = false
-        facade.withCurrentBackendAsync(timeout: 0.01, { _, completion in
+        var transitionResult: Result<Void, Error>?
+        facade.withCurrentBackendAsync(timeout: 0.5, { _, completion in
             deferredCompletion = completion
+            transitionStarted.signal()
         }) { (result: Result<Void, Error>) in
-            routedCompletionCount += 1
-            if case .failure = result {
-                routedCommandTimedOut = true
-            }
-            timedOut.fulfill()
+            transitionResult = result
+            transitionFinished.fulfill()
         }
-        wait(for: [timedOut], timeout: 1)
+        XCTAssertEqual(transitionStarted.wait(timeout: .now() + 1), .success)
+
+        facade.withCurrentBackendAsync({ backend, completion in
+            backend.pause()
+            completion(.success(()))
+        }) { (_: Result<Void, Error>) in
+            pauseFinished.fulfill()
+        }
+
+        XCTAssertEqual(
+            XCTWaiter.wait(for: [pauseFinished], timeout: 0.05),
+            .completed,
+            "pause must not wait for a long asynchronous transition"
+        )
         deferredCompletion?(.success(()))
-        XCTAssertTrue(routedCommandTimedOut)
-        XCTAssertEqual(routedCompletionCount, 1)
+        wait(for: [transitionFinished], timeout: 1)
+        XCTAssertNoThrow(try transitionResult?.get())
+    }
+
+    func test_swapSettlesLeaseAndWaitsForItsActualCompletionBeforeSnapshot() {
+        let old = FakeBackend(kind: .pingPong, snapshot: snapshot, audible: true)
+        let facade = PlaybackBackendFacade(initial: old, factory: FakeFactory())
+        let transitionStarted = DispatchSemaphore(value: 0)
+        let transitionFinished = expectation(description: "transition lease released")
+        var deferredCompletion: ((Result<Void, Error>) -> Void)?
+        var transitionCompletionCount = 0
+
+        facade.withCurrentBackendAsync({ _, completion in
+            deferredCompletion = completion
+            transitionStarted.signal()
+        }) { (_: Result<Void, Error>) in
+            transitionCompletionCount += 1
+            transitionFinished.fulfill()
+        }
+        XCTAssertEqual(transitionStarted.wait(timeout: .now() + 1), .success)
+        old.settleHook = {
+            deferredCompletion?(.failure(FakeError.cancelled))
+        }
+
+        let result = awaitResult { facade.setPlaybackBackend(.standard, completion: $0) }
+        wait(for: [transitionFinished], timeout: 1)
+
+        XCTAssertEqual(try? result.get().backend, .standard)
+        XCTAssertEqual(transitionCompletionCount, 1)
+        XCTAssertLessThan(old.calls.firstIndex(of: "settle")!, old.calls.firstIndex(of: "snapshot")!)
+        XCTAssertTrue(old.disposed)
+    }
+
+    func test_nativeCommandCompletionIsResolvedExactlyOnce() {
+        var results: [Result<Void, Error>] = []
+        let completion = PlaybackBackendCommandCompletion<Void> { results.append($0) }
+
+        completion.resolve(.failure(FakeError.cancelled))
+        completion.resolve(.success(()))
+
+        XCTAssertEqual(results.count, 1)
+        XCTAssertThrowsError(try results[0].get())
+    }
+
+    func test_commandDuringCandidateRestoreRepreparesFromFreshSnapshot() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let authority = PlaybackBackendAuthority()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory, authority: authority)
+        let pauseEntered = DispatchSemaphore(value: 0)
+        let hookLock = NSLock()
+        var didPause = false
+
+        factory.restoreHook = {
+            hookLock.lock()
+            let shouldPause = !didPause
+            didPause = true
+            hookLock.unlock()
+            guard shouldPause else { return }
+
+            facade.withCurrentBackendAsync({ backend, completion in
+                backend.pause()
+                pauseEntered.signal()
+                completion(.success(()))
+            }) { (_: Result<Void, Error>) in }
+            XCTAssertEqual(pauseEntered.wait(timeout: .now() + 0.05), .success)
+        }
+
+        let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
+
+        XCTAssertEqual(try? result.get().backend, .pingPong)
+        XCTAssertEqual(factory.created.count, 2, "a stale candidate must be discarded and prepared again")
+        XCTAssertEqual(factory.created.first?.restoredSnapshot?.playWhenReady, true)
+        XCTAssertTrue(factory.created.first?.disposed == true)
+        XCTAssertEqual(factory.created.last?.restoredSnapshot?.playWhenReady, false)
+        XCTAssertTrue(authority.isAuthoritative(.pingPong, identity: factory.created.last!))
+    }
+
+    func test_continuouslyStalePreparationIsBoundedAndKeepsOldOwner() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let authority = PlaybackBackendAuthority()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory, authority: authority)
+        let lock = NSLock()
+        var position = snapshot.position
+
+        factory.restoreHook = {
+            let commandEntered = DispatchSemaphore(value: 0)
+            facade.withCurrentBackendAsync({ backend, completion in
+                lock.lock()
+                position += 1
+                let nextPosition = position
+                lock.unlock()
+                try backend.seek(to: nextPosition)
+                commandEntered.signal()
+                completion(.success(()))
+            }) { (_: Result<Void, Error>) in }
+            XCTAssertEqual(commandEntered.wait(timeout: .now() + 0.05), .success)
+        }
+
+        let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
+
+        XCTAssertThrowsError(try result.get()) { error in
+            XCTAssertEqual((error as NSError).userInfo["code"] as? String, "playback_backend_busy")
+        }
+        XCTAssertEqual(factory.created.count, 8)
+        XCTAssertTrue(factory.created.allSatisfy(\.disposed))
+        XCTAssertTrue(facade.currentBackend === old)
+        XCTAssertTrue(authority.isAuthoritative(.standard, identity: old))
+        XCTAssertTrue(old.audible)
     }
 
     func test_initialBackendActivatesAndPublishesExactIdentity() {
@@ -239,7 +427,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertFalse(first === current)
     }
 
-    func test_restoreRollbackRepublishesExactPreviousGeneration() {
+    func test_restoreFailureKeepsExactPreviousGenerationWithoutRestoringOld() {
         let previous = FakeBackend(kind: .pingPong, snapshot: snapshot, initiallyAuthoritative: true)
         let factory = FakeFactory(failRestore: true)
         let authority = PlaybackBackendAuthority()
@@ -250,7 +438,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertThrowsError(try result.get())
         XCTAssertTrue(authority.isAuthoritative(.pingPong, identity: previous))
         XCTAssertFalse(authority.isAuthoritative(.standard, identity: factory.created[0]))
-        XCTAssertTrue(previous.calls.contains("resumeControlSurface"))
+        XCTAssertFalse(previous.calls.contains("restore"))
+        XCTAssertFalse(previous.calls.contains("resumeControlSurface"))
     }
 
     func test_sameTargetIsNoOpAndPreservesGeneration() {
@@ -265,6 +454,65 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(facade.currentBackend === initial)
         XCTAssertTrue(authority.isAuthoritative(.standard, identity: initial))
         XCTAssertTrue(factory.created.isEmpty)
+        XCTAssertFalse(initial.calls.contains("settle"))
+    }
+
+    func test_sameTargetWaitsForActiveLeaseWithoutSettlingIt() {
+        let initial = FakeBackend(kind: .pingPong, snapshot: snapshot)
+        let facade = PlaybackBackendFacade(initial: initial, factory: FakeFactory())
+        let leaseStarted = DispatchSemaphore(value: 0)
+        let leaseFinished = expectation(description: "lease finished")
+        let sameTargetFinished = DispatchSemaphore(value: 0)
+        var deferredCompletion: ((Result<Void, Error>) -> Void)?
+        var sameTargetResult: Result<PlaybackBackendTransactionResult, Error>?
+
+        facade.withCurrentBackendAsync({ _, completion in
+            deferredCompletion = completion
+            leaseStarted.signal()
+        }) { (_: Result<Void, Error>) in leaseFinished.fulfill() }
+        XCTAssertEqual(leaseStarted.wait(timeout: .now() + 1), .success)
+        facade.setPlaybackBackend(.pingPong) {
+            sameTargetResult = $0
+            sameTargetFinished.signal()
+        }
+
+        XCTAssertEqual(sameTargetFinished.wait(timeout: .now() + 0.05), .timedOut)
+        XCTAssertFalse(initial.calls.contains("settle"))
+        deferredCompletion?(.success(()))
+        wait(for: [leaseFinished], timeout: 1)
+        XCTAssertEqual(sameTargetFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(try? sameTargetResult?.get().snapshot, snapshot)
+        XCTAssertFalse(initial.calls.contains("settle"))
+    }
+
+    func test_commandsWaitForPostCommitDisposalFenceAndRouteReplacement() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory)
+        let disposeEntered = DispatchSemaphore(value: 0)
+        let releaseDispose = DispatchSemaphore(value: 0)
+        let swapFinished = expectation(description: "swap finished")
+        let commandFinished = expectation(description: "command finished")
+        let commandEntered = DispatchSemaphore(value: 0)
+        var routedBackend: PlaybackBackend?
+        old.disposeHook = {
+            disposeEntered.signal()
+            releaseDispose.wait()
+        }
+
+        facade.setPlaybackBackend(.pingPong) { _ in swapFinished.fulfill() }
+        XCTAssertEqual(disposeEntered.wait(timeout: .now() + 1), .success)
+        facade.withCurrentBackendAsync({ backend, completion in
+            routedBackend = backend
+            backend.pause()
+            commandEntered.signal()
+            completion(.success(()))
+        }) { (_: Result<Void, Error>) in commandFinished.fulfill() }
+
+        XCTAssertEqual(commandEntered.wait(timeout: .now() + 0.05), .timedOut)
+        releaseDispose.signal()
+        wait(for: [swapFinished, commandFinished], timeout: 1)
+        XCTAssertTrue(routedBackend === factory.created.first)
     }
 
     func test_repeatedSwapsPublishOnlyLatestGeneration() {
@@ -330,6 +578,8 @@ private final class FakeFactory: PlaybackBackendFactory {
     private(set) var created: [FakeBackend] = []
     private(set) var requested: [PlaybackBackendKind] = []
     var prepareHook: (() -> Void)?
+    var restoreHook: (() -> Void)?
+    var commitHook: (() -> Void)?
 
     init(
         registry: AudibleRegistry? = nil,
@@ -358,7 +608,9 @@ private final class FakeFactory: PlaybackBackendFactory {
             barrier: barrier,
             sharedResource: sharedResource,
             mutateSharedOnRestore: mutateSharedOnRestore,
-            prepareHook: prepareHook
+            prepareHook: prepareHook,
+            restoreHook: restoreHook,
+            commitHook: commitHook
         )
         created.append(backend)
         registry?.backends.append(backend)
@@ -377,6 +629,8 @@ private final class FakeBackend: PlaybackBackend {
     private let sharedResource: SharedPlaybackResource?
     private let mutateSharedOnRestore: Bool
     private let prepareHook: (() -> Void)?
+    private let restoreHook: (() -> Void)?
+    private let commitHook: (() -> Void)?
     private var capturedSharedQueue: [AnyObject] = []
     private var isAuthoritative: Bool
     private(set) var calls: [String] = []
@@ -384,6 +638,8 @@ private final class FakeBackend: PlaybackBackend {
     private(set) var committedQueue: [String]?
     private(set) var disposed = false
     private(set) var audible: Bool
+    var settleHook: (() -> Void)?
+    var disposeHook: (() -> Void)?
 
     init(
         kind: PlaybackBackendKind,
@@ -397,7 +653,9 @@ private final class FakeBackend: PlaybackBackend {
         sharedResource: SharedPlaybackResource? = nil,
         mutateSharedOnRestore: Bool = false,
         initiallyAuthoritative: Bool = false,
-        prepareHook: (() -> Void)? = nil
+        prepareHook: (() -> Void)? = nil,
+        restoreHook: (() -> Void)? = nil,
+        commitHook: (() -> Void)? = nil
     ) {
         self.kind = kind
         self.snapshotValue = snapshot
@@ -411,9 +669,14 @@ private final class FakeBackend: PlaybackBackend {
         self.mutateSharedOnRestore = mutateSharedOnRestore
         self.isAuthoritative = initiallyAuthoritative
         self.prepareHook = prepareHook
+        self.restoreHook = restoreHook
+        self.commitHook = commitHook
     }
 
-    func settleActiveTransition() throws { calls.append("settle") }
+    func settleActiveTransition() throws {
+        calls.append("settle")
+        settleHook?()
+    }
     func activateInitialControlSurface() { calls.append("activateInitialControlSurface") }
     func suspendControlSurface() throws { calls.append("suspendControlSurface") }
     func resumeControlSurface(_ snapshot: PlaybackBackendSnapshot) {
@@ -436,6 +699,7 @@ private final class FakeBackend: PlaybackBackend {
     }
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
         calls.append("restore")
+        restoreHook?()
         if mutateSharedOnRestore && !isAuthoritative {
             sharedResource?.queue = []
         }
@@ -450,15 +714,20 @@ private final class FakeBackend: PlaybackBackend {
     func stopAndMute() throws { calls.append("stopAndMute"); setAudible(false) }
     func commitQueue(_ snapshot: PlaybackBackendSnapshot) {
         calls.append("commitQueue")
+        commitHook?()
         committedQueue = snapshot.queueIDs
         setAudible(snapshot.playWhenReady)
         isAuthoritative = true
     }
     func play() throws { setAudible(true) }
-    func pause() { setAudible(false) }
+    func pause() {
+        snapshotValue = snapshotValue.with(playWhenReady: false)
+        setAudible(false)
+    }
     func seek(to position: Double) throws { snapshotValue = snapshotValue.with(position: position) }
     func startTransition(_ request: PlaybackTransitionRequest) throws {}
     func dispose() throws {
+        disposeHook?()
         disposed = true
         isAuthoritative = false
         calls.append("dispose")
@@ -484,6 +753,7 @@ private final class SharedPlaybackResource {
 private enum FakeError: Error {
     case prepare
     case restore
+    case cancelled
     case secretDisposalDetail
 }
 

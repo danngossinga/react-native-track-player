@@ -105,15 +105,26 @@ assert(
 assert(
   facade.includes('var identity: AnyObject { get }') &&
     facade.includes('ObjectIdentifier($0.identity)') &&
-    facade.includes('authority.clear()') &&
+    !facade.includes('self.authority.clear()') &&
+    facade.includes('authority.publish(initial)') &&
     facade.includes('authority.publish(replacement)'),
-  'iOS authority must be unpublished during swaps and republished with exact backend identity.'
+  'iOS must keep the old exact-generation authority published through candidate preparation and publish the replacement only at commit.'
 );
 assert(
   facade.indexOf('try previous.relinquishExclusiveControlSurfaceBeforeCommit()') <
-    facade.indexOf('self.backend = replacement') &&
+    facade.indexOf('replacement.commitQueue(captured.snapshot)') &&
+    facade.indexOf('replacement.commitQueue(captured.snapshot)') <
+      facade.indexOf('self.backend = replacement') &&
+    facade.indexOf('self.backend = replacement') < facade.indexOf('self.authority.publish(replacement)') &&
     facade.includes('initial.activateInitialControlSurface()'),
-  'iOS must relinquish the old control surface before commit and explicitly activate the initial owner.'
+  'iOS must commit the queue before publishing the facade pointer and exact authority.'
+);
+assert(
+  facade.includes('private let cleanupDiagnosticQueue = DispatchQueue(') &&
+    facade.includes('self.reportCleanupDiagnostic(.disposalFailed)') &&
+    facade.includes('cleanupDiagnosticQueue.async {') &&
+    !facade.includes('self.onCleanupDiagnostic(.disposalFailed)'),
+  'iOS post-commit cleanup diagnostics must be observational and unable to block transaction completion.'
 );
 assert(
   makePlaybackBackend.includes('let incomingQueue = initiallyAuthoritative ? nil : playerTracks()') &&
@@ -176,6 +187,12 @@ assert(
   'iOS deferred standby maintenance must be cancelled with other playback work.'
 );
 assert(
+  orchestrator.includes('private var activeCrossfadeCompletion: PlaybackBackendCommandCompletion<Void>?') &&
+    orchestrator.includes('cancelActiveCrossfade(errorCode: "pause")') &&
+    orchestrator.includes('cancelActiveCrossfade(errorCode: "backend_swap")'),
+  'iOS pause and backend swap must resolve the exact active crossfade command lease.'
+);
+assert(
   !pingPongPrepare.includes('player.') &&
     pingPongCommit.includes('player.volume = 0') &&
     pingPongCommit.includes('player.playWhenReady = false'),
@@ -184,14 +201,16 @@ assert(
 assert(
   standardBackend.includes('authoritativeQueue') &&
     standardBackend.includes('samePlaybackBackendTrackObjects') &&
-    facade.includes('restoreAuthoritativeBackend(previous, snapshot: snapshot)'),
+    facade.includes('restoreAuthoritativeBackend(previous, snapshot: captured.snapshot)'),
   'iOS backend rollback must preserve full Track object identity and restore the authoritative queue.'
 );
 assert(
   facade.includes('withCurrentBackendAsync') &&
-    facade.includes('playback_backend_command_timeout') &&
+    facade.includes('PlaybackBackendCommandCompletion') &&
+    facade.includes('activeCommandLeases') &&
+    !facade.includes('"playback_backend_command_timeout"') &&
     player.includes('withActivePlaybackBackendAsync'),
-  'iOS playback commands must serialize through the facade with a bounded timeout.'
+  'iOS playback commands must use exact-completion leases and must not report a timeout while native work can still mutate state.'
 );
 assert(
   player.includes('let initialBackend: PlaybackBackendKind = crossfadeEnabled ? .pingPong : .standard') &&

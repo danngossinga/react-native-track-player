@@ -188,14 +188,58 @@ final class PlaybackTransitionGenerationSidecar {
     }
 }
 
+final class PlaybackBackendCommandCompletion<Value> {
+    private let lock = NSLock()
+    private var resolved = false
+    private let resolveOnce: (Result<Value, Error>) -> Void
+
+    init(resolve: @escaping (Result<Value, Error>) -> Void) {
+        resolveOnce = resolve
+    }
+
+    func resolve(_ result: Result<Value, Error>) {
+        lock.lock()
+        guard !resolved else {
+            lock.unlock()
+            return
+        }
+        resolved = true
+        lock.unlock()
+        resolveOnce(result)
+    }
+}
+
 final class PlaybackBackendFacade {
-    private let transactionQueue = DispatchQueue(label: "com.doublesymmetry.trackplayer.playback-backend")
+    static let maximumPreparationAttempts = 8
+
+    private struct VersionedSnapshot {
+        let snapshot: PlaybackBackendSnapshot
+        let version: UInt64
+    }
+
+    private enum CommitDecision {
+        case committed
+        case stale
+        case wait(DispatchSemaphore)
+        case failed(Error)
+    }
+
+    private let admissionQueue = DispatchQueue(label: "com.doublesymmetry.trackplayer.playback-backend.admission")
+    private let swapQueue = DispatchQueue(label: "com.doublesymmetry.trackplayer.playback-backend.swap")
+    private let cleanupDiagnosticQueue = DispatchQueue(
+        label: "com.doublesymmetry.trackplayer.playback-backend.cleanup-diagnostic"
+    )
     private let factory: PlaybackBackendFactory
     private let authority: PlaybackBackendAuthority
     private let onCleanupDiagnostic: (PlaybackBackendCleanupDiagnostic) -> Void
     private let backendLock = NSLock()
     private var backend: PlaybackBackend
     private var nextOperationID = 0
+    private var commandVersion: UInt64 = 0
+    private var activeCommandLeases = 0
+    private var leaseDrainWaiters: [DispatchSemaphore] = []
+    private var physicalHandoffActive = false
+    private var pendingCommandAdmissions: [() -> Void] = []
 
     init(
         initial: PlaybackBackend,
@@ -226,47 +270,12 @@ final class PlaybackBackendFacade {
         ) throws -> Void,
         completion: @escaping (Result<Value, Error>) -> Void
     ) {
-        transactionQueue.async {
-            let semaphore = DispatchSemaphore(value: 0)
-            let lock = NSLock()
-            var captured: Result<Value, Error>?
-            var acceptingResult = true
-            do {
-                try operation(self.backend) { result in
-                    lock.lock()
-                    guard acceptingResult else {
-                        lock.unlock()
-                        return
-                    }
-                    acceptingResult = false
-                    captured = result
-                    lock.unlock()
-                    semaphore.signal()
-                }
-                if semaphore.wait(timeout: .now() + timeout) == .timedOut {
-                    lock.lock()
-                    acceptingResult = false
-                    lock.unlock()
-                    completion(.failure(NSError(
-                        domain: "RNTrackPlayer.PlaybackBackend",
-                        code: 2,
-                        userInfo: [
-                            NSLocalizedDescriptionKey: "The playback backend command timed out.",
-                            "code": "playback_backend_command_timeout"
-                        ]
-                    )))
-                    return
-                }
-                lock.lock()
-                let result = captured
-                lock.unlock()
-                completion(result!)
-            } catch {
-                lock.lock()
-                acceptingResult = false
-                lock.unlock()
-                completion(.failure(error))
-            }
+        // Kept for source compatibility. A native command is never reported as
+        // timed out while it can still mutate a backend; its lease ends only
+        // when the native operation resolves or is explicitly cancelled.
+        _ = timeout
+        admissionQueue.async {
+            self.admitCommand(operation, completion: completion)
         }
     }
 
@@ -274,15 +283,18 @@ final class PlaybackBackendFacade {
         _ kind: PlaybackBackendKind,
         completion: @escaping (Result<PlaybackBackendTransactionResult, Error>) -> Void
     ) {
-        transactionQueue.async {
+        swapQueue.async {
             self.nextOperationID += 1
             let operationID = self.nextOperationID
-            let previous = self.backend
 
             do {
-                try previous.settleActiveTransition()
-                let snapshot = try previous.snapshot()
-                if previous.kind == kind {
+                let sameTarget: PlaybackBackend? = self.admissionQueue.sync {
+                    let previous = self.backend
+                    guard previous.kind == kind else { return nil }
+                    return previous
+                }
+                if let sameTarget {
+                    let snapshot = try self.captureSameTargetSnapshot(of: sameTarget)
                     completion(.success(PlaybackBackendTransactionResult(
                         backend: kind,
                         operationID: operationID,
@@ -291,71 +303,198 @@ final class PlaybackBackendFacade {
                     return
                 }
 
-                try previous.suspendControlSurface()
-                self.authority.clear()
-                let replacement = self.factory.create(kind)
-                do {
-                    try replacement.prepareSilently(snapshot)
-                    try replacement.restore(snapshot)
-                } catch {
-                    self.cleanupUncommitted(replacement)
-                    self.authority.publish(previous)
-                    self.restoreAuthoritativeBackend(previous, snapshot: snapshot)
-                    previous.resumeControlSurface(snapshot)
-                    completion(.failure(error))
-                    return
+                let previous = self.admissionQueue.sync { self.backend }
+                for _ in 0..<Self.maximumPreparationAttempts {
+                    let captured = try self.captureVersionedSnapshot(of: previous)
+                    let replacement = self.factory.create(kind)
+                    do {
+                        try replacement.prepareSilently(captured.snapshot)
+                        try replacement.restore(captured.snapshot)
+                    } catch {
+                        self.cleanupUncommitted(replacement)
+                        completion(.failure(error))
+                        return
+                    }
+
+                    var admissionWaitCount = 0
+                    while true {
+                        let decision = self.admissionQueue.sync {
+                            guard self.backend === previous else {
+                                return CommitDecision.failed(self.busyError())
+                            }
+                            guard self.activeCommandLeases == 0 else {
+                                let waiter = DispatchSemaphore(value: 0)
+                                self.leaseDrainWaiters.append(waiter)
+                                return CommitDecision.wait(waiter)
+                            }
+                            guard self.commandVersion == captured.version else {
+                                return CommitDecision.stale
+                            }
+
+                            do {
+                                try previous.stopAndMute()
+                                try previous.relinquishExclusiveControlSurfaceBeforeCommit()
+                                replacement.commitQueue(captured.snapshot)
+                                self.backendLock.lock()
+                                self.backend = replacement
+                                self.backendLock.unlock()
+                                self.authority.publish(replacement)
+                                self.physicalHandoffActive = true
+                                return CommitDecision.committed
+                            } catch {
+                                self.restoreAuthoritativeBackend(previous, snapshot: captured.snapshot)
+                                previous.resumeControlSurface(captured.snapshot)
+                                self.authority.publish(previous)
+                                return CommitDecision.failed(error)
+                            }
+                        }
+
+                        switch decision {
+                        case .wait(let waiter):
+                            admissionWaitCount += 1
+                            waiter.wait()
+                            if admissionWaitCount >= Self.maximumPreparationAttempts {
+                                self.cleanupUncommitted(replacement)
+                                completion(.failure(self.busyError()))
+                                return
+                            }
+                            continue
+                        case .stale:
+                            self.cleanupUncommitted(replacement)
+                        case .failed(let error):
+                            self.cleanupUncommitted(replacement)
+                            completion(.failure(error))
+                            return
+                        case .committed:
+                            do {
+                                try previous.dispose()
+                            } catch {
+                                self.reportCleanupDiagnostic(.disposalFailed)
+                            }
+                            self.finishPhysicalHandoff()
+                            completion(.success(PlaybackBackendTransactionResult(
+                                backend: kind,
+                                operationID: operationID,
+                                snapshot: captured.snapshot
+                            )))
+                            return
+                        }
+                        break
+                    }
                 }
 
-                do {
-                    try previous.stopAndMute()
-                } catch {
-                    self.cleanupUncommitted(replacement)
-                    self.authority.publish(previous)
-                    self.restoreAuthoritativeBackend(previous, snapshot: snapshot)
-                    previous.resumeControlSurface(snapshot)
-                    completion(.failure(error))
-                    return
-                }
-
-                do {
-                    try previous.relinquishExclusiveControlSurfaceBeforeCommit()
-                } catch {
-                    self.cleanupUncommitted(replacement)
-                    self.authority.publish(previous)
-                    self.restoreAuthoritativeBackend(previous, snapshot: snapshot)
-                    previous.resumeControlSurface(snapshot)
-                    completion(.failure(error))
-                    return
-                }
-
-                // Atomic facade-reference replacement is the only commit point.
-                // commitQueue is deliberately non-throwing for both adapters.
-                self.backendLock.lock()
-                self.backend = replacement
-                self.backendLock.unlock()
-                replacement.commitQueue(snapshot)
-                self.authority.publish(replacement)
-
-                do {
-                    try previous.dispose()
-                } catch {
-                    self.onCleanupDiagnostic(.disposalFailed)
-                }
-
-                completion(.success(PlaybackBackendTransactionResult(
-                    backend: kind,
-                    operationID: operationID,
-                    snapshot: snapshot
-                )))
+                completion(.failure(self.busyError()))
             } catch {
                 completion(.failure(error))
             }
         }
     }
 
+    private func admitCommand<Value>(
+        _ operation: @escaping (
+            PlaybackBackend,
+            @escaping (Result<Value, Error>) -> Void
+        ) throws -> Void,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        if physicalHandoffActive {
+            pendingCommandAdmissions.append { [weak self] in
+                self?.admitCommand(operation, completion: completion)
+            }
+            return
+        }
+
+        let capturedBackend = backend
+        commandVersion &+= 1
+        activeCommandLeases += 1
+        let commandCompletion = PlaybackBackendCommandCompletion<Value> { result in
+            self.admissionQueue.async {
+                self.activeCommandLeases -= 1
+                if self.activeCommandLeases == 0 {
+                    let waiters = self.leaseDrainWaiters
+                    self.leaseDrainWaiters.removeAll()
+                    waiters.forEach { $0.signal() }
+                }
+                completion(result)
+            }
+        }
+        do {
+            try operation(capturedBackend, commandCompletion.resolve)
+        } catch {
+            commandCompletion.resolve(.failure(error))
+        }
+    }
+
+    private func finishPhysicalHandoff() {
+        admissionQueue.sync {
+            physicalHandoffActive = false
+            let admissions = pendingCommandAdmissions
+            pendingCommandAdmissions.removeAll()
+            admissions.forEach { admission in
+                admissionQueue.async(execute: admission)
+            }
+        }
+    }
+
+    private func captureSameTargetSnapshot(
+        of expectedBackend: PlaybackBackend
+    ) throws -> PlaybackBackendSnapshot {
+        for _ in 0..<Self.maximumPreparationAttempts {
+            let decision: (Result<PlaybackBackendSnapshot, Error>?, DispatchSemaphore?) = try admissionQueue.sync {
+                guard backend === expectedBackend else {
+                    return (.failure(busyError()), nil)
+                }
+                guard activeCommandLeases == 0 else {
+                    let waiter = DispatchSemaphore(value: 0)
+                    leaseDrainWaiters.append(waiter)
+                    return (nil, waiter)
+                }
+                return (.success(try expectedBackend.snapshot()), nil)
+            }
+            if let result = decision.0 { return try result.get() }
+            decision.1!.wait()
+        }
+        throw busyError()
+    }
+
+    private func captureVersionedSnapshot(
+        of expectedBackend: PlaybackBackend
+    ) throws -> VersionedSnapshot {
+        for _ in 0..<Self.maximumPreparationAttempts {
+            let decision: (Result<VersionedSnapshot, Error>?, DispatchSemaphore?) = try admissionQueue.sync {
+                guard backend === expectedBackend else {
+                    return (.failure(busyError()), nil)
+                }
+                try expectedBackend.settleActiveTransition()
+                guard activeCommandLeases == 0 else {
+                    let waiter = DispatchSemaphore(value: 0)
+                    leaseDrainWaiters.append(waiter)
+                    return (nil, waiter)
+                }
+                return (.success(VersionedSnapshot(
+                    snapshot: try expectedBackend.snapshot(),
+                    version: commandVersion
+                )), nil)
+            }
+
+            if let capture = decision.0 {
+                return try capture.get()
+            }
+            decision.1!.wait()
+        }
+        throw busyError()
+    }
+
     private func cleanupUncommitted(_ replacement: PlaybackBackend) {
         try? replacement.stopAndMute()
         try? replacement.dispose()
+    }
+
+    private func reportCleanupDiagnostic(_ diagnostic: PlaybackBackendCleanupDiagnostic) {
+        let observer = onCleanupDiagnostic
+        cleanupDiagnosticQueue.async {
+            observer(diagnostic)
+        }
     }
 
     private func restoreAuthoritativeBackend(
@@ -364,5 +503,16 @@ final class PlaybackBackendFacade {
     ) {
         try? previous.restore(snapshot)
         previous.commitQueue(snapshot)
+    }
+
+    private func busyError() -> Error {
+        return NSError(
+            domain: "RNTrackPlayer.PlaybackBackend",
+            code: 3,
+            userInfo: [
+                NSLocalizedDescriptionKey: "The playback backend remained busy while preparing a replacement.",
+                "code": "playback_backend_busy"
+            ]
+        )
     }
 }

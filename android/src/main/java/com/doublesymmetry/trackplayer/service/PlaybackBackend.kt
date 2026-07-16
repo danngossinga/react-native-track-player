@@ -2,6 +2,12 @@ package com.doublesymmetry.trackplayer.service
 
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.Deferred
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.withContext
+import com.doublesymmetry.trackplayer.utils.RejectionException
+import java.util.concurrent.atomic.AtomicBoolean
 
 enum class PlaybackBackendType {
     STANDARD,
@@ -115,8 +121,14 @@ internal class PlaybackControlOwnerRegistry {
     @Synchronized
     fun deactivate(owner: Any, physicalDeactivation: () -> Unit) {
         if (activeOwner !== owner) return
-        physicalDeactivation()
-        activeOwner = null
+        try {
+            physicalDeactivation()
+        } finally {
+            // Registry ownership is logical bookkeeping. A throwing physical
+            // destroy must not strand the old owner and block replacement
+            // activation after the facade's post-commit cleanup diagnostic.
+            activeOwner = null
+        }
     }
 
     @Synchronized
@@ -145,8 +157,9 @@ interface PlaybackBackend {
     fun activateInitialControlSurface() = Unit
     fun relinquishExclusiveControlSurfaceBeforeCommit() = Unit
     /**
-     * Publishes already-restored state after the facade swap. Implementations
-     * must not throw: every fallible operation belongs before the commit point.
+     * Finalizes already-restored state immediately before facade pointer
+     * publication. Implementations must not throw: every fallible operation
+     * belongs before the commit point.
      */
     fun commitQueue(snapshot: PlaybackBackendSnapshot)
     fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) = Unit
@@ -158,7 +171,15 @@ interface PlaybackBackend {
 }
 
 fun interface PlaybackBackendFactory {
-    fun create(type: PlaybackBackendType): PlaybackBackend
+    suspend fun create(type: PlaybackBackendType, identity: Any): PlaybackBackend
+}
+
+internal class PhysicalRemoteTicket internal constructor(
+    internal val sourceIdentity: Any,
+    internal val backendGeneration: Long,
+    internal val handoff: Any?
+) {
+    internal val consumed = AtomicBoolean(false)
 }
 
 internal class PlaybackBackendFacade(
@@ -167,10 +188,52 @@ internal class PlaybackBackendFacade(
     private val onCleanupDiagnostic: (PlaybackBackendCleanupDiagnostic) -> Unit = {},
     private val authority: AndroidPlaybackBackendAuthority = AndroidPlaybackBackendAuthority()
 ) {
-    private val transactionMutex = Mutex()
+    private data class VersionedSnapshot(
+        val snapshot: PlaybackBackendSnapshot,
+        val version: Long
+    )
+
+    private sealed class SnapshotDecision {
+        data class Captured(val value: VersionedSnapshot) : SnapshotDecision()
+        data class Wait(val signal: Deferred<Unit>) : SnapshotDecision()
+    }
+
+    private sealed class CommitDecision {
+        object Stale : CommitDecision()
+        data class Wait(val signal: Deferred<Unit>) : CommitDecision()
+        data class Failed(val error: Exception) : CommitDecision()
+        data class Ready(val physicalHandoff: PhysicalHandoffState) : CommitDecision()
+    }
+
+    private sealed class BackendLeaseDecision {
+        data class Captured(val backend: PlaybackBackend) : BackendLeaseDecision()
+        data class Wait(val signal: Deferred<Unit>) : BackendLeaseDecision()
+        object Rejected : BackendLeaseDecision()
+    }
+
+    private class PhysicalHandoffState(
+        val signal: CompletableDeferred<Unit>,
+        val previousGeneration: Long,
+        val previousRemoteSource: Any?,
+        val candidateRemoteSource: Any?
+    ) {
+        val acceptedRemoteSources = listOfNotNull(previousRemoteSource, candidateRemoteSource)
+        var resultGeneration: Long? = null
+        var committed = false
+    }
+
+    private val admissionMutex = Mutex()
+    private val swapMutex = Mutex()
     @Volatile
     private var backend = initialBackend
     private var nextOperationId = 0L
+    private var commandVersion = 0L
+    private var activeCommandLeases = 0
+    private var leaseDrainSignal = CompletableDeferred(Unit)
+    private var physicalHandoff: PhysicalHandoffState? = null
+    private var completedPhysicalHandoff: PhysicalHandoffState? = null
+    private var backendGeneration = 0L
+    private var candidateRemoteProxy: Any? = null
 
     init {
         initialBackend.activateInitialControlSurface()
@@ -181,113 +244,440 @@ internal class PlaybackBackendFacade(
 
     suspend fun <T> withCurrentBackend(
         operation: suspend (PlaybackBackend) -> T
-    ): T = transactionMutex.withLock {
-        operation(backend)
+    ): T {
+        val captured = acquireCurrentBackendLease()
+        return try {
+            operation(captured)
+        } finally {
+            releaseCommandLease()
+        }
     }
 
     suspend fun routeIfAuthoritative(
         expectedIdentity: Any,
         operation: suspend (PlaybackBackend) -> Unit
-    ): Boolean = transactionMutex.withLock {
-        val current = backend
-        if (current.identity !== expectedIdentity ||
-            !authority.isAuthoritative(current.type, expectedIdentity)
-        ) return@withLock false
-        operation(current)
-        true
+    ): Boolean {
+        val captured = acquireAuthoritativeBackendLease(expectedIdentity) ?: return false
+        return try {
+            operation(captured)
+            true
+        } finally {
+            releaseCommandLease()
+        }
+    }
+
+    suspend fun capturePhysicalRemoteTicket(sourceIdentity: Any): PhysicalRemoteTicket? =
+        admissionMutex.withLock {
+            val current = backend
+            val currentStandard = current.type == PlaybackBackendType.STANDARD &&
+                current.identity === sourceIdentity &&
+                authority.isAuthoritative(PlaybackBackendType.STANDARD, sourceIdentity)
+            val candidateProxy = candidateRemoteProxy === sourceIdentity
+            val handoff = physicalHandoff?.takeIf { state ->
+                state.acceptedRemoteSources.any { it === sourceIdentity }
+            }
+            if (!currentStandard && !candidateProxy && handoff == null) return@withLock null
+            PhysicalRemoteTicket(
+                sourceIdentity,
+                handoff?.previousGeneration ?: backendGeneration,
+                handoff
+            )
+        }
+
+    suspend fun routePhysicalRemote(
+        ticket: PhysicalRemoteTicket,
+        operation: suspend (PlaybackBackend) -> Unit
+    ): Boolean {
+        if (!ticket.consumed.compareAndSet(false, true)) return false
+        val ticketHandoff = ticket.handoff as? PhysicalHandoffState
+        if (ticketHandoff != null) {
+            ticketHandoff.signal.await()
+            val captured = admissionMutex.withLock {
+                if (!canRouteAfterHandoff(ticket, ticketHandoff)) return@withLock null
+                acquireCommandLease()
+                backend
+            } ?: return false
+            return try {
+                operation(captured)
+                true
+            } finally {
+                releaseCommandLease()
+            }
+        }
+
+        while (true) {
+            var promotedHandoff: PhysicalHandoffState? = null
+            when (val decision = admissionMutex.withLock {
+                val handoff = physicalHandoff
+                val validCurrent = isAcceptedRemoteSource(ticket.sourceIdentity)
+                if (handoff != null) {
+                    if (validCurrent || handoff.acceptedRemoteSources.any { it === ticket.sourceIdentity }) {
+                        promotedHandoff = handoff
+                        return@withLock BackendLeaseDecision.Wait(handoff.signal)
+                    }
+                    return@withLock BackendLeaseDecision.Rejected
+                }
+                if (!validCurrent || ticket.backendGeneration != backendGeneration) {
+                    val completedHandoff = completedPhysicalHandoff
+                    val canPromoteAcrossCompletedHandoff = completedHandoff != null &&
+                        ticket.backendGeneration == completedHandoff.previousGeneration &&
+                        backendGeneration == completedHandoff.resultGeneration &&
+                        completedHandoff.acceptedRemoteSources.any { it === ticket.sourceIdentity }
+                    if (!canPromoteAcrossCompletedHandoff) {
+                        return@withLock BackendLeaseDecision.Rejected
+                    }
+                }
+                acquireCommandLease()
+                BackendLeaseDecision.Captured(backend)
+            }) {
+                is BackendLeaseDecision.Captured -> return try {
+                    operation(decision.backend)
+                    true
+                } finally {
+                    releaseCommandLease()
+                }
+                is BackendLeaseDecision.Wait -> {
+                    decision.signal.await()
+                    val handoff = promotedHandoff ?: return false
+                    val captured = admissionMutex.withLock {
+                        if (!canRouteAfterHandoff(ticket, handoff)) return@withLock null
+                        acquireCommandLease()
+                        backend
+                    } ?: return false
+                    return try {
+                        operation(captured)
+                        true
+                    } finally {
+                        releaseCommandLease()
+                    }
+                }
+                BackendLeaseDecision.Rejected -> return false
+            }
+        }
     }
 
     suspend fun setPlaybackBackend(type: PlaybackBackendType): PlaybackBackendTransactionResult =
-        transactionMutex.withLock {
+        swapMutex.withLock swap@{
             nextOperationId += 1
             val operationId = nextOperationId
-            val previous = backend
-
-            previous.settleActiveTransition()
-            val snapshot = previous.snapshot()
+            val previous = admissionMutex.withLock { backend }
             if (previous.type == type) {
-                return@withLock PlaybackBackendTransactionResult(type, operationId, snapshot)
+                return@swap PlaybackBackendTransactionResult(
+                    type,
+                    operationId,
+                    captureSameTargetSnapshot(previous)
+                )
             }
 
-            previous.suspendControlSurface()
-            authority.clear()
-            val replacement = try {
-                factory.create(type)
-            } catch (error: Exception) {
-                authority.publish(previous)
-                resumeAuthoritativeControlSurface(previous, snapshot)
-                throw error
-            }
+            var previousSurfaceSuspended = false
+            var replacement: PlaybackBackend? = null
+            var lastSnapshot: PlaybackBackendSnapshot? = null
+            var candidateIdentity: Any? = null
+            val logicallyCommitted = AtomicBoolean(false)
+            val candidateCleanupClaimed = AtomicBoolean(false)
             try {
-                replacement.prepareSilently(snapshot)
-                replacement.restore(snapshot)
-            } catch (error: Exception) {
-                cleanupUncommitted(replacement)
-                authority.publish(previous)
-                restoreAuthoritativeBackend(previous, snapshot)
-                resumeAuthoritativeControlSurface(previous, snapshot)
-                throw error
+                repeat(MAXIMUM_PREPARATION_ATTEMPTS) {
+                    val captured = captureVersionedSnapshot(previous)
+                    lastSnapshot = captured.snapshot
+                    if (!previousSurfaceSuspended &&
+                        previous.type == PlaybackBackendType.PING_PONG &&
+                        type == PlaybackBackendType.STANDARD
+                    ) {
+                        previousSurfaceSuspended = true
+                        previous.suspendControlSurface()
+                    }
+
+                    if (replacement == null) {
+                        val identity = Any()
+                        candidateIdentity = identity
+                        if (type == PlaybackBackendType.STANDARD) {
+                            admissionMutex.withLock {
+                                candidateRemoteProxy = identity
+                            }
+                        }
+                        replacement = factory.create(type, identity)
+                        check(replacement!!.identity === identity) {
+                            "Playback backend factory must preserve the pre-admitted candidate identity."
+                        }
+                    }
+                    replacement!!.prepareSilently(captured.snapshot)
+                    replacement!!.restore(captured.snapshot)
+
+                    var admissionWaits = 0
+                    while (true) {
+                        val decision = admissionMutex.withLock admission@{
+                            physicalHandoff?.let {
+                                return@admission CommitDecision.Wait(it.signal)
+                            }
+                            if (backend !== previous) {
+                                return@admission CommitDecision.Failed(busyError())
+                            }
+                            if (activeCommandLeases != 0) {
+                                return@admission CommitDecision.Wait(leaseDrainSignal)
+                            }
+                            if (commandVersion != captured.version) {
+                                return@admission CommitDecision.Stale
+                            }
+                            val handoff = PhysicalHandoffState(
+                                signal = CompletableDeferred(),
+                                previousGeneration = backendGeneration,
+                                previousRemoteSource = previous.identity.takeIf {
+                                    previous.type == PlaybackBackendType.STANDARD
+                                },
+                                candidateRemoteSource = candidateRemoteProxy
+                            )
+                            physicalHandoff = handoff
+                            CommitDecision.Ready(handoff)
+                        }
+
+                        when (decision) {
+                            is CommitDecision.Wait -> {
+                                admissionWaits += 1
+                                decision.signal.await()
+                                if (admissionWaits >= MAXIMUM_PREPARATION_ATTEMPTS) {
+                                    throw busyError()
+                                }
+                            }
+                            CommitDecision.Stale -> {
+                                // Keep the same physical candidate and its remote
+                                // proxy alive; prepare/restore is repeatable.
+                                break
+                            }
+                            is CommitDecision.Failed -> throw decision.error
+                            is CommitDecision.Ready -> {
+                                // From this point the handoff owns rollback and
+                                // reactivation of the previous control surface.
+                                previousSurfaceSuspended = false
+                                performPhysicalHandoff(
+                                    previous,
+                                    replacement!!,
+                                    captured.snapshot,
+                                    decision.physicalHandoff,
+                                    logicallyCommitted,
+                                    candidateCleanupClaimed
+                                )
+                                return@swap PlaybackBackendTransactionResult(
+                                    type,
+                                    operationId,
+                                    captured.snapshot
+                                )
+                            }
+                        }
+                    }
+                }
+
+                throw busyError()
+            } finally {
+                if (!logicallyCommitted.get()) {
+                    withContext(NonCancellable) {
+                        replacement?.let {
+                            cleanupUncommittedOnce(it, candidateCleanupClaimed)
+                        }
+                        clearCandidateRemoteProxy(candidateIdentity)
+                        if (previousSurfaceSuspended && lastSnapshot != null) {
+                            resumeAuthoritativeControlSurface(previous, lastSnapshot!!)
+                        }
+                    }
+                }
             }
-
-            try {
-                previous.stopAndMute()
-            } catch (error: Exception) {
-                cleanupUncommitted(replacement)
-                authority.publish(previous)
-                restoreAuthoritativeBackend(previous, snapshot)
-                resumeAuthoritativeControlSurface(previous, snapshot)
-                throw error
-            }
-
-            try {
-                previous.relinquishExclusiveControlSurfaceBeforeCommit()
-            } catch (error: Exception) {
-                cleanupUncommitted(replacement)
-                authority.publish(previous)
-                restoreAuthoritativeBackend(previous, snapshot)
-                resumeAuthoritativeControlSurface(previous, snapshot)
-                throw error
-            }
-
-            // Single commit point. Queue publication and activation are
-            // deliberately non-throwing. Authority remains unpublished until
-            // both have completed, so candidate callbacks cannot escape early.
-            backend = replacement
-            replacement.commitQueue(snapshot)
-            replacement.activateAfterCommit(snapshot)
-            authority.publish(replacement)
-
-            try {
-                previous.dispose()
-            } catch (_: Exception) {
-                onCleanupDiagnostic(PlaybackBackendCleanupDiagnostic())
-            }
-
-            PlaybackBackendTransactionResult(type, operationId, snapshot)
         }
 
-    private suspend fun cleanupUncommitted(replacement: PlaybackBackend) {
+    private suspend fun performPhysicalHandoff(
+        previous: PlaybackBackend,
+        replacement: PlaybackBackend,
+        snapshot: PlaybackBackendSnapshot,
+        handoff: PhysicalHandoffState,
+        logicallyCommitted: AtomicBoolean,
+        candidateCleanupClaimed: AtomicBoolean
+    ) {
         try {
-            replacement.stopAndMute()
-        } catch (_: Exception) {
-            // The candidate was prepared silently and never became authoritative.
-        }
-        try {
-            replacement.dispose()
-        } catch (_: Exception) {
-            // Pre-commit cleanup never changes the authoritative backend result.
+            previous.stopAndMute()
+            previous.relinquishExclusiveControlSurfaceBeforeCommit()
+            admissionMutex.withLock {
+                check(physicalHandoff === handoff)
+                check(backend === previous)
+                replacement.commitQueue(snapshot)
+                backend = replacement
+                authority.publish(replacement)
+                backendGeneration += 1
+                handoff.resultGeneration = backendGeneration
+                handoff.committed = true
+                if (candidateRemoteProxy === replacement.identity) candidateRemoteProxy = null
+                logicallyCommitted.set(true)
+            }
+
+            withContext(NonCancellable) {
+                try {
+                    previous.dispose()
+                } catch (_: Exception) {
+                    reportDiagnostic(PlaybackBackendCleanupDiagnostic())
+                }
+                try {
+                    replacement.activateAfterCommit(snapshot)
+                } catch (_: Exception) {
+                    // The facade and authority are already committed. Surface the
+                    // sanitized diagnostic, but never report a rejected transaction
+                    // whose replacement is now authoritative.
+                    reportDiagnostic(
+                        PlaybackBackendCleanupDiagnostic(
+                            code = "playback_backend_activation_failed",
+                            message = "The replacement playback backend could not be fully activated."
+                        )
+                    )
+                }
+            }
+        } catch (error: Exception) {
+            if (!logicallyCommitted.get()) {
+                cleanupUncommittedOnce(replacement, candidateCleanupClaimed)
+                rollbackAuthoritativeBackend(previous, snapshot)
+            }
+            throw error
+        } finally {
+            withContext(NonCancellable) {
+                admissionMutex.withLock {
+                    if (physicalHandoff === handoff) physicalHandoff = null
+                    if (logicallyCommitted.get()) completedPhysicalHandoff = handoff
+                    handoff.signal.complete(Unit)
+                }
+            }
         }
     }
 
-    private suspend fun restoreAuthoritativeBackend(
+    private suspend fun captureSameTargetSnapshot(
+        previous: PlaybackBackend
+    ): PlaybackBackendSnapshot {
+        repeat(MAXIMUM_PREPARATION_ATTEMPTS) {
+            val decision = admissionMutex.withLock {
+                physicalHandoff?.let { return@withLock SnapshotDecision.Wait(it.signal) }
+                check(backend === previous)
+                if (activeCommandLeases != 0) {
+                    SnapshotDecision.Wait(leaseDrainSignal)
+                } else {
+                    SnapshotDecision.Captured(VersionedSnapshot(previous.snapshot(), commandVersion))
+                }
+            }
+            when (decision) {
+                is SnapshotDecision.Captured -> return decision.value.snapshot
+                is SnapshotDecision.Wait -> decision.signal.await()
+            }
+        }
+        throw busyError()
+    }
+
+    private suspend fun captureVersionedSnapshot(previous: PlaybackBackend): VersionedSnapshot {
+        repeat(MAXIMUM_PREPARATION_ATTEMPTS) {
+            val decision = admissionMutex.withLock {
+                physicalHandoff?.let { return@withLock SnapshotDecision.Wait(it.signal) }
+                check(backend === previous) { "The authoritative playback backend changed unexpectedly." }
+                previous.settleActiveTransition()
+                if (activeCommandLeases != 0) {
+                    SnapshotDecision.Wait(leaseDrainSignal)
+                } else {
+                    SnapshotDecision.Captured(VersionedSnapshot(previous.snapshot(), commandVersion))
+                }
+            }
+            when (decision) {
+                is SnapshotDecision.Captured -> return decision.value
+                is SnapshotDecision.Wait -> decision.signal.await()
+            }
+        }
+        throw busyError()
+    }
+
+    private suspend fun acquireCurrentBackendLease(): PlaybackBackend {
+        while (true) {
+            when (val decision = admissionMutex.withLock {
+                physicalHandoff?.let { return@withLock BackendLeaseDecision.Wait(it.signal) }
+                acquireCommandLease()
+                BackendLeaseDecision.Captured(backend)
+            }) {
+                is BackendLeaseDecision.Captured -> return decision.backend
+                is BackendLeaseDecision.Wait -> decision.signal.await()
+                BackendLeaseDecision.Rejected -> error("Unexpected rejected backend admission.")
+            }
+        }
+    }
+
+    private suspend fun acquireAuthoritativeBackendLease(
+        expectedIdentity: Any
+    ): PlaybackBackend? {
+        while (true) {
+            when (val decision = admissionMutex.withLock {
+                physicalHandoff?.let { return@withLock BackendLeaseDecision.Wait(it.signal) }
+                val current = backend
+                if (current.identity !== expectedIdentity ||
+                    !authority.isAuthoritative(current.type, expectedIdentity)
+                ) return@withLock BackendLeaseDecision.Rejected
+                acquireCommandLease()
+                BackendLeaseDecision.Captured(current)
+            }) {
+                is BackendLeaseDecision.Captured -> return decision.backend
+                is BackendLeaseDecision.Wait -> decision.signal.await()
+                BackendLeaseDecision.Rejected -> return null
+            }
+        }
+    }
+
+    private fun acquireCommandLease() {
+        commandVersion += 1
+        if (activeCommandLeases == 0) leaseDrainSignal = CompletableDeferred()
+        activeCommandLeases += 1
+    }
+
+    private suspend fun releaseCommandLease() {
+        withContext(NonCancellable) {
+            admissionMutex.withLock {
+                activeCommandLeases -= 1
+                if (activeCommandLeases == 0) leaseDrainSignal.complete(Unit)
+            }
+        }
+    }
+
+    private suspend fun cleanupUncommitted(replacement: PlaybackBackend) {
+        withContext(NonCancellable) {
+            admissionMutex.withLock {
+                if (candidateRemoteProxy === replacement.identity) candidateRemoteProxy = null
+            }
+            try {
+                replacement.stopAndMute()
+            } catch (_: Exception) {
+                // The candidate was prepared silently and never became authoritative.
+            }
+            try {
+                replacement.dispose()
+            } catch (_: Exception) {
+                // Pre-commit cleanup never changes the authoritative backend result.
+            }
+        }
+    }
+
+    private suspend fun cleanupUncommittedOnce(
+        replacement: PlaybackBackend,
+        cleanupClaimed: AtomicBoolean
+    ) {
+        if (cleanupClaimed.compareAndSet(false, true)) cleanupUncommitted(replacement)
+    }
+
+    private suspend fun clearCandidateRemoteProxy(identity: Any?) {
+        if (identity == null) return
+        admissionMutex.withLock {
+            if (candidateRemoteProxy === identity) candidateRemoteProxy = null
+        }
+    }
+
+    private suspend fun rollbackAuthoritativeBackend(
         previous: PlaybackBackend,
         snapshot: PlaybackBackendSnapshot
     ) {
-        try {
-            previous.restore(snapshot)
-            previous.commitQueue(snapshot)
-        } catch (_: Exception) {
-            // Preserve the original error and authoritative facade reference.
+        withContext(NonCancellable) {
+            try {
+                previous.restore(snapshot)
+                previous.commitQueue(snapshot)
+                authority.publish(previous)
+                previous.activateAfterCommit(snapshot)
+            } catch (_: Exception) {
+                // Preserve the original error and authoritative facade reference.
+            }
         }
     }
 
@@ -295,10 +685,58 @@ internal class PlaybackBackendFacade(
         previous: PlaybackBackend,
         snapshot: PlaybackBackendSnapshot
     ) {
-        try {
-            previous.resumeControlSurface(snapshot)
-        } catch (_: Exception) {
-            // Rollback keeps the old backend authoritative even if UI refresh fails.
+        withContext(NonCancellable) {
+            try {
+                previous.resumeControlSurface(snapshot)
+            } catch (_: Exception) {
+                // Rollback keeps the old backend authoritative even if UI refresh fails.
+            }
         }
+    }
+
+    private fun busyError(): RejectionException = RejectionException(
+        "The playback backend remained busy while preparing a replacement.",
+        "playback_backend_busy"
+    )
+
+    private fun reportDiagnostic(diagnostic: PlaybackBackendCleanupDiagnostic) {
+        try {
+            onCleanupDiagnostic(diagnostic)
+        } catch (_: Exception) {
+            // Diagnostics are observational and must never change a committed
+            // transaction result.
+        }
+    }
+
+    private fun isAcceptedRemoteSource(sourceIdentity: Any): Boolean {
+        val current = backend
+        return (current.type == PlaybackBackendType.STANDARD &&
+            current.identity === sourceIdentity &&
+            authority.isAuthoritative(PlaybackBackendType.STANDARD, sourceIdentity)) ||
+            candidateRemoteProxy === sourceIdentity
+    }
+
+    private fun canRouteAfterHandoff(
+        ticket: PhysicalRemoteTicket,
+        handoff: PhysicalHandoffState
+    ): Boolean {
+        if (handoff.committed) {
+            return ticket.backendGeneration == handoff.previousGeneration &&
+                backendGeneration == handoff.resultGeneration &&
+                handoff.acceptedRemoteSources.any { it === ticket.sourceIdentity }
+        }
+
+        val previousSource = handoff.previousRemoteSource ?: return false
+        val current = backend
+        return previousSource === ticket.sourceIdentity &&
+            ticket.backendGeneration == handoff.previousGeneration &&
+            backendGeneration == handoff.previousGeneration &&
+            current.type == PlaybackBackendType.STANDARD &&
+            current.identity === previousSource &&
+            authority.isAuthoritative(PlaybackBackendType.STANDARD, previousSource)
+    }
+
+    companion object {
+        const val MAXIMUM_PREPARATION_ATTEMPTS = 8
     }
 }

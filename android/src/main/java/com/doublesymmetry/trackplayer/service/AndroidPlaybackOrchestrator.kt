@@ -7,11 +7,14 @@ import com.doublesymmetry.trackplayer.model.TrackAudioItem
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.onTimeout
+import kotlinx.coroutines.selects.select
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
@@ -87,6 +90,7 @@ internal class AndroidPlaybackOrchestrator(
     private var crossfadeRunId = 0
     private var activeCrossfadeFromIndex: Int? = null
     private var activeCrossfadeToIndex: Int? = null
+    private var activeCrossfadeCancellation: CompletableDeferred<Unit>? = null
     private var preparedCrossfadeFromIndex: Int? = null
     private var preparedCrossfadeToIndex: Int? = null
     private var preparedCrossfadeSeekToMs: Long = 0L
@@ -301,18 +305,10 @@ internal class AndroidPlaybackOrchestrator(
 
     fun pause() {
         playWhenReady = false
-        when (state) {
-            AndroidPlaybackOrchestratorState.CROSSFADING -> {
-                activeEngine.pause()
-                standbyEngine.pause()
-                setState(AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE)
-            }
-            else -> {
-                activeEngine.pause()
-                standbyEngine.pause()
-                setState(AndroidPlaybackOrchestratorState.PAUSED)
-            }
-        }
+        cancelCrossfade("pause", promoteIncoming = true)
+        activeEngine.pause()
+        standbyEngine.pause()
+        setState(AndroidPlaybackOrchestratorState.PAUSED)
     }
 
     fun stop() {
@@ -429,6 +425,10 @@ internal class AndroidPlaybackOrchestrator(
         waitUntil: Double = 0.0
     ) {
         val fromIndex = currentIndex
+        if (activeCrossfadeCancellation != null) {
+            emitCrossfade("error", fromIndex, activeCrossfadeToIndex ?: -1, errorCode = "crossfade_in_progress")
+            throw RejectionException("A crossfade is already in progress.", "crossfade_in_progress")
+        }
         val toIndex = if (preparedCrossfadeFromIndex == fromIndex && preparedCrossfadeToIndex != null) {
             preparedCrossfadeToIndex!!
         } else {
@@ -451,6 +451,8 @@ internal class AndroidPlaybackOrchestrator(
 
         crossfadeRunId += 1
         val runId = crossfadeRunId
+        val cancellation = CompletableDeferred<Unit>()
+        activeCrossfadeCancellation = cancellation
         activeCrossfadeFromIndex = fromIndex
         activeCrossfadeToIndex = toIndex
         val intervalMs = max(10.0, fadeInterval).toLong()
@@ -463,7 +465,7 @@ internal class AndroidPlaybackOrchestrator(
 
         try {
             if (waitDelayMs > 0) {
-                delayChecked(waitDelayMs, runId)
+                delayChecked(waitDelayMs, runId, cancellation)
             }
             ensureCrossfadeRunActive(runId)
             ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
@@ -493,10 +495,6 @@ internal class AndroidPlaybackOrchestrator(
             var lastRunningEmitMs = -CROSSFADE_RUNNING_EVENT_INTERVAL_MS
             while (elapsedMs < durationMs) {
                 ensureCrossfadeRunActive(runId)
-                if (state == AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE) {
-                    delay(intervalMs)
-                    continue
-                }
                 if (!playWhenReady) {
                     ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
                 }
@@ -539,7 +537,7 @@ internal class AndroidPlaybackOrchestrator(
                     emitCrossfade("running", fromIndex, toIndex, elapsedMs = elapsedMs.toInt(), fromVolume = fromVolume, toVolume = toVolume)
                     lastRunningEmitMs = elapsedMs
                 }
-                delay(intervalMs)
+                delayCrossfade(intervalMs, runId, cancellation)
                 elapsedMs = min(durationMs, elapsedMs + intervalMs)
             }
 
@@ -574,6 +572,10 @@ internal class AndroidPlaybackOrchestrator(
             emitCrossfade("error", fromIndex, toIndex, errorCode = "crossfade_unexpected_error")
             setState(AndroidPlaybackOrchestratorState.ERROR)
             throw error
+        } finally {
+            if (activeCrossfadeCancellation === cancellation) {
+                activeCrossfadeCancellation = null
+            }
         }
     }
 
@@ -801,6 +803,7 @@ internal class AndroidPlaybackOrchestrator(
         val toIndex = activeCrossfadeToIndex
         val wasCrossfading = fromIndex != null && toIndex != null
         crossfadeRunId += 1
+        activeCrossfadeCancellation?.complete(Unit)
         standbyMaintenanceJob?.cancel()
         standbyMaintenanceJob = null
         if (wasCrossfading) {
@@ -829,7 +832,11 @@ internal class AndroidPlaybackOrchestrator(
         }
     }
 
-    private suspend fun delayChecked(durationMs: Long, runId: Int) {
+    private suspend fun delayChecked(
+        durationMs: Long,
+        runId: Int,
+        cancellation: CompletableDeferred<Unit>
+    ) {
         var remaining = durationMs
         while (remaining > 0) {
             ensureCrossfadeRunActive(runId)
@@ -841,9 +848,22 @@ internal class AndroidPlaybackOrchestrator(
                 )
             }
             val slice = min(remaining, 100L)
-            delay(slice)
+            delayCrossfade(slice, runId, cancellation)
             remaining -= slice
         }
+    }
+
+    @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+    private suspend fun delayCrossfade(
+        durationMs: Long,
+        runId: Int,
+        cancellation: CompletableDeferred<Unit>
+    ) {
+        select<Unit> {
+            onTimeout(durationMs) { }
+            cancellation.onAwait { ensureCrossfadeRunActive(runId) }
+        }
+        ensureCrossfadeRunActive(runId)
     }
 
     private fun emitCrossfade(

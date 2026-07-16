@@ -47,6 +47,7 @@ internal class KotlinAudioPlaybackBackend(
     private val queueStore: AndroidTrackQueue,
     private val transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
     private val onCommitted: (QueuedAudioPlayer) -> Unit,
+    private val onActivated: (QueuedAudioPlayer) -> Unit,
     private val onDisposed: (QueuedAudioPlayer) -> Unit,
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
@@ -59,7 +60,10 @@ internal class KotlinAudioPlaybackBackend(
     private var playerReleased = false
 
     init {
-        if (initiallyAuthoritative) onCommitted(player)
+        if (initiallyAuthoritative) {
+            onCommitted(player)
+            onActivated(player)
+        }
     }
 
     override val queueItems: List<TrackAudioItem>
@@ -143,7 +147,9 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun relinquishExclusiveControlSurfaceBeforeCommit() {
-        releasePlayer()
+        // KotlinAudio does not expose a supported MediaSession suspension API.
+        // Destruction is therefore deliberately deferred to dispose(), after
+        // the facade has logically committed the replacement backend.
     }
 
     override fun commitQueue(snapshot: PlaybackBackendSnapshot) {
@@ -159,6 +165,7 @@ internal class KotlinAudioPlaybackBackend(
         player.volume = snapshot.volume
         player.playWhenReady = snapshot.playWhenReady
         if (snapshot.playWhenReady) player.play() else player.pause()
+        onActivated(player)
     }
 
     override suspend fun play() { player.play() }
