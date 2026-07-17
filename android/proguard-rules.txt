@@ -1,3 +1,11 @@
 
 # Ignore "not found" errors for libraries
 -dontwarn com.google.android.exoplayer2.**
+
+# KotlinAudio v2.1.0 has no public MediaSession suspend/resume API. RNTP's
+# handoff barrier reflects this exact field to prevent overlapping sessions.
+# Keep the dependency pinned and update KotlinAudioMediaSessionControl if the
+# upstream private contract changes.
+-keepclassmembers class com.doublesymmetry.kotlinaudio.players.BaseAudioPlayer {
+    private android.support.v4.media.session.MediaSessionCompat mediaSession;
+}

@@ -40,13 +40,21 @@ import kotlinx.coroutines.flow.flow
 import kotlin.system.exitProcess
 import timber.log.Timber
 
+internal fun resolvePreviousTrackForPlaybackEvent(
+    tracks: List<Track>,
+    previousIndex: Int?,
+    explicitPreviousTrack: Track?
+): Track? = explicitPreviousTrack ?: previousIndex?.let(tracks::getOrNull)
+
 @MainThread
 class MusicService : HeadlessJsTaskService() {
     private data class StandardPlayerBinding(
         val player: QueuedAudioPlayer,
         val identity: Any,
         val ownerJob: Job,
-        val productAdmission: SharedFlowAdmissionGate
+        val ownerScope: CoroutineScope,
+        val productAdmission: SharedFlowAdmissionGate,
+        val mediaSessionControl: KotlinAudioMediaSessionControl
     )
 
     private var player: QueuedAudioPlayer? = null
@@ -92,6 +100,14 @@ class MusicService : HeadlessJsTaskService() {
         }
     }
 
+    private suspend fun <T> withActivePlaybackBackendRead(
+        operation: suspend (AndroidPlaybackBackendRouting) -> T
+    ): T {
+        return playbackBackendFacade!!.withCurrentBackendRead { backend ->
+            operation(backend as AndroidPlaybackBackendRouting)
+        }
+    }
+
     private fun requireKotlinAudioPlayer(): QueuedAudioPlayer {
         return player ?: throw IllegalStateException("KotlinAudio player is not initialized for this playback mode.")
     }
@@ -109,13 +125,21 @@ class MusicService : HeadlessJsTaskService() {
         val ownerScope = CoroutineScope(scope.coroutineContext + ownerJob)
         val productAdmission = SharedFlowAdmissionGate()
         return try {
+            val mediaSessionControl = KotlinAudioMediaSessionControl.from(created)
             created.automaticallyUpdateNotificationMetadata = false
             created.ratingType = configuredRatingType
             (created.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
             observeRemoteActions(created, identity, ownerScope)
             observeEvents(created, identity, ownerScope, productAdmission)
             setupForegrounding(created, identity, ownerScope, productAdmission)
-            StandardPlayerBinding(created, identity, ownerJob, productAdmission)
+            StandardPlayerBinding(
+                created,
+                identity,
+                ownerJob,
+                ownerScope,
+                productAdmission,
+                mediaSessionControl
+            )
         } catch (error: Exception) {
             ownerJob.cancel()
             playbackControlOwnerRegistry.deactivate(identity) { created.destroy() }
@@ -140,13 +164,25 @@ class MusicService : HeadlessJsTaskService() {
             androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
     }
 
-    private fun activateStandardPlayerBinding(binding: StandardPlayerBinding) {
+    private fun activateStandardPlayerBinding(binding: StandardPlayerBinding): Job {
         // Authority is already published for swaps when this hook runs. Admit
         // the continuously subscribed product collectors first, then create a
         // fresh canonical notification/state event that cannot be mistaken for
         // candidate restore replay.
-        binding.productAdmission.admit()
-        latestNotificationConfig?.let { binding.player.notificationManager.createNotification(it) }
+        return binding.productAdmission.admitAfterProducerDrain(binding.ownerScope) {
+            if (!isActivePlayer(binding.player, binding.identity)) return@admitAfterProducerDrain
+            try {
+                latestNotificationConfig?.let {
+                    binding.player.notificationManager.createNotification(it)
+                }
+            } catch (error: Exception) {
+                Timber.e(error, "Unable to publish the committed standard notification")
+            }
+            emit(
+                MusicEvents.PLAYBACK_STATE,
+                getPlayerStateBundle(binding.player.playerState)
+            )
+        }
     }
 
     /**
@@ -238,12 +274,16 @@ class MusicService : HeadlessJsTaskService() {
         stopForeground(true)
     }
 
-    private fun createPlaybackOrchestrator(identity: Any): AndroidPlaybackOrchestrator {
+    private fun createPlaybackOrchestrator(
+        identity: Any,
+        eventAdmission: SharedFlowAdmissionGate
+    ): AndroidPlaybackOrchestrator {
         lateinit var created: AndroidPlaybackOrchestrator
         fun isAuthoritative(): Boolean =
-            playbackOrchestrator === created &&
+                playbackOrchestrator === created &&
                 playbackOrchestratorIdentity === identity &&
-                playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)
+                playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity) &&
+                eventAdmission.acceptsEvents()
 
         created = AndroidPlaybackOrchestrator(
             context = this@MusicService,
@@ -256,9 +296,19 @@ class MusicService : HeadlessJsTaskService() {
                     emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state))
                 }
 
-                override fun onActiveTrackChanged(index: Int?, previousIndex: Int?, oldPositionMs: Long) {
+                override fun onActiveTrackChanged(
+                    index: Int?,
+                    previousIndex: Int?,
+                    oldPositionMs: Long,
+                    previousItem: TrackAudioItem?
+                ) {
                     if (!isAuthoritative()) return
-                    emitPlaybackTrackChangedEvents(index, previousIndex, oldPositionMs.toSeconds())
+                    emitPlaybackTrackChangedEvents(
+                        index,
+                        previousIndex,
+                        oldPositionMs.toSeconds(),
+                        previousItem?.track
+                    )
                 }
 
                 override fun onQueueEnded(index: Int, positionMs: Long) {
@@ -406,24 +456,62 @@ class MusicService : HeadlessJsTaskService() {
                         if (standardPlayerBinding === binding) standardPlayerBinding = null
                         if (player === disposed) player = null
                     },
+                    onActivatedAfterDrain = { activated ->
+                        if (activated === binding.player) {
+                            activateStandardPlayerBinding(binding).join()
+                        }
+                    },
+                    suspendControlSurface = {
+                        binding.productAdmission.suspendAdmission()
+                        playbackControlOwnerRegistry.deactivate(binding.identity) {
+                            binding.mediaSessionControl.deactivate()
+                        }
+                    },
+                    resumeControlSurface = {
+                        playbackControlOwnerRegistry.activate(binding.identity) {
+                            binding.mediaSessionControl.activate()
+                        }
+                        activateStandardPlayerBinding(binding).join()
+                    },
                     initiallyAuthoritative = initiallyAuthoritative
                 )
             }
             PlaybackBackendType.PING_PONG -> {
-                val orchestrator = createPlaybackOrchestrator(identity)
+                val eventAdmission = SharedFlowAdmissionGate()
+                val orchestrator = createPlaybackOrchestrator(identity, eventAdmission)
                 val surface = createOrchestratedMediaSurface(identity)
                 fun publishSurface(reason: String) {
                     latestOrchestratedMediaSurfaceConfig?.let(surface::updateConfig)
                     surface.publish(orchestrator.snapshot(), reason)
+                }
+                fun publishInitialSurface() {
+                    eventAdmission.admit()
+                    emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(orchestrator.playbackState))
+                    publishSurface("backend-initial")
+                }
+                suspend fun admitAndPublishSurface(reason: String) {
+                    eventAdmission.admitAfterProducerDrain(scope) {
+                        emit(
+                            MusicEvents.PLAYBACK_STATE,
+                            getPlayerStateBundle(orchestrator.playbackState)
+                        )
+                        publishSurface(reason)
+                    }.join()
                 }
                 PingPongPlaybackBackend(
                     orchestrator,
                     identity,
                     crossfadeQueue,
                     transitionGenerationSidecar,
-                    suspendControlSurface = surface::hide,
-                    resumeControlSurface = { publishSurface("backend-rollback") },
-                    activateControlSurface = { publishSurface("backend-commit") },
+                    suspendControlSurface = {
+                        eventAdmission.suspendAdmission()
+                        surface.hide()
+                    },
+                    resumeControlSurface = { admitAndPublishSurface("backend-rollback") },
+                    activateControlSurface = ::publishInitialSurface,
+                    activateControlSurfaceAfterDrain = {
+                        admitAndPublishSurface("backend-commit")
+                    },
                     onCommitted = { committed ->
                         if (committed === orchestrator) {
                             playbackOrchestrator = orchestrator
@@ -498,7 +586,8 @@ class MusicService : HeadlessJsTaskService() {
                     putString("message", diagnostic.message)
                 })
             },
-            authority = playbackBackendAuthority
+            authority = playbackBackendAuthority,
+            diagnosticScope = scope
         )
     }
 
@@ -626,9 +715,9 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     private suspend fun progressUpdateEvent(): Bundle? {
         return withContext(Dispatchers.Main) {
-            withActivePlaybackBackend { backend ->
+            withActivePlaybackBackendRead { backend ->
                 if (backend.playbackState != AudioPlayerState.PLAYING) {
-                    return@withActivePlaybackBackend null
+                    return@withActivePlaybackBackendRead null
                 }
                 Bundle().apply {
                     putDouble(POSITION_KEY, backend.positionMs.toSeconds())
@@ -1078,7 +1167,8 @@ class MusicService : HeadlessJsTaskService() {
     private fun emitPlaybackTrackChangedEvents(
         index: Int?,
         previousIndex: Int?,
-        oldPosition: Double
+        oldPosition: Double,
+        previousTrack: Track? = null
     ) {
         val a = Bundle()
         a.putDouble(POSITION_KEY, oldPosition)
@@ -1098,10 +1188,15 @@ class MusicService : HeadlessJsTaskService() {
         if (tracks.isNotEmpty() && activeIndex in tracks.indices) {
             b.putInt("index", activeIndex)
             b.putBundle("track", tracks[activeIndex].originalItem)
-            if (previousIndex != null && previousIndex in tracks.indices) {
-                b.putInt("lastIndex", previousIndex)
-                b.putBundle("lastTrack", tracks[previousIndex].originalItem)
-            }
+        }
+        val resolvedPreviousTrack = resolvePreviousTrackForPlaybackEvent(
+            tracks,
+            previousIndex,
+            previousTrack
+        )
+        if (previousIndex != null && resolvedPreviousTrack != null) {
+            b.putInt("lastIndex", previousIndex)
+            b.putBundle("lastTrack", resolvedPreviousTrack.originalItem)
         }
         emit(MusicEvents.PLAYBACK_ACTIVE_TRACK_CHANGED, b)
     }

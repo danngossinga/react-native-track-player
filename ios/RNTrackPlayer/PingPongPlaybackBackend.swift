@@ -10,19 +10,22 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     private let transitionGenerationSidecar: PlaybackTransitionGenerationSidecar
     private let queueProvider: () -> [Track]
     private let onCommitted: (IOSPlaybackOrchestrator, QueuedAudioPlayer) -> Void
+    private let onActivated: (IOSPlaybackOrchestrator) -> Void
     private let onDisposed: (IOSPlaybackOrchestrator, QueuedAudioPlayer) -> Void
-    private var pendingQueue: [Track] = []
-    private var authoritativeQueue: [Track] = []
+    private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
+    private var pendingQueueChanged = false
+    private(set) var queueResetCount = 0
 
     init(
         player: QueuedAudioPlayer,
         orchestrator: IOSPlaybackOrchestrator,
         transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
         onCommitted: @escaping (IOSPlaybackOrchestrator, QueuedAudioPlayer) -> Void,
+        onActivated: @escaping (IOSPlaybackOrchestrator) -> Void,
         onDisposed: @escaping (IOSPlaybackOrchestrator, QueuedAudioPlayer) -> Void,
         initiallyAuthoritative: Bool = false,
         queueProvider: @escaping () -> [Track]
@@ -31,12 +34,10 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         self.orchestrator = orchestrator
         self.transitionGenerationSidecar = transitionGenerationSidecar
         self.onCommitted = onCommitted
+        self.onActivated = onActivated
         self.onDisposed = onDisposed
         self.isAuthoritative = initiallyAuthoritative
         self.queueProvider = queueProvider
-        if initiallyAuthoritative {
-            onCommitted(orchestrator, player)
-        }
     }
 
     var playbackState: State { return orchestrator.playbackState }
@@ -55,7 +56,7 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
 
     func snapshot() throws -> PlaybackBackendSnapshot {
         let queue = queueProvider()
-        authoritativeQueue = queue
+        queueState.captureAuthoritative(queue)
         let index = queue.indices.contains(orchestrator.currentIndex) ? orchestrator.currentIndex : nil
         return PlaybackBackendSnapshot(
             queueIDs: queue.map(playbackBackendTrackID),
@@ -71,43 +72,97 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func prepareSilently(_ snapshot: PlaybackBackendSnapshot) throws {
+        let queue = queueProvider()
+        pendingQueueChanged = !samePlaybackBackendTrackObjects(queueState.pending, queue)
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        pendingQueue = queueProvider()
+        queueState.stage(queue)
         pendingSnapshot = snapshot
         orchestrator.setVolume(0)
-        orchestrator.replaceQueue(pendingQueue, currentIndex: snapshot.activeIndex ?? -1)
     }
 
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        let queue = isAuthoritative ? authoritativeQueue : pendingQueue
+        let queue = isAuthoritative ? queueState.authoritative : queueState.pending
         if isAuthoritative && !samePlaybackBackendTrackObjects(queueProvider(), queue) {
             player.stop()
             player.clear()
             try player.add(items: queue)
         }
         orchestrator.setRate(snapshot.rate)
-        player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
-        let needsPlaybackRestore = !isAuthoritative ||
-            orchestrator.currentIndex != (snapshot.activeIndex ?? -1) ||
-            abs(orchestrator.currentTime - snapshot.position) > 0.75 ||
-            orchestrator.playWhenReady != snapshot.playWhenReady
-        if needsPlaybackRestore {
+        if isAuthoritative {
+            player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
+        }
+        let expectedIndex = snapshot.activeIndex ?? -1
+        let queueNeedsReplacement = pendingQueueChanged || orchestrator.currentIndex != expectedIndex
+        if queueNeedsReplacement {
+            queueResetCount += 1
             orchestrator.replaceQueue(queue, currentIndex: snapshot.activeIndex ?? -1)
         }
-        if needsPlaybackRestore,
-           let index = snapshot.activeIndex,
-           queue.indices.contains(index) {
-            try awaitResult { completion in
-                orchestrator.skip(to: index, initialTime: snapshot.position, completion: completion)
+        if let index = snapshot.activeIndex, queue.indices.contains(index) {
+            if queueNeedsReplacement {
+                try awaitResult { completion in
+                    orchestrator.skip(to: index, initialTime: snapshot.position, completion: completion)
+                }
+            } else if abs(orchestrator.currentTime - snapshot.position) > 0.75 {
+                try awaitResult { completion in
+                    orchestrator.seek(to: snapshot.position, completion: completion)
+                }
             }
         }
         orchestrator.pause()
     }
 
+    func prepareActivation(_ snapshot: PlaybackBackendSnapshot) throws {
+        guard !disposed else {
+            throw playbackBackendError(
+                code: "playback_backend_activation_not_ready",
+                message: "The ping-pong playback candidate was disposed before activation."
+            )
+        }
+        try orchestrator.verifyPreparedForActivation(expectedIndex: snapshot.activeIndex)
+        try awaitResult { completion in
+            orchestrator.preparePlaybackForActivation(
+                playWhenReady: snapshot.playWhenReady,
+                completion: completion
+            )
+        }
+    }
+
+    func beginHandoffQuiescence() throws -> PlaybackBackendSnapshot {
+        return try performPlaybackBackendOnMainSync {
+            let intendedPlayWhenReady = orchestrator.playWhenReady
+            let intendedVolume = orchestrator.volume
+            orchestrator.setVolume(0)
+            orchestrator.pause()
+            return try snapshot().withIntent(
+                playWhenReady: intendedPlayWhenReady,
+                volume: intendedVolume
+            )
+        }
+    }
+
+    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {
+        try awaitResult { completion in
+            orchestrator.preparePlaybackForActivation(
+                playWhenReady: snapshot.playWhenReady,
+                completion: completion
+            )
+        }
+        try performPlaybackBackendOnMainSync {
+            orchestrator.activatePreparedPlayback(
+                playWhenReady: snapshot.playWhenReady,
+                restoredVolume: snapshot.volume
+            )
+        }
+    }
+
     func stopAndMute() throws {
         orchestrator.setVolume(0)
         orchestrator.stop()
+    }
+
+    func suspendEventDeliveryForHandoff() throws {
+        orchestrator.delegate = nil
     }
 
     func suspendControlSurface() throws {
@@ -118,6 +173,13 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     func resumeControlSurface(_ snapshot: PlaybackBackendSnapshot) {
         controlSurfaceRelinquished = false
         onCommitted(orchestrator, player)
+        onActivated(orchestrator)
+    }
+
+    func activateInitialControlSurface() {
+        guard isAuthoritative else { return }
+        onCommitted(orchestrator, player)
+        onActivated(orchestrator)
     }
 
     func relinquishExclusiveControlSurfaceBeforeCommit() throws {
@@ -130,21 +192,32 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     func commitQueue(_ snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
         pendingSnapshot = snapshot
-        authoritativeQueue = pendingQueue
+        _ = queueState.commit()
         isAuthoritative = true
+    }
+
+    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         // The canonical QueuedAudioPlayer may still be the previous standard
         // backend before the facade swap. Muting it is therefore post-commit.
         player.volume = 0
         player.playWhenReady = false
         player.automaticallyUpdateNowPlayingInfo = false
-        orchestrator.setVolume(snapshot.volume)
-        if snapshot.playWhenReady {
-            orchestrator.play { _ in }
-        } else {
-            orchestrator.pause()
-        }
+        player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
+        orchestrator.activatePreparedPlayback(
+            playWhenReady: snapshot.playWhenReady,
+            restoredVolume: 0
+        )
         controlSurfaceRelinquished = false
         onCommitted(orchestrator, player)
+        orchestrator.setVolume(snapshot.volume)
+        onActivated(orchestrator)
+    }
+
+    func reactivateAfterRollback(_ snapshot: PlaybackBackendSnapshot) {
+        isAuthoritative = true
+        _ = queueState.rollback()
+        try? cancelHandoffQuiescence(snapshot)
+        resumeControlSurface(snapshot)
     }
 
     func play() throws {
@@ -172,12 +245,13 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     func dispose() throws {
         if disposed { return }
         disposed = true
+        let wasAuthoritative = isAuthoritative
         isAuthoritative = false
-        if !controlSurfaceRelinquished {
+        if wasAuthoritative && !controlSurfaceRelinquished {
             player.remoteCommands = []
         }
-        orchestrator.stop()
         onDisposed(orchestrator, player)
+        orchestrator.stop()
     }
 
     func syncQueue(_ tracks: [Track]) {

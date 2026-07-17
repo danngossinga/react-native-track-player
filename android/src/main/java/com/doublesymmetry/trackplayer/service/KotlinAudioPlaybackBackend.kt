@@ -49,22 +49,18 @@ internal class KotlinAudioPlaybackBackend(
     private val onCommitted: (QueuedAudioPlayer) -> Unit,
     private val onActivated: (QueuedAudioPlayer) -> Unit,
     private val onDisposed: (QueuedAudioPlayer) -> Unit,
+    private val onActivatedAfterDrain: suspend (QueuedAudioPlayer) -> Unit = { onActivated(it) },
+    private val suspendControlSurface: () -> Unit = {},
+    private val resumeControlSurface: suspend () -> Unit = {},
+    private val readinessGate: StandardPlaybackReadinessGate = StandardPlaybackReadinessGate(),
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
-    private var pendingQueue: List<TrackAudioItem> = emptyList()
-    private var authoritativeQueue: List<TrackAudioItem> = emptyList()
+    private val queueState = PlaybackBackendQueueState<TrackAudioItem>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty()
     private var isAuthoritative = initiallyAuthoritative
     private var disposed = false
     private var playerReleased = false
-
-    init {
-        if (initiallyAuthoritative) {
-            onCommitted(player)
-            onActivated(player)
-        }
-    }
 
     override val queueItems: List<TrackAudioItem>
         get() = queueStore.snapshot()
@@ -92,7 +88,7 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun snapshot(): PlaybackBackendSnapshot {
         val queue = player.items.map { it as TrackAudioItem }
         queueStore.replaceWith(queue)
-        authoritativeQueue = queue
+        queueState.captureAuthoritative(queue)
         val index = player.currentIndex.takeIf { it in queue.indices }
         return PlaybackBackendSnapshot(
             queueIds = queue.map { it.track.queueId.toString() },
@@ -109,7 +105,7 @@ internal class KotlinAudioPlaybackBackend(
 
     override suspend fun prepareSilently(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        pendingQueue = queueStore.snapshot()
+        queueState.stage(queueStore.snapshot())
         pendingSnapshot = snapshot
         if (!isAuthoritative) {
             player.volume = 0f
@@ -119,7 +115,7 @@ internal class KotlinAudioPlaybackBackend(
 
     override suspend fun restore(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        val queue = if (isAuthoritative) authoritativeQueue else pendingQueue
+        val queue = if (isAuthoritative) queueState.authoritative() else queueState.pending()
         val current = player.items.map { it as TrackAudioItem }
         val queueChanged = !sameAudioItems(current, queue)
         if (!isAuthoritative || queueChanged) {
@@ -140,32 +136,90 @@ internal class KotlinAudioPlaybackBackend(
         player.pause()
     }
 
+    override suspend fun prepareActivation(snapshot: PlaybackBackendSnapshot) {
+        check(!disposed && !playerReleased) { "The standard playback candidate was disposed before activation." }
+        StandardPlaybackActivationSnapshotValidator.validate(snapshot)
+        val index = snapshot.activeIndex
+        if (index == null) return
+        check(index in queueState.pending().indices) {
+            "The standard playback candidate does not contain the active track."
+        }
+        readinessGate.await(index, snapshot.positionMs) {
+            StandardPlaybackReadinessObservation(
+                state = player.playerState,
+                currentIndex = player.currentIndex,
+                positionMs = player.position
+            )
+        }
+    }
+
+    override suspend fun beginHandoffQuiescence(): PlaybackBackendSnapshot {
+        settleActiveTransition()
+        val logicalPlayWhenReady = player.playWhenReady
+        val logicalVolume = player.volume
+        player.volume = 0f
+        player.playWhenReady = false
+        player.pause()
+        return snapshot().copy(
+            playWhenReady = logicalPlayWhenReady,
+            volume = logicalVolume
+        )
+    }
+
+    override suspend fun cancelHandoffQuiescence(snapshot: PlaybackBackendSnapshot) {
+        if (disposed || playerReleased) return
+        player.volume = snapshot.volume
+        player.playWhenReady = snapshot.playWhenReady
+        if (snapshot.playWhenReady) player.play() else player.pause()
+    }
+
     override suspend fun stopAndMute() {
         if (playerReleased) return
         player.volume = 0f
         player.stop()
     }
 
+    override suspend fun suspendControlSurface() {
+        suspendControlSurface.invoke()
+    }
+
+    override suspend fun resumeControlSurface(snapshot: PlaybackBackendSnapshot) {
+        resumeControlSurface.invoke()
+    }
+
+    override fun activateInitialControlSurface() {
+        check(isAuthoritative) { "Only the authoritative standard backend can activate initially." }
+        onCommitted(player)
+        onActivated(player)
+    }
+
     override fun relinquishExclusiveControlSurfaceBeforeCommit() {
-        // KotlinAudio does not expose a supported MediaSession suspension API.
-        // Destruction is therefore deliberately deferred to dispose(), after
-        // the facade has logically committed the replacement backend.
+        // MusicService's pinned KotlinAudio adapter already deactivated the
+        // private MediaSession at the physical barrier. Destruction remains
+        // asynchronous until after replacement activation and admission.
     }
 
     override fun commitQueue(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
         pendingSnapshot = snapshot
-        authoritativeQueue = pendingQueue
+        val committedQueue = queueState.commit()
         isAuthoritative = true
-        queueStore.replaceWith(pendingQueue)
+        queueStore.replaceWith(committedQueue)
         onCommitted(player)
     }
 
-    override fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) {
+    override suspend fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) {
         player.volume = snapshot.volume
         player.playWhenReady = snapshot.playWhenReady
         if (snapshot.playWhenReady) player.play() else player.pause()
-        onActivated(player)
+        onActivatedAfterDrain(player)
+    }
+
+    override suspend fun reactivateAfterRollback(snapshot: PlaybackBackendSnapshot) {
+        isAuthoritative = true
+        queueStore.replaceWith(queueState.rollback())
+        onCommitted(player)
+        activateAfterCommit(snapshot)
     }
 
     override suspend fun play() { player.play() }

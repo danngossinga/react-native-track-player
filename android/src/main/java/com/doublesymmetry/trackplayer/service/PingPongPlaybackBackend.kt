@@ -10,21 +10,17 @@ internal class PingPongPlaybackBackend(
     private val queueStore: AndroidTrackQueue,
     private val transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
     private val suspendControlSurface: () -> Unit,
-    private val resumeControlSurface: () -> Unit,
+    private val resumeControlSurface: suspend () -> Unit,
     private val activateControlSurface: () -> Unit,
+    private val activateControlSurfaceAfterDrain: suspend () -> Unit = { activateControlSurface() },
     private val onCommitted: (AndroidPlaybackOrchestrator) -> Unit,
     private val onDisposed: (AndroidPlaybackOrchestrator) -> Unit,
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.PING_PONG
-    private var pendingQueue: List<TrackAudioItem> = emptyList()
-    private var authoritativeQueue: List<TrackAudioItem> = emptyList()
+    private val queueState = PlaybackBackendQueueState<TrackAudioItem>()
     private var isAuthoritative = initiallyAuthoritative
     private var disposed = false
-
-    init {
-        if (initiallyAuthoritative) onCommitted(orchestrator)
-    }
 
     override val queueItems: List<TrackAudioItem>
         get() = queueStore.snapshot()
@@ -53,7 +49,7 @@ internal class PingPongPlaybackBackend(
 
     override suspend fun snapshot(): PlaybackBackendSnapshot {
         val queue = queueStore.snapshot()
-        authoritativeQueue = queue
+        queueState.captureAuthoritative(queue)
         val index = orchestrator.currentIndex.takeIf { it in queue.indices }
         return PlaybackBackendSnapshot(
             queueIds = queue.map { it.track.queueId.toString() },
@@ -70,27 +66,47 @@ internal class PingPongPlaybackBackend(
 
     override suspend fun prepareSilently(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        pendingQueue = queueStore.snapshot()
+        queueState.stage(queueStore.snapshot())
         orchestrator.setVolume(0f)
-        orchestrator.setQueue(pendingQueue)
+        orchestrator.setQueue(queueState.pending())
     }
 
     override suspend fun restore(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        val queue = if (isAuthoritative) authoritativeQueue else pendingQueue
+        val queue = if (isAuthoritative) queueState.authoritative() else queueState.pending()
         orchestrator.setQueue(queue)
         orchestrator.setRate(snapshot.rate)
         orchestrator.setRepeatMode(RepeatMode.fromOrdinal(snapshot.repeatMode))
         val index = snapshot.activeIndex
-        val needsRestore = !isAuthoritative ||
-            orchestrator.currentIndex != (index ?: -1) ||
-            kotlin.math.abs(orchestrator.positionMs - snapshot.positionMs) > 750L ||
-            orchestrator.playWhenReady != snapshot.playWhenReady
-        if (needsRestore && index != null && index in queue.indices) {
-            orchestrator.skip(index)
-            orchestrator.seekTo(snapshot.positionMs)
+        if (index != null && index in queue.indices) {
+            val indexChanged = orchestrator.currentIndex != index
+            if (indexChanged) orchestrator.skip(index)
+            if (indexChanged || orchestrator.positionMs != snapshot.positionMs) {
+                orchestrator.seekTo(snapshot.positionMs)
+            }
         }
         orchestrator.pause()
+    }
+
+    override suspend fun prepareActivation(snapshot: PlaybackBackendSnapshot) {
+        orchestrator.verifyPreparedForActivation(snapshot.activeIndex)
+    }
+
+    override suspend fun beginHandoffQuiescence(): PlaybackBackendSnapshot {
+        val quiescence = orchestrator.beginHandoffQuiescence()
+        return snapshot().copy(
+            playWhenReady = quiescence.playWhenReady,
+            volume = quiescence.volume
+        )
+    }
+
+    override suspend fun cancelHandoffQuiescence(snapshot: PlaybackBackendSnapshot) {
+        orchestrator.cancelHandoffQuiescence(
+            AndroidPlaybackHandoffQuiescence(
+                playWhenReady = snapshot.playWhenReady,
+                volume = snapshot.volume
+            )
+        )
     }
 
     override suspend fun stopAndMute() {
@@ -107,27 +123,36 @@ internal class PingPongPlaybackBackend(
     }
 
     override fun activateInitialControlSurface() {
+        check(isAuthoritative) { "Only the authoritative ping-pong backend can activate initially." }
+        onCommitted(orchestrator)
         activateControlSurface.invoke()
     }
 
     override fun relinquishExclusiveControlSurfaceBeforeCommit() {
-        suspendControlSurface.invoke()
+        // The physical surface was already hidden at the handoff barrier.
     }
 
     override fun commitQueue(snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        authoritativeQueue = pendingQueue
+        val committedQueue = queueState.commit()
         isAuthoritative = true
-        queueStore.replaceWith(pendingQueue)
+        queueStore.replaceWith(committedQueue)
         onCommitted(orchestrator)
     }
 
-    override fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) {
+    override suspend fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) {
         orchestrator.activatePreparedPlayback(
             playWhenReady = snapshot.playWhenReady,
             restoredVolume = snapshot.volume
         )
-        activateControlSurface.invoke()
+        activateControlSurfaceAfterDrain.invoke()
+    }
+
+    override suspend fun reactivateAfterRollback(snapshot: PlaybackBackendSnapshot) {
+        isAuthoritative = true
+        queueStore.replaceWith(queueState.rollback())
+        onCommitted(orchestrator)
+        activateAfterCommit(snapshot)
     }
 
     override suspend fun play() { orchestrator.play() }

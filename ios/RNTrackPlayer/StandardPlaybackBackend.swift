@@ -1,6 +1,73 @@
 import Foundation
 import SwiftAudioEx
 
+struct StandardPlaybackReadinessObservation {
+    let state: AudioPlayerState
+    let index: Int
+    let position: Double
+}
+
+enum StandardPlaybackReadinessGate {
+    static func wait(
+        expectedIndex: Int,
+        expectedPosition: Double,
+        timeout: TimeInterval = 5,
+        observe: () -> StandardPlaybackReadinessObservation,
+        waitForNextPoll: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
+    ) throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            let observation = observe()
+            if observation.state == .failed {
+                throw playbackBackendError(
+                    code: "playback_backend_activation_not_ready",
+                    message: "The standard playback candidate failed while restoring playback."
+                )
+            }
+            let isReadyState = observation.state == .ready ||
+                observation.state == .paused ||
+                observation.state == .playing
+            let restoredPosition = max(0, expectedPosition)
+            if isReadyState,
+               observation.index == expectedIndex,
+               abs(observation.position - restoredPosition) <= 0.75 {
+                return
+            }
+            if Date() >= deadline {
+                throw playbackBackendError(
+                    code: "playback_backend_activation_not_ready",
+                    message: "The standard playback candidate timed out while restoring playback."
+                )
+            }
+            waitForNextPoll()
+        }
+    }
+}
+
+private func waitForStandardPlaybackActivation(
+    player: QueuedAudioPlayer,
+    snapshot: PlaybackBackendSnapshot
+) throws {
+    guard let expectedIndex = snapshot.activeIndex else { return }
+    guard !Thread.isMainThread else {
+        throw playbackBackendError(
+            code: "playback_backend_activation_not_ready",
+            message: "Standard playback readiness cannot wait on the main thread."
+        )
+    }
+    try StandardPlaybackReadinessGate.wait(
+        expectedIndex: expectedIndex,
+        expectedPosition: snapshot.position,
+        observe: {
+            StandardPlaybackReadinessObservation(
+                state: player.playerState,
+                index: player.currentIndex,
+                position: player.currentTime
+            )
+        }
+    )
+}
+
 protocol IOSPlaybackBackendRouting: PlaybackBackend {
     var playbackState: State { get }
     var currentIndex: Int { get }
@@ -53,38 +120,51 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let player: QueuedAudioPlayer
     private let transitionGenerationSidecar: PlaybackTransitionGenerationSidecar
     private let automaticallyUpdateNowPlayingInfo: () -> Bool
-    private let incomingQueue: [Track]?
+    private let incomingQueueProvider: (() -> [Track])?
     private let queueProvider: () -> [Track]
     private let onCommitted: (QueuedAudioPlayer) -> Void
+    private let onActivated: (QueuedAudioPlayer) -> Void
     private let onDisposed: (QueuedAudioPlayer) -> Void
-    private var pendingQueue: [Track] = []
-    private var authoritativeQueue: [Track] = []
+    private let waitForActivationReadiness: (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
+    private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
+    private(set) var queueReloadCount = 0
 
     init(
         player: QueuedAudioPlayer,
         transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
+        onActivated: @escaping (QueuedAudioPlayer) -> Void,
         onDisposed: @escaping (QueuedAudioPlayer) -> Void,
+        waitForActivationReadiness: @escaping (
+            QueuedAudioPlayer,
+            PlaybackBackendSnapshot
+        ) throws -> Void = waitForStandardPlaybackActivation,
         initiallyAuthoritative: Bool = false,
         incomingQueue: [Track]? = nil,
+        incomingQueueProvider: (() -> [Track])? = nil,
         queueProvider: @escaping () -> [Track]
     ) {
         self.player = player
         self.transitionGenerationSidecar = transitionGenerationSidecar
         self.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo
         self.onCommitted = onCommitted
+        self.onActivated = onActivated
         self.onDisposed = onDisposed
+        self.waitForActivationReadiness = waitForActivationReadiness
         self.isAuthoritative = initiallyAuthoritative
-        self.incomingQueue = incomingQueue
-        self.queueProvider = queueProvider
-        if initiallyAuthoritative {
-            onCommitted(player)
+        if let incomingQueueProvider = incomingQueueProvider {
+            self.incomingQueueProvider = incomingQueueProvider
+        } else if let incomingQueue = incomingQueue {
+            self.incomingQueueProvider = { incomingQueue }
+        } else {
+            self.incomingQueueProvider = nil
         }
+        self.queueProvider = queueProvider
     }
 
     var playbackState: State { return State.fromPlayerState(state: player.playerState) }
@@ -101,7 +181,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func snapshot() throws -> PlaybackBackendSnapshot {
         let queue = queueProvider()
-        authoritativeQueue = queue
+        queueState.captureAuthoritative(queue)
         let index = queue.indices.contains(player.currentIndex) ? player.currentIndex : nil
         return PlaybackBackendSnapshot(
             queueIDs: queue.map(playbackBackendTrackID),
@@ -117,19 +197,23 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func prepareSilently(_ snapshot: PlaybackBackendSnapshot) throws {
-        transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        pendingQueue = playbackBackendQueueForRestore(
-            incoming: incomingQueue,
+        let queue = playbackBackendQueueForRestore(
+            incomingProvider: incomingQueueProvider,
             current: queueProvider
         )
+        try validateStandardPlaybackActivationSnapshot(snapshot, queueCount: queue.count)
+        transitionGenerationSidecar.restore(snapshot.transitionGeneration)
+        queueState.stage(queue)
         pendingSnapshot = snapshot
+        player.volume = 0
     }
 
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        let queue = isAuthoritative ? authoritativeQueue : pendingQueue
+        let queue = isAuthoritative ? queueState.authoritative : queueState.pending
         let queueChanged = !samePlaybackBackendTrackObjects(queueProvider(), queue)
-        if !isAuthoritative || queueChanged {
+        if queueChanged {
+            queueReloadCount += 1
             player.stop()
             player.clear()
             try player.add(items: queue)
@@ -137,18 +221,73 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         player.rate = snapshot.rate
         player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
         if let index = snapshot.activeIndex,
-           queue.indices.contains(index),
-           !isAuthoritative || queueChanged || player.currentIndex != index {
-            try player.jumpToItem(atIndex: index, playWhenReady: false)
-            player.seek(to: snapshot.position)
+           queue.indices.contains(index) {
+            let indexChanged = player.currentIndex != index
+            if queueChanged || indexChanged {
+                try player.jumpToItem(atIndex: index, playWhenReady: false)
+            }
+            if queueChanged || indexChanged ||
+                abs(player.currentTime - max(0, snapshot.position)) > 0.75 {
+                player.seek(to: snapshot.position)
+            }
         }
         player.playWhenReady = false
         player.pause()
     }
 
+    func prepareActivation(_ snapshot: PlaybackBackendSnapshot) throws {
+        guard !disposed else {
+            throw playbackBackendError(
+                code: "playback_backend_activation_not_ready",
+                message: "The standard playback candidate was disposed before activation."
+            )
+        }
+        try validateStandardPlaybackActivationSnapshot(
+            snapshot,
+            queueCount: queueState.pending.count
+        )
+        if let index = snapshot.activeIndex,
+           !queueState.pending.indices.contains(index) {
+            throw playbackBackendError(
+                code: "playback_backend_activation_not_ready",
+                message: "The standard playback candidate did not restore the active track."
+            )
+        }
+        try waitForActivationReadiness(player, snapshot)
+    }
+
+    func beginHandoffQuiescence() throws -> PlaybackBackendSnapshot {
+        return try performPlaybackBackendOnMainSync {
+            let intendedPlayWhenReady = player.playWhenReady
+            let intendedVolume = player.volume
+            player.volume = 0
+            player.pause()
+            return try snapshot().withIntent(
+                playWhenReady: intendedPlayWhenReady,
+                volume: intendedVolume
+            )
+        }
+    }
+
+    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {
+        try performPlaybackBackendOnMainSync {
+            player.playWhenReady = snapshot.playWhenReady
+            if snapshot.playWhenReady {
+                player.play()
+            } else {
+                player.pause()
+            }
+            player.volume = snapshot.volume
+        }
+    }
+
     func stopAndMute() throws {
         player.volume = 0
         player.stop()
+    }
+
+    func suspendEventDeliveryForHandoff() throws {
+        onDisposed(player)
     }
 
     func suspendControlSurface() throws {
@@ -159,6 +298,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func resumeControlSurface(_ snapshot: PlaybackBackendSnapshot) {
         controlSurfaceRelinquished = false
         onCommitted(player)
+        onActivated(player)
+    }
+
+    func activateInitialControlSurface() {
+        guard isAuthoritative else { return }
+        onCommitted(player)
+        onActivated(player)
     }
 
     func relinquishExclusiveControlSurfaceBeforeCommit() throws {
@@ -171,13 +317,29 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func commitQueue(_ snapshot: PlaybackBackendSnapshot) {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
         pendingSnapshot = snapshot
-        authoritativeQueue = pendingQueue
+        _ = queueState.commit()
         isAuthoritative = true
+    }
+
+    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
-        player.volume = snapshot.volume
         player.playWhenReady = snapshot.playWhenReady
+        if snapshot.playWhenReady {
+            player.play()
+        } else {
+            player.pause()
+        }
         controlSurfaceRelinquished = false
         onCommitted(player)
+        player.volume = snapshot.volume
+        onActivated(player)
+    }
+
+    func reactivateAfterRollback(_ snapshot: PlaybackBackendSnapshot) {
+        isAuthoritative = true
+        _ = queueState.rollback()
+        try? cancelHandoffQuiescence(snapshot)
+        resumeControlSurface(snapshot)
     }
 
     func play() throws { player.play() }

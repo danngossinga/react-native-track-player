@@ -11,6 +11,29 @@ import MediaPlayer
 import QuartzCore
 import SwiftAudioEx
 
+func orchestratedActiveTrackEventBody(
+    index: Int?,
+    lastIndex: Int?,
+    lastTrack: Track?,
+    lastPosition: Double,
+    queue: [Track]
+) -> [String: Any] {
+    var body: [String: Any] = ["lastPosition": lastPosition]
+    if let lastIndex = lastIndex {
+        body["lastIndex"] = lastIndex
+    }
+    if let lastTrack = lastTrack?.toObject() {
+        body["lastTrack"] = lastTrack
+    }
+    if let index = index {
+        body["index"] = index
+        if queue.indices.contains(index) {
+            body["track"] = queue[index].toObject()
+        }
+    }
+    return body
+}
+
 @objc(RNTrackPlayer)
 public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOSPlaybackOrchestratorDelegate {
 
@@ -21,6 +44,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var player = QueuedAudioPlayer()
     private var playbackOrchestrator = IOSPlaybackOrchestrator()
     private let playbackBackendAuthority = PlaybackBackendAuthority()
+    private let playerEventTokensLock = NSLock()
+    private var playerEventTokens: [ObjectIdentifier: PlaybackBackendEventToken] = [:]
     private let transitionGenerationSidecar = PlaybackTransitionGenerationSidecar()
     private var playbackBackendFacade: PlaybackBackendFacade? = nil
     private let audioSessionController = AudioSessionController.shared
@@ -44,7 +69,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public override init() {
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
-        playbackOrchestrator.delegate = self
         audioSessionController.delegate = self
         configureSystemLifecycleEvents()
     }
@@ -55,32 +79,48 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     private func configurePlayerEvents(_ source: QueuedAudioPlayer) {
-        source.event.receiveChapterMetadata.addListener(self) { [weak self, weak source] metadata in
+        let identity = ObjectIdentifier(source)
+        let token = PlaybackBackendEventToken()
+        playerEventTokensLock.lock()
+        guard playerEventTokens[identity] == nil else {
+            playerEventTokensLock.unlock()
+            return
+        }
+        playerEventTokens[identity] = token
+        playerEventTokensLock.unlock()
+
+        source.event.receiveChapterMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerChapterMetadataReceived(source: source, metadata: metadata)
         }
-        source.event.receiveTimedMetadata.addListener(self) { [weak self, weak source] metadata in
+        source.event.receiveTimedMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerTimedMetadataReceived(source: source, metadata: metadata)
         }
-        source.event.receiveCommonMetadata.addListener(self) { [weak self, weak source] metadata in
+        source.event.receiveCommonMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerCommonMetadataReceived(source: source, metadata: metadata)
         }
-        source.event.stateChange.addListener(self) { [weak self, weak source] state in
+        source.event.stateChange.addListener(self) { [weak self, weak source, token] state in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerStateChange(source: source, state: state)
         }
-        source.event.fail.addListener(self) { [weak self, weak source] error in
+        source.event.fail.addListener(self) { [weak self, weak source, token] error in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerFailed(source: source, error: error)
         }
-        source.event.currentItem.addListener(self) { [weak self, weak source] data in
+        source.event.currentItem.addListener(self) { [weak self, weak source, token] data in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerCurrentItemChange(
@@ -92,19 +132,27 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 lastPosition: data.lastPosition
             )
         }
-        source.event.secondElapse.addListener(self) { [weak self, weak source] seconds in
+        source.event.secondElapse.addListener(self) { [weak self, weak source, token] seconds in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerSecondElapse(source: source, seconds: seconds)
         }
-        source.event.playWhenReadyChange.addListener(self) { [weak self, weak source] playWhenReady in
+        source.event.playWhenReadyChange.addListener(self) { [weak self, weak source, token] playWhenReady in
+            guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
             self.handlePlayWhenReadyChange(source: source, playWhenReady: playWhenReady)
         }
+        token.activate()
     }
 
     private func removePlayerEvents(_ source: QueuedAudioPlayer) {
+        playerEventTokensLock.lock()
+        let token = playerEventTokens.removeValue(forKey: ObjectIdentifier(source))
+        token?.invalidate()
+        playerEventTokensLock.unlock()
+
         source.event.receiveChapterMetadata.removeListener(self)
         source.event.receiveTimedMetadata.removeListener(self)
         source.event.receiveCommonMetadata.removeListener(self)
@@ -357,9 +405,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     ) -> PlaybackBackend {
         switch kind {
         case .standard:
-            let incomingQueue = initiallyAuthoritative ? nil : playerTracks()
+            let incomingQueueProvider: (() -> [Track])?
+            if initiallyAuthoritative {
+                incomingQueueProvider = nil
+            } else {
+                incomingQueueProvider = { [weak self] in self?.playerTracks() ?? [] }
+            }
             let source = initiallyAuthoritative ? player : makeStandardPlayerCandidate()
-            configurePlayerEvents(source)
             return StandardPlaybackBackend(
                 player: source,
                 transitionGenerationSidecar: transitionGenerationSidecar,
@@ -369,18 +421,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onCommitted: { [weak self] committed in
                     self?.commitStandardPlayer(committed)
                 },
+                onActivated: { [weak self] committed in
+                    self?.publishCanonicalStandardState(committed)
+                },
                 onDisposed: { [weak self] disposed in
                     self?.removePlayerEvents(disposed)
                 },
                 initiallyAuthoritative: initiallyAuthoritative,
-                incomingQueue: incomingQueue,
+                incomingQueueProvider: incomingQueueProvider,
                 queueProvider: { [weak source] in
                     return source?.items.compactMap { $0 as? Track } ?? []
                 })
         case .pingPong:
             let queuePlayer = player
             let orchestrator = IOSPlaybackOrchestrator()
-            orchestrator.delegate = self
             return PingPongPlaybackBackend(
                 player: queuePlayer,
                 orchestrator: orchestrator,
@@ -388,7 +442,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onCommitted: { [weak self] committed, queuePlayer in
                     self?.commitPingPongOrchestrator(committed, queuePlayer: queuePlayer)
                 },
+                onActivated: { [weak self] committed in
+                    self?.publishCanonicalPingPongState(committed)
+                },
                 onDisposed: { [weak self] disposed, _ in
+                    disposed.delegate = nil
                     if self?.playbackOrchestrator === disposed {
                         self?.stopOrchestratedProgressUpdates()
                     }
@@ -422,6 +480,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private func commitStandardPlayer(_ committed: QueuedAudioPlayer) {
         performOnMainSync {
             player = committed
+            configurePlayerEvents(committed)
             committed.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
             configureRemoteCommandHandlers(committed, kind: .standard, identity: committed)
             committed.remoteCommands = configuredRemoteCommands
@@ -439,6 +498,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         performOnMainSync {
             player = queuePlayer
             playbackOrchestrator = committed
+            committed.delegate = self
             queuePlayer.automaticallyUpdateNowPlayingInfo = false
             configureRemoteCommandHandlers(queuePlayer, kind: .pingPong, identity: committed)
             queuePlayer.remoteCommands = configuredRemoteCommands
@@ -449,6 +509,41 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             )
             updateNowPlayingForOrchestrator(force: true)
         }
+    }
+
+    private func publishCanonicalStandardState(_ committed: QueuedAudioPlayer) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: committed),
+              committed === player else { return }
+        stopOrchestratedProgressUpdates()
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(state: committed.playerState)
+        )
+        configureAudioSession()
+        emit(
+            event: EventType.PlaybackPlayWhenReadyChanged,
+            body: ["playWhenReady": committed.playWhenReady]
+        )
+    }
+
+    private func publishCanonicalPingPongState(_ committed: IOSPlaybackOrchestrator) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: committed),
+              committed === playbackOrchestrator else { return }
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(state: committed.playbackState)
+        )
+        configureAudioSession()
+        emit(
+            event: EventType.PlaybackPlayWhenReadyChanged,
+            body: ["playWhenReady": committed.playWhenReady]
+        )
+        if committed.playbackState == .playing {
+            startOrchestratedProgressUpdates()
+        } else {
+            stopOrchestratedProgressUpdates()
+        }
+        updateNowPlayingForOrchestrator(committed, force: true)
     }
 
     private func configureRemoteCommandHandlers(
@@ -1654,6 +1749,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         _ orchestrator: IOSPlaybackOrchestrator,
         didChangeActiveTrack index: Int?,
         lastIndex: Int?,
+        lastTrack: Track?,
         lastPosition: Double
     ) {
         guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
@@ -1671,21 +1767,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         refreshRemoteCommandAvailability()
         updateNowPlayingForOrchestrator()
 
-        var activeTrackBody: Dictionary<String, Any> = ["lastPosition": lastPosition]
-        if let lastIndex = lastIndex {
-            activeTrackBody["lastIndex"] = lastIndex
-            if lastIndex >= 0 && lastIndex < player.items.count,
-               let lastTrack = (player.items[lastIndex] as? Track)?.toObject() {
-                activeTrackBody["lastTrack"] = lastTrack
-            }
-        }
-        if let index = index {
-            activeTrackBody["index"] = index
-            if index >= 0 && index < player.items.count,
-               let track = (player.items[index] as? Track)?.toObject() {
-                activeTrackBody["track"] = track
-            }
-        }
+        let activeTrackBody = orchestratedActiveTrackEventBody(
+            index: index,
+            lastIndex: lastIndex,
+            lastTrack: lastTrack,
+            lastPosition: lastPosition,
+            queue: player.items.compactMap { $0 as? Track }
+        )
         emit(event: EventType.PlaybackActiveTrackChanged, body: activeTrackBody)
 
         var trackChangedBody: Dictionary<String, Any> = ["position": lastPosition]

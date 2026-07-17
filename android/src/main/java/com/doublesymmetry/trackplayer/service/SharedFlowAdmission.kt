@@ -7,6 +7,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.yield
 
 /**
  * Product flows subscribe while the Standard candidate is created, before its
@@ -19,6 +20,26 @@ internal class SharedFlowAdmissionGate {
 
     fun admit() {
         admitted.set(true)
+    }
+
+    fun suspendAdmission() {
+        admitted.set(false)
+    }
+
+    /**
+     * KotlinAudio publishes PlayerEventHolder updates with MainScope.launch.
+     * Starting this fence on the same Main-backed owner scope and yielding once
+     * lets both the queued producer and the resumed collector run while the gate
+     * is still quarantined. The admission flip and canonical event are therefore
+     * ordered after every restore event already posted by the candidate.
+     */
+    fun admitAfterProducerDrain(
+        scope: CoroutineScope,
+        onAdmitted: () -> Unit = {}
+    ): Job = scope.launch(start = CoroutineStart.DEFAULT) {
+        yield()
+        admitted.set(true)
+        onAdmitted()
     }
 
     fun acceptsEvents(): Boolean = admitted.get()

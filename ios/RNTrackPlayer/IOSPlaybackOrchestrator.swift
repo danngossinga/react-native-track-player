@@ -26,6 +26,7 @@ protocol IOSPlaybackOrchestratorDelegate: AnyObject {
         _ orchestrator: IOSPlaybackOrchestrator,
         didChangeActiveTrack index: Int?,
         lastIndex: Int?,
+        lastTrack: Track?,
         lastPosition: Double
     )
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didEndQueueAt index: Int, position: Double)
@@ -51,6 +52,7 @@ private final class IOSCrossfadeContext {
     let targetVolume: Float
     let outgoingStartVolume: Float
     let incomingStartTime: Double
+    let completionGate: PlaybackBackendCommandCompletion<Void>
     var elapsedMs: Int
     var lastRunningEmitMs: Int
 
@@ -62,7 +64,8 @@ private final class IOSCrossfadeContext {
         intervalMs: Int,
         targetVolume: Float,
         outgoingStartVolume: Float,
-        incomingStartTime: Double
+        incomingStartTime: Double,
+        completionGate: PlaybackBackendCommandCompletion<Void>
     ) {
         self.runId = runId
         self.fromIndex = fromIndex
@@ -72,12 +75,27 @@ private final class IOSCrossfadeContext {
         self.targetVolume = targetVolume
         self.outgoingStartVolume = outgoingStartVolume
         self.incomingStartTime = incomingStartTime
+        self.completionGate = completionGate
         self.elapsedMs = 0
         self.lastRunningEmitMs = -250
     }
 }
 
 final class IOSPlaybackOrchestrator {
+    typealias SeekOperation = (
+        IOSCrossfadeEngine,
+        Double,
+        @escaping (Result<Void, Error>) -> Void
+    ) -> Void
+    typealias StandbyPrepareOperation = (
+        IOSCrossfadeEngine,
+        Track,
+        Double,
+        @escaping (Result<Void, Error>) -> Void
+    ) -> Void
+    typealias StandbyMaintenanceScheduler = (TimeInterval, DispatchWorkItem) -> Void
+    typealias SynchronizationTestHook = () -> Void
+
     weak var delegate: IOSPlaybackOrchestratorDelegate?
 
     private let engineA = IOSCrossfadeEngine(name: "engineA")
@@ -91,16 +109,30 @@ final class IOSPlaybackOrchestrator {
     private var scheduledStartWorkItem: DispatchWorkItem?
     private var endObserverWorkItem: DispatchWorkItem?
     private var standbyMaintenanceWorkItem: DispatchWorkItem?
-    private var activeCrossfadeCompletion: PlaybackBackendCommandCompletion<Void>?
-    private var activeCrossfadeCompletionRunID: Int?
+    private let crossfadeCommandSlot = PlaybackBackendExclusiveCommandSlot<Void>()
     private var preparedFromIndex: Int?
     private var preparedToIndex: Int?
     private var preparedSeekTo: Double = 0
     private var activeEngineIndex: Int?
     private var standbyEngineIndex: Int?
+    private var standbyPreparationGeneration = 0
+    private var standbyMaintenanceGeneration = 0
+    private var crossfadeEventGeneration: UInt64 = 0
     private let checkpointStore = PlaybackCheckpointStore()
     private var lastKnownState: State = .none
     private var pendingRecoveryPosition: Double?
+    private let operationRegistry = PlaybackBackendOperationRegistry()
+    private let seekOperation: SeekOperation
+    private let standbyPrepareOperation: StandbyPrepareOperation
+    private let standbyMaintenanceScheduler: StandbyMaintenanceScheduler
+    private let standbyMaintenanceAfterValidationHook: SynchronizationTestHook
+    private let crossfadeRampAfterValidationHook: SynchronizationTestHook
+    private let standbyPreparationBeforeNativeInvocationHook: SynchronizationTestHook
+    private let crossfadeRunningBeforeDeliveryHook: SynchronizationTestHook
+    private let crossfadeFinishAfterCommitHook: SynchronizationTestHook
+    private let crossfadeMutationLock = NSLock()
+    private let standbyPreparationInvocationQueue = DispatchQueue.main
+    private let crossfadeEventDeliveryQueue = DispatchQueue.main
     private(set) var state: IOSPlaybackOrchestratorState = .idle
     private(set) var currentIndex: Int = -1
     private(set) var playWhenReady: Bool = false
@@ -111,7 +143,41 @@ final class IOSPlaybackOrchestrator {
         return runId
     }
 
-    init() {
+    var isEndObservationScheduled: Bool {
+        return endObserverWorkItem != nil
+    }
+
+    var logicalEngineOutputVolume: Float {
+        return logicalEngine.volume
+    }
+
+    init(
+        seekOperation: @escaping SeekOperation = { engine, position, completion in
+            engine.seek(to: position, completion: completion)
+        },
+        standbyPrepareOperation: @escaping StandbyPrepareOperation = {
+            engine, track, position, completion in
+            engine.prepare(track: track, position: position, completion: completion)
+        },
+        standbyMaintenanceScheduler: @escaping StandbyMaintenanceScheduler = {
+            delay, workItem in
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+        },
+        standbyMaintenanceAfterValidationHook: @escaping SynchronizationTestHook = {},
+        crossfadeRampAfterValidationHook: @escaping SynchronizationTestHook = {},
+        standbyPreparationBeforeNativeInvocationHook: @escaping SynchronizationTestHook = {},
+        crossfadeRunningBeforeDeliveryHook: @escaping SynchronizationTestHook = {},
+        crossfadeFinishAfterCommitHook: @escaping SynchronizationTestHook = {}
+    ) {
+        self.seekOperation = seekOperation
+        self.standbyPrepareOperation = standbyPrepareOperation
+        self.standbyMaintenanceScheduler = standbyMaintenanceScheduler
+        self.standbyMaintenanceAfterValidationHook = standbyMaintenanceAfterValidationHook
+        self.crossfadeRampAfterValidationHook = crossfadeRampAfterValidationHook
+        self.standbyPreparationBeforeNativeInvocationHook =
+            standbyPreparationBeforeNativeInvocationHook
+        self.crossfadeRunningBeforeDeliveryHook = crossfadeRunningBeforeDeliveryHook
+        self.crossfadeFinishAfterCommitHook = crossfadeFinishAfterCommitHook
         activeEngine = engineA
         standbyEngine = engineB
     }
@@ -187,22 +253,77 @@ final class IOSPlaybackOrchestrator {
     }
 
     func setQueue(_ tracks: [Track]) {
+        let isUnchanged = queue.count == tracks.count && zip(queue, tracks).allSatisfy {
+            $0.0 === $0.1
+        }
+        guard !isUnchanged else { return }
+        let lastIndex = currentIndex >= 0 ? currentIndex : nil
+        let lastPosition = currentTime
         let currentTrack = self.currentTrack
+        let retainedIndex = currentTrack.flatMap { track in
+            tracks.firstIndex(where: { $0 === track })
+        }
+        operationRegistry.invalidateAll(reason: "queue_changed")
+        if retainedIndex != nil && (state == .crossfading || state == .pausedDuringCrossfade) {
+            promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "queue_changed")
+        } else {
+            emitCrossfadeCancellationIfNeeded(errorCode: "queue_changed")
+        }
+        cancelActiveCrossfade(errorCode: "queue_changed")
+        cancelAllWork()
         queue = tracks
-        if let currentTrack = currentTrack,
-           let newIndex = tracks.firstIndex(where: { $0 === currentTrack }) {
-            currentIndex = newIndex
-            activeEngineIndex = newIndex
-            standbyEngineIndex = nextIndex(after: newIndex)
+        if currentTrack != nil {
+            if let newIndex = retainedIndex {
+                currentIndex = newIndex
+                activeEngineIndex = newIndex
+                standbyEngine.pause()
+                standbyEngine.reset()
+                standbyEngineIndex = nil
+                if state == .preloadingNext {
+                    state = playWhenReady ? .playingSingle : .paused
+                }
+                if lastIndex != newIndex {
+                    delegate?.playbackOrchestrator(
+                        self,
+                        didChangeActiveTrack: newIndex,
+                        lastIndex: lastIndex,
+                        lastTrack: currentTrack,
+                        lastPosition: lastPosition
+                    )
+                }
+                if playWhenReady && state == .playingSingle {
+                    scheduleEndObserver()
+                    preloadNextIfPossible()
+                }
+            } else {
+                resetEngines()
+                currentIndex = -1
+                playWhenReady = false
+                state = .idle
+                delegate?.playbackOrchestrator(
+                    self,
+                    didChangeActiveTrack: nil,
+                    lastIndex: lastIndex,
+                    lastTrack: currentTrack,
+                    lastPosition: lastPosition
+                )
+                emitStateIfNeeded()
+            }
         } else if !tracks.indices.contains(currentIndex) {
             resetEngines()
             currentIndex = -1
+            playWhenReady = false
+            state = .idle
+            emitStateIfNeeded()
         }
         IOSPlaybackLog.log("queue sync count=\(tracks.count) currentIndex=\(currentIndex)")
         refreshNowPlaying()
     }
 
     func replaceQueue(_ tracks: [Track], currentIndex: Int = -1) {
+        operationRegistry.invalidateAll(reason: "queue_replaced")
+        emitCrossfadeCancellationIfNeeded(errorCode: "queue_replaced")
+        cancelActiveCrossfade(errorCode: "queue_replaced")
         cancelAllWork()
         resetEngines()
         queue = tracks
@@ -210,6 +331,90 @@ final class IOSPlaybackOrchestrator {
         activeEngineIndex = self.currentIndex >= 0 ? self.currentIndex : nil
         standbyEngineIndex = nil
         state = self.currentIndex >= 0 ? .paused : .idle
+        emitStateIfNeeded()
+        refreshNowPlaying()
+    }
+
+    func verifyPreparedForActivation(expectedIndex: Int?) throws {
+        guard state != .error && state != .loading && state != .seeking && state != .skipping else {
+            throw makeError(
+                "playback_backend_activation_not_ready",
+                "The ping-pong playback candidate is still transitioning."
+            )
+        }
+        guard let expectedIndex = expectedIndex else { return }
+        guard queue.indices.contains(expectedIndex),
+              currentIndex == expectedIndex,
+              activeEngineIndex == expectedIndex,
+              activeEngine.isReady else {
+            throw makeError(
+                "playback_backend_activation_not_ready",
+                "The ping-pong playback candidate did not restore the active track."
+            )
+        }
+    }
+
+    func preparePlaybackForActivation(
+        playWhenReady: Bool,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard hasCurrentItem else {
+            self.playWhenReady = false
+            state = .idle
+            if playWhenReady {
+                completion(.failure(makeError(
+                    "playback_backend_activation_not_ready",
+                    "The ping-pong playback candidate has no active track to play."
+                )))
+            } else {
+                completion(.success(()))
+            }
+            return
+        }
+
+        activeEngine.setVolume(0)
+        self.playWhenReady = playWhenReady
+        guard playWhenReady else {
+            activeEngine.pause()
+            standbyEngine.pause()
+            state = .paused
+            emitStateIfNeeded()
+            completion(.success(()))
+            return
+        }
+
+        activeEngine.play(rate: rate) { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success:
+                self.state = .playingSingle
+                self.scheduleEndObserver()
+                self.emitStateIfNeeded()
+                self.refreshNowPlaying()
+                completion(.success(()))
+            case .failure(let error):
+                self.playWhenReady = false
+                self.activeEngine.pause()
+                self.state = .paused
+                self.emitStateIfNeeded()
+                completion(.failure(error))
+            }
+        }
+    }
+
+    func activatePreparedPlayback(playWhenReady: Bool, restoredVolume: Float) {
+        volume = max(0, min(1, restoredVolume))
+        self.playWhenReady = playWhenReady
+        guard hasCurrentItem else {
+            activeEngine.pause()
+            standbyEngine.pause()
+            state = .idle
+            emitStateIfNeeded()
+            refreshNowPlaying()
+            return
+        }
+
+        activeEngine.setVolume(volume)
         emitStateIfNeeded()
         refreshNowPlaying()
     }
@@ -275,12 +480,13 @@ final class IOSPlaybackOrchestrator {
     func pause() {
         IOSPlaybackLog.log("pause state=\(state)")
         checkpoint(reason: "pause")
+        operationRegistry.invalidateAll(reason: "pause")
         playWhenReady = false
         if state == .crossfading || state == .pausedDuringCrossfade {
             promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "pause")
         }
-        cancelScheduledPlaybackWork()
         cancelActiveCrossfade(errorCode: "pause")
+        cancelScheduledPlaybackWork()
         activeEngine.pause()
         standbyEngine.pause()
         state = hasCurrentItem ? .paused : .idle
@@ -300,19 +506,35 @@ final class IOSPlaybackOrchestrator {
     }
 
     func settleActiveTransition() {
+        operationRegistry.invalidateAll(reason: "backend_swap")
         if state == .crossfading || state == .pausedDuringCrossfade {
             promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "backend_swap")
         }
-        cancelScheduledPlaybackWork()
         cancelActiveCrossfade(errorCode: "backend_swap")
+        cancelScheduledPlaybackWork()
+        if state == .preloadingNext {
+            state = playWhenReady ? .playingSingle : .paused
+            emitStateIfNeeded()
+            refreshNowPlaying()
+        } else if state == .loading || state == .seeking || state == .skipping {
+            resetEngines()
+            state = hasCurrentItem ? .paused : .idle
+            emitStateIfNeeded()
+            refreshNowPlaying()
+        }
+        if playWhenReady && state == .playingSingle {
+            scheduleEndObserver()
+            preloadNextIfPossible()
+        }
     }
 
     func stop() {
         IOSPlaybackLog.log("stop")
+        operationRegistry.invalidateAll(reason: "stop")
         playWhenReady = false
         emitCrossfadeCancellationIfNeeded(errorCode: "stop")
-        cancelAllWork()
         cancelActiveCrossfade(errorCode: "stop")
+        cancelAllWork()
         resetEngines()
         currentIndex = -1
         checkpointStore.clear()
@@ -356,29 +578,42 @@ final class IOSPlaybackOrchestrator {
         if state == .crossfading || state == .pausedDuringCrossfade {
             promoteLogicalEngineAfterCrossfadeCancellation(errorCode: "seek")
         }
-        cancelScheduledPlaybackWork()
         cancelActiveCrossfade(errorCode: "seek")
+        cancelScheduledPlaybackWork()
 
+        let completionGate = PlaybackBackendCommandCompletion<Void> { result in
+            completion?(result)
+        }
+        let ticket = operationRegistry.begin { [weak self, completionGate] reason in
+            guard let self = self else { return }
+            self.stabilizeCancelledOperation()
+            completionGate.resolve(.failure(self.makeError(
+                "cancelled",
+                "Playback seek was cancelled by \(reason)."
+            )))
+        }
         state = .seeking
         emitStateIfNeeded()
-        activeEngine.seek(to: position) { [weak self] result in
+        seekOperation(activeEngine, position) { [weak self, completionGate] result in
             guard let self = self else { return }
-            switch result {
-            case .success:
-                self.checkpoint(position: position, reason: "seek")
-                self.state = self.playWhenReady ? .playingSingle : .paused
-                if self.playWhenReady {
-                    self.activeEngine.play(rate: self.rate)
-                    self.scheduleEndObserver()
+            guard self.operationRegistry.complete(ticket, perform: {
+                switch result {
+                case .success:
+                    self.checkpoint(position: position, reason: "seek")
+                    self.state = self.playWhenReady ? .playingSingle : .paused
+                    if self.playWhenReady {
+                        self.activeEngine.play(rate: self.rate)
+                        self.scheduleEndObserver()
+                    }
+                case .failure:
+                    self.state = .error
                 }
-                self.emitStateIfNeeded()
-                self.refreshNowPlaying()
-                completion?(.success(()))
-            case .failure(let error):
-                self.state = .error
-                self.emitStateIfNeeded()
-                completion?(.failure(error))
-            }
+                self.operationRegistry.performAfterCurrentMutation {
+                    self.emitStateIfNeeded()
+                    self.refreshNowPlaying()
+                }
+            }) else { return }
+            completionGate.resolve(result)
         }
     }
 
@@ -393,9 +628,10 @@ final class IOSPlaybackOrchestrator {
         }
         IOSPlaybackLog.log("skip to=\(index) initialTime=\(initialTime)")
         let wasPlaying = playWhenReady
+        operationRegistry.invalidateAll(reason: "skip")
         emitCrossfadeCancellationIfNeeded(errorCode: "skip")
-        cancelAllWork()
         cancelActiveCrossfade(errorCode: "skip")
+        cancelAllWork()
         state = .skipping
         emitStateIfNeeded()
         loadIndex(index, position: max(0, initialTime), autoPlay: wasPlaying, completion: completion)
@@ -418,45 +654,115 @@ final class IOSPlaybackOrchestrator {
         seekTo: Double,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        let fromIndex = currentIndex
-        let toIndex = previous ? fromIndex - 1 : fromIndex + 1
-        guard playWhenReady, (state == .playingSingle || state == .preloadingNext) else {
-            emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
-            completion(.failure(makeError("crossfade_not_playing", "Crossfade cannot prepare while playback is not active.")))
-            return
-        }
-        guard state != .crossfading && state != .pausedDuringCrossfade else {
-            emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_in_progress")
-            completion(.failure(makeError("crossfade_in_progress", "A crossfade is already in progress.")))
-            return
-        }
-        guard canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: 1) else {
-            emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_target_unavailable")
-            completion(.failure(makeError("crossfade_target_unavailable", "No crossfade target track is available.")))
-            return
-        }
+        var fromIndex = -1
+        var toIndex = -1
+        var completionGate: PlaybackBackendCommandCompletion<Void>?
+        var rejection: (event: String, code: String, error: NSError)?
+        var normalizedPreloadState = false
 
-        prepareStandby(index: toIndex, position: max(0, seekTo)) { [weak self] result in
-            guard let self = self else { return }
-            switch result {
-            case .success:
-                self.preparedFromIndex = fromIndex
-                self.preparedToIndex = toIndex
-                self.preparedSeekTo = max(0, seekTo)
-                self.emitCrossfadeState(
-                    "prepared",
-                    fromIndex: fromIndex,
-                    toIndex: toIndex,
-                    elapsedMs: 0,
-                    fromVolume: self.volume,
-                    toVolume: 0,
-                    errorCode: nil
-                )
-                completion(.success(()))
-            case .failure(let error):
-                self.emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
-                completion(.failure(error))
+        crossfadeMutationLock.lock()
+        fromIndex = currentIndex
+        toIndex = previous ? fromIndex - 1 : fromIndex + 1
+        if !playWhenReady || (state != .playingSingle && state != .preloadingNext) {
+            rejection = (
+                "cancelled",
+                "not_playing",
+                makeError("crossfade_not_playing", "Crossfade cannot prepare while playback is not active.")
+            )
+        } else if state == .crossfading || state == .pausedDuringCrossfade {
+            rejection = (
+                "error",
+                "crossfade_in_progress",
+                makeError("crossfade_in_progress", "A crossfade is already in progress.")
+            )
+        } else if !canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: 1) {
+            rejection = (
+                "error",
+                "crossfade_target_unavailable",
+                makeError("crossfade_target_unavailable", "No crossfade target track is available.")
+            )
+        } else if let admitted = crossfadeCommandSlot.begin(resolve: completion) {
+            completionGate = admitted
+            cancelStandbyMaintenanceLocked()
+            if state == .preloadingNext {
+                state = .playingSingle
+                normalizedPreloadState = true
             }
+        } else {
+            rejection = (
+                "error",
+                "crossfade_in_progress",
+                makeError("crossfade_in_progress", "A crossfade is already scheduled or in progress.")
+            )
+        }
+        crossfadeMutationLock.unlock()
+
+        if let rejection {
+            emitCrossfadeState(
+                rejection.event,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                errorCode: rejection.code
+            )
+            completion(.failure(rejection.error))
+            return
+        }
+        guard let completionGate else { return }
+        if normalizedPreloadState { emitStateIfNeeded() }
+
+        let ticket = operationRegistry.begin { [weak self, completionGate] reason in
+            guard let self = self else { return }
+            self.crossfadeMutationLock.lock()
+            self.standbyEngine.pause()
+            self.standbyEngine.reset()
+            self.standbyEngineIndex = nil
+            self.crossfadeMutationLock.unlock()
+            self.emitCrossfadeState(
+                "cancelled",
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                errorCode: reason
+            )
+            self.crossfadeCommandSlot.complete(completionGate, result: .failure(self.makeError(
+                "cancelled",
+                "Crossfade preparation was cancelled by \(reason)."
+            )))
+        }
+        prepareStandby(index: toIndex, position: max(0, seekTo)) { [weak self, completionGate] result in
+            guard let self = self else { return }
+            guard self.operationRegistry.complete(ticket, perform: {
+                self.crossfadeMutationLock.lock()
+                switch result {
+                case .success:
+                    self.preparedFromIndex = fromIndex
+                    self.preparedToIndex = toIndex
+                    self.preparedSeekTo = max(0, seekTo)
+                case .failure: break
+                }
+                self.crossfadeMutationLock.unlock()
+                self.operationRegistry.performAfterCurrentMutation {
+                    switch result {
+                    case .success:
+                        self.emitCrossfadeState(
+                            "prepared",
+                            fromIndex: fromIndex,
+                            toIndex: toIndex,
+                            elapsedMs: 0,
+                            fromVolume: self.volume,
+                            toVolume: 0,
+                            errorCode: nil
+                        )
+                    case .failure:
+                        self.emitCrossfadeState(
+                            "error",
+                            fromIndex: fromIndex,
+                            toIndex: toIndex,
+                            errorCode: "prepare_failed"
+                        )
+                    }
+                }
+            }) else { return }
+            self.crossfadeCommandSlot.complete(completionGate, result: result)
         }
     }
 
@@ -467,33 +773,71 @@ final class IOSPlaybackOrchestrator {
         waitUntil: Double,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        let fromIndex = currentIndex
-        let toIndex = preparedFromIndex == fromIndex && preparedToIndex != nil
+        var fromIndex = -1
+        var toIndex = -1
+        let durationMs = max(1, Int(fadeDuration))
+        var completionGate: PlaybackBackendCommandCompletion<Void>?
+        var rejection: (event: String, code: String, error: NSError)?
+        var normalizedPreloadState = false
+        var currentRunId = -1
+        var scheduledFromVolume: Float = 0
+
+        crossfadeMutationLock.lock()
+        fromIndex = currentIndex
+        toIndex = preparedFromIndex == fromIndex && preparedToIndex != nil
             ? preparedToIndex!
             : fromIndex + 1
-        let durationMs = max(1, Int(fadeDuration))
-        guard playWhenReady, (state == .playingSingle || state == .preloadingNext) else {
-            emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
-            completion(.failure(makeError("crossfade_not_playing", "Crossfade cannot start while playback is not active.")))
-            return
-        }
-        guard canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: durationMs) else {
-            emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_unavailable")
-            completion(.failure(makeError("crossfade_unavailable", "Crossfade is not available for this transition.")))
-            return
-        }
-
-        runId += 1
-        let currentRunId = runId
-        let completionGate = PlaybackBackendCommandCompletion<Void>(resolve: completion)
-        activeCrossfadeCompletion = completionGate
-        activeCrossfadeCompletionRunID = currentRunId
-        let transitionCompletion: (Result<Void, Error>) -> Void = { [weak self, completionGate] result in
-            if self?.activeCrossfadeCompletionRunID == currentRunId {
-                self?.activeCrossfadeCompletion = nil
-                self?.activeCrossfadeCompletionRunID = nil
+        if crossfadeCommandSlot.isOccupied {
+            rejection = (
+                "error",
+                "crossfade_in_progress",
+                makeError("crossfade_in_progress", "A crossfade is already scheduled or in progress.")
+            )
+        } else if !playWhenReady || (state != .playingSingle && state != .preloadingNext) {
+            rejection = (
+                "cancelled",
+                "not_playing",
+                makeError("crossfade_not_playing", "Crossfade cannot start while playback is not active.")
+            )
+        } else if !canCrossfade(fromIndex: fromIndex, toIndex: toIndex, durationMs: durationMs) {
+            rejection = (
+                "error",
+                "crossfade_unavailable",
+                makeError("crossfade_unavailable", "Crossfade is not available for this transition.")
+            )
+        } else if let admitted = crossfadeCommandSlot.begin(resolve: completion) {
+            completionGate = admitted
+            cancelStandbyMaintenanceLocked()
+            if state == .preloadingNext {
+                state = .playingSingle
+                normalizedPreloadState = true
             }
-            completionGate.resolve(result)
+            runId += 1
+            currentRunId = runId
+            scheduledFromVolume = activeEngine.volume
+        } else {
+            rejection = (
+                "error",
+                "crossfade_in_progress",
+                makeError("crossfade_in_progress", "A crossfade is already scheduled or in progress.")
+            )
+        }
+        crossfadeMutationLock.unlock()
+
+        if let rejection {
+            emitCrossfadeState(
+                rejection.event,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                errorCode: rejection.code
+            )
+            completion(.failure(rejection.error))
+            return
+        }
+        guard let completionGate else { return }
+        if normalizedPreloadState { emitStateIfNeeded() }
+        let transitionCompletion: (Result<Void, Error>) -> Void = { [weak self, completionGate] result in
+            self?.crossfadeCommandSlot.complete(completionGate, result: result)
         }
         let intervalMs = max(10, Int(fadeInterval))
         let targetVolume = Float(max(0, min(1, fadeToVolume)))
@@ -502,7 +846,7 @@ final class IOSPlaybackOrchestrator {
             fromIndex: fromIndex,
             toIndex: toIndex,
             elapsedMs: 0,
-            fromVolume: activeEngine.volume,
+            fromVolume: scheduledFromVolume,
             toVolume: 0,
             errorCode: nil
         )
@@ -523,6 +867,7 @@ final class IOSPlaybackOrchestrator {
                     durationMs: durationMs,
                     intervalMs: intervalMs,
                     targetVolume: targetVolume,
+                    completionGate: completionGate,
                     completion: transitionCompletion
                 )
                 return
@@ -553,10 +898,22 @@ final class IOSPlaybackOrchestrator {
             return
         }
 
+        let completionGate = PlaybackBackendCommandCompletion<Void> { result in
+            completion?(result)
+        }
+        let ticket = operationRegistry.begin { [weak self, completionGate] reason in
+            guard let self = self else { return }
+            self.stabilizeCancelledOperation()
+            completionGate.resolve(.failure(self.makeError(
+                "cancelled",
+                "Playback load was cancelled by \(reason)."
+            )))
+        }
         runId += 1
         let currentRunId = runId
         let lastIndex = currentIndex >= 0 ? currentIndex : nil
         let lastPosition = currentTime
+        let lastTrack = currentTrack
         let track = queue[index]
         state = .loading
         emitStateIfNeeded()
@@ -565,51 +922,85 @@ final class IOSPlaybackOrchestrator {
         activeEngine.setVolume(autoPlay ? volume : 0)
 
         activeEngine.prepare(track: track, position: position) { [weak self] result in
-            guard let self = self, self.runId == currentRunId else { return }
+            guard let self = self,
+                  self.runId == currentRunId,
+                  self.operationRegistry.isCurrent(ticket) else { return }
             switch result {
             case .success:
-                self.currentIndex = index
-                self.checkpoint(position: position, reason: "load")
-                self.delegate?.playbackOrchestrator(
-                    self,
-                    didChangeActiveTrack: index,
-                    lastIndex: lastIndex,
-                    lastPosition: lastPosition
-                )
                 if autoPlay {
-                    self.playWhenReady = true
-                    self.activeEngine.setVolume(self.volume)
-                    self.activeEngine.play(rate: self.rate) { playResult in
-                        switch playResult {
-                        case .success:
-                            self.state = .playingSingle
-                            self.scheduleEndObserver()
-                            self.preloadNextIfPossible()
-                            self.emitStateIfNeeded()
-                            self.refreshNowPlaying()
-                            completion?(.success(()))
-                        case .failure(let error):
-                            IOSPlaybackLog.log("loadIndex autoplay failed index=\(index) error=\(error.localizedDescription)")
-                            self.playWhenReady = false
-                            self.state = .paused
-                            self.emitStateIfNeeded()
-                            self.refreshNowPlaying()
-                            completion?(.failure(error))
+                    guard self.operationRegistry.performIfCurrent(ticket, perform: {
+                        self.currentIndex = index
+                        self.checkpoint(position: position, reason: "load")
+                        self.playWhenReady = true
+                        self.activeEngine.setVolume(self.volume)
+                        self.operationRegistry.performAfterCurrentMutation {
+                            self.delegate?.playbackOrchestrator(
+                                self,
+                                didChangeActiveTrack: index,
+                                lastIndex: lastIndex,
+                                lastTrack: lastTrack,
+                                lastPosition: lastPosition
+                            )
                         }
-                    }
+                        self.activeEngine.play(rate: self.rate) { [weak self, completionGate] playResult in
+                            guard let self = self else { return }
+                            self.operationRegistry.performAfterCurrentMutation {
+                                DispatchQueue.main.async {
+                                    guard self.runId == currentRunId else { return }
+                                    guard self.operationRegistry.complete(ticket, perform: {
+                                        switch playResult {
+                                        case .success:
+                                            self.state = .playingSingle
+                                            self.scheduleEndObserver()
+                                        case .failure(let error):
+                                            IOSPlaybackLog.log("loadIndex autoplay failed index=\(index) error=\(error.localizedDescription)")
+                                            self.playWhenReady = false
+                                            self.state = .paused
+                                        }
+                                        self.operationRegistry.performAfterCurrentMutation {
+                                            if case .success = playResult {
+                                                self.preloadNextIfPossible()
+                                            }
+                                            self.emitStateIfNeeded()
+                                            self.refreshNowPlaying()
+                                        }
+                                    }) else { return }
+                                    completionGate.resolve(playResult)
+                                }
+                            }
+                        }
+                    }) else { return }
                     return
                 } else {
-                    self.playWhenReady = false
-                    self.state = .paused
-                    self.activeEngine.setVolume(self.volume)
+                    guard self.operationRegistry.complete(ticket, perform: {
+                        self.currentIndex = index
+                        self.checkpoint(position: position, reason: "load")
+                        self.playWhenReady = false
+                        self.state = .paused
+                        self.activeEngine.setVolume(self.volume)
+                        self.operationRegistry.performAfterCurrentMutation {
+                            self.delegate?.playbackOrchestrator(
+                                self,
+                                didChangeActiveTrack: index,
+                                lastIndex: lastIndex,
+                                lastTrack: lastTrack,
+                                lastPosition: lastPosition
+                            )
+                            self.emitStateIfNeeded()
+                            self.refreshNowPlaying()
+                        }
+                    }) else { return }
                 }
-                self.emitStateIfNeeded()
-                self.refreshNowPlaying()
-                completion?(.success(()))
+                completionGate.resolve(.success(()))
             case .failure(let error):
-                self.state = .error
-                self.emitStateIfNeeded()
-                completion?(.failure(error))
+                guard self.operationRegistry.complete(ticket, perform: {
+                    self.state = .error
+                    self.operationRegistry.performAfterCurrentMutation {
+                        self.emitStateIfNeeded()
+                        self.refreshNowPlaying()
+                    }
+                }) else { return }
+                completionGate.resolve(.failure(error))
             }
         }
     }
@@ -621,6 +1012,7 @@ final class IOSPlaybackOrchestrator {
         durationMs: Int,
         intervalMs: Int,
         targetVolume: Float,
+        completionGate: PlaybackBackendCommandCompletion<Void>,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         guard self.runId == runId else { return }
@@ -635,14 +1027,39 @@ final class IOSPlaybackOrchestrator {
                 guard let self = self, self.runId == runId else { return }
                 switch result {
                 case .success:
+                    self.crossfadeMutationLock.lock()
+                    guard self.runId == runId else {
+                        self.crossfadeMutationLock.unlock()
+                        return
+                    }
                     let lastPosition = self.activeEngine.currentTime
+                    let lastTrack = self.queue.indices.contains(fromIndex)
+                        ? self.queue[fromIndex]
+                        : nil
                     self.currentIndex = toIndex
                     self.checkpoint(position: self.standbyEngine.currentTime, reason: "crossfade_start")
                     self.state = .crossfading
+                    let context = IOSCrossfadeContext(
+                        runId: runId,
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        durationMs: durationMs,
+                        intervalMs: intervalMs,
+                        targetVolume: targetVolume,
+                        outgoingStartVolume: outgoingStartVolume,
+                        incomingStartTime: self.standbyEngine.currentTime,
+                        completionGate: completionGate
+                    )
+                    self.crossfadeEventGeneration &+= 1
+                    self.crossfadeContext = context
+                    let startedFromVolume = self.activeEngine.volume
+                    let startedToVolume = self.standbyEngine.volume
+                    self.crossfadeMutationLock.unlock()
                     self.delegate?.playbackOrchestrator(
                         self,
                         didChangeActiveTrack: toIndex,
                         lastIndex: fromIndex,
+                        lastTrack: lastTrack,
                         lastPosition: lastPosition
                     )
                     self.refreshNowPlaying()
@@ -652,21 +1069,10 @@ final class IOSPlaybackOrchestrator {
                         fromIndex: fromIndex,
                         toIndex: toIndex,
                         elapsedMs: 0,
-                        fromVolume: self.activeEngine.volume,
-                        toVolume: self.standbyEngine.volume,
+                        fromVolume: startedFromVolume,
+                        toVolume: startedToVolume,
                         errorCode: nil
                     )
-                    let context = IOSCrossfadeContext(
-                        runId: runId,
-                        fromIndex: fromIndex,
-                        toIndex: toIndex,
-                        durationMs: durationMs,
-                        intervalMs: intervalMs,
-                        targetVolume: targetVolume,
-                        outgoingStartVolume: outgoingStartVolume,
-                        incomingStartTime: self.standbyEngine.currentTime
-                    )
-                    self.crossfadeContext = context
                     self.runCrossfadeRamp(context: context, completion: completion)
                 case .failure(let error):
                     self.emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_start_failed")
@@ -685,7 +1091,14 @@ final class IOSPlaybackOrchestrator {
             case .success:
                 startPreparedStandby()
             case .failure(let error):
-                self.emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
+                if !self.isStandbyPreparationSuperseded(error) {
+                    self.emitCrossfadeState(
+                        "error",
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        errorCode: "prepare_failed"
+                    )
+                }
                 completion(.failure(error))
             }
         }
@@ -695,68 +1108,104 @@ final class IOSPlaybackOrchestrator {
         context: IOSCrossfadeContext,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard runId == context.runId else { return }
-        guard state == .crossfading else { return }
+        var shouldFallback = false
+        var shouldFinish = false
+        var firstFrame: (fromVolume: Float, toVolume: Float)?
+        var nextWorkItem: DispatchWorkItem?
+
+        crossfadeMutationLock.lock()
+        guard runId == context.runId,
+              state == .crossfading,
+              crossfadeContext === context else {
+            crossfadeMutationLock.unlock()
+            return
+        }
+        crossfadeRampAfterValidationHook()
 
         if context.elapsedMs >= 2000,
            standbyEngine.currentTime <= context.incomingStartTime + 0.2 {
-            fallbackToTargetAfterStalledCrossfade(context: context, completion: completion)
-            return
-        }
-
-        if activeEngine.duration > 0,
-           activeEngine.currentTime >= max(0, activeEngine.duration - 0.15) {
+            shouldFallback = true
+        } else if activeEngine.duration > 0,
+                  activeEngine.currentTime >= max(0, activeEngine.duration - 0.15) {
             if standbyEngine.currentTime > context.incomingStartTime + 0.2 {
                 context.elapsedMs = context.durationMs
-                finishCrossfade(context: context, completion: completion)
+                shouldFinish = true
             } else {
-                fallbackToTargetAfterStalledCrossfade(context: context, completion: completion)
+                shouldFallback = true
             }
-            return
+        } else {
+            let progress = min(1, max(0, Double(context.elapsedMs) / Double(context.durationMs)))
+            let angle = progress * Double.pi / 2
+            let fromVolume = context.outgoingStartVolume * Float(cos(angle))
+            let toVolume = context.targetVolume * Float(sin(angle))
+            activeEngine.setVolume(fromVolume)
+            standbyEngine.setVolume(toVolume)
+
+            if context.elapsedMs == 0 {
+                firstFrame = (fromVolume, toVolume)
+            }
+            if context.elapsedMs - context.lastRunningEmitMs >= 250 ||
+                context.elapsedMs >= context.durationMs {
+                enqueueCrossfadeEventLocked(
+                    "running",
+                    fromIndex: context.fromIndex,
+                    toIndex: context.toIndex,
+                    elapsedMs: context.elapsedMs,
+                    fromVolume: fromVolume,
+                    toVolume: toVolume,
+                    errorCode: nil,
+                    admissionGeneration: crossfadeEventGeneration,
+                    beforeDelivery: crossfadeRunningBeforeDeliveryHook
+                )
+                context.lastRunningEmitMs = context.elapsedMs
+            }
+            if context.elapsedMs >= context.durationMs {
+                shouldFinish = true
+            } else {
+                context.elapsedMs = min(context.durationMs, context.elapsedMs + context.intervalMs)
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self = self else { return }
+                    self.runCrossfadeRamp(context: context, completion: completion)
+                }
+                crossfadeWorkItem = workItem
+                nextWorkItem = workItem
+            }
         }
+        crossfadeMutationLock.unlock()
 
-        let progress = min(1, max(0, Double(context.elapsedMs) / Double(context.durationMs)))
-        let angle = progress * Double.pi / 2
-        let fromVolume = context.outgoingStartVolume * Float(cos(angle))
-        let toVolume = context.targetVolume * Float(sin(angle))
-        activeEngine.setVolume(fromVolume)
-        standbyEngine.setVolume(toVolume)
-
-        if context.elapsedMs == 0 {
-            IOSPlaybackLog.log("crossfade first frame fromVolume=\(fromVolume) toVolume=\(toVolume)")
-        }
-
-        if context.elapsedMs - context.lastRunningEmitMs >= 250 || context.elapsedMs >= context.durationMs {
-            emitCrossfadeState(
-                "running",
-                fromIndex: context.fromIndex,
-                toIndex: context.toIndex,
-                elapsedMs: context.elapsedMs,
-                fromVolume: fromVolume,
-                toVolume: toVolume,
-                errorCode: nil
+        if let firstFrame {
+            IOSPlaybackLog.log(
+                "crossfade first frame fromVolume=\(firstFrame.fromVolume) " +
+                "toVolume=\(firstFrame.toVolume)"
             )
-            context.lastRunningEmitMs = context.elapsedMs
         }
-
-        if context.elapsedMs >= context.durationMs {
-            finishCrossfade(context: context, completion: completion)
-            return
+        if shouldFallback {
+            fallbackToTargetAfterStalledCrossfade(context: context, completion: completion)
+        } else if shouldFinish {
+            finishCrossfade(context: context)
+        } else if let nextWorkItem {
+            DispatchQueue.main.asyncAfter(
+                deadline: .now() + .milliseconds(context.intervalMs),
+                execute: nextWorkItem
+            )
         }
-
-        context.elapsedMs = min(context.durationMs, context.elapsedMs + context.intervalMs)
-        let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            self.runCrossfadeRamp(context: context, completion: completion)
-        }
-        crossfadeWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(context.intervalMs), execute: workItem)
     }
 
-    private func finishCrossfade(
-        context: IOSCrossfadeContext,
-        completion: @escaping (Result<Void, Error>) -> Void
-    ) {
+    private func finishCrossfade(context: IOSCrossfadeContext) {
+        crossfadeMutationLock.lock()
+        guard runId == context.runId,
+              state == .crossfading,
+              crossfadeContext === context else {
+            crossfadeMutationLock.unlock()
+            return
+        }
+        guard let terminalResolver = crossfadeCommandSlot.takeResolver(
+            context.completionGate,
+            result: .success(())
+        ) else {
+            crossfadeMutationLock.unlock()
+            return
+        }
         IOSPlaybackLog.log("crossfade completed from=\(context.fromIndex) to=\(context.toIndex)")
         activeEngine.setVolume(0)
         activeEngine.pause()
@@ -775,28 +1224,37 @@ final class IOSPlaybackOrchestrator {
         preparedSeekTo = 0
         crossfadeContext = nil
         crossfadeWorkItem = nil
-        IOSPlaybackLog.log("active/standby swap activeIndex=\(activeEngineIndex ?? -1)")
-        emitCrossfadeState(
+        crossfadeEventGeneration &+= 1
+        enqueueCrossfadeEventLocked(
             "completed",
             fromIndex: context.fromIndex,
             toIndex: context.toIndex,
             elapsedMs: context.durationMs,
             fromVolume: 0,
             toVolume: context.targetVolume,
-            errorCode: nil
+            errorCode: nil,
+            beforeDelivery: crossfadeFinishAfterCommitHook,
+            afterDelivery: terminalResolver
         )
+        IOSPlaybackLog.log("active/standby swap activeIndex=\(activeEngineIndex ?? -1)")
+        crossfadeMutationLock.unlock()
         emitStateIfNeeded()
         refreshNowPlaying()
         scheduleEndObserver()
         schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs: context.durationMs)
-        completion(.success(()))
     }
 
     private func schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs crossfadeDurationMs: Int) {
-        standbyMaintenanceWorkItem?.cancel()
-        guard playWhenReady, state == .playingSingle, nextIndex(after: currentIndex) != nil else { return }
+        crossfadeMutationLock.lock()
+        cancelStandbyMaintenanceLocked()
+        guard playWhenReady, state == .playingSingle, nextIndex(after: currentIndex) != nil else {
+            crossfadeMutationLock.unlock()
+            return
+        }
 
         let currentRunId = runId
+        standbyMaintenanceGeneration += 1
+        let currentMaintenanceGeneration = standbyMaintenanceGeneration
         let activeDuration = duration
         let activePosition = currentTime
         let preloadLeadSeconds = 8.0
@@ -809,35 +1267,64 @@ final class IOSPlaybackOrchestrator {
 
         IOSPlaybackLog.log("post-crossfade standby maintenance scheduled delay=\(delaySeconds)")
         let workItem = DispatchWorkItem { [weak self] in
-            guard let self = self, self.runId == currentRunId else { return }
-            guard self.playWhenReady, self.state == .playingSingle else { return }
+            guard let self = self else { return }
+            self.crossfadeMutationLock.lock()
+            guard self.runId == currentRunId,
+                  self.standbyMaintenanceGeneration == currentMaintenanceGeneration else {
+                self.crossfadeMutationLock.unlock()
+                return
+            }
+            self.standbyMaintenanceWorkItem = nil
+            guard self.playWhenReady,
+                  self.state == .playingSingle,
+                  !self.crossfadeCommandSlot.isOccupied,
+                  self.preparedToIndex == nil else {
+                self.crossfadeMutationLock.unlock()
+                return
+            }
+            self.standbyMaintenanceAfterValidationHook()
             self.standbyEngine.reset()
             self.standbyEngineIndex = nil
-            self.preloadNextIfPossible()
+            let didStart = self.preloadNextIfPossibleLocked()
+            self.crossfadeMutationLock.unlock()
+            if didStart { self.emitStateIfNeeded() }
         }
         standbyMaintenanceWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + delaySeconds, execute: workItem)
+        crossfadeMutationLock.unlock()
+        standbyMaintenanceScheduler(delaySeconds, workItem)
     }
 
     private func fallbackToTargetAfterStalledCrossfade(
         context: IOSCrossfadeContext,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        IOSPlaybackLog.log("crossfade incoming stalled from=\(context.fromIndex) to=\(context.toIndex) incomingStart=\(context.incomingStartTime) incomingNow=\(standbyEngine.currentTime)")
-        emitCrossfadeState(
-            "error",
-            fromIndex: context.fromIndex,
-            toIndex: context.toIndex,
-            elapsedMs: context.elapsedMs,
-            fromVolume: activeEngine.volume,
-            toVolume: standbyEngine.volume,
-            errorCode: "incoming_stalled"
-        )
+        crossfadeMutationLock.lock()
+        guard runId == context.runId,
+              state == .crossfading,
+              crossfadeContext === context else {
+            crossfadeMutationLock.unlock()
+            return
+        }
+        let incomingNow = standbyEngine.currentTime
+        let outgoingVolume = activeEngine.volume
+        let incomingVolume = standbyEngine.volume
         crossfadeWorkItem?.cancel()
         crossfadeWorkItem = nil
         crossfadeContext = nil
         standbyEngine.pause()
         standbyEngine.reset()
+        crossfadeEventGeneration &+= 1
+        enqueueCrossfadeEventLocked(
+            "error",
+            fromIndex: context.fromIndex,
+            toIndex: context.toIndex,
+            elapsedMs: context.elapsedMs,
+            fromVolume: outgoingVolume,
+            toVolume: incomingVolume,
+            errorCode: "incoming_stalled"
+        )
+        crossfadeMutationLock.unlock()
+        IOSPlaybackLog.log("crossfade incoming stalled from=\(context.fromIndex) to=\(context.toIndex) incomingStart=\(context.incomingStartTime) incomingNow=\(incomingNow)")
         skip(to: context.toIndex, initialTime: 0, completion: completion)
     }
 
@@ -847,11 +1334,16 @@ final class IOSPlaybackOrchestrator {
     }
 
     private func promoteLogicalEngineAfterCrossfadeCancellation(errorCode: String) {
+        crossfadeMutationLock.lock()
         guard let context = crossfadeContext,
-              state == .crossfading || state == .pausedDuringCrossfade else { return }
+              state == .crossfading || state == .pausedDuringCrossfade else {
+            crossfadeMutationLock.unlock()
+            return
+        }
+        let cancellationElapsedMs = context.elapsedMs
+        let cancellationFromVolume = activeEngine.volume
+        let cancellationToVolume = standbyEngine.volume
         IOSPlaybackLog.log("crossfade cancel promote logical engine currentIndex=\(currentIndex)")
-        let lastPosition = activeEngine.currentTime
-        emitCrossfadeCancellationIfNeeded(errorCode: errorCode)
         crossfadeWorkItem?.cancel()
         crossfadeWorkItem = nil
         activeEngine.pause()
@@ -859,18 +1351,25 @@ final class IOSPlaybackOrchestrator {
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
         standbyEngine = outgoingEngine
+        volume = context.targetVolume
+        activeEngine.setVolume(context.targetVolume)
         currentIndex = context.toIndex
         activeEngineIndex = currentIndex
         standbyEngineIndex = nil
         checkpoint(position: activeEngine.currentTime, reason: "crossfade_cancel")
         crossfadeContext = nil
         state = playWhenReady ? .playingSingle : .paused
-        delegate?.playbackOrchestrator(
-            self,
-            didChangeActiveTrack: context.toIndex,
-            lastIndex: context.fromIndex,
-            lastPosition: lastPosition
+        crossfadeEventGeneration &+= 1
+        enqueueCrossfadeEventLocked(
+            "cancelled",
+            fromIndex: context.fromIndex,
+            toIndex: context.toIndex,
+            elapsedMs: cancellationElapsedMs,
+            fromVolume: cancellationFromVolume,
+            toVolume: cancellationToVolume,
+            errorCode: errorCode
         )
+        crossfadeMutationLock.unlock()
     }
 
     private func prepareStandby(
@@ -878,36 +1377,132 @@ final class IOSPlaybackOrchestrator {
         position: Double,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard queue.indices.contains(index) else {
-            completion(.failure(makeError("index_out_of_bounds", "The track index is out of bounds.")))
-            return
-        }
-        let track = queue[index]
-        standbyEngineIndex = index
-        IOSPlaybackLog.log("standby prepare index=\(index)")
-        standbyEngine.prepare(track: track, position: position, completion: completion)
+        crossfadeMutationLock.lock()
+        let failure = enqueueStandbyPreparationLocked(
+            index: index,
+            position: position,
+            completion: completion
+        )
+        crossfadeMutationLock.unlock()
+        if let failure { completion(.failure(failure)) }
     }
 
     private func preloadNextIfPossible() {
-        guard let next = nextIndex(after: currentIndex) else { return }
-        guard state == .playingSingle else { return }
-        guard canUseTrackForCrossfade(index: currentIndex), canUseTrackForCrossfade(index: next) else { return }
+        crossfadeMutationLock.lock()
+        let didStart = preloadNextIfPossibleLocked()
+        crossfadeMutationLock.unlock()
+        if didStart { emitStateIfNeeded() }
+    }
+
+    @discardableResult
+    private func preloadNextIfPossibleLocked() -> Bool {
+        guard let next = nextIndex(after: currentIndex) else { return false }
+        guard state == .playingSingle else { return false }
+        guard canUseTrackForCrossfade(index: currentIndex), canUseTrackForCrossfade(index: next) else { return false }
         state = .preloadingNext
-        emitStateIfNeeded()
-        prepareStandby(index: next, position: 0) { [weak self] result in
+        let failure = enqueueStandbyPreparationLocked(index: next, position: 0) { [weak self] result in
             guard let self = self else { return }
+            self.crossfadeMutationLock.lock()
+            var logMessage: String?
             switch result {
             case .success:
-                IOSPlaybackLog.log("standby preload ready index=\(next)")
+                logMessage = "standby preload ready index=\(next)"
             case .failure(let error):
-                IOSPlaybackLog.log("standby preload failed index=\(next) error=\(error.localizedDescription)")
-                self.standbyEngineIndex = nil
+                if !self.isStandbyPreparationSuperseded(error) {
+                    logMessage = "standby preload failed index=\(next) error=\(error.localizedDescription)"
+                    self.standbyEngineIndex = nil
+                }
             }
+            let shouldEmit = self.state == .preloadingNext &&
+                !self.isStandbyPreparationSupersededResult(result)
             if self.state == .preloadingNext {
-                self.state = self.playWhenReady ? .playingSingle : .paused
-                self.emitStateIfNeeded()
+                if shouldEmit {
+                    self.state = self.playWhenReady ? .playingSingle : .paused
+                }
             }
+            self.crossfadeMutationLock.unlock()
+            if let logMessage { IOSPlaybackLog.log(logMessage) }
+            if shouldEmit { self.emitStateIfNeeded() }
         }
+        if let failure {
+            state = playWhenReady ? .playingSingle : .paused
+            IOSPlaybackLog.log("standby preload rejected index=\(next) error=\(failure.localizedDescription)")
+            return false
+        }
+        return true
+    }
+
+    private func enqueueStandbyPreparationLocked(
+        index: Int,
+        position: Double,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) -> Error? {
+        guard queue.indices.contains(index) else {
+            return makeError("index_out_of_bounds", "The track index is out of bounds.")
+        }
+        let track = queue[index]
+        let engine = standbyEngine
+        standbyPreparationGeneration += 1
+        let preparationGeneration = standbyPreparationGeneration
+        let supersededError = makeError(
+            "standby_preparation_superseded",
+            "Standby preparation was superseded by newer playback work."
+        )
+        let operation = standbyPrepareOperation
+        IOSPlaybackLog.log("standby prepare reserved index=\(index) generation=\(preparationGeneration)")
+
+        // Enqueue while the mutation lock is held. This preserves native invocation
+        // order even though the operation and every terminal callback run unlocked.
+        let terminalQueue = standbyPreparationInvocationQueue
+        standbyPreparationInvocationQueue.async { [weak self] in
+            guard let self else {
+                completion(.failure(supersededError))
+                return
+            }
+            self.standbyPreparationBeforeNativeInvocationHook()
+            self.crossfadeMutationLock.lock()
+            guard self.standbyPreparationGeneration == preparationGeneration,
+                  self.standbyEngine === engine else {
+                self.crossfadeMutationLock.unlock()
+                completion(.failure(supersededError))
+                return
+            }
+            operation(engine, track, position) { [weak self] result in
+                // Always defer terminal processing. Test doubles may complete
+                // synchronously while the native invocation still owns the lock.
+                terminalQueue.async {
+                    guard let self else {
+                        completion(.failure(supersededError))
+                        return
+                    }
+                    self.crossfadeMutationLock.lock()
+                    let resolvedResult: Result<Void, Error>
+                    if self.standbyPreparationGeneration != preparationGeneration ||
+                        self.standbyEngine !== engine {
+                        resolvedResult = .failure(supersededError)
+                    } else {
+                        switch result {
+                        case .success:
+                            self.standbyEngineIndex = index
+                        case .failure:
+                            self.standbyEngineIndex = nil
+                        }
+                        resolvedResult = result
+                    }
+                    self.crossfadeMutationLock.unlock()
+                    completion(resolvedResult)
+                }
+            }
+            self.crossfadeMutationLock.unlock()
+        }
+        return nil
+    }
+
+    private func isStandbyPreparationSupersededResult(
+        _ result: Result<Void, Error>
+    ) -> Bool {
+        guard case .failure(let error) = result else { return false }
+        return isStandbyPreparationSuperseded(error)
     }
 
     private func canCrossfade(fromIndex: Int, toIndex: Int, durationMs: Int) -> Bool {
@@ -965,20 +1560,33 @@ final class IOSPlaybackOrchestrator {
         scheduleEndObserver()
     }
 
-    private func cancelAllWork() {
+    private func stabilizeCancelledOperation() {
         runId += 1
+        pendingRecoveryPosition = nil
+        guard state == .loading || state == .seeking || state == .skipping else { return }
+        resetEngines()
+        playWhenReady = false
+        state = hasCurrentItem ? .paused : .idle
+        emitStateIfNeeded()
+        refreshNowPlaying()
+    }
+
+    private func cancelAllWork() {
+        crossfadeMutationLock.lock()
+        runId += 1
+        standbyPreparationGeneration += 1
         crossfadeWorkItem?.cancel()
         crossfadeWorkItem = nil
         scheduledStartWorkItem?.cancel()
         scheduledStartWorkItem = nil
         endObserverWorkItem?.cancel()
         endObserverWorkItem = nil
-        standbyMaintenanceWorkItem?.cancel()
-        standbyMaintenanceWorkItem = nil
+        cancelStandbyMaintenanceLocked()
         crossfadeContext = nil
         preparedFromIndex = nil
         preparedToIndex = nil
         preparedSeekTo = 0
+        crossfadeMutationLock.unlock()
     }
 
     private func checkpoint(reason: String) {
@@ -1039,15 +1647,16 @@ final class IOSPlaybackOrchestrator {
     }
 
     private func cancelScheduledPlaybackWork() {
+        crossfadeMutationLock.lock()
         runId += 1
+        standbyPreparationGeneration += 1
         crossfadeWorkItem?.cancel()
         crossfadeWorkItem = nil
         scheduledStartWorkItem?.cancel()
         scheduledStartWorkItem = nil
         endObserverWorkItem?.cancel()
         endObserverWorkItem = nil
-        standbyMaintenanceWorkItem?.cancel()
-        standbyMaintenanceWorkItem = nil
+        cancelStandbyMaintenanceLocked()
         crossfadeContext = nil
         preparedFromIndex = nil
         preparedToIndex = nil
@@ -1056,16 +1665,39 @@ final class IOSPlaybackOrchestrator {
         standbyEngine.pause()
         standbyEngine.reset()
         standbyEngineIndex = nil
+        crossfadeMutationLock.unlock()
+    }
+
+    private func cancelStandbyMaintenance() {
+        crossfadeMutationLock.lock()
+        cancelStandbyMaintenanceLocked()
+        crossfadeMutationLock.unlock()
+    }
+
+    private func cancelStandbyMaintenanceLocked() {
+        standbyMaintenanceGeneration += 1
+        standbyMaintenanceWorkItem?.cancel()
+        standbyMaintenanceWorkItem = nil
+    }
+
+    private func isStandbyPreparationSuperseded(_ error: Error) -> Bool {
+        return (error as NSError).userInfo["code"] as? String ==
+            "standby_preparation_superseded"
     }
 
     private func cancelActiveCrossfade(errorCode: String) {
-        guard let completion = activeCrossfadeCompletion else { return }
-        activeCrossfadeCompletion = nil
-        activeCrossfadeCompletionRunID = nil
-        completion.resolve(.failure(makeError(
+        let error = makeError(
             "crossfade_cancelled",
             "Crossfade was cancelled by \(errorCode)."
-        )))
+        )
+        crossfadeMutationLock.lock()
+        let terminalResolver = crossfadeCommandSlot.takeCurrentResolver(
+            result: .failure(error)
+        )
+        if let terminalResolver {
+            crossfadeEventDeliveryQueue.async(execute: terminalResolver)
+        }
+        crossfadeMutationLock.unlock()
     }
 
     private func queueHash() -> String {
@@ -1081,8 +1713,13 @@ final class IOSPlaybackOrchestrator {
     }
 
     private func emitCrossfadeCancellationIfNeeded(errorCode: String) {
-        guard let context = crossfadeContext else { return }
-        emitCrossfadeState(
+        crossfadeMutationLock.lock()
+        guard let context = crossfadeContext else {
+            crossfadeMutationLock.unlock()
+            return
+        }
+        crossfadeEventGeneration &+= 1
+        enqueueCrossfadeEventLocked(
             "cancelled",
             fromIndex: context.fromIndex,
             toIndex: context.toIndex,
@@ -1091,15 +1728,60 @@ final class IOSPlaybackOrchestrator {
             toVolume: standbyEngine.volume,
             errorCode: errorCode
         )
+        crossfadeMutationLock.unlock()
     }
 
     private func resetEngines() {
+        crossfadeMutationLock.lock()
+        resetEnginesLocked()
+        crossfadeMutationLock.unlock()
+    }
+
+    private func resetEnginesLocked() {
+        standbyPreparationGeneration += 1
         activeEngine.reset()
         standbyEngine.reset()
         activeEngine = engineA
         standbyEngine = engineB
         activeEngineIndex = nil
         standbyEngineIndex = nil
+    }
+
+    private func enqueueCrossfadeEventLocked(
+        _ eventState: String,
+        fromIndex: Int,
+        toIndex: Int,
+        elapsedMs: Int? = nil,
+        fromVolume: Float? = nil,
+        toVolume: Float? = nil,
+        errorCode: String? = nil,
+        admissionGeneration: UInt64? = nil,
+        beforeDelivery: @escaping () -> Void = {},
+        afterDelivery: @escaping () -> Void = {}
+    ) {
+        crossfadeEventDeliveryQueue.async { [weak self] in
+            guard let self else {
+                afterDelivery()
+                return
+            }
+            self.crossfadeMutationLock.lock()
+            let isAdmitted = admissionGeneration.map {
+                self.crossfadeEventGeneration == $0
+            } ?? true
+            self.crossfadeMutationLock.unlock()
+            guard isAdmitted else { return }
+            beforeDelivery()
+            self.emitCrossfadeState(
+                eventState,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                elapsedMs: elapsedMs,
+                fromVolume: fromVolume,
+                toVolume: toVolume,
+                errorCode: errorCode
+            )
+            afterDelivery()
+        }
     }
 
     private func emitCrossfadeState(

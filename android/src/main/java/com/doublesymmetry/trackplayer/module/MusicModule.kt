@@ -103,6 +103,17 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         }
     }
 
+    private suspend fun completeCommand(
+        callback: Promise,
+        operation: suspend () -> Unit
+    ) {
+        completePlaybackCommand(
+            operation = operation,
+            resolve = { callback.resolve(null) },
+            reject = { rejectWithException(callback, it) }
+        )
+    }
+
     private fun readableArrayToTrackList(data: ReadableArray?): MutableList<Track> {
         val bundleList = Arguments.toList(data)
         if (bundleList !is ArrayList) {
@@ -393,8 +404,9 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         }
         val bundle = Arguments.toBundle(data);
         if (bundle is Bundle) {
-            musicService.load(bundleToTrack(bundle))
-            callback.resolve(null)
+            completeCommand(callback) {
+                musicService.load(bundleToTrack(bundle))
+            }
         } else {
             callback.reject("invalid_track_object", "Track was not a dictionary type")
         }
@@ -499,13 +511,12 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.skip(index.toInt())
-
-        if (initialTime >= 0) {
-            musicService.seekTo(initialTime.toFloat())
+        completeCommand(callback) {
+            musicService.skip(index.toInt())
+            if (initialTime >= 0) {
+                musicService.seekTo(initialTime.toFloat())
+            }
         }
-
-        callback.resolve(null)
     }
     }
 
@@ -514,13 +525,12 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.skipToNext()
-
-        if (initialTime >= 0) {
-            musicService.seekTo(initialTime.toFloat())
+        completeCommand(callback) {
+            musicService.skipToNext()
+            if (initialTime >= 0) {
+                musicService.seekTo(initialTime.toFloat())
+            }
         }
-
-        callback.resolve(null)
     }
     }
 
@@ -529,13 +539,12 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.skipToPrevious()
-
-        if (initialTime >= 0) {
-            musicService.seekTo(initialTime.toFloat())
+        completeCommand(callback) {
+            musicService.skipToPrevious()
+            if (initialTime >= 0) {
+                musicService.seekTo(initialTime.toFloat())
+            }
         }
-
-        callback.resolve(null)
     }
     }
 
@@ -544,9 +553,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.reset()
-
-        callback.resolve(null)
+        completeCommand(callback) { musicService.reset() }
     }
     }
 
@@ -555,8 +562,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.play()
-        callback.resolve(null)
+        completeCommand(callback) { musicService.play() }
     }
     }
 
@@ -565,8 +571,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.pause()
-        callback.resolve(null)
+        completeCommand(callback) { musicService.pause() }
     }
     }
 
@@ -575,8 +580,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.stop()
-        callback.resolve(null)
+        completeCommand(callback) { musicService.stop() }
     }
     }
 
@@ -585,8 +589,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.seekTo(seconds.toFloat())
-        callback.resolve(null)
+        completeCommand(callback) { musicService.seekTo(seconds.toFloat()) }
     }
     }
 
@@ -595,8 +598,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.seekBy(offset.toFloat())
-        callback.resolve(null)
+        completeCommand(callback) { musicService.seekBy(offset.toFloat()) }
     }
     }
 
@@ -605,8 +607,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.retry()
-        callback.resolve(null)
+        completeCommand(callback) { musicService.retry() }
     }
     }
 
@@ -625,11 +626,8 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        try {
+        completeCommand(callback) {
             musicService.crossFadePrepare(previous, seekTo)
-            callback.resolve(null)
-        } catch (exception: Exception) {
-            rejectWithException(callback, exception)
         }
     }
     }
@@ -645,11 +643,8 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        try {
+        completeCommand(callback) {
             musicService.crossFade(fadeDuration, fadeInterval, fadeToVolume, waitUntil)
-            callback.resolve(null)
-        } catch (exception: Exception) {
-            rejectWithException(callback, exception)
         }
     }
     }
