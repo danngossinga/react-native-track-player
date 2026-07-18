@@ -70,6 +70,7 @@ private func waitForStandardPlaybackActivation(
 
 protocol IOSPlaybackBackendRouting: PlaybackBackend {
     var playbackState: State { get }
+    var publicPlaybackError: IOSPlaybackErrorSnapshot? { get }
     var currentIndex: Int { get }
     var position: Double { get }
     var duration: Double { get }
@@ -77,6 +78,7 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
     var publicVolume: Float { get }
     var publicRate: Float { get }
     var publicPlayWhenReady: Bool { get }
+    var publicRepeatMode: Int { get }
     var queue: [Track] { get }
 
     func syncQueue(_ tracks: [Track])
@@ -113,6 +115,56 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
     )
 }
 
+struct IOSPlaybackErrorSnapshot: Equatable {
+    let message: String?
+    let code: String?
+
+    var dictionary: Dictionary<String, Any> {
+        var body: Dictionary<String, Any> = [:]
+        if let message = message {
+            body["message"] = message
+        }
+        if let code = code {
+            body["code"] = code
+        }
+        return body
+    }
+}
+
+func iosPlaybackErrorSnapshot(
+    from error: AudioPlayerError.PlaybackError?
+) -> IOSPlaybackErrorSnapshot? {
+    switch error {
+    case .some(.failedToLoadKeyValue):
+        return IOSPlaybackErrorSnapshot(
+            message: "Failed to load resource",
+            code: "ios_failed_to_load_resource"
+        )
+    case .some(.invalidSourceUrl):
+        return IOSPlaybackErrorSnapshot(
+            message: "The source url was invalid",
+            code: "ios_invalid_source_url"
+        )
+    case .some(.notConnectedToInternet):
+        return IOSPlaybackErrorSnapshot(
+            message: "A network resource was requested, but an internet connection has not been established and can’t be established automatically.",
+            code: "ios_not_connected_to_internet"
+        )
+    case .some(.playbackFailed):
+        return IOSPlaybackErrorSnapshot(
+            message: "Playback of the track failed",
+            code: "ios_playback_failed"
+        )
+    case .some(.itemWasUnplayable):
+        return IOSPlaybackErrorSnapshot(
+            message: "The track could not be played",
+            code: "ios_track_unplayable"
+        )
+    case .none:
+        return nil
+    }
+}
+
 final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     let kind = PlaybackBackendKind.standard
     var identity: AnyObject { return player }
@@ -125,9 +177,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let onCommitted: (QueuedAudioPlayer) -> Void
     private let onActivated: (QueuedAudioPlayer) -> Void
     private let onDisposed: (QueuedAudioPlayer) -> Void
+    private let onIdleTrackActivationWillBegin: (QueuedAudioPlayer) -> Void
+    private let onIdleTrackActivated: (QueuedAudioPlayer, Int?) -> Void
     private let waitForActivationReadiness: (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
     private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
+    private var idleWithoutActiveTrack = false
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
@@ -140,6 +195,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
         onDisposed: @escaping (QueuedAudioPlayer) -> Void,
+        onIdleTrackActivationWillBegin: @escaping (QueuedAudioPlayer) -> Void = { _ in },
+        onIdleTrackActivated: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
         waitForActivationReadiness: @escaping (
             QueuedAudioPlayer,
             PlaybackBackendSnapshot
@@ -155,6 +212,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.onCommitted = onCommitted
         self.onActivated = onActivated
         self.onDisposed = onDisposed
+        self.onIdleTrackActivationWillBegin = onIdleTrackActivationWillBegin
+        self.onIdleTrackActivated = onIdleTrackActivated
         self.waitForActivationReadiness = waitForActivationReadiness
         self.isAuthoritative = initiallyAuthoritative
         if let incomingQueueProvider = incomingQueueProvider {
@@ -167,14 +226,20 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.queueProvider = queueProvider
     }
 
-    var playbackState: State { return State.fromPlayerState(state: player.playerState) }
-    var currentIndex: Int { return player.currentIndex }
-    var position: Double { return player.currentTime }
-    var duration: Double { return player.duration }
-    var bufferedPosition: Double { return player.bufferedPosition }
+    var playbackState: State {
+        return idleWithoutActiveTrack ? .none : State.fromPlayerState(state: player.playerState)
+    }
+    var publicPlaybackError: IOSPlaybackErrorSnapshot? {
+        return iosPlaybackErrorSnapshot(from: player.playbackError)
+    }
+    var currentIndex: Int { return idleWithoutActiveTrack ? -1 : player.currentIndex }
+    var position: Double { return idleWithoutActiveTrack ? 0 : player.currentTime }
+    var duration: Double { return idleWithoutActiveTrack ? 0 : player.duration }
+    var bufferedPosition: Double { return idleWithoutActiveTrack ? 0 : player.bufferedPosition }
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
-    var publicPlayWhenReady: Bool { return player.playWhenReady }
+    var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
+    var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 
     func settleActiveTransition() throws {}
@@ -182,13 +247,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func snapshot() throws -> PlaybackBackendSnapshot {
         let queue = queueProvider()
         queueState.captureAuthoritative(queue)
-        let index = queue.indices.contains(player.currentIndex) ? player.currentIndex : nil
+        let index = queue.indices.contains(currentIndex) ? currentIndex : nil
         return PlaybackBackendSnapshot(
             queueIDs: queue.map(playbackBackendTrackID),
             activeIndex: index,
             activeTrackID: index.map { playbackBackendTrackID(queue[$0]) },
-            position: max(0, player.currentTime),
-            playWhenReady: player.playWhenReady,
+            position: max(0, position),
+            playWhenReady: publicPlayWhenReady,
             volume: player.volume,
             rate: player.rate,
             repeatMode: player.repeatMode.rawValue,
@@ -218,6 +283,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             player.clear()
             try player.add(items: queue)
         }
+        idleWithoutActiveTrack = snapshot.activeIndex == nil && !queue.isEmpty
         player.rate = snapshot.rate
         player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
         if let index = snapshot.activeIndex,
@@ -323,8 +389,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
-        player.playWhenReady = snapshot.playWhenReady
-        if snapshot.playWhenReady {
+        player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady
+        if player.playWhenReady {
             player.play()
         } else {
             player.pause()
@@ -342,7 +408,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         resumeControlSurface(snapshot)
     }
 
-    func play() throws { player.play() }
+    func play() throws {
+        let wasIdle = idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
+        if wasIdle { idleWithoutActiveTrack = false }
+        player.play()
+        publishIdleTrackActivationIfNeeded(wasIdle)
+    }
     func pause() { player.pause() }
     func seek(to position: Double) throws { player.seek(to: position) }
 
@@ -373,57 +445,105 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         for index in indexes.sorted().reversed() {
             try player.removeItem(at: index)
         }
+        if player.items.isEmpty { idleWithoutActiveTrack = false }
     }
 
     func move(from: Int, to: Int) throws {
         try player.moveItem(fromIndex: from, toIndex: to)
     }
 
-    func removeUpcomingTracks() { player.removeUpcomingItems() }
+    func removeUpcomingTracks() {
+        guard !idleWithoutActiveTrack else { return }
+        player.removeUpcomingItems()
+    }
 
     func replaceQueue(_ tracks: [Track]) throws {
         player.clear()
         try player.add(items: tracks)
+        if tracks.isEmpty { idleWithoutActiveTrack = false }
     }
 
-    func clearQueue() { player.clear() }
+    func clearQueue() {
+        player.clear()
+        idleWithoutActiveTrack = false
+    }
 
     func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {
+        let wasIdle = idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
+        if wasIdle { idleWithoutActiveTrack = false }
         player.load(item: track)
+        publishIdleTrackActivationIfNeeded(wasIdle)
         completion(.success(player.currentIndex))
     }
 
     func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+        let wasIdle = idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
         do {
+            if wasIdle { idleWithoutActiveTrack = false }
             try player.jumpToItem(atIndex: index, playWhenReady: player.playerState == .playing)
             if initialTime >= 0 { player.seek(to: initialTime) }
+            publishIdleTrackActivationIfNeeded(wasIdle)
             completion(.success(()))
         } catch {
+            if wasIdle { idleWithoutActiveTrack = true }
+            cancelIdleTrackActivationIfNeeded(wasIdle)
             completion(.failure(error))
         }
     }
 
     func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+        if idleWithoutActiveTrack {
+            beginIdleTrackActivationIfNeeded(true)
+            do {
+                idleWithoutActiveTrack = false
+                try player.jumpToItem(atIndex: 0, playWhenReady: false)
+                if initialTime >= 0 { player.seek(to: initialTime) }
+                publishIdleTrackActivationIfNeeded(true)
+                completion(.success(()))
+            } catch {
+                idleWithoutActiveTrack = true
+                cancelIdleTrackActivationIfNeeded(true)
+                completion(.failure(error))
+            }
+            return
+        }
         player.next()
         if initialTime >= 0 { player.seek(to: initialTime) }
         completion(.success(()))
     }
 
     func skipToPrevious(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !idleWithoutActiveTrack else {
+            completion(.failure(playbackBackendError(
+                code: "index_out_of_bounds",
+                message: "The previous track index is out of bounds."
+            )))
+            return
+        }
         player.previous()
         if initialTime >= 0 { player.seek(to: initialTime) }
         completion(.success(()))
     }
 
     func play(completion: @escaping (Result<Void, Error>) -> Void) {
+        let wasIdle = idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
+        if wasIdle { idleWithoutActiveTrack = false }
         player.play()
+        publishIdleTrackActivationIfNeeded(wasIdle)
         completion(.success(()))
     }
 
     func stop() { player.stop() }
 
     func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
+        let wasIdle = value && idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
+        if wasIdle { idleWithoutActiveTrack = false }
         player.playWhenReady = value
+        publishIdleTrackActivationIfNeeded(wasIdle)
         completion(.success(()))
     }
 
@@ -439,7 +559,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func setVolume(_ value: Float) { player.volume = value }
     func setRate(_ value: Float) { player.rate = value }
-    func retry() { player.reload(startFromCurrentTime: true) }
+    func retry() {
+        let wasIdle = idleWithoutActiveTrack
+        beginIdleTrackActivationIfNeeded(wasIdle)
+        if wasIdle { idleWithoutActiveTrack = false }
+        player.reload(startFromCurrentTime: true)
+        publishIdleTrackActivationIfNeeded(wasIdle)
+    }
     func setRepeatMode(_ rawValue: Int) {
         player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: rawValue) ?? .off
     }
@@ -466,6 +592,19 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             code: "crossfade_disabled",
             message: "The standard playback backend does not own a crossfade engine."
         )))
+    }
+
+    private func publishIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
+        guard wasIdle else { return }
+        onIdleTrackActivated(player, player.currentIndex >= 0 ? player.currentIndex : nil)
+    }
+
+    private func beginIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
+        if wasIdle { onIdleTrackActivationWillBegin(player) }
+    }
+
+    private func cancelIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
+        if wasIdle { onIdleTrackActivated(player, nil) }
     }
 }
 

@@ -34,6 +34,17 @@ func orchestratedActiveTrackEventBody(
     return body
 }
 
+private struct StandardActiveTrackEventKey: Equatable {
+    let source: ObjectIdentifier
+    let trackID: String?
+    let index: Int?
+}
+
+private struct PendingStandardIdleTrackActivation {
+    let source: ObjectIdentifier
+    var emittedByPhysicalPlayer: Bool
+}
+
 @objc(RNTrackPlayer)
 public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOSPlaybackOrchestratorDelegate {
 
@@ -59,6 +70,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var backwardJumpInterval: NSNumber? = nil;
     private var configuredCapabilityValues: Set<String> = []
     private var configuredRemoteCommands: [RemoteCommand] = []
+    private var pendingStandardIdleTrackActivation: PendingStandardIdleTrackActivation? = nil
+    private var standardIdleActivationDuplicateGuard: StandardActiveTrackEventKey? = nil
     private var sessionCategory: AVAudioSession.Category = .playback
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
@@ -399,6 +412,29 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }, completion: completion)
     }
 
+    private func withActivePlaybackBackendRead<Value>(
+        _ operation: @escaping (IOSPlaybackBackendRouting) throws -> Value,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        playbackBackendFacade!.withCurrentBackendRead({ backend in
+            try operation(backend as! IOSPlaybackBackendRouting)
+        }, completion: completion)
+    }
+
+    private func resolveActivePlaybackBackendRead<Value>(
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock,
+        message: String,
+        _ operation: @escaping (IOSPlaybackBackendRouting) throws -> Value
+    ) {
+        withActivePlaybackBackendRead(operation) { result in
+            switch result {
+            case .success(let value): resolve(value)
+            case .failure(let error): reject("playback_read_failed", message, error)
+            }
+        }
+    }
+
     private func makePlaybackBackend(
         _ kind: PlaybackBackendKind,
         initiallyAuthoritative: Bool = false
@@ -426,6 +462,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 },
                 onDisposed: { [weak self] disposed in
                     self?.removePlayerEvents(disposed)
+                },
+                onIdleTrackActivationWillBegin: { [weak self] source in
+                    self?.beginStandardIdleTrackActivation(source: source)
+                },
+                onIdleTrackActivated: { [weak self] source, index in
+                    self?.finishStandardIdleTrackActivation(source: source, index: index)
                 },
                 initiallyAuthoritative: initiallyAuthoritative,
                 incomingQueueProvider: incomingQueueProvider,
@@ -479,6 +521,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     private func commitStandardPlayer(_ committed: QueuedAudioPlayer) {
         performOnMainSync {
+            pendingStandardIdleTrackActivation = nil
+            standardIdleActivationDuplicateGuard = nil
             player = committed
             configurePlayerEvents(committed)
             committed.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
@@ -514,16 +558,70 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private func publishCanonicalStandardState(_ committed: QueuedAudioPlayer) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: committed),
               committed === player else { return }
+        let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
         stopOrchestratedProgressUpdates()
         emit(
             event: EventType.PlaybackState,
-            body: getPlaybackStateBodyKeyValues(state: committed.playerState)
+            body: getPlaybackStateBodyKeyValues(
+                state: backend?.playbackState ?? State.fromPlayerState(state: committed.playerState),
+                error: backend?.publicPlaybackError
+            )
         )
         configureAudioSession()
         emit(
             event: EventType.PlaybackPlayWhenReadyChanged,
-            body: ["playWhenReady": committed.playWhenReady]
+            body: ["playWhenReady": backend?.publicPlayWhenReady ?? committed.playWhenReady]
         )
+    }
+
+    private func standardActiveTrackEventKey(
+        source: QueuedAudioPlayer,
+        item: AudioItem?,
+        index: Int?
+    ) -> StandardActiveTrackEventKey {
+        return StandardActiveTrackEventKey(
+            source: ObjectIdentifier(source),
+            trackID: (item as? Track).map(playbackBackendTrackID),
+            index: index
+        )
+    }
+
+    private func beginStandardIdleTrackActivation(source: QueuedAudioPlayer) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              source === player else { return }
+        standardIdleActivationDuplicateGuard = nil
+        pendingStandardIdleTrackActivation = PendingStandardIdleTrackActivation(
+            source: ObjectIdentifier(source),
+            emittedByPhysicalPlayer: false
+        )
+    }
+
+    private func finishStandardIdleTrackActivation(source: QueuedAudioPlayer, index: Int?) {
+        let sourceID = ObjectIdentifier(source)
+        guard let pending = pendingStandardIdleTrackActivation,
+              pending.source == sourceID else { return }
+        pendingStandardIdleTrackActivation = nil
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              source === player,
+              let index = index,
+              source.items.indices.contains(index),
+              !pending.emittedByPhysicalPlayer else { return }
+        let item = source.items[index]
+        let key = standardActiveTrackEventKey(source: source, item: item, index: index)
+
+        handleAudioPlayerCurrentItemChange(
+            source: source,
+            item: item,
+            index: index,
+            lastItem: nil,
+            lastIndex: nil,
+            lastPosition: 0
+        )
+        standardIdleActivationDuplicateGuard = key
+        DispatchQueue.main.async { [weak self] in
+            guard self?.standardIdleActivationDuplicateGuard == key else { return }
+            self?.standardIdleActivationDuplicateGuard = nil
+        }
     }
 
     private func publishCanonicalPingPongState(_ committed: IOSPlaybackOrchestrator) {
@@ -747,15 +845,18 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             return
         }
 
-        // deactivate the session when there is no current item to be played
-        if (player.currentItem == nil) {
+        let routedBackend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
+        let hasLogicalCurrentItem = routedBackend?.kind == .standard
+            ? (routedBackend!.currentIndex >= 0)
+            : (player.currentItem != nil)
+        if !hasLogicalCurrentItem {
             try? audioSessionController.deactivateSession()
             return
         }
         
         // activate the audio session when there is an item to be played
         // and the player has been configured to start when it is ready loading:
-        if (player.playWhenReady) {
+        if (routedBackend?.publicPlayWhenReady ?? player.playWhenReady) {
             activateAudioSessionForPlayback()
         }
     }
@@ -766,20 +867,32 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getPlayerLifecycle:rejecter:)
-    public func getPlayerLifecycle(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        resolve(playerLifecycleDictionary())
+    public func getPlayerLifecycle(
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard hasInitialized else {
+            resolve(playerLifecycleDictionary(backend: nil))
+            return
+        }
+        withActivePlaybackBackendRead({ self.playerLifecycleDictionary(backend: $0) }) { result in
+            switch result {
+            case .success(let lifecycle): resolve(lifecycle)
+            case .failure(let error): reject("playback_read_failed", "Unable to read player lifecycle.", error)
+            }
+        }
     }
 
-    private func playerLifecycleDictionary() -> [String: Any] {
-        let playbackState: State = {
-            if !hasInitialized { return .none }
-            return activePlaybackBackend.playbackState
-        }()
-        let activeIndex = hasInitialized ? activePlaybackBackend.currentIndex : -1
-        let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < player.items.count ? activeIndex : NSNull()
+    private func playerLifecycleDictionary(
+        backend: IOSPlaybackBackendRouting?
+    ) -> [String: Any] {
+        let playbackState = backend?.playbackState ?? .none
+        let activeIndex = backend?.currentIndex ?? -1
+        let queueSize = backend?.queue.count ?? 0
+        let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < queueSize ? activeIndex : NSNull()
         let phase = setupInProgress ? "settingUp" : (hasInitialized ? "ready" : "uninitialized")
-        let backend = hasInitialized ? activePlaybackBackend.kind.rawValue : "none"
-        let playWhenReady = hasInitialized ? activePlaybackBackend.publicPlayWhenReady : false
+        let backendName = backend?.kind.rawValue ?? "none"
+        let playWhenReady = backend?.publicPlayWhenReady ?? false
 
         return [
             "phase": phase,
@@ -789,8 +902,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             "canAcceptCommands": hasInitialized,
             "playbackState": playbackState.rawValue,
             "playWhenReady": playWhenReady,
-            "backend": backend,
-            "queueSize": hasInitialized ? activePlaybackBackend.queue.count : 0,
+            "backend": backendName,
+            "queueSize": queueSize,
             "activeTrackIndex": normalizedActiveIndex
         ]
     }
@@ -820,7 +933,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 guard let self = self else { return }
                 switch result {
                 case .success:
-                    resolve(self.playerLifecycleDictionary())
+                    self.withActivePlaybackBackendRead({ self.playerLifecycleDictionary(backend: $0) }) {
+                        switch $0 {
+                        case .success(let lifecycle): resolve(lifecycle)
+                        case .failure(let error):
+                            reject("playback_read_failed", "Unable to read player lifecycle.", error)
+                        }
+                    }
                 case .failure(let error):
                     reject("playback_backend_swap_failed", "Unable to change playback backend.", error)
                 }
@@ -882,11 +1001,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         let queuePlayer = sourcePlayer ?? player
         let orchestrator = sourceOrchestrator ?? playbackOrchestrator
         let backendKind = kind ?? (useOrchestratedCrossfade ? .pingPong : .standard)
+        let routedBackend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
         let center = MPRemoteCommandCenter.shared()
-        let logicalIndex = backendKind == .pingPong ? orchestrator.currentIndex : queuePlayer.currentIndex
+        let logicalIndex = backendKind == .pingPong
+            ? orchestrator.currentIndex
+            : (routedBackend?.kind == .standard ? routedBackend!.currentIndex : queuePlayer.currentIndex)
         let hasCurrentItem = backendKind == .pingPong
             ? orchestrator.hasCurrentItem
-            : queuePlayer.currentItem != nil
+            : logicalIndex >= 0
 
         center.nextTrackCommand.isEnabled = configuredCapabilityValues.contains(Capability.next.rawValue)
             && hasCurrentItem
@@ -1240,9 +1362,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getPlayWhenReady:rejecter:)
-    public func getPlayWhenReady(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPlayWhenReady(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        resolve(activePlaybackBackend.publicPlayWhenReady)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read playWhenReady."
+        ) { $0.publicPlayWhenReady }
     }
 
     @objc(stop:rejecter:)
@@ -1313,10 +1439,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getRepeatMode:rejecter:)
-    public func getRepeatMode(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getRepeatMode(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(player.repeatMode.rawValue)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read repeat mode."
+        ) { $0.publicRepeatMode }
     }
 
     @objc(setVolume:resolver:rejecter:)
@@ -1392,10 +1521,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getVolume:rejecter:)
-    public func getVolume(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getVolume(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackVolume())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read volume."
+        ) { $0.publicVolume }
     }
 
     @objc(setRate:resolver:rejecter:)
@@ -1411,30 +1543,38 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getRate:rejecter:)
-    public func getRate(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getRate(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(activePlaybackBackend.publicRate)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read playback rate."
+        ) { $0.publicRate }
     }
 
     @objc(getTrack:resolver:rejecter:)
-    public func getTrack(index: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getTrack(index: NSNumber, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let queue = activePlaybackBackend.queue
-        if (index.intValue >= 0 && index.intValue < queue.count) {
-            resolve(queue[index.intValue].toObject())
-        } else {
-            resolve(NSNull())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read track."
+        ) { backend -> Any in
+            let queue = backend.queue
+            return queue.indices.contains(index.intValue)
+                ? queue[index.intValue].toObject()
+                : NSNull()
         }
     }
 
     @objc(getQueue:rejecter:)
-    public func getQueue(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getQueue(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let serializedQueue = activePlaybackBackend.queue.map { $0.toObject() }
-        resolve(serializedQueue)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read queue."
+        ) { $0.queue.map { $0.toObject() } }
     }
 
     @objc(setQueue:resolver:rejecter:)
@@ -1465,65 +1605,77 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getActiveTrack:rejecter:)
-    public func getActiveTrack(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getActiveTrack(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let index = activePlaybackBackend.currentIndex
-        let queue = activePlaybackBackend.queue
-        if (index >= 0 && index < queue.count) {
-            resolve(queue[index].toObject())
-        } else {
-            resolve(NSNull())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read active track."
+        ) { backend -> Any in
+            let index = backend.currentIndex
+            let queue = backend.queue
+            return queue.indices.contains(index) ? queue[index].toObject() : NSNull()
         }
     }
 
     @objc(getActiveTrackIndex:rejecter:)
-    public func getActiveTrackIndex(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getActiveTrackIndex(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let index = activePlaybackBackend.currentIndex
-        if index < 0 || index >= activePlaybackBackend.queue.count {
-            resolve(NSNull())
-        } else {
-            resolve(index)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read active track index."
+        ) { backend -> Any in
+            let index = backend.currentIndex
+            return backend.queue.indices.contains(index) ? index : NSNull()
         }
     }
 
     @objc(getDuration:rejecter:)
-    public func getDuration(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getDuration(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackDuration())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read duration.") {
+            $0.duration
+        }
     }
 
     @objc(getBufferedPosition:rejecter:)
-    public func getBufferedPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getBufferedPosition(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicBufferedPosition())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read buffered position.") {
+            $0.bufferedPosition
+        }
     }
 
     @objc(getPosition:rejecter:)
-    public func getPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPosition(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackPosition())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read position.") {
+            $0.position
+        }
     }
 
     @objc(getProgress:rejecter:)
-    public func getProgress(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getProgress(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        resolve([
-            "position": publicPlaybackPosition(),
-            "duration": publicPlaybackDuration(),
-            "buffered": publicBufferedPosition()
-        ])
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read progress.") {
+            [
+                "position": $0.position,
+                "duration": $0.duration,
+                "buffered": $0.bufferedPosition
+            ]
+        }
     }
 
     @objc(getPlaybackState:rejecter:)
-    public func getPlaybackState(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPlaybackState(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        resolve(getPlaybackStateBodyKeyValues(state: activePlaybackBackend.playbackState))
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read playback state.") {
+            self.getPlaybackStateBodyKeyValues(
+                state: $0.playbackState,
+                error: $0.publicPlaybackError
+            )
+        }
     }
 
     @objc(updateMetadataForTrack:metadata:resolver:rejecter:)
@@ -1558,52 +1710,39 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         resolve(NSNull())
     }
 
-    private func getPlaybackStateErrorKeyValues() -> Dictionary<String, Any> {
-        switch player.playbackError {
-            case .failedToLoadKeyValue: return [
-                "message": "Failed to load resource",
-                "code": "ios_failed_to_load_resource"
-            ]
-            case .invalidSourceUrl: return [
-                "message": "The source url was invalid",
-                "code": "ios_invalid_source_url"
-            ]
-            case .notConnectedToInternet: return [
-                "message": "A network resource was requested, but an internet connection has not been established and can’t be established automatically.",
-                "code": "ios_not_connected_to_internet"
-            ]
-            case .playbackFailed: return [
-                "message": "Playback of the track failed",
-                "code": "ios_playback_failed"
-            ]
-            case .itemWasUnplayable: return [
-                "message": "The track could not be played",
-                "code": "ios_track_unplayable"
-            ]
-            default: return [
-                "message": "A playback error occurred",
-                "code": "ios_playback_error"
-            ]
-        }
-    }
-
-    private func getPlaybackStateBodyKeyValues(state: AudioPlayerState) -> Dictionary<String, Any> {
+    private func getPlaybackStateBodyKeyValues(
+        state: AudioPlayerState,
+        error: IOSPlaybackErrorSnapshot? = nil
+    ) -> Dictionary<String, Any> {
         var body: Dictionary<String, Any> = ["state": State.fromPlayerState(state: state).rawValue]
         if (state == AudioPlayerState.failed) {
-            body["error"] = getPlaybackStateErrorKeyValues()
+            body["error"] = error?.dictionary ?? [:]
         }
         return body
     }
 
-    private func getPlaybackStateBodyKeyValues(state: State) -> Dictionary<String, Any> {
-        return ["state": state.rawValue]
+    private func getPlaybackStateBodyKeyValues(
+        state: State,
+        error: IOSPlaybackErrorSnapshot? = nil
+    ) -> Dictionary<String, Any> {
+        var body: Dictionary<String, Any> = ["state": state.rawValue]
+        if state == .error {
+            body["error"] = error?.dictionary ?? [:]
+        }
+        return body
     }
 
     // MARK: - QueuedAudioPlayer Event Handlers
 
     func handleAudioPlayerStateChange(source: QueuedAudioPlayer, state: AVPlayerWrapperState) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
-        emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(
+                state: state,
+                error: iosPlaybackErrorSnapshot(from: source.playbackError)
+            )
+        )
         if (state == .ended) {
             emit(event: EventType.PlaybackQueueEnded, body: [
                 "track": source.currentIndex,
@@ -1650,6 +1789,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         lastPosition: Double?
     ) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+
+        if pendingStandardIdleTrackActivation?.source == ObjectIdentifier(source) {
+            pendingStandardIdleTrackActivation?.emittedByPhysicalPlayer = true
+        }
+
+        let eventKey = standardActiveTrackEventKey(source: source, item: item, index: index)
+        if standardIdleActivationDuplicateGuard == eventKey {
+            standardIdleActivationDuplicateGuard = nil
+            return
+        }
 
         if let item = item {
             DispatchQueue.main.async {

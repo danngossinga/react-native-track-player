@@ -19,9 +19,16 @@ internal data class StandardPlaybackReadinessObservation(
 
 internal object StandardPlaybackActivationSnapshotValidator {
     fun validate(snapshot: PlaybackBackendSnapshot) {
-        if (snapshot.queueIds.isNotEmpty() && snapshot.activeIndex == null) {
+        val validIdle = snapshot.activeIndex == null &&
+            snapshot.activeTrackId == null &&
+            !snapshot.playWhenReady
+        val activeIndex = snapshot.activeIndex
+        val validActive = activeIndex != null &&
+            activeIndex in snapshot.queueIds.indices &&
+            snapshot.activeTrackId == snapshot.queueIds[activeIndex]
+        if (!validIdle && !validActive) {
             throw RejectionException(
-                "The standard playback candidate requires an active track for a non-empty queue.",
+                "The standard playback candidate did not restore a coherent active track.",
                 "playback_backend_activation_not_ready"
             )
         }

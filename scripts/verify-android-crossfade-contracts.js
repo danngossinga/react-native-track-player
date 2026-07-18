@@ -29,6 +29,7 @@ const standardBackend = read('android/src/main/java/com/doublesymmetry/trackplay
 const pingPongBackend = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PingPongPlaybackBackend.kt');
 const mediaSurface = read('android/src/main/java/com/doublesymmetry/trackplayer/service/AndroidOrchestratedMediaSurface.kt');
 const sharedFlowAdmission = read('android/src/main/java/com/doublesymmetry/trackplayer/service/SharedFlowAdmission.kt');
+const mediaSessionInstrumentation = read('android/src/androidTest/java/com/doublesymmetry/trackplayer/service/KotlinAudioMediaSessionControlInstrumentationTest.kt');
 
 const prepareCrossfade = section(
   orchestrator,
@@ -99,13 +100,13 @@ assert(
 );
 assert(
   facade.indexOf('previous.relinquishExclusiveControlSurfaceBeforeCommit()') <
-    facade.indexOf('replacement.commitQueue(snapshot)') &&
-    facade.indexOf('replacement.commitQueue(snapshot)') < facade.indexOf('backend = replacement') &&
-    facade.indexOf('backend = replacement') < facade.indexOf('authority.publish(replacement)') &&
-    facade.indexOf('backend = replacement') < facade.indexOf('replacement.activateAfterCommit(snapshot)') &&
+    facade.indexOf('finalReplacement.commitQueue(snapshot)') &&
+    facade.indexOf('finalReplacement.commitQueue(snapshot)') < facade.indexOf('backend = finalReplacement') &&
+    facade.indexOf('backend = finalReplacement') < facade.indexOf('authority.publish(finalReplacement)') &&
+    facade.indexOf('backend = finalReplacement') < facade.indexOf('finalReplacement.activateAfterCommit(snapshot)') &&
     !standardRelinquish.includes('releasePlayer()') &&
     standardDispose.includes('releasePlayer()'),
-  'Android must defer standard-player destruction until post-commit disposal, before activating PingPong.'
+  'Android must defer standard-player destruction until post-commit disposal and activate the replacement only after commit.'
 );
 assert(
   facade.includes('owner?.let { it.type == type && it.identity === identity }') &&
@@ -120,7 +121,7 @@ assert(
   'Android authority, remotes, and media surfaces must pre-admit one exact identity per backend generation.'
 );
 assert(
-  progressUpdateEvent.includes('withActivePlaybackBackend { backend ->') &&
+  progressUpdateEvent.includes('withActivePlaybackBackendRead { backend ->') &&
     progressUpdateEvent.includes('backend.playbackState != AudioPlayerState.PLAYING') &&
     progressUpdateEvent.includes('backend.positionMs.toSeconds()') &&
     progressUpdateEvent.includes('backend.bufferedMs.toSeconds()'),
@@ -214,16 +215,35 @@ assert(
   'Android playback commands must use cancellable operations with non-leaking facade leases.'
 );
 assert(
-  standardBackend.includes('authoritativeQueue') &&
-    pingPongBackend.includes('authoritativeQueue') &&
-    facade.includes('rollbackAuthoritativeBackend(previous, snapshot)'),
+  standardBackend.includes('private val queueState = PlaybackBackendQueueState<TrackAudioItem>()') &&
+    standardBackend.includes('queueState.captureAuthoritative(queue)') &&
+    standardBackend.includes('queueStore.replaceWith(queueState.rollback())') &&
+    pingPongBackend.includes('private val queueState = PlaybackBackendQueueState<TrackAudioItem>()') &&
+    pingPongBackend.includes('queueState.captureAuthoritative(queue)') &&
+    pingPongBackend.includes('queueStore.replaceWith(queueState.rollback())') &&
+    facade.includes('rollbackHandoffQuiescence(') &&
+    facade.includes('previous.cancelHandoffQuiescence(snapshot)') &&
+    facade.includes('previous.resumeControlSurface(snapshot)'),
   'Android backend rollback must retain full TrackAudioItem identity and restore the authoritative queue.'
+);
+assert(
+  standardBackend.includes('private val logicalPlaybackState = KotlinAudioLogicalPlaybackStateSidecar()') &&
+    standardBackend.includes('override val currentIndex: Int\n        get() = logicalPlaybackState.currentIndex(player.currentIndex)') &&
+    standardBackend.includes('selectFirstPhysicalItemIfNeeded()') &&
+    standardBackend.includes('if (logicalPlaybackState.shouldIgnorePrevious()) return') &&
+    mediaSessionInstrumentation.includes('testRestoredIdlePlayPublishesCanonicalFirstTrack') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleRetryPublishesCanonicalFirstTrack') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleLoadPublishesCanonicalCallbackAndQueue') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleQueueActivatesPhysicalZeroOnlyOnNext') &&
+    mediaSessionInstrumentation.includes('canonicalActivationIndices()'),
+  'Android restored standard-idle activation must publish exactly canonical index 0 and guard previous/double activation.'
 );
 assert(
   sharedFlowAdmission.includes('CoroutineStart.UNDISPATCHED') &&
     sharedFlowAdmission.includes('if (gate.acceptsEvents())') &&
     musicService.includes('val productAdmission = SharedFlowAdmissionGate()') &&
-    musicService.includes('binding.productAdmission.admit()'),
+    musicService.includes('binding.productAdmission.suspendAdmission()') &&
+    musicService.includes('binding.productAdmission.admitAfterProducerDrain(binding.ownerScope)'),
   'Android standard candidates must subscribe before restore and quarantine replayed product events until post-commit admission.'
 );
 assert(

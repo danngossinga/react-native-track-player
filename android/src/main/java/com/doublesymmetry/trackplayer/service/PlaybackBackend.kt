@@ -298,14 +298,13 @@ internal class PlaybackBackendFacade(
     suspend fun capturePhysicalRemoteTicket(sourceIdentity: Any): PhysicalRemoteTicket? =
         admissionMutex.withLock {
             val current = backend
-            val currentStandard = current.type == PlaybackBackendType.STANDARD &&
-                current.identity === sourceIdentity &&
-                authority.isAuthoritative(PlaybackBackendType.STANDARD, sourceIdentity)
+            val currentAuthoritative = current.identity === sourceIdentity &&
+                authority.isAuthoritative(current.type, sourceIdentity)
             val candidateProxy = candidateRemoteProxy === sourceIdentity
             val handoff = physicalHandoff?.takeIf { state ->
                 state.acceptedRemoteSources.any { it === sourceIdentity }
             }
-            if (!currentStandard && !candidateProxy && handoff == null) return@withLock null
+            if (!currentAuthoritative && !candidateProxy && handoff == null) return@withLock null
             PhysicalRemoteTicket(
                 sourceIdentity,
                 handoff?.previousGeneration ?: backendGeneration,
@@ -433,9 +432,7 @@ internal class PlaybackBackendFacade(
                     val handoff = PhysicalHandoffState(
                         signal = CompletableDeferred(),
                         previousGeneration = backendGeneration,
-                        previousRemoteSource = previous.identity.takeIf {
-                            previous.type == PlaybackBackendType.STANDARD
-                        },
+                        previousRemoteSource = previous.identity,
                         candidateRemoteSource = candidateRemoteProxy
                     )
                     // Publishing the barrier closes command admission before
@@ -780,9 +777,8 @@ internal class PlaybackBackendFacade(
 
     private fun isAcceptedRemoteSource(sourceIdentity: Any): Boolean {
         val current = backend
-        return (current.type == PlaybackBackendType.STANDARD &&
-            current.identity === sourceIdentity &&
-            authority.isAuthoritative(PlaybackBackendType.STANDARD, sourceIdentity)) ||
+        return (current.identity === sourceIdentity &&
+            authority.isAuthoritative(current.type, sourceIdentity)) ||
             candidateRemoteProxy === sourceIdentity
     }
 
@@ -798,12 +794,11 @@ internal class PlaybackBackendFacade(
 
         val previousSource = handoff.previousRemoteSource ?: return false
         val current = backend
-        return previousSource === ticket.sourceIdentity &&
+        return handoff.acceptedRemoteSources.any { it === ticket.sourceIdentity } &&
             ticket.backendGeneration == handoff.previousGeneration &&
             backendGeneration == handoff.previousGeneration &&
-            current.type == PlaybackBackendType.STANDARD &&
             current.identity === previousSource &&
-            authority.isAuthoritative(PlaybackBackendType.STANDARD, previousSource)
+            authority.isAuthoritative(current.type, previousSource)
     }
 
     companion object {

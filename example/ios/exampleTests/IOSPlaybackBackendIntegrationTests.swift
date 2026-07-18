@@ -1,9 +1,26 @@
 import XCTest
+import MediaPlayer
 import React
 import SwiftAudioEx
 @testable import react_native_track_player
 
 final class IOSPlaybackBackendIntegrationTests: XCTestCase {
+    func test_iosPlaybackStateErrorContractUsesBackendReadLease() throws {
+        let source = try sourceFile("ios/RNTrackPlayer/RNTrackPlayer.swift")
+        let getter = source
+            .substring(after: "public func getPlaybackState")
+            .substring(before: "@objc(updateMetadataForTrack")
+        let stateBody = source
+            .substring(after: "state: State,")
+            .substring(before: "// MARK: - QueuedAudioPlayer Event Handlers")
+
+        XCTAssertTrue(getter.contains("$0.publicPlaybackError"))
+        XCTAssertFalse(getter.contains("getPlaybackStateBodyKeyValues(state: $0.playbackState)"))
+        XCTAssertTrue(stateBody.contains("error: IOSPlaybackErrorSnapshot? = nil"))
+        XCTAssertTrue(stateBody.contains("if state == .error"))
+        XCTAssertTrue(stateBody.contains("body[\"error\"]"))
+    }
+
     func test_realRNTrackPlayerPreservesLoadedFixtureAcrossBackendRoundTrip() throws {
         let fixtureURL = try bundledAudioURL()
         let module: RNTrackPlayer = onMain {
@@ -53,12 +70,17 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertEqual((standard?["activeTrackIndex"] as? NSNumber)?.intValue, 0)
 
         var activeTrack: [String: Any]?
+        let activeTrackRead = expectation(description: "read active track after round trip")
         onMain {
             module.getActiveTrack(
-                resolve: { activeTrack = $0 as? [String: Any] },
-                reject: rejecting("getActiveTrack")
+                resolve: {
+                    activeTrack = $0 as? [String: Any]
+                    activeTrackRead.fulfill()
+                },
+                reject: rejecting("getActiveTrack", fulfilling: activeTrackRead)
             )
         }
+        wait(for: [activeTrackRead], timeout: 2)
         XCTAssertEqual(activeTrack?["id"] as? String, "bundled-pure-round-trip")
 
         let reset = expectation(description: "reset RNTrackPlayer")
@@ -71,7 +93,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         wait(for: [reset], timeout: 5)
     }
 
-    func test_realStandardCandidateRejectsNonemptyQueueWithoutActiveIndex() throws {
+    func test_realStandardCandidateRestoresIdleNonemptyQueueWithoutActiveIndex() throws {
         let fixtureURL = try bundledAudioURL()
         let track = makeTrack(id: "nil-active-standard", url: fixtureURL, duration: 28.2)
         let player = QueuedAudioPlayer()
@@ -96,19 +118,192 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             onActivated: { _ in activatedCount += 1 },
             onDisposed: { _ in },
             incomingQueue: [track],
-            queueProvider: { [] }
+            queueProvider: { player.items.compactMap { $0 as? Track } }
         )
 
-        XCTAssertThrowsError(try candidate.prepareSilently(snapshot)) { error in
-            XCTAssertEqual(
-                (error as NSError).userInfo["code"] as? String,
-                "playback_backend_activation_not_ready"
+        try candidate.prepareSilently(snapshot)
+        try candidate.restore(snapshot)
+        try candidate.prepareActivation(snapshot)
+        candidate.commitQueue(snapshot)
+        candidate.activateAfterCommit(snapshot)
+
+        XCTAssertEqual(player.items.count, 1)
+        XCTAssertEqual(candidate.currentIndex, -1)
+        XCTAssertFalse(candidate.publicPlayWhenReady)
+        XCTAssertEqual(candidate.playbackState.rawValue, State.none.rawValue)
+        XCTAssertEqual(committedCount, 1)
+        XCTAssertEqual(activatedCount, 1)
+
+        let appended = makeTrack(id: "nil-active-appended", url: fixtureURL, duration: 28.2)
+        let third = makeTrack(id: "nil-active-third", url: fixtureURL, duration: 28.2)
+        try candidate.add([appended, third], at: 1)
+        XCTAssertEqual(candidate.currentIndex, -1)
+        candidate.removeUpcomingTracks()
+        XCTAssertEqual(candidate.queue.map(playbackBackendTrackID), [
+            "nil-active-standard", "nil-active-appended", "nil-active-third"
+        ])
+        try candidate.replaceQueue([track])
+        XCTAssertEqual(candidate.currentIndex, -1)
+        try candidate.remove(at: [0])
+        XCTAssertTrue(candidate.queue.isEmpty)
+        try candidate.add([appended], at: 0)
+        XCTAssertEqual(candidate.currentIndex, 0)
+
+        try candidate.restore(snapshot)
+        XCTAssertEqual(candidate.currentIndex, -1)
+        try candidate.replaceQueue([])
+        try candidate.add([appended], at: 0)
+        XCTAssertEqual(candidate.currentIndex, 0)
+    }
+
+    func test_standardQueueMutationsDoNotCreateIdleSidecarWithoutRestoredSnapshot() throws {
+        let fixtureURL = try bundledAudioURL()
+        let first = makeTrack(id: "normal-add", url: fixtureURL, duration: 28.2)
+        let replacement = makeTrack(id: "normal-replace", url: fixtureURL, duration: 28.2)
+        let player = QueuedAudioPlayer()
+        let backend = StandardPlaybackBackend(
+            player: player,
+            transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+            automaticallyUpdateNowPlayingInfo: { false },
+            onCommitted: { _ in },
+            onActivated: { _ in },
+            onDisposed: { _ in },
+            initiallyAuthoritative: true,
+            queueProvider: { player.items.compactMap { $0 as? Track } }
+        )
+
+        try backend.add([first], at: 0)
+        XCTAssertEqual(backend.currentIndex, 0)
+        try backend.replaceQueue([replacement])
+        XCTAssertEqual(backend.currentIndex, 0)
+    }
+
+    func test_realRNTrackPlayerFirstPlayFromRestoredStandardIdlePublishesCanonicalTrackAndRemoteAvailabilityOnce() throws {
+        let recorder = RecordingEventObserver()
+        EventEmitter.shared.onEmit = { [weak recorder] event, body in
+            recorder?.record(event: event, body: body)
+        }
+        defer { EventEmitter.shared.onEmit = nil }
+
+        let fixtureURL = try bundledAudioURL()
+        let module: RNTrackPlayer = onMain {
+            let module = RNTrackPlayer()
+            module.setValue(RNTrackPlayerTestEventSink.shared, forKey: "callableJSModules")
+            module.setupPlayer(
+                config: ["crossfade": true, "autoUpdateMetadata": false],
+                resolve: { _ in },
+                reject: rejecting("setupPlayer")
+            )
+            module.update(
+                options: ["capabilities": ["play", "pause", "next", "previous"]],
+                resolve: { _ in },
+                reject: rejecting("updateOptions")
+            )
+            return module
+        }
+
+        let added = expectation(description: "add idle queue")
+        onMain {
+            module.add(
+                trackDicts: [
+                    ["id": "idle-first", "url": fixtureURL.absoluteString, "duration": 28.2],
+                    ["id": "idle-second", "url": fixtureURL.absoluteString, "duration": 28.2]
+                ],
+                before: -1,
+                resolve: { _ in added.fulfill() },
+                reject: rejecting("add", fulfilling: added)
             )
         }
-        XCTAssertTrue(player.items.isEmpty)
-        XCTAssertEqual(player.currentIndex, -1)
-        XCTAssertEqual(committedCount, 0)
-        XCTAssertEqual(activatedCount, 0)
+        wait(for: [added], timeout: 5)
+
+        let lifecycle = awaitBackendSwap(module, config: ["type": "standard"])
+        XCTAssertTrue(lifecycle?["activeTrackIndex"] is NSNull)
+        XCTAssertFalse(MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled)
+        XCTAssertFalse(MPRemoteCommandCenter.shared().previousTrackCommand.isEnabled)
+        recorder.reset()
+
+        let played = expectation(description: "play restored standard idle queue")
+        onMain {
+            module.play(
+                resolve: { _ in
+                    let activeEvents = recorder.events(for: .PlaybackActiveTrackChanged)
+                    XCTAssertEqual(activeEvents.count, 1)
+                    XCTAssertEqual(activeEvents.first?["index"] as? Int, 0)
+                    XCTAssertEqual(
+                        (activeEvents.first?["track"] as? [String: Any])?["id"] as? String,
+                        "idle-first"
+                    )
+                    XCTAssertTrue(MPRemoteCommandCenter.shared().nextTrackCommand.isEnabled)
+                    XCTAssertFalse(MPRemoteCommandCenter.shared().previousTrackCommand.isEnabled)
+                    played.fulfill()
+                },
+                reject: rejecting("play", fulfilling: played)
+            )
+        }
+        wait(for: [played], timeout: 5)
+
+        let duplicateWindow = expectation(description: "no duplicate canonical active-track event")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { duplicateWindow.fulfill() }
+        wait(for: [duplicateWindow], timeout: 1)
+        XCTAssertEqual(recorder.events(for: .PlaybackActiveTrackChanged).count, 1)
+
+        let reset = expectation(description: "reset idle activation module")
+        onMain {
+            module.reset(
+                resolve: { _ in reset.fulfill() },
+                reject: rejecting("reset", fulfilling: reset)
+            )
+        }
+        wait(for: [reset], timeout: 5)
+    }
+
+    func test_standardIdleSkipNextActivatesIndexZeroAndPreviousRejects() throws {
+        let fixtureURL = try bundledAudioURL()
+        let tracks = [
+            makeTrack(id: "idle-skip-first", url: fixtureURL, duration: 28.2),
+            makeTrack(id: "idle-skip-second", url: fixtureURL, duration: 28.2)
+        ]
+        let player = QueuedAudioPlayer()
+        let snapshot = PlaybackBackendSnapshot(
+            queueIDs: tracks.map(playbackBackendTrackID),
+            activeIndex: nil,
+            activeTrackID: nil,
+            position: 0,
+            playWhenReady: false,
+            volume: 1,
+            rate: 1,
+            repeatMode: SwiftAudioEx.RepeatMode.off.rawValue,
+            transitionGeneration: 0
+        )
+        let candidate = StandardPlaybackBackend(
+            player: player,
+            transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+            automaticallyUpdateNowPlayingInfo: { false },
+            onCommitted: { _ in },
+            onActivated: { _ in },
+            onDisposed: { _ in },
+            incomingQueue: tracks,
+            queueProvider: { player.items.compactMap { $0 as? Track } }
+        )
+        try candidate.prepareSilently(snapshot)
+        try candidate.restore(snapshot)
+        try candidate.prepareActivation(snapshot)
+        candidate.commitQueue(snapshot)
+        candidate.activateAfterCommit(snapshot)
+
+        var nextResult: Result<Void, Error>?
+        candidate.skipToNext(initialTime: -1) { nextResult = $0 }
+        XCTAssertNoThrow(try nextResult?.get())
+        XCTAssertEqual(candidate.currentIndex, 0)
+
+        try candidate.restore(snapshot)
+        XCTAssertEqual(candidate.currentIndex, -1)
+        var previousResult: Result<Void, Error>?
+        candidate.skipToPrevious(initialTime: -1) { previousResult = $0 }
+        XCTAssertThrowsError(try previousResult?.get()) { error in
+            XCTAssertEqual((error as NSError).userInfo["code"] as? String, "index_out_of_bounds")
+        }
+        XCTAssertEqual(candidate.currentIndex, -1)
     }
 
     func test_realStandardFinalRebaseUpdatesPositionWithoutReloadingSameQueue() throws {
@@ -422,6 +617,22 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             $0.state == "cancelled" && $0.errorCode == "queue_changed"
         }.count, 1)
         orchestrator.pause()
+    }
+
+    func test_awakenedScheduledCrossfadeTimerCannotRacePauseCancellation() throws {
+        try assertAwakenedScheduledCrossfadeCancellation(.pause)
+    }
+
+    func test_awakenedScheduledCrossfadeTimerCannotRaceBackendSwapCancellation() throws {
+        try assertAwakenedScheduledCrossfadeCancellation(.backendSwap)
+    }
+
+    func test_awakenedScheduledCrossfadeTimerCannotRaceQueueCancellation() throws {
+        try assertAwakenedScheduledCrossfadeCancellation(.queueChange)
+    }
+
+    func test_awakenedScheduledCrossfadeTimerCannotRaceSeekCancellation() throws {
+        try assertAwakenedScheduledCrossfadeCancellation(.seek)
     }
 
     func test_activeTrackRemapPayloadUsesCapturedPreviousTrack() throws {
@@ -1160,12 +1371,180 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertEqual(delegate.states.last, State.none.rawValue)
     }
 
+    private func assertAwakenedScheduledCrossfadeCancellation(
+        _ mutation: ScheduledCrossfadeCancellationMutation
+    ) throws {
+        let fixtureURL = try bundledAudioURL()
+        let outgoing = makeTrack(
+            id: "scheduled-race-\(mutation.label)-outgoing",
+            url: fixtureURL,
+            duration: 28.2
+        )
+        let incoming = makeTrack(
+            id: "scheduled-race-\(mutation.label)-incoming",
+            url: fixtureURL,
+            duration: 28.2
+        )
+        let replacement = makeTrack(
+            id: "scheduled-race-\(mutation.label)-replacement",
+            url: fixtureURL,
+            duration: 28.2
+        )
+        let timerAwakened = DispatchSemaphore(value: 0)
+        let releaseTimer = DispatchSemaphore(value: 0)
+        let timerFinished = DispatchSemaphore(value: 0)
+        let cancellationClaimed = DispatchSemaphore(value: 0)
+        let releaseCancellation = DispatchSemaphore(value: 0)
+        let mutationFinished = DispatchSemaphore(value: 0)
+        let observationLock = NSLock()
+        var timerAttemptedStart = false
+        var barrierFailure: String?
+        let orchestrator = IOSPlaybackOrchestrator(
+            scheduledCrossfadeTimerHook: { check in
+                timerAwakened.signal()
+                if releaseTimer.wait(timeout: .now() + 10) != .success {
+                    observationLock.lock()
+                    barrierFailure = "timer was not released"
+                    observationLock.unlock()
+                }
+                let attemptedStart = check()
+                observationLock.lock()
+                timerAttemptedStart = attemptedStart
+                observationLock.unlock()
+                timerFinished.signal()
+            },
+            scheduledCrossfadeCancellationAfterClaimHook: {
+                cancellationClaimed.signal()
+                if releaseCancellation.wait(timeout: .now() + 10) != .success {
+                    observationLock.lock()
+                    barrierFailure = "cancellation was not released"
+                    observationLock.unlock()
+                }
+            }
+        )
+        let delegate = RecordingOrchestratorDelegate()
+        orchestrator.delegate = delegate
+        orchestrator.replaceQueue([outgoing, incoming], currentIndex: 0)
+
+        let played = expectation(description: "scheduled race source playing \(mutation.label)")
+        orchestrator.play { result in
+            if case .failure(let error) = result { XCTFail("play failed: \(error)") }
+            played.fulfill()
+        }
+        wait(for: [played], timeout: 10)
+        let scheduledStartTime = orchestrator.currentTime * 1_000 + 100
+
+        let controllerFinished = expectation(
+            description: "scheduled race barrier finished \(mutation.label)"
+        )
+        DispatchQueue.global(qos: .userInitiated).async {
+            guard timerAwakened.wait(timeout: .now() + 10) == .success else {
+                observationLock.lock()
+                barrierFailure = "scheduled timer did not awaken"
+                observationLock.unlock()
+                releaseTimer.signal()
+                releaseCancellation.signal()
+                controllerFinished.fulfill()
+                return
+            }
+            DispatchQueue.global(qos: .userInitiated).async {
+                switch mutation {
+                case .pause:
+                    orchestrator.pause()
+                case .backendSwap:
+                    orchestrator.settleActiveTransition()
+                case .queueChange:
+                    orchestrator.setQueue([outgoing, replacement])
+                case .seek:
+                    orchestrator.seek(to: 1) { _ in }
+                }
+                mutationFinished.signal()
+            }
+            if cancellationClaimed.wait(timeout: .now() + 10) != .success {
+                observationLock.lock()
+                barrierFailure = "scheduled cancellation did not claim the gate"
+                observationLock.unlock()
+            }
+            let playbackDeadline = Date().addingTimeInterval(2)
+            while orchestrator.currentTime * 1_000 < scheduledStartTime,
+                  Date() < playbackDeadline {
+                Thread.sleep(forTimeInterval: 0.005)
+            }
+            if orchestrator.currentTime * 1_000 < scheduledStartTime {
+                observationLock.lock()
+                barrierFailure = "playback did not reach the scheduled start time"
+                observationLock.unlock()
+            }
+            releaseTimer.signal()
+            if timerFinished.wait(timeout: .now() + 10) != .success {
+                observationLock.lock()
+                barrierFailure = "awakened timer did not finish its check"
+                observationLock.unlock()
+            }
+            releaseCancellation.signal()
+            if mutationFinished.wait(timeout: .now() + 10) != .success {
+                observationLock.lock()
+                barrierFailure = "cancelling mutation did not finish"
+                observationLock.unlock()
+            }
+            controllerFinished.fulfill()
+        }
+
+        let crossfadeFinished = expectation(
+            description: "scheduled race crossfade terminal \(mutation.label)"
+        )
+        let crossfadeResult = ObjectBox<Result<Void, Error>>()
+        var completionCount = 0
+        var statesAtCompletion: [(state: String, errorCode: String?)] = []
+        orchestrator.crossFade(
+            fadeDuration: 1_000,
+            fadeInterval: 50,
+            fadeToVolume: 1,
+            waitUntil: scheduledStartTime
+        ) { result in
+            completionCount += 1
+            crossfadeResult.value = result
+            statesAtCompletion = delegate.crossfadeEvents
+            crossfadeFinished.fulfill()
+        }
+
+        wait(for: [controllerFinished, crossfadeFinished], timeout: 20)
+        observationLock.lock()
+        let recordedBarrierFailure = barrierFailure
+        let recordedStartAttempt = timerAttemptedStart
+        observationLock.unlock()
+        XCTAssertNil(recordedBarrierFailure)
+        XCTAssertFalse(recordedStartAttempt)
+        XCTAssertEqual(completionCount, 1)
+        XCTAssertThrowsError(try XCTUnwrap(crossfadeResult.value).get())
+        XCTAssertEqual(statesAtCompletion.map(\.state), ["scheduled", "cancelled"])
+        XCTAssertEqual(statesAtCompletion.last?.errorCode, mutation.expectedErrorCode)
+        XCTAssertEqual(delegate.crossfadeEvents.filter {
+            $0.state == "cancelled" && $0.errorCode == mutation.expectedErrorCode
+        }.count, 1)
+        XCTAssertFalse(delegate.crossfadeEvents.contains {
+            $0.state == "started" || $0.state == "running" || $0.state == "completed"
+        })
+        XCTAssertNotEqual(orchestrator.state, .crossfading)
+        orchestrator.pause()
+    }
+
     private func makeTrack(id: String) -> Track {
         return Track(dictionary: [
             "id": id,
             "url": URL(fileURLWithPath: "/tmp/\(id).m4a").absoluteString,
             "duration": 60.0
         ])!
+    }
+
+    private func sourceFile(_ relativePath: String) throws -> String {
+        var root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        root.appendPathComponent(relativePath)
+        return try String(contentsOf: root, encoding: .utf8)
     }
 
     private func bundledAudioURL() throws -> URL {
@@ -1228,12 +1607,68 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
     }
 }
 
+private enum ScheduledCrossfadeCancellationMutation {
+    case pause
+    case backendSwap
+    case queueChange
+    case seek
+
+    var label: String {
+        switch self {
+        case .pause: return "pause"
+        case .backendSwap: return "backend-swap"
+        case .queueChange: return "queue-change"
+        case .seek: return "seek"
+        }
+    }
+
+    var expectedErrorCode: String {
+        switch self {
+        case .pause: return "pause"
+        case .backendSwap: return "backend_swap"
+        case .queueChange: return "queue_changed"
+        case .seek: return "seek"
+        }
+    }
+}
+
 private final class ObjectBox<Value> {
     var value: Value?
 }
 
 private enum RNTrackPlayerTestEventSink {
     static let shared = RCTCallableJSModules()
+}
+
+private final class RecordingEventObserver {
+    private(set) var recorded: [(event: EventType, body: Any?)] = []
+
+    func record(event: EventType, body: Any?) {
+        recorded.append((event: event, body: body))
+    }
+
+    func reset() {
+        recorded.removeAll()
+    }
+
+    func events(for event: EventType) -> [[String: Any]] {
+        return recorded.compactMap { entry in
+            guard entry.event == event else { return nil }
+            return entry.body as? [String: Any]
+        }
+    }
+}
+
+private extension String {
+    func substring(after marker: String) -> String {
+        guard let range = range(of: marker) else { return "" }
+        return String(self[range.upperBound...])
+    }
+
+    func substring(before marker: String) -> String {
+        guard let range = range(of: marker) else { return self }
+        return String(self[..<range.lowerBound])
+    }
 }
 
 private struct StandardRebaseObservation {

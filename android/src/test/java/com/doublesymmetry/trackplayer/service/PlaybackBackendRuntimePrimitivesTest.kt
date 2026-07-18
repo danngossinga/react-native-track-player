@@ -8,12 +8,128 @@ import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
 class PlaybackBackendRuntimePrimitivesTest {
+    @Test
+    fun standardLogicalIdleMasksKotlinAudioPhysicalAutoSelection() {
+        for (logicalIndex in listOf<Int?>(null, -1)) {
+            val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+            sidecar.restore(
+                PlaybackBackendSnapshot(
+                    queueIds = listOf("queued"),
+                    activeIndex = logicalIndex,
+                    activeTrackId = null,
+                    positionMs = 0L,
+                    playWhenReady = false,
+                    volume = 1f,
+                    rate = 1f,
+                    repeatMode = 0,
+                    transitionGeneration = 0L
+                )
+            )
+
+            assertEquals(-1, sidecar.currentIndex(physicalIndex = 0))
+            assertEquals(AudioPlayerState.IDLE, sidecar.playbackState(AudioPlayerState.READY))
+            assertEquals(0L, sidecar.positionMs(physicalPositionMs = 321L))
+            assertEquals(0L, sidecar.durationMs(physicalDurationMs = 4_000L))
+            assertEquals(0L, sidecar.bufferedMs(physicalBufferedMs = 2_000L))
+            assertFalse(sidecar.playWhenReady(physicalPlayWhenReady = true))
+            assertNull(sidecar.activeIndex(physicalIndex = 0, queueSize = 1))
+        }
+    }
+
+    @Test
+    fun standardLogicalIdleSurvivesPauseAndReadsUntilExplicitActivation() {
+        val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+        sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("queued")))
+
+        assertEquals(AudioPlayerState.IDLE, sidecar.playbackState(AudioPlayerState.PAUSED))
+        assertEquals(-1, sidecar.currentIndex(0))
+        assertEquals(AudioPlayerState.IDLE, sidecar.playbackState(AudioPlayerState.READY))
+
+        sidecar.activate()
+
+        assertEquals(0, sidecar.currentIndex(0))
+        assertEquals(AudioPlayerState.READY, sidecar.playbackState(AudioPlayerState.READY))
+        assertEquals(321L, sidecar.positionMs(321L))
+        assertEquals(4_000L, sidecar.durationMs(4_000L))
+        assertEquals(2_000L, sidecar.bufferedMs(2_000L))
+        assertTrue(sidecar.playWhenReady(true))
+        assertEquals(0, sidecar.activeIndex(physicalIndex = 0, queueSize = 1))
+    }
+
+    @Test
+    fun standardLogicalIdleNextActivatesPhysicalZeroButPreviousStaysIdle() {
+        val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+        sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first", "second")))
+
+        assertTrue(sidecar.shouldIgnorePrevious())
+        assertEquals(-1, sidecar.currentIndex(physicalIndex = 0))
+        assertTrue(sidecar.consumeIdleForNext())
+        assertEquals(0, sidecar.currentIndex(physicalIndex = 0))
+        assertFalse(sidecar.consumeIdleForNext())
+        assertFalse(sidecar.shouldIgnorePrevious())
+    }
+
+    @Test
+    fun standardLogicalIdleQueueMutationPolicyOnlyPreservesRestoredIdle() {
+        val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+
+        sidecar.restore(PlaybackBackendSnapshot.empty())
+        sidecar.onQueueSizeChanged(queueSize = 2)
+        assertTrue(sidecar.hasLogicalActiveItem(physicalIndex = 0))
+
+        sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first", "second")))
+        sidecar.onQueueSizeChanged(queueSize = 3)
+        assertFalse(sidecar.hasLogicalActiveItem(physicalIndex = 0))
+
+        sidecar.onQueueCleared()
+        assertFalse(sidecar.hasLogicalActiveItem(physicalIndex = -1))
+    }
+
+    @Test
+    fun standardFailedExplicitActivationRestoresLogicalIdle() {
+        val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+        sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first")))
+
+        val wasIdle = sidecar.activate()
+        sidecar.rollbackActivation(wasIdle)
+
+        assertEquals(-1, sidecar.currentIndex(physicalIndex = 0))
+        assertEquals(AudioPlayerState.IDLE, sidecar.playbackState(AudioPlayerState.READY))
+    }
+
+    @Test
+    fun standardActivationValidatorAcceptsOnlyCoherentIdleOrActiveSnapshots() {
+        val idle = PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first"))
+        StandardPlaybackActivationSnapshotValidator.validate(idle)
+        StandardPlaybackActivationSnapshotValidator.validate(
+            idle.copy(activeIndex = 0, activeTrackId = "first", playWhenReady = true)
+        )
+
+        val incoherent = listOf(
+            idle.copy(playWhenReady = true),
+            idle.copy(activeIndex = -1),
+            idle.copy(activeTrackId = "first"),
+            idle.copy(activeIndex = 0, activeTrackId = null),
+            idle.copy(activeIndex = 0, activeTrackId = "wrong"),
+            idle.copy(activeIndex = 1, activeTrackId = "first")
+        )
+        incoherent.forEach { snapshot ->
+            try {
+                StandardPlaybackActivationSnapshotValidator.validate(snapshot)
+                fail("expected incoherent snapshot rejection: $snapshot")
+            } catch (error: RejectionException) {
+                assertEquals("playback_backend_activation_not_ready", error.code)
+            }
+        }
+    }
+
     @Test
     fun standardReadinessPollsCurrentStateSoAReadyTransitionCannotBeLost() = runTest {
         val observations = listOf(

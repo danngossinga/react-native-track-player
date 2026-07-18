@@ -478,9 +478,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(candidate.preparedSharedQueues.last?[1] === freshSecond)
     }
 
-    func test_standardCandidateRejectsNonemptyQueueWithoutActiveIndexAndKeepsPingOwner() {
-        let invalid = PlaybackBackendSnapshot(
-            queueIDs: ["orphan"],
+    func test_standardCandidateAcceptsIdleNonemptyQueueWithoutActiveIndex() {
+        let idle = PlaybackBackendSnapshot(
+            queueIDs: ["queued"],
             activeIndex: nil,
             activeTrackID: nil,
             position: 0,
@@ -492,31 +492,56 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         )
         let old = FakeBackend(
             kind: .pingPong,
-            snapshot: invalid,
-            audible: true,
+            snapshot: idle,
+            audible: false,
             initiallyAuthoritative: true
         )
         let factory = FakeFactory()
         let authority = PlaybackBackendAuthority()
         let facade = PlaybackBackendFacade(initial: old, factory: factory, authority: authority)
         factory.activationHook = { _ in
-            try validateStandardPlaybackActivationSnapshot(invalid, queueCount: 1)
+            try validateStandardPlaybackActivationSnapshot(idle, queueCount: 1)
         }
 
         let result = awaitResult { facade.setPlaybackBackend(.standard, completion: $0) }
 
-        XCTAssertThrowsError(try result.get()) { error in
-            XCTAssertEqual(
-                (error as NSError).userInfo["code"] as? String,
-                "playback_backend_activation_not_ready"
-            )
-        }
-        XCTAssertTrue(facade.currentBackend === old)
-        XCTAssertTrue(authority.isAuthoritative(.pingPong, identity: old))
-        XCTAssertTrue(old.audible)
-        XCTAssertFalse(old.calls.contains("beginHandoffQuiescence"))
-        XCTAssertFalse(old.calls.contains("suspendControlSurface"))
-        XCTAssertFalse(factory.created.first?.calls.contains("commitQueue") == true)
+        XCTAssertEqual(try? result.get().snapshot, idle)
+        XCTAssertEqual(factory.created.first?.restoredSnapshot, idle)
+        XCTAssertEqual(factory.created.first?.committedQueue, ["queued"])
+        XCTAssertFalse(factory.created.first?.audible == true)
+        XCTAssertTrue(authority.isAuthoritative(.standard, identity: factory.created.first!))
+    }
+
+    func test_standardActivationValidatorRejectsMissingOrMismatchedActiveTrackIdentity() {
+        let missingIdentity = PlaybackBackendSnapshot(
+            queueIDs: ["expected"],
+            activeIndex: 0,
+            activeTrackID: nil,
+            position: 0,
+            playWhenReady: false,
+            volume: 1,
+            rate: 1,
+            repeatMode: 0,
+            transitionGeneration: 0
+        )
+        let mismatchedIdentity = PlaybackBackendSnapshot(
+            queueIDs: ["expected"],
+            activeIndex: 0,
+            activeTrackID: "different",
+            position: 0,
+            playWhenReady: false,
+            volume: 1,
+            rate: 1,
+            repeatMode: 0,
+            transitionGeneration: 0
+        )
+
+        XCTAssertThrowsError(
+            try validateStandardPlaybackActivationSnapshot(missingIdentity, queueCount: 1)
+        )
+        XCTAssertThrowsError(
+            try validateStandardPlaybackActivationSnapshot(mismatchedIdentity, queueCount: 1)
+        )
     }
 
     func test_finalRebaseFailureResumesOldBeforeQueuedCommandRuns() {
@@ -616,6 +641,88 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(facade.currentBackend === factory.created.first)
         XCTAssertTrue(old.calls.contains("beginHandoffQuiescence"))
         XCTAssertTrue(oldControlWasActiveDuringFinalRebase)
+    }
+
+    func test_readDuringFinalHandoffWaitsAndRunsOnCommittedReplacement() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory)
+        let finalRebaseEntered = DispatchSemaphore(value: 0)
+        let releaseFinalRebase = DispatchSemaphore(value: 0)
+        let swapFinished = expectation(description: "swap committed")
+        let readFinished = DispatchSemaphore(value: 0)
+        var readBackend: PlaybackBackendKind?
+        factory.activationHook = { call in
+            guard call == 2 else { return }
+            finalRebaseEntered.signal()
+            releaseFinalRebase.wait()
+        }
+
+        facade.setPlaybackBackend(.pingPong) { _ in swapFinished.fulfill() }
+        XCTAssertEqual(finalRebaseEntered.wait(timeout: .now() + 1), .success)
+        facade.withCurrentBackendRead({ $0.kind }) { result in
+            readBackend = try? result.get()
+            readFinished.signal()
+        }
+        XCTAssertEqual(readFinished.wait(timeout: .now() + 0.05), .timedOut)
+        releaseFinalRebase.signal()
+
+        wait(for: [swapFinished], timeout: 2)
+        XCTAssertEqual(readFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(readBackend, .pingPong)
+    }
+
+    func test_readDoesNotInvalidateCandidatePreparationVersion() {
+        let old = FakeBackend(kind: .standard, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory)
+        let readFinished = DispatchSemaphore(value: 0)
+        var didRead = false
+        factory.prepareHook = {
+            guard !didRead else { return }
+            didRead = true
+            facade.withCurrentBackendRead({ $0.kind }) { result in
+                XCTAssertEqual(try? result.get(), .standard)
+                readFinished.signal()
+            }
+            XCTAssertEqual(readFinished.wait(timeout: .now() + 1), .success)
+        }
+
+        let result = awaitResult { facade.setPlaybackBackend(.pingPong, completion: $0) }
+
+        XCTAssertEqual(try? result.get().backend, .pingPong)
+        XCTAssertEqual(factory.created.count, 1)
+    }
+
+    func test_readDuringFailedFinalHandoffWaitsAndRunsOnRolledBackBackend() {
+        let old = FakeBackend(kind: .pingPong, snapshot: snapshot, audible: true)
+        let factory = FakeFactory()
+        let facade = PlaybackBackendFacade(initial: old, factory: factory)
+        let finalRebaseEntered = DispatchSemaphore(value: 0)
+        let releaseFinalRebase = DispatchSemaphore(value: 0)
+        let swapFinished = expectation(description: "swap rejected")
+        let readFinished = DispatchSemaphore(value: 0)
+        var readBackend: PlaybackBackendKind?
+        factory.activationHook = { call in
+            guard call == 2 else { return }
+            finalRebaseEntered.signal()
+            releaseFinalRebase.wait()
+            throw FakeError.restore
+        }
+
+        facade.setPlaybackBackend(.standard) { _ in swapFinished.fulfill() }
+        XCTAssertEqual(finalRebaseEntered.wait(timeout: .now() + 1), .success)
+        facade.withCurrentBackendRead({ $0.kind }) { result in
+            readBackend = try? result.get()
+            readFinished.signal()
+        }
+        XCTAssertEqual(readFinished.wait(timeout: .now() + 0.05), .timedOut)
+        releaseFinalRebase.signal()
+
+        wait(for: [swapFinished], timeout: 2)
+        XCTAssertEqual(readFinished.wait(timeout: .now() + 1), .success)
+        XCTAssertEqual(readBackend, .pingPong)
+        XCTAssertTrue(facade.currentBackend === old)
     }
 
     func test_rollbackFailureIsSanitizedAfterCanonicalSurfaceIsRestored() {

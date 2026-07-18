@@ -1,6 +1,10 @@
 package com.doublesymmetry.trackplayer.service
 
+import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
+import com.doublesymmetry.kotlinaudio.models.RepeatMode
+import com.doublesymmetry.trackplayer.model.TrackAudioItem
 import com.doublesymmetry.trackplayer.utils.RejectionException
+import java.io.File
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.cancelAndJoin
@@ -222,32 +226,30 @@ class PlaybackBackendTransactionTest {
     }
 
     @Test
-    fun standardCandidateRejectsNonEmptyQueueWithoutActiveIndexAndKeepsPingAuthority() = runTest {
-        val invalidSnapshot = snapshot.copy(activeIndex = null, activeTrackId = null)
+    fun standardCandidateAcceptsNonEmptyQueueWithoutActiveIndex() = runTest {
+        val queuedIdleSnapshot = snapshot.copy(
+            activeIndex = null,
+            activeTrackId = null,
+            positionMs = 0L,
+            playWhenReady = false
+        )
         val authority = AndroidPlaybackBackendAuthority()
         val old = FakeBackend(
             PlaybackBackendType.PING_PONG,
-            invalidSnapshot,
-            audible = true,
+            queuedIdleSnapshot,
             authority = authority
         )
         val factory = FakeFactory(authority = authority)
         val facade = PlaybackBackendFacade(old, factory, authority = authority)
 
-        try {
-            facade.setPlaybackBackend(PlaybackBackendType.STANDARD)
-            fail("expected incoherent snapshot rejection")
-        } catch (error: RejectionException) {
-            assertEquals("playback_backend_activation_not_ready", error.code)
-        }
+        val result = facade.setPlaybackBackend(PlaybackBackendType.STANDARD)
+        val replacement = factory.created.single()
 
-        assertSame(old, facade.currentBackend())
-        assertSame(old.identity, authority.currentIdentity())
-        assertTrue(old.audible)
-        assertFalse(old.disposed)
-        assertFalse(old.calls.contains("suspendControlSurface"))
-        assertFalse(old.calls.contains("resumeControlSurface"))
-        assertTrue(factory.created.isEmpty())
+        assertEquals(queuedIdleSnapshot, result.snapshot)
+        assertSame(replacement, facade.currentBackend())
+        assertEquals(queuedIdleSnapshot, replacement.restoredSnapshot)
+        assertEquals(queuedIdleSnapshot.queueIds, replacement.committedQueue)
+        assertFalse(replacement.audible)
     }
 
     @Test
@@ -447,6 +449,135 @@ class PlaybackBackendTransactionTest {
 
         assertEquals(PlaybackBackendType.PING_PONG, swap.await().backend)
         assertEquals(2, factory.created.single().calls.count { it == "prepare" })
+    }
+
+    @Test
+    fun readDuringPhysicalHandoffWaitsForCommittedWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.STANDARD,
+            snapshot,
+            precommitHandoffBarrier = handoff
+        )
+        val factory = FakeFactory()
+        val facade = PlaybackBackendFacade(old, factory)
+        val swap = async { facade.setPlaybackBackend(PlaybackBackendType.PING_PONG) }
+        handoff.entered.await()
+
+        val read = async { facade.withCurrentBackendRead { it } }
+        runCurrent()
+        assertFalse(read.isCompleted)
+
+        handoff.release.complete(Unit)
+        swap.await()
+        assertSame(factory.created.single(), read.await())
+    }
+
+    @Test
+    fun readDuringFailedPhysicalHandoffWaitsForRollbackWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            failRelinquish = true,
+            precommitHandoffBarrier = handoff
+        )
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+
+        supervisorScope {
+            val swap = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+            handoff.entered.await()
+            val read = async { facade.withCurrentBackendRead { it } }
+            runCurrent()
+            assertFalse(read.isCompleted)
+
+            handoff.release.complete(Unit)
+            expectFailure("relinquish") { swap.await() }
+            assertSame(old, read.await())
+        }
+    }
+
+    @Test
+    fun errorSnapshotReadWaitsForCommittedWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            precommitHandoffBarrier = handoff
+        )
+        val expectedError = AndroidPlaybackErrorSnapshot(
+            message = "decoder failed",
+            code = "android-decoder"
+        )
+        val factory = FakeFactory(
+            createdPlaybackState = AudioPlayerState.ERROR,
+            createdPlaybackError = expectedError
+        )
+        val facade = PlaybackBackendFacade(old, factory)
+        val swap = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+        handoff.entered.await()
+
+        val read = async {
+            facade.withCurrentBackendRead {
+                (it as AndroidPlaybackBackendRouting).readSnapshot()
+            }
+        }
+        runCurrent()
+        assertFalse(read.isCompleted)
+
+        handoff.release.complete(Unit)
+        swap.await()
+        val result = read.await()
+        assertEquals(AudioPlayerState.ERROR, result.playbackState)
+        assertEquals(expectedError, result.playbackError)
+    }
+
+    @Test
+    fun errorSnapshotReadWaitsForRollbackWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val expectedError = AndroidPlaybackErrorSnapshot(
+            message = "source failed",
+            code = "android-source"
+        )
+        val old = FakeBackend(
+            PlaybackBackendType.STANDARD,
+            snapshot,
+            failRelinquish = true,
+            precommitHandoffBarrier = handoff,
+            readPlaybackState = AudioPlayerState.ERROR,
+            readPlaybackError = expectedError
+        )
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+
+        supervisorScope {
+            val swap = async { facade.setPlaybackBackend(PlaybackBackendType.PING_PONG) }
+            handoff.entered.await()
+            val read = async {
+                facade.withCurrentBackendRead {
+                    (it as AndroidPlaybackBackendRouting).readSnapshot()
+                }
+            }
+            runCurrent()
+            assertFalse(read.isCompleted)
+
+            handoff.release.complete(Unit)
+            expectFailure("relinquish") { swap.await() }
+            val result = read.await()
+            assertEquals(AudioPlayerState.ERROR, result.playbackState)
+            assertEquals(expectedError, result.playbackError)
+        }
+    }
+
+    @Test
+    fun pingReadSnapshotMayHaveNoPlaybackError() = runTest {
+        val ping = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            readPlaybackState = AudioPlayerState.ERROR,
+            readPlaybackError = null
+        )
+
+        assertNull(ping.readSnapshot().playbackError)
     }
 
     @Test
@@ -889,7 +1020,7 @@ class PlaybackBackendTransactionTest {
     }
 
     @Test
-    fun candidateRemoteCapturedBeforeRollbackIsRejectedWithoutRouting() = runTest {
+    fun candidateRemoteCapturedBeforeRollbackRoutesExactlyOnceToPreviousWinner() = runTest {
         val restoreBarrier = RestoreFailureBarrier()
         val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot, audible = true)
         val factory = FakeFactory(restoreFailureBarrier = restoreBarrier)
@@ -903,9 +1034,11 @@ class PlaybackBackendTransactionTest {
             restoreBarrier.release.complete(Unit)
             expectFailure("restore") { swap.await() }
 
-            assertFalse(facade.routePhysicalRemote(ticket) { it.play() })
-            assertEquals(0, old.playCalls)
+            assertTrue(facade.routePhysicalRemote(ticket) { it.play() })
+            assertEquals(1, old.playCalls)
             assertEquals(0, candidate.playCalls)
+            assertFalse(facade.routePhysicalRemote(ticket) { it.play() })
+            assertEquals(1, old.playCalls)
             assertNull(facade.capturePhysicalRemoteTicket(candidate.identity))
             assertSame(old, facade.currentBackend())
         }
@@ -943,7 +1076,7 @@ class PlaybackBackendTransactionTest {
     }
 
     @Test
-    fun candidateRemoteCapturedDuringFailedHandoffIsRejectedWithoutRouting() = runTest {
+    fun candidateRemoteCapturedDuringFailedHandoffRoutesExactlyOnceToPreviousWinner() = runTest {
         val creation = CandidateCreationBarrier()
         val old = FakeBackend(
             PlaybackBackendType.PING_PONG,
@@ -962,11 +1095,41 @@ class PlaybackBackendTransactionTest {
             expectFailure("relinquish") { swap.await() }
             val candidate = factory.created.single()
 
-            assertFalse(facade.routePhysicalRemote(ticket) { it.play() })
-            assertEquals(0, old.playCalls)
+            assertTrue(facade.routePhysicalRemote(ticket) { it.play() })
+            assertEquals(1, old.playCalls)
             assertEquals(0, candidate.playCalls)
+            assertFalse(facade.routePhysicalRemote(ticket) { it.play() })
+            assertEquals(1, old.playCalls)
             assertSame(old, facade.currentBackend())
         }
+    }
+
+    @Test
+    fun pingRemoteCapturedDuringPhysicalHandoffRoutesExactlyOnceToCommittedWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            audible = true,
+            precommitHandoffBarrier = handoff
+        )
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+        val swap = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+        handoff.entered.await()
+
+        val ticket = requireNotNull(facade.capturePhysicalRemoteTicket(old.identity))
+        val routed = async { facade.routePhysicalRemote(ticket) { it.pause() } }
+        runCurrent()
+        assertFalse(routed.isCompleted)
+
+        handoff.release.complete(Unit)
+        swap.await()
+        val replacement = facade.currentBackend() as FakeBackend
+        assertTrue(routed.await())
+        assertEquals(1, replacement.pauseCalls)
+        assertEquals(0, old.pauseCalls)
+        assertFalse(facade.routePhysicalRemote(ticket) { it.pause() })
+        assertEquals(1, replacement.pauseCalls)
     }
 
     @Test
@@ -989,6 +1152,108 @@ class PlaybackBackendTransactionTest {
         assertEquals(0, old.pauseCalls)
         assertFalse(facade.routePhysicalRemote(ticket) { it.pause() })
         assertEquals(1, replacement.pauseCalls)
+    }
+
+    @Test
+    fun orchestratedRatingRemoteContractUsesPhysicalTicketRouter() {
+        val source = musicServiceSource()
+        val handler = source
+            .substringAfter("override fun onRemoteSetRating(rating: RatingCompat)")
+            .substringBefore("override fun onForegroundServiceStartError")
+        val router = source
+            .substringAfter("private fun runOrchestratedRemoteCommand(")
+            .substringBefore("@MainThread")
+
+        assertTrue(handler.contains("runOrchestratedRemoteCommand("))
+        assertFalse(handler.contains("routeIfAuthoritative("))
+        assertTrue(handler.contains("MusicEvents.BUTTON_SET_RATING"))
+        assertTrue(router.contains("capturePhysicalRemoteTicket("))
+        assertTrue(router.contains("routePhysicalRemote("))
+        assertTrue(router.contains("emitHandledByNativeRemoteEvent("))
+    }
+
+    @Test
+    fun errorPlaybackStateContractAlwaysIncludesErrorBundle() {
+        val method = sourceFile(
+            "android/src/main/java/com/doublesymmetry/trackplayer/module/MusicModule.kt"
+        ).substringAfter("fun getPlaybackState(callback: Promise)")
+        val errorBundle = method.indexOf("putBundle(\"error\"")
+        val optionalErrorFields = method.indexOf("snapshot.playbackError?.let")
+
+        assertTrue(errorBundle >= 0)
+        assertTrue(optionalErrorFields >= 0)
+        assertTrue(errorBundle < optionalErrorFields)
+    }
+
+    @Test
+    fun ratingRemoteCapturedDuringCommitRoutesOnceToWinnerAndRejectsForeignSource() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            audible = true,
+            precommitHandoffBarrier = handoff
+        )
+        val factory = FakeFactory()
+        val facade = PlaybackBackendFacade(old, factory)
+
+        val swap = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+        handoff.entered.await()
+        assertNull(facade.capturePhysicalRemoteTicket(Any()))
+        val ticket = requireNotNull(facade.capturePhysicalRemoteTicket(old.identity))
+        val routed = async {
+            facade.routePhysicalRemote(ticket) {
+                (it as FakeBackend).ratingRemoteCalls += 1
+            }
+        }
+        runCurrent()
+        assertFalse(routed.isCompleted)
+
+        handoff.release.complete(Unit)
+        swap.await()
+        val replacement = factory.created.single()
+        assertTrue(routed.await())
+        assertEquals(0, old.ratingRemoteCalls)
+        assertEquals(1, replacement.ratingRemoteCalls)
+        assertFalse(facade.routePhysicalRemote(ticket) { (it as FakeBackend).ratingRemoteCalls += 1 })
+        assertEquals(1, replacement.ratingRemoteCalls)
+    }
+
+    @Test
+    fun ratingRemoteCapturedDuringRollbackRoutesOnceToPreviousWinner() = runTest {
+        val handoff = PrecommitHandoffBarrier()
+        val old = FakeBackend(
+            PlaybackBackendType.PING_PONG,
+            snapshot,
+            audible = true,
+            failRelinquish = true,
+            precommitHandoffBarrier = handoff
+        )
+        val factory = FakeFactory()
+        val facade = PlaybackBackendFacade(old, factory)
+
+        supervisorScope {
+            val swap = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+            handoff.entered.await()
+            assertNull(facade.capturePhysicalRemoteTicket(Any()))
+            val ticket = requireNotNull(facade.capturePhysicalRemoteTicket(old.identity))
+            val routed = async {
+                facade.routePhysicalRemote(ticket) {
+                    (it as FakeBackend).ratingRemoteCalls += 1
+                }
+            }
+            runCurrent()
+            assertFalse(routed.isCompleted)
+
+            handoff.release.complete(Unit)
+            expectFailure("relinquish") { swap.await() }
+            val candidate = factory.created.single()
+            assertTrue(routed.await())
+            assertEquals(1, old.ratingRemoteCalls)
+            assertEquals(0, candidate.ratingRemoteCalls)
+            assertFalse(facade.routePhysicalRemote(ticket) { (it as FakeBackend).ratingRemoteCalls += 1 })
+            assertEquals(1, old.ratingRemoteCalls)
+        }
     }
 
     @Test
@@ -1321,6 +1586,21 @@ class PlaybackBackendTransactionTest {
         }
     }
 
+    private fun musicServiceSource(): String = sourceFile(
+        "android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt"
+    )
+
+    private fun sourceFile(relativePath: String): String {
+        val workingDirectory = requireNotNull(System.getProperty("user.dir"))
+        var directory: File? = File(workingDirectory).canonicalFile
+        while (directory != null) {
+            val source = File(directory, relativePath)
+            if (source.isFile) return source.readText()
+            directory = directory.parentFile
+        }
+        error("$relativePath was not found above $workingDirectory")
+    }
+
     private class FakeFactory(
         private val all: MutableList<FakeBackend> = mutableListOf(),
         private val audibleCounts: MutableList<Int> = mutableListOf(),
@@ -1337,7 +1617,9 @@ class PlaybackBackendTransactionTest {
         private val controlOwners: PlaybackControlOwnerRegistry? = null,
         private val controlTrace: MutableList<String> = mutableListOf(),
         private val lifecycleTrace: MutableList<String> = mutableListOf(),
-        private val protocolTrace: MutableList<String> = mutableListOf()
+        private val protocolTrace: MutableList<String> = mutableListOf(),
+        private val createdPlaybackState: AudioPlayerState = AudioPlayerState.PAUSED,
+        private val createdPlaybackError: AndroidPlaybackErrorSnapshot? = null
     ) : PlaybackBackendFactory {
         val created = mutableListOf<FakeBackend>()
         val requested = mutableListOf<PlaybackBackendType>()
@@ -1370,6 +1652,8 @@ class PlaybackBackendTransactionTest {
                 protocolTrace = protocolTrace,
                 activateControlOnCreation = type == PlaybackBackendType.STANDARD && controlOwners != null,
                 commitHook = { commitHook?.invoke() },
+                readPlaybackState = createdPlaybackState,
+                readPlaybackError = createdPlaybackError,
                 identity = if (preserveIdentity) identity else Any()
             ).also {
                 created += it
@@ -1461,8 +1745,10 @@ class PlaybackBackendTransactionTest {
         initiallyOwnsControlSurface: Boolean = false,
         private val initialActivationHook: (() -> Unit)? = null,
         private val commitHook: (() -> Unit)? = null,
+        var readPlaybackState: AudioPlayerState = AudioPlayerState.PAUSED,
+        var readPlaybackError: AndroidPlaybackErrorSnapshot? = null,
         override val identity: Any = Any()
-    ) : PlaybackBackend {
+    ) : AndroidPlaybackBackendRouting {
         val calls = mutableListOf<String>()
         val preparedSnapshots = mutableListOf<PlaybackBackendSnapshot>()
         var restoredSnapshot: PlaybackBackendSnapshot? = null
@@ -1471,6 +1757,7 @@ class PlaybackBackendTransactionTest {
         var playCalls = 0
         var transitionCalls = 0
         var pauseCalls = 0
+        var ratingRemoteCalls = 0
         var activationCalls = 0
         var authorityAtCommit: Any? = null
         var authorityAtActivation: Any? = null
@@ -1480,6 +1767,26 @@ class PlaybackBackendTransactionTest {
         private var physicalDeactivationCalls = 0
         private var preparationInFlight = false
         private var preparedQueue: List<String> = emptyList()
+
+        override val queueItems: List<TrackAudioItem> = emptyList()
+        override val currentIndex: Int
+            get() = snapshotValue.activeIndex ?: -1
+        override val playbackState: AudioPlayerState
+            get() = readPlaybackState
+        override val playbackError: AndroidPlaybackErrorSnapshot?
+            get() = readPlaybackError
+        override val playWhenReady: Boolean
+            get() = snapshotValue.playWhenReady
+        override val positionMs: Long
+            get() = snapshotValue.positionMs
+        override val durationMs: Long = 0L
+        override val bufferedMs: Long = 0L
+        override val volume: Float
+            get() = snapshotValue.volume
+        override val rate: Float
+            get() = snapshotValue.rate
+        override val repeatMode: RepeatMode
+            get() = RepeatMode.fromOrdinal(snapshotValue.repeatMode)
 
         init {
             if (initiallyOwnsControlSurface || activateControlOnCreation) activateControlSurface()
@@ -1632,6 +1939,26 @@ class PlaybackBackendTransactionTest {
             transitionBarrier?.entered?.complete(Unit)
             transitionBarrier?.release?.await()
         }
+
+        override fun add(items: List<TrackAudioItem>, atIndex: Int?) = Unit
+        override fun move(fromIndex: Int, toIndex: Int) = Unit
+        override fun remove(indexes: List<Int>) = Unit
+        override fun removeUpcomingTracks() = Unit
+        override fun removePreviousTracks() = Unit
+        override fun replace(index: Int, item: TrackAudioItem) = Unit
+        override fun replaceQueue(items: List<TrackAudioItem>) = Unit
+        override fun clearQueue() = Unit
+        override suspend fun load(item: TrackAudioItem) = Unit
+        override suspend fun skip(index: Int) = Unit
+        override suspend fun skipToNext() = Unit
+        override suspend fun skipToPrevious() = Unit
+        override suspend fun seekBy(offsetMs: Long) = Unit
+        override suspend fun retry() = Unit
+        override fun stop() = Unit
+        override fun setVolume(value: Float) = Unit
+        override fun setRate(value: Float) = Unit
+        override fun setRepeatMode(value: RepeatMode) = Unit
+        override suspend fun prepareCrossfade(previous: Boolean, seekTo: Double) = Unit
 
         override suspend fun dispose() {
             protocolTrace += "$type:dispose"

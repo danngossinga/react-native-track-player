@@ -28,6 +28,7 @@ internal class PingPongPlaybackBackend(
         get() = orchestrator.currentIndex
     override val playbackState: AudioPlayerState
         get() = orchestrator.playbackState
+    override val playbackError: AndroidPlaybackErrorSnapshot? = null
     override val playWhenReady: Boolean
         get() = orchestrator.playWhenReady
     override val positionMs: Long

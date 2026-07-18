@@ -108,6 +108,9 @@ class MusicService : HeadlessJsTaskService() {
         }
     }
 
+    internal suspend fun getPlaybackBackendReadSnapshot(): AndroidPlaybackBackendReadSnapshot =
+        withActivePlaybackBackendRead { it.readSnapshot() }
+
     private fun requireKotlinAudioPlayer(): QueuedAudioPlayer {
         return player ?: throw IllegalStateException("KotlinAudio player is not initialized for this playback mode.")
     }
@@ -164,7 +167,10 @@ class MusicService : HeadlessJsTaskService() {
             androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
     }
 
-    private fun activateStandardPlayerBinding(binding: StandardPlayerBinding): Job {
+    private fun activateStandardPlayerBinding(
+        binding: StandardPlayerBinding,
+        canonicalPlaybackState: AudioPlayerState = binding.player.playerState
+    ): Job {
         // Authority is already published for swaps when this hook runs. Admit
         // the continuously subscribed product collectors first, then create a
         // fresh canonical notification/state event that cannot be mistaken for
@@ -180,7 +186,7 @@ class MusicService : HeadlessJsTaskService() {
             }
             emit(
                 MusicEvents.PLAYBACK_STATE,
-                getPlayerStateBundle(binding.player.playerState)
+                getPlayerStateBundle(canonicalPlaybackState)
             )
         }
     }
@@ -199,14 +205,8 @@ class MusicService : HeadlessJsTaskService() {
     private var appKilledPlaybackBehavior = AppKilledPlaybackBehavior.CONTINUE_PLAYBACK
     private var stopForegroundGracePeriod: Int = DEFAULT_STOP_FOREGROUND_GRACE_PERIOD
 
-    val tracks: List<Track>
+    private val tracks: List<Track>
         get() = activePlaybackBackend().queueItems.map { it.track }
-
-    val currentTrack
-        get() = activePlaybackBackend().queueItems[activePlaybackBackend().currentIndex].track
-
-    val state
-        get() = activePlaybackBackend().playbackState
 
     var ratingType: Int
         get() = configuredRatingType
@@ -220,19 +220,6 @@ class MusicService : HeadlessJsTaskService() {
 
     val event
         get() = requireKotlinAudioPlayer().event
-
-    var playWhenReady: Boolean
-        get() = activePlaybackBackend().playWhenReady
-        set(value) {
-            scope.launch {
-                withActivePlaybackBackend { backend ->
-                    if (value) backend.play() else backend.pause()
-                    if (backend.type == PlaybackBackendType.PING_PONG) {
-                        refreshOrchestratedMediaSurface(reason = "play-when-ready")
-                    }
-                }
-            }
-        }
 
     private var latestOptions: Bundle? = null
     private var capabilities: List<Capability> = emptyList()
@@ -403,18 +390,14 @@ class MusicService : HeadlessJsTaskService() {
                         MusicEvents.BUTTON_JUMP_BACKWARD,
                         Bundle().apply { putInt("interval", interval) }
                     ) { it.seekBy(-interval * 1000L) }
-                override fun onRemoteSetRating(rating: RatingCompat) {
-                    scope.launch {
-                        playbackBackendFacade?.routeIfAuthoritative(identity) { backend ->
-                            if (backend.type != PlaybackBackendType.PING_PONG) return@routeIfAuthoritative
-                            Bundle().apply {
-                                setRating(this, "rating", rating)
-                                putBoolean("handledByNative", true)
-                                emit(MusicEvents.BUTTON_SET_RATING, this)
-                            }
-                        }
-                    }
-                }
+                override fun onRemoteSetRating(rating: RatingCompat) =
+                    runOrchestratedRemoteCommand(
+                        identity,
+                        "set-rating",
+                        MusicEvents.BUTTON_SET_RATING,
+                        Bundle().apply { setRating(this, "rating", rating) },
+                        refreshAfter = false
+                    ) { }
                 override fun onForegroundServiceStartError(error: Exception) {
                     if (!playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)) return
                     Timber.e(
@@ -456,9 +439,15 @@ class MusicService : HeadlessJsTaskService() {
                         if (standardPlayerBinding === binding) standardPlayerBinding = null
                         if (player === disposed) player = null
                     },
-                    onActivatedAfterDrain = { activated ->
+                    onLogicalActiveItemActivated = { index ->
+                        if (isActivePlayer(binding.player, binding.identity)) {
+                            emitPlaybackTrackChangedEvents(index, null, 0.0)
+                            updateNotificationMetadataForIndex(index)
+                        }
+                    },
+                    onActivatedAfterDrain = { activated, canonicalPlaybackState ->
                         if (activated === binding.player) {
-                            activateStandardPlayerBinding(binding).join()
+                            activateStandardPlayerBinding(binding, canonicalPlaybackState).join()
                         }
                     },
                     suspendControlSurface = {
@@ -467,11 +456,11 @@ class MusicService : HeadlessJsTaskService() {
                             binding.mediaSessionControl.deactivate()
                         }
                     },
-                    resumeControlSurface = {
+                    resumeControlSurface = { canonicalPlaybackState ->
                         playbackControlOwnerRegistry.activate(binding.identity) {
                             binding.mediaSessionControl.activate()
                         }
-                        activateStandardPlayerBinding(binding).join()
+                        activateStandardPlayerBinding(binding, canonicalPlaybackState).join()
                     },
                     initiallyAuthoritative = initiallyAuthoritative
                 )
@@ -795,18 +784,17 @@ class MusicService : HeadlessJsTaskService() {
         refreshAfter: Boolean = true,
         command: suspend (AndroidPlaybackBackendRouting) -> Unit
     ) {
-        scope.launch {
+        scope.launch(start = CoroutineStart.UNDISPATCHED) {
             try {
-                var executed = false
-                playbackBackendFacade?.routeIfAuthoritative(identity) { backend ->
-                    if (backend.type != PlaybackBackendType.PING_PONG) return@routeIfAuthoritative
+                val facade = playbackBackendFacade ?: return@launch
+                val ticket = facade.capturePhysicalRemoteTicket(identity) ?: return@launch
+                var routedBackendType: PlaybackBackendType? = null
+                val executed = facade.routePhysicalRemote(ticket) { backend ->
                     command(backend as AndroidPlaybackBackendRouting)
-                    executed = true
+                    routedBackendType = backend.type
                 }
-                if (!executed ||
-                    !playbackBackendAuthority.isAuthoritative(PlaybackBackendType.PING_PONG, identity)
-                ) return@launch
-                if (refreshAfter) {
+                if (!executed) return@launch
+                if (refreshAfter && routedBackendType == PlaybackBackendType.PING_PONG) {
                     refreshOrchestratedMediaSurface(reason = "remote-$reason")
                 }
                 emitHandledByNativeRemoteEvent(event, eventData)
@@ -998,10 +986,7 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getCurrentTrackIndex(): Int = activePlaybackBackend().currentIndex
-
-    @MainThread
-    fun getRate(): Float = activePlaybackBackend().rate
+    private fun getCurrentTrackIndex(): Int = activePlaybackBackend().currentIndex
 
     @MainThread
     suspend fun setRate(value: Float) {
@@ -1009,16 +994,10 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getRepeatMode(): RepeatMode = configuredRepeatMode
-
-    @MainThread
     suspend fun setRepeatMode(value: RepeatMode) {
         configuredRepeatMode = value
         withActivePlaybackBackend { it.setRepeatMode(value) }
     }
-
-    @MainThread
-    fun getVolume(): Float = activePlaybackBackend().volume
 
     @MainThread
     suspend fun setVolume(value: Float) {
@@ -1085,13 +1064,13 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getDurationInSeconds(): Double = activePlaybackBackend().durationMs.toSeconds()
+    private fun getDurationInSeconds(): Double = activePlaybackBackend().durationMs.toSeconds()
 
     @MainThread
-    fun getPositionInSeconds(): Double = activePlaybackBackend().positionMs.toSeconds()
+    private fun getPositionInSeconds(): Double = activePlaybackBackend().positionMs.toSeconds()
 
     @MainThread
-    fun getBufferedPositionInSeconds(): Double = activePlaybackBackend().bufferedMs.toSeconds()
+    private fun getBufferedPositionInSeconds(): Double = activePlaybackBackend().bufferedMs.toSeconds()
 
     @MainThread
     fun getPlayerStateBundle(state: AudioPlayerState): Bundle {
@@ -1111,22 +1090,23 @@ class MusicService : HeadlessJsTaskService() {
     }
 
     @MainThread
-    fun getPlayerLifecycleBundle(
+    suspend fun getPlayerLifecycleBundle(
         serviceBound: Boolean,
         playerInitialized: Boolean,
         setupInProgress: Boolean
     ): Bundle {
-        val items = playerItems()
-        val activeIndex = getCurrentTrackIndex()
+        val snapshot = getPlaybackBackendReadSnapshot()
+        val items = snapshot.queueItems
+        val activeIndex = snapshot.currentIndex
         return Bundle().apply {
             putString("phase", if (setupInProgress) "settingUp" else "ready")
             putBoolean("serviceBound", serviceBound)
             putBoolean("playerInitialized", playerInitialized)
             putBoolean("setupInProgress", setupInProgress)
             putBoolean("canAcceptCommands", serviceBound && playerInitialized && !setupInProgress)
-            putString("playbackState", state.asLibState.state)
-            putBoolean("playWhenReady", playWhenReady)
-            putString("backend", if (useOrchestratedCrossfade()) "pingPong" else "standard")
+            putString("playbackState", snapshot.playbackState.asLibState.state)
+            putBoolean("playWhenReady", snapshot.playWhenReady)
+            putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "pingPong" else "standard")
             putInt("queueSize", items.size)
             if (activeIndex in items.indices) {
                 putInt("activeTrackIndex", activeIndex)
@@ -1314,7 +1294,7 @@ class MusicService : HeadlessJsTaskService() {
                     notificationId = it.notificationId;
                     notification = it.notification;
                     if (it.ongoing) {
-                        if (playWhenReady) {
+                        if (source.playWhenReady) {
                             startForegroundIfNecessary()
                         }
                     } else if (shouldStopForeground()) {

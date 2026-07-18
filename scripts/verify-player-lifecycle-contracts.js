@@ -110,9 +110,10 @@ assert(
   'Android legacy/Turbo fallback maps must expose setPlaybackBackend with arity one.'
 );
 assert(
-  androidService.includes('fun getPlayerLifecycleBundle(') &&
-    androidService.includes('putString("playbackState", state.asLibState.state)') &&
-    androidService.includes('putString("backend", if (useOrchestratedCrossfade()) "pingPong" else "standard")'),
+  androidService.includes('suspend fun getPlayerLifecycleBundle(') &&
+    androidService.includes('val snapshot = getPlaybackBackendReadSnapshot()') &&
+    androidService.includes('putString("playbackState", snapshot.playbackState.asLibState.state)') &&
+    androidService.includes('putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "pingPong" else "standard")'),
   'Android service must report playback state and backend in lifecycle.'
 );
 assert(

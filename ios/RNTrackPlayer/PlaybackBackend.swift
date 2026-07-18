@@ -112,13 +112,23 @@ func validateStandardPlaybackActivationSnapshot(
     _ snapshot: PlaybackBackendSnapshot,
     queueCount: Int
 ) throws {
-    guard queueCount == 0 || snapshot.activeIndex != nil else {
+    let hasMatchingQueueCount = snapshot.queueIDs.count == queueCount
+    let hasValidIdleState = hasMatchingQueueCount &&
+        snapshot.activeIndex == nil &&
+        snapshot.activeTrackID == nil &&
+        !snapshot.playWhenReady
+    let hasCoherentActiveTrack = snapshot.activeIndex.map { index in
+        hasMatchingQueueCount &&
+            snapshot.queueIDs.indices.contains(index) &&
+            snapshot.activeTrackID == snapshot.queueIDs[index]
+    } ?? false
+    guard hasValidIdleState || hasCoherentActiveTrack else {
         throw NSError(
             domain: "RNTrackPlayer.PlaybackBackend",
             code: 1,
             userInfo: [
                 NSLocalizedDescriptionKey:
-                    "The standard playback candidate has a non-empty queue but no active track.",
+                    "The standard playback candidate did not restore the active track.",
                 "code": "playback_backend_activation_not_ready"
             ]
         )
@@ -290,6 +300,13 @@ final class PlaybackBackendExclusiveCommandSlot<Value> {
     var isOccupied: Bool {
         lock.lock()
         let result = current != nil
+        lock.unlock()
+        return result
+    }
+
+    func isCurrent(_ completion: PlaybackBackendCommandCompletion<Value>) -> Bool {
+        lock.lock()
+        let result = current === completion
         lock.unlock()
         return result
     }
@@ -618,6 +635,15 @@ final class PlaybackBackendFacade {
         }
     }
 
+    func withCurrentBackendRead<Value>(
+        _ operation: @escaping (PlaybackBackend) throws -> Value,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        admissionQueue.async {
+            self.admitRead(operation, completion: completion)
+        }
+    }
+
     func setPlaybackBackend(
         _ kind: PlaybackBackendKind,
         completion: @escaping (Result<PlaybackBackendTransactionResult, Error>) -> Void
@@ -802,6 +828,29 @@ final class PlaybackBackendFacade {
         } catch {
             commandCompletion.resolve(.failure(error))
         }
+    }
+
+    private func admitRead<Value>(
+        _ operation: @escaping (PlaybackBackend) throws -> Value,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        if physicalHandoffActive {
+            pendingCommandAdmissions.append { [weak self] in
+                self?.admitRead(operation, completion: completion)
+            }
+            return
+        }
+
+        let capturedBackend = backend
+        activeCommandLeases += 1
+        let result = Result { try operation(capturedBackend) }
+        activeCommandLeases -= 1
+        if activeCommandLeases == 0 {
+            let waiters = leaseDrainWaiters
+            leaseDrainWaiters.removeAll()
+            waiters.forEach { $0.signal() }
+        }
+        completion(result)
     }
 
     private func finishPhysicalHandoff() {

@@ -41,6 +41,7 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     var playbackState: State { return orchestrator.playbackState }
+    var publicPlaybackError: IOSPlaybackErrorSnapshot? { return nil }
     var currentIndex: Int { return orchestrator.currentIndex }
     var position: Double { return orchestrator.currentTime }
     var duration: Double { return orchestrator.duration }
@@ -48,6 +49,7 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     var publicVolume: Float { return orchestrator.volume }
     var publicRate: Float { return orchestrator.rate }
     var publicPlayWhenReady: Bool { return orchestrator.playWhenReady }
+    var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 
     func settleActiveTransition() throws {

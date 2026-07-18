@@ -81,6 +81,14 @@ private final class IOSCrossfadeContext {
     }
 }
 
+private struct IOSScheduledCrossfade {
+    let runId: Int
+    let fromIndex: Int
+    let toIndex: Int
+    let fromVolume: Float
+    let completionGate: PlaybackBackendCommandCompletion<Void>
+}
+
 final class IOSPlaybackOrchestrator {
     typealias SeekOperation = (
         IOSCrossfadeEngine,
@@ -95,6 +103,7 @@ final class IOSPlaybackOrchestrator {
     ) -> Void
     typealias StandbyMaintenanceScheduler = (TimeInterval, DispatchWorkItem) -> Void
     typealias SynchronizationTestHook = () -> Void
+    typealias ScheduledCrossfadeTimerHook = (@escaping () -> Bool) -> Void
 
     weak var delegate: IOSPlaybackOrchestratorDelegate?
 
@@ -105,6 +114,7 @@ final class IOSPlaybackOrchestrator {
     private var queue: [Track] = []
     private var runId = 0
     private var crossfadeContext: IOSCrossfadeContext?
+    private var scheduledCrossfade: IOSScheduledCrossfade?
     private var crossfadeWorkItem: DispatchWorkItem?
     private var scheduledStartWorkItem: DispatchWorkItem?
     private var endObserverWorkItem: DispatchWorkItem?
@@ -130,6 +140,8 @@ final class IOSPlaybackOrchestrator {
     private let standbyPreparationBeforeNativeInvocationHook: SynchronizationTestHook
     private let crossfadeRunningBeforeDeliveryHook: SynchronizationTestHook
     private let crossfadeFinishAfterCommitHook: SynchronizationTestHook
+    private let scheduledCrossfadeTimerHook: ScheduledCrossfadeTimerHook
+    private let scheduledCrossfadeCancellationAfterClaimHook: SynchronizationTestHook
     private let crossfadeMutationLock = NSLock()
     private let standbyPreparationInvocationQueue = DispatchQueue.main
     private let crossfadeEventDeliveryQueue = DispatchQueue.main
@@ -167,7 +179,11 @@ final class IOSPlaybackOrchestrator {
         crossfadeRampAfterValidationHook: @escaping SynchronizationTestHook = {},
         standbyPreparationBeforeNativeInvocationHook: @escaping SynchronizationTestHook = {},
         crossfadeRunningBeforeDeliveryHook: @escaping SynchronizationTestHook = {},
-        crossfadeFinishAfterCommitHook: @escaping SynchronizationTestHook = {}
+        crossfadeFinishAfterCommitHook: @escaping SynchronizationTestHook = {},
+        scheduledCrossfadeTimerHook: @escaping ScheduledCrossfadeTimerHook = { check in
+            _ = check()
+        },
+        scheduledCrossfadeCancellationAfterClaimHook: @escaping SynchronizationTestHook = {}
     ) {
         self.seekOperation = seekOperation
         self.standbyPrepareOperation = standbyPrepareOperation
@@ -178,6 +194,9 @@ final class IOSPlaybackOrchestrator {
             standbyPreparationBeforeNativeInvocationHook
         self.crossfadeRunningBeforeDeliveryHook = crossfadeRunningBeforeDeliveryHook
         self.crossfadeFinishAfterCommitHook = crossfadeFinishAfterCommitHook
+        self.scheduledCrossfadeTimerHook = scheduledCrossfadeTimerHook
+        self.scheduledCrossfadeCancellationAfterClaimHook =
+            scheduledCrossfadeCancellationAfterClaimHook
         activeEngine = engineA
         standbyEngine = engineB
     }
@@ -815,6 +834,21 @@ final class IOSPlaybackOrchestrator {
             runId += 1
             currentRunId = runId
             scheduledFromVolume = activeEngine.volume
+            scheduledCrossfade = IOSScheduledCrossfade(
+                runId: currentRunId,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                fromVolume: scheduledFromVolume,
+                completionGate: admitted
+            )
+            enqueueCrossfadeEventLocked(
+                "scheduled",
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                elapsedMs: 0,
+                fromVolume: scheduledFromVolume,
+                toVolume: 0
+            )
         } else {
             rejection = (
                 "error",
@@ -837,29 +871,71 @@ final class IOSPlaybackOrchestrator {
         guard let completionGate else { return }
         if normalizedPreloadState { emitStateIfNeeded() }
         let transitionCompletion: (Result<Void, Error>) -> Void = { [weak self, completionGate] result in
-            self?.crossfadeCommandSlot.complete(completionGate, result: result)
+            guard let self else { return }
+            self.crossfadeMutationLock.lock()
+            let terminalResolver = self.crossfadeCommandSlot.takeResolver(
+                completionGate,
+                result: result
+            )
+            if terminalResolver != nil,
+               self.scheduledCrossfade?.runId == currentRunId,
+               self.scheduledCrossfade?.completionGate === completionGate {
+                self.scheduledCrossfade = nil
+                self.scheduledStartWorkItem?.cancel()
+                self.scheduledStartWorkItem = nil
+            }
+            self.crossfadeMutationLock.unlock()
+            terminalResolver?()
         }
         let intervalMs = max(10, Int(fadeInterval))
         let targetVolume = Float(max(0, min(1, fadeToVolume)))
-        emitCrossfadeState(
-            "scheduled",
-            fromIndex: fromIndex,
-            toIndex: toIndex,
-            elapsedMs: 0,
-            fromVolume: scheduledFromVolume,
-            toVolume: 0,
-            errorCode: nil
-        )
 
-        func scheduleStartCheck() {
-            guard self.runId == currentRunId else { return }
+        func scheduleStartCheck() -> Bool {
+            var nextCheck: (workItem: DispatchWorkItem, delayMs: Int)?
+            self.crossfadeMutationLock.lock()
+            guard let scheduled = self.scheduledCrossfade,
+                  self.runId == currentRunId,
+                  scheduled.runId == currentRunId,
+                  scheduled.fromIndex == fromIndex,
+                  scheduled.toIndex == toIndex,
+                  scheduled.completionGate === completionGate,
+                  self.crossfadeCommandSlot.isCurrent(completionGate) else {
+                self.crossfadeMutationLock.unlock()
+                return false
+            }
             guard self.playWhenReady else {
-                self.emitCrossfadeState("cancelled", fromIndex: fromIndex, toIndex: toIndex, errorCode: "not_playing")
-                transitionCompletion(.failure(self.makeError("crossfade_not_playing", "Crossfade was cancelled because playback is paused.")))
-                return
+                let error = self.makeError(
+                    "crossfade_not_playing",
+                    "Crossfade was cancelled because playback is paused."
+                )
+                let terminalResolver = self.crossfadeCommandSlot.takeResolver(
+                    completionGate,
+                    result: .failure(error)
+                )
+                if let terminalResolver {
+                    self.runId += 1
+                    self.scheduledCrossfade = nil
+                    self.scheduledStartWorkItem?.cancel()
+                    self.scheduledStartWorkItem = nil
+                    self.crossfadeEventGeneration &+= 1
+                    self.enqueueCrossfadeEventLocked(
+                        "cancelled",
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        elapsedMs: 0,
+                        fromVolume: scheduled.fromVolume,
+                        toVolume: 0,
+                        errorCode: "not_playing",
+                        afterDelivery: terminalResolver
+                    )
+                }
+                self.crossfadeMutationLock.unlock()
+                return false
             }
             let remainingMs = Int(waitUntil - self.currentTime * 1000)
             if remainingMs <= 0 {
+                self.scheduledStartWorkItem = nil
+                self.crossfadeMutationLock.unlock()
                 self.startCrossfade(
                     runId: currentRunId,
                     fromIndex: fromIndex,
@@ -870,21 +946,25 @@ final class IOSPlaybackOrchestrator {
                     completionGate: completionGate,
                     completion: transitionCompletion
                 )
-                return
+                return true
             }
 
             let workItem = DispatchWorkItem { [weak self] in
-                guard self != nil else { return }
-                scheduleStartCheck()
+                guard let self else { return }
+                self.scheduledCrossfadeTimerHook(scheduleStartCheck)
             }
             self.scheduledStartWorkItem = workItem
+            nextCheck = (workItem, max(50, min(250, remainingMs)))
+            self.crossfadeMutationLock.unlock()
+            guard let nextCheck else { return false }
             DispatchQueue.main.asyncAfter(
-                deadline: .now() + .milliseconds(max(50, min(250, remainingMs))),
-                execute: workItem
+                deadline: .now() + .milliseconds(nextCheck.delayMs),
+                execute: nextCheck.workItem
             )
+            return false
         }
 
-        scheduleStartCheck()
+        _ = scheduleStartCheck()
     }
 
     private func loadIndex(
@@ -1015,10 +1095,27 @@ final class IOSPlaybackOrchestrator {
         completionGate: PlaybackBackendCommandCompletion<Void>,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
-        guard self.runId == runId else { return }
+        crossfadeMutationLock.lock()
+        let admitted = isScheduledCrossfadeAdmittedLocked(
+            runId: runId,
+            fromIndex: fromIndex,
+            toIndex: toIndex,
+            completionGate: completionGate
+        )
+        crossfadeMutationLock.unlock()
+        guard admitted else { return }
 
         let startPreparedStandby = { [weak self] in
-            guard let self = self, self.runId == runId else { return }
+            guard let self = self else { return }
+            self.crossfadeMutationLock.lock()
+            let admitted = self.isScheduledCrossfadeAdmittedLocked(
+                runId: runId,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                completionGate: completionGate
+            )
+            self.crossfadeMutationLock.unlock()
+            guard admitted else { return }
             IOSPlaybackLog.log("crossfade start from=\(fromIndex) to=\(toIndex)")
             let outgoingStartVolume = self.activeEngine.volume > 0 ? self.activeEngine.volume : self.volume
             self.activeEngine.setVolume(outgoingStartVolume)
@@ -1028,7 +1125,12 @@ final class IOSPlaybackOrchestrator {
                 switch result {
                 case .success:
                     self.crossfadeMutationLock.lock()
-                    guard self.runId == runId else {
+                    guard self.isScheduledCrossfadeAdmittedLocked(
+                        runId: runId,
+                        fromIndex: fromIndex,
+                        toIndex: toIndex,
+                        completionGate: completionGate
+                    ) else {
                         self.crossfadeMutationLock.unlock()
                         return
                     }
@@ -1050,6 +1152,8 @@ final class IOSPlaybackOrchestrator {
                         incomingStartTime: self.standbyEngine.currentTime,
                         completionGate: completionGate
                     )
+                    self.scheduledCrossfade = nil
+                    self.scheduledStartWorkItem = nil
                     self.crossfadeEventGeneration &+= 1
                     self.crossfadeContext = context
                     let startedFromVolume = self.activeEngine.volume
@@ -1087,6 +1191,15 @@ final class IOSPlaybackOrchestrator {
         }
 
         prepareStandby(index: toIndex, position: preparedFromIndex == fromIndex ? preparedSeekTo : 0) { result in
+            self.crossfadeMutationLock.lock()
+            let admitted = self.isScheduledCrossfadeAdmittedLocked(
+                runId: runId,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                completionGate: completionGate
+            )
+            self.crossfadeMutationLock.unlock()
+            guard admitted else { return }
             switch result {
             case .success:
                 startPreparedStandby()
@@ -1102,6 +1215,21 @@ final class IOSPlaybackOrchestrator {
                 completion(.failure(error))
             }
         }
+    }
+
+    private func isScheduledCrossfadeAdmittedLocked(
+        runId: Int,
+        fromIndex: Int,
+        toIndex: Int,
+        completionGate: PlaybackBackendCommandCompletion<Void>
+    ) -> Bool {
+        guard let scheduled = scheduledCrossfade else { return false }
+        return self.runId == runId &&
+            scheduled.runId == runId &&
+            scheduled.fromIndex == fromIndex &&
+            scheduled.toIndex == toIndex &&
+            scheduled.completionGate === completionGate &&
+            crossfadeCommandSlot.isCurrent(completionGate)
     }
 
     private func runCrossfadeRamp(
@@ -1691,13 +1819,42 @@ final class IOSPlaybackOrchestrator {
             "Crossfade was cancelled by \(errorCode)."
         )
         crossfadeMutationLock.lock()
-        let terminalResolver = crossfadeCommandSlot.takeCurrentResolver(
-            result: .failure(error)
-        )
-        if let terminalResolver {
-            crossfadeEventDeliveryQueue.async(execute: terminalResolver)
+        let scheduled = scheduledCrossfade
+        var didClaimScheduled = false
+        if let scheduled {
+            if let terminalResolver = crossfadeCommandSlot.takeResolver(
+                scheduled.completionGate,
+                result: .failure(error)
+            ) {
+                didClaimScheduled = true
+                runId += 1
+                scheduledCrossfade = nil
+                scheduledStartWorkItem?.cancel()
+                scheduledStartWorkItem = nil
+                crossfadeEventGeneration &+= 1
+                enqueueCrossfadeEventLocked(
+                    "cancelled",
+                    fromIndex: scheduled.fromIndex,
+                    toIndex: scheduled.toIndex,
+                    elapsedMs: 0,
+                    fromVolume: scheduled.fromVolume,
+                    toVolume: 0,
+                    errorCode: errorCode,
+                    afterDelivery: terminalResolver
+                )
+            }
+        } else {
+            let terminalResolver = crossfadeCommandSlot.takeCurrentResolver(
+                result: .failure(error)
+            )
+            if let terminalResolver {
+                crossfadeEventDeliveryQueue.async(execute: terminalResolver)
+            }
         }
         crossfadeMutationLock.unlock()
+        if didClaimScheduled {
+            scheduledCrossfadeCancellationAfterClaimHook()
+        }
     }
 
     private func queueHash() -> String {
