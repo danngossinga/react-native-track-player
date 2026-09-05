@@ -223,6 +223,54 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertEqual(fixture.gate.capturedSeconds, [5])
     }
 
+    func test_realStandardSeekAfterStopLoadsSilentlyBeforeSubsequentPlay() throws {
+        let fixture = try makeStandardSeekFixture()
+        let originalTrack = try XCTUnwrap(onMain { fixture.player.currentItem as? Track })
+        let nextTrack = makeTrack(id: "retained-after-stop-seek", url: try bundledAudioURL(), duration: 28.2)
+        let results = StandardSeekResults()
+        let completed = expectation(description: "seek after stop finishes without an external play or reload")
+        fixture.gate.didCapture = { seconds in
+            XCTAssertEqual(seconds, 5)
+            XCTAssertEqual(results.count, 0, "The seek promise resolved before its actual callback")
+            self.onMain {
+                XCTAssertFalse(fixture.backend.publicPlayWhenReady, "Loading for a stopped seek must remain paused")
+                fixture.gate.releaseFirst(seconds: 5)
+            }
+        }
+        onMain {
+            do {
+                try fixture.backend.add([nextTrack], at: 1)
+            } catch {
+                XCTFail("Adding the second fixture track failed: \(error)")
+                return
+            }
+            fixture.backend.stop()
+            XCTAssertEqual(fixture.player.duration, 0)
+            XCTAssertFalse(fixture.backend.publicPlayWhenReady)
+            fixture.backend.seek(to: 5) {
+                results.append($0)
+                completed.fulfill()
+            }
+        }
+        wait(for: [completed], timeout: 30)
+        XCTAssertTrue(results.succeeded, "A stopped seek must load the native item instead of timing out while waiting for a later play")
+        XCTAssertEqual(fixture.gate.capturedSeconds, [5])
+        guard results.succeeded else { return }
+
+        onMain {
+            XCTAssertEqual(fixture.player.items.count, 2)
+            XCTAssertTrue((fixture.player.items[0] as? Track) === originalTrack)
+            XCTAssertTrue((fixture.player.items[1] as? Track) === nextTrack)
+            XCTAssertEqual(fixture.backend.currentIndex, 0)
+            XCTAssertEqual(fixture.backend.position, 5, accuracy: 0.25)
+            XCTAssertFalse(fixture.backend.publicPlayWhenReady)
+            fixture.backend.play { result in
+                if case .failure(let error) = result { XCTFail("Play after the completed seek failed: \(error)") }
+            }
+            XCTAssertTrue(fixture.backend.publicPlayWhenReady)
+        }
+    }
+
     func test_iosPlaybackStateErrorContractUsesBackendReadLease() throws {
         let source = try sourceFile("ios/RNTrackPlayer/RNTrackPlayer.swift")
         let getter = source
