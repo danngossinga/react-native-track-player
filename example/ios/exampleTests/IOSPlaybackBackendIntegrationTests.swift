@@ -1,10 +1,135 @@
 import XCTest
+import AVFoundation
 import MediaPlayer
 import React
-import SwiftAudioEx
+@testable import SwiftAudioEx
 @testable import react_native_track_player
 
 final class IOSPlaybackBackendIntegrationTests: XCTestCase {
+    func test_realStandardSeekWaitsForActualNativeCompletionExactlyOnce() throws {
+        let fixture = try makeStandardSeekFixture()
+        let captured = expectation(description: "AVFoundation finished the retained seek")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        let completed = expectation(description: "standard seek completion")
+        let results = StandardSeekResults()
+
+        onMain {
+            fixture.backend.seek(to: 5) { result in
+                results.append(result)
+                completed.fulfill()
+            }
+        }
+        wait(for: [captured], timeout: 10)
+        XCTAssertEqual(results.count, 0, "The command completed before its actual native seek callback was delivered")
+
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        wait(for: [completed], timeout: 5)
+        XCTAssertTrue(results.succeeded)
+
+        // Re-delivery is an explicit callback fault injection, not another seek.
+        onMain { fixture.player.AVWrapper(seekTo: 5, didFinish: true) }
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertEqual(results.count, 1)
+    }
+
+    func test_realStandardSameIndexSkipWaitsForItsExplicitInitialTime() throws {
+        let fixture = try makeStandardSeekFixture()
+        let captured = expectation(description: "native skip position reached")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        let completed = expectation(description: "skip completion")
+        let results = StandardSeekResults()
+
+        onMain {
+            fixture.backend.skip(to: 0, initialTime: 5) { result in
+                results.append(result)
+                completed.fulfill()
+            }
+        }
+        wait(for: [captured], timeout: 10)
+        XCTAssertEqual(results.count, 0, "skip(initialTime:) completed before the native position restore")
+        XCTAssertFalse(fixture.gate.capturedSeconds.contains(0), "An explicit same-index skip must not issue a redundant seek to zero")
+
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        wait(for: [completed], timeout: 5)
+        XCTAssertTrue(results.succeeded)
+        XCTAssertEqual(onMain { fixture.backend.currentIndex }, 0)
+    }
+
+    func test_realStandardPauseCancelsPendingSeekAndLateCompletionCannotResume() throws {
+        let fixture = try makeStandardSeekFixture()
+        let captured = expectation(description: "native seek retained before pause")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        let results = StandardSeekResults()
+
+        onMain {
+            fixture.player.play()
+            fixture.backend.seek(to: 5) { results.append($0) }
+        }
+        wait(for: [captured], timeout: 10)
+        onMain { fixture.backend.pause() }
+        XCTAssertEqual(results.count, 1)
+        XCTAssertTrue(results.failed, "A real pause must invalidate the pending seek")
+        XCTAssertFalse(onMain { fixture.backend.publicPlayWhenReady })
+
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertEqual(results.count, 1)
+        XCTAssertFalse(onMain { fixture.backend.publicPlayWhenReady }, "A late seek callback undid the explicit pause")
+    }
+
+    func test_realStandardReplacementDrainsOldSamePositionCallbackBeforeNewSeek() throws {
+        let fixture = try makeStandardSeekFixture()
+        let firstCaptured = expectation(description: "old item seek retained")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { firstCaptured.fulfill() } }
+        let oldResults = StandardSeekResults()
+        onMain { fixture.backend.seek(to: 5) { oldResults.append($0) } }
+        wait(for: [firstCaptured], timeout: 10)
+
+        let replacement = makeTrack(id: "replacement-same-position", url: try bundledAudioURL(), duration: 28.2)
+        let secondCaptured = expectation(description: "replacement item seek retained")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { secondCaptured.fulfill() } }
+        let newResults = StandardSeekResults()
+        let newCompleted = expectation(description: "replacement seek completion")
+        onMain {
+            XCTAssertNoThrow(try fixture.backend.replaceQueue([replacement]))
+            fixture.backend.seek(to: 5) { result in
+                newResults.append(result)
+                newCompleted.fulfill()
+            }
+        }
+        XCTAssertEqual(oldResults.count, 1)
+        XCTAssertTrue(oldResults.failed, "Replacing the item must cancel its admitted seek")
+        XCTAssertEqual(newResults.count, 0)
+
+        // The SDK event carries only (seconds, didFinish): both operations use 5.
+        // Releasing the OLD actual callback must never complete the NEW command.
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertEqual(newResults.count, 0, "An old callback with the same target completed the new item's seek")
+        wait(for: [secondCaptured], timeout: 10)
+
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        wait(for: [newCompleted], timeout: 5)
+        XCTAssertTrue(newResults.succeeded)
+        XCTAssertEqual(oldResults.count, 1)
+    }
+
+    func test_realStandardDisposalCancelsPendingSeekExactlyOnce() throws {
+        let fixture = try makeStandardSeekFixture()
+        let captured = expectation(description: "native seek retained before disposal")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        let results = StandardSeekResults()
+        onMain { fixture.backend.seek(to: 5) { results.append($0) } }
+        wait(for: [captured], timeout: 10)
+
+        onMain { XCTAssertNoThrow(try fixture.backend.dispose()) }
+        XCTAssertEqual(results.count, 1)
+        XCTAssertTrue(results.failed)
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertEqual(results.count, 1)
+    }
+
     func test_iosPlaybackStateErrorContractUsesBackendReadLease() throws {
         let source = try sourceFile("ios/RNTrackPlayer/RNTrackPlayer.swift")
         let getter = source
@@ -1529,6 +1654,70 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         orchestrator.pause()
     }
 
+    private func makeStandardSeekFixture() throws -> StandardSeekFixture {
+        let fixtureURL = try bundledAudioURL()
+        let track = makeTrack(id: UUID().uuidString, url: fixtureURL, duration: 28.2)
+        let loaded = expectation(description: "standard bundled fixture is loaded")
+        let observer = NSObject()
+        let readinessLock = NSLock()
+        var reportedReady = false
+        let player = onMain { QueuedAudioPlayer() }
+        player.event.stateChange.addListener(observer) { state in
+            guard state == .ready || state == .paused else { return }
+            readinessLock.lock()
+            let shouldReport = !reportedReady
+            reportedReady = true
+            readinessLock.unlock()
+            if shouldReport { loaded.fulfill() }
+        }
+        onMain {
+            player.automaticallyUpdateNowPlayingInfo = false
+            player.remoteCommands = []
+            player.add(items: [track], playWhenReady: false)
+        }
+        wait(for: [loaded], timeout: 10)
+        player.event.stateChange.removeListener(observer)
+        let fixture = onMain { () -> StandardSeekFixture in
+            let gate = StandardSeekCallbackGate(forwarding: player)
+            player.wrapper.delegate = gate
+            let backend = StandardPlaybackBackend(
+                player: player,
+                transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                automaticallyUpdateNowPlayingInfo: { false },
+                onCommitted: { _ in },
+                onActivated: { _ in },
+                onDisposed: { _ in },
+                initiallyAuthoritative: true,
+                queueProvider: { player.items.compactMap { $0 as? Track } }
+            )
+            return StandardSeekFixture(player: player, backend: backend, gate: gate)
+        }
+        addTeardownBlock {
+            self.onMain {
+                try? fixture.backend.dispose()
+                fixture.player.wrapper.delegate = fixture.player
+                fixture.player.clear()
+            }
+        }
+        return fixture
+    }
+
+    private func drainStandardSeekEvents(_ player: QueuedAudioPlayer) {
+        // The SDK delivers seek events on its private serial queue. This marker
+        // drains that queue and all prior main-thread completion work without a sleep.
+        let drained = expectation(description: "SwiftAudioEx seek event queue drained")
+        let observer = NSObject()
+        let marker = -987654.0
+        player.event.seek.addListener(observer) { event in
+            if event.seconds == marker {
+                DispatchQueue.main.async { drained.fulfill() }
+            }
+        }
+        onMain { player.AVWrapper(seekTo: marker, didFinish: false) }
+        wait(for: [drained], timeout: 5)
+        player.event.seek.removeListener(observer)
+    }
+
     private func makeTrack(id: String) -> Track {
         return Track(dictionary: [
             "id": id,
@@ -1605,6 +1794,109 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         if Thread.isMainThread { return operation() }
         return DispatchQueue.main.sync(execute: operation)
     }
+}
+
+private struct StandardSeekFixture {
+    let player: QueuedAudioPlayer
+    let backend: StandardPlaybackBackend
+    let gate: StandardSeekCallbackGate
+}
+
+private final class StandardSeekResults {
+    private let lock = NSLock()
+    private var values: [Result<Void, Error>] = []
+
+    func append(_ value: Result<Void, Error>) {
+        lock.lock()
+        values.append(value)
+        lock.unlock()
+    }
+
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return values.count
+    }
+
+    var succeeded: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard values.count == 1, case .success = values[0] else { return false }
+        return true
+    }
+
+    var failed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard values.count == 1, case .failure = values[0] else { return false }
+        return true
+    }
+}
+
+// Retains the real AVFoundation callback before AudioPlayer publishes it on
+// event.seek. The player, file, queue and Standard backend all remain real.
+// No production seam or invented item/generation field is used.
+private final class StandardSeekCallbackGate: AVPlayerWrapperDelegate {
+    private weak var forward: AVPlayerWrapperDelegate?
+    private let lock = NSLock()
+    private var pending: [(seconds: Double, didFinish: Bool)] = []
+    private var captured: [Double] = []
+    private var captureHandler: ((Double) -> Void)?
+
+    init(forwarding delegate: AVPlayerWrapperDelegate) { forward = delegate }
+
+    var didCapture: ((Double) -> Void)? {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return captureHandler
+        }
+        set {
+            lock.lock()
+            captureHandler = newValue
+            lock.unlock()
+        }
+    }
+
+    var capturedSeconds: [Double] {
+        lock.lock()
+        defer { lock.unlock() }
+        return captured
+    }
+
+    func AVWrapper(seekTo seconds: Double, didFinish: Bool) {
+        lock.lock()
+        pending.append((seconds, didFinish))
+        captured.append(seconds)
+        let handler = captureHandler
+        lock.unlock()
+        handler?(seconds)
+    }
+
+    func releaseFirst(seconds: Double) {
+        lock.lock()
+        let index = pending.firstIndex { $0.seconds == seconds }
+        let event = index.map { pending.remove(at: $0) }
+        lock.unlock()
+        guard let event else {
+            XCTFail("No retained native seek callback for \(seconds)")
+            return
+        }
+        forward?.AVWrapper(seekTo: event.seconds, didFinish: event.didFinish)
+    }
+
+    func AVWrapper(didChangeState state: AVPlayerWrapperState) { forward?.AVWrapper(didChangeState: state) }
+    func AVWrapper(secondsElapsed seconds: Double) { forward?.AVWrapper(secondsElapsed: seconds) }
+    func AVWrapper(failedWithError error: Error?) { forward?.AVWrapper(failedWithError: error) }
+    func AVWrapper(didUpdateDuration duration: Double) { forward?.AVWrapper(didUpdateDuration: duration) }
+    func AVWrapper(didReceiveCommonMetadata metadata: [AVMetadataItem]) { forward?.AVWrapper(didReceiveCommonMetadata: metadata) }
+    func AVWrapper(didReceiveChapterMetadata metadata: [AVTimedMetadataGroup]) { forward?.AVWrapper(didReceiveChapterMetadata: metadata) }
+    func AVWrapper(didReceiveTimedMetadata metadata: [AVTimedMetadataGroup]) { forward?.AVWrapper(didReceiveTimedMetadata: metadata) }
+    func AVWrapper(didChangePlayWhenReady playWhenReady: Bool) { forward?.AVWrapper(didChangePlayWhenReady: playWhenReady) }
+    func AVWrapperItemDidPlayToEndTime() { forward?.AVWrapperItemDidPlayToEndTime() }
+    func AVWrapperItemFailedToPlayToEndTime() { forward?.AVWrapperItemFailedToPlayToEndTime() }
+    func AVWrapperItemPlaybackStalled() { forward?.AVWrapperItemPlaybackStalled() }
+    func AVWrapperDidRecreateAVPlayer() { forward?.AVWrapperDidRecreateAVPlayer() }
 }
 
 private enum ScheduledCrossfadeCancellationMutation {
