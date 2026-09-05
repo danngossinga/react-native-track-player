@@ -6,6 +6,134 @@ import React
 @testable import react_native_track_player
 
 final class IOSPlaybackBackendIntegrationTests: XCTestCase {
+    // These tests run in the private RNTP integration host with RNTP_E2E_PROBES
+    // enabled for its Pods. The production module exposes no additional API.
+    func test_e2eLifecycleProbeIsReadOnlyAndRetiredEnginesAreSilentAfterModeSwitch() throws {
+        let module = makeE2EProbeModule(crossfade: false)
+        let empty = try awaitE2EProbe(module)
+        assertE2EProbeShape(empty)
+        XCTAssertEqual(empty["backendKind"] as? String, "standard")
+        let standard = try XCTUnwrap(e2eEngines(empty).first)
+        // SwiftAudioEx exposes configured volume/rate, not its AVPlayer. A
+        // Standard observation must not manufacture physical playing evidence.
+        XCTAssertTrue(standard["observedRate"] is NSNull)
+        XCTAssertTrue(standard["timeControlStatus"] is NSNull)
+        XCTAssertTrue(standard["currentItemPresent"] is NSNull)
+        let again = try awaitE2EProbe(module)
+        XCTAssertEqual(again["backendId"] as? String, empty["backendId"] as? String)
+        XCTAssertEqual(again["generation"] as? Int, empty["generation"] as? Int)
+        XCTAssertEqual(e2eEngines(again).first?["id"] as? String, standard["id"] as? String)
+        XCTAssertEqual(e2eEngines(again).first?["generation"] as? Int, standard["generation"] as? Int)
+        XCTAssertEqual(again["currentIndex"] as? Int, empty["currentIndex"] as? Int)
+        XCTAssertTrue(e2eEngineIDs(again, live: true).isSubset(of: e2eEngineIDs(empty, live: true)), "Reading the probe created a crossfade engine")
+
+        // Keep an engine outside the current backend alive. A registry built
+        // only from current A/B would incorrectly omit this real AVPlayer.
+        let witness = onMain { IOSCrossfadeEngine(name: "retained-probe-witness") }
+        defer { withExtendedLifetime(witness) {} }
+        let witnessed = try awaitE2EProbe(module)
+        let witnessIDs = e2eEngineIDs(witnessed, live: true).subtracting(e2eEngineIDs(again, live: true))
+        XCTAssertEqual(witnessIDs.count, 1)
+
+        try addE2EProbeTracks(module)
+        _ = awaitBackendSwap(module, config: ["type": "pingPong", "engineMode": "orchestratedDualEngine"])
+        awaitE2ECommand("play") { module.play(resolve: $0, reject: $1) }
+        let playing = try awaitE2EProbe(module) { probe in
+            self.e2eEngines(probe).contains {
+                self.e2eNumber($0, "observedRate") > 0 && self.e2eNumber($0, "volume") > 0 &&
+                    $0["timeControlStatus"] as? String == "playing" && self.e2eNumber($0, "position") >= 0.25
+            }
+        }
+        assertE2EProbeShape(playing)
+        XCTAssertEqual(e2eEngines(playing).count, 2)
+        let oldIDs = e2eEngineIDs(playing)
+        XCTAssertEqual(oldIDs.count, 2)
+        XCTAssertTrue(oldIDs.isSubset(of: e2eEngineIDs(playing, live: true)))
+
+        _ = awaitBackendSwap(module, config: ["type": "standard"])
+        let switched = try awaitE2EProbe(module) { probe in
+            guard probe["backendKind"] as? String == "standard" else { return false }
+            return self.e2eEngines(probe, live: true).filter {
+                oldIDs.contains($0["id"] as? String ?? "")
+            }.allSatisfy {
+                self.e2eNumber($0, "observedRate") == 0 || self.e2eNumber($0, "volume") == 0
+            }
+        }
+        assertE2EProbeShape(switched)
+        XCTAssertNotEqual(switched["backendId"] as? String, playing["backendId"] as? String)
+        XCTAssertNotEqual(switched["backendId"] as? String, empty["backendId"] as? String)
+        XCTAssertEqual(switched["currentIndex"] as? Int, 0)
+        XCTAssertTrue(witnessIDs.isSubset(of: e2eEngineIDs(switched, live: true)))
+        // Missing weak entries prove release; remaining old entries must carry
+        // an actual silent rate or volume. Absence never means disposed=true.
+        XCTAssertNil(switched["disposed"])
+    }
+
+    func test_e2eLifecycleProbeObservesRealABOverlapProgressAndPauseBoth() throws {
+        let module = makeE2EProbeModule(crossfade: true)
+        assertE2EProbeShape(try awaitE2EProbe(module))
+        try addE2EProbeTracks(module)
+        awaitE2ECommand("play") { module.play(resolve: $0, reject: $1) }
+        awaitE2ECommand("crossFadePrepare") { module.crossFadePrepare(previous: false, seekTo: 0, resolve: $0, reject: $1) }
+        let terminal = expectation(description: "pause cancels the admitted crossfade")
+        onMain {
+            module.crossFade(fadeDuration: 8_000, fadeInterval: 50, fadeToVolume: 1, waitUntil: 0,
+                resolve: { _ in XCTFail("Crossfade completed before the test paused its real overlap"); terminal.fulfill() },
+                reject: { code, _, error in
+                    XCTAssertEqual(code, "crossfade_failed")
+                    XCTAssertEqual((error as NSError?)?.userInfo["code"] as? String, "crossfade_cancelled")
+                    terminal.fulfill()
+                })
+        }
+        let overlap = try awaitE2EProbe(module) { probe in
+            let engines = self.e2eEngines(probe)
+            return engines.count == 2 && engines.allSatisfy {
+                self.e2eNumber($0, "observedRate") > 0 && self.e2eNumber($0, "volume") > 0.1 &&
+                    $0["timeControlStatus"] as? String == "playing" && $0["currentItemPresent"] as? Bool == true
+            }
+        }
+        let initialPositions = e2eEngines(overlap).reduce(into: [String: Double]()) {
+            $0[$1["id"] as? String ?? ""] = e2eNumber($1, "position")
+        }
+        XCTAssertEqual(initialPositions.count, 2)
+        XCTAssertEqual(overlap["activeEngineIndex"] as? Int, 0)
+        XCTAssertEqual(overlap["standbyEngineIndex"] as? Int, 1)
+        let advanced = try awaitE2EProbe(module, timeout: 5) { probe in
+            let engines = self.e2eEngines(probe)
+            return engines.count == 2 && engines.allSatisfy {
+                guard let start = initialPositions[$0["id"] as? String ?? ""] else { return false }
+                return self.e2eNumber($0, "position") >= start + 2 &&
+                    self.e2eNumber($0, "observedRate") > 0 && self.e2eNumber($0, "volume") > 0 &&
+                    $0["timeControlStatus"] as? String == "playing"
+            }
+        }
+        XCTAssertEqual(e2eEngineIDs(advanced), e2eEngineIDs(overlap))
+        awaitE2ECommand("pause") { module.pause(resolve: $0, reject: $1) }
+        wait(for: [terminal], timeout: 5)
+        let paused = try awaitE2EProbe(module) { probe in
+            let engines = self.e2eEngines(probe)
+            return engines.count == 2 && engines.allSatisfy {
+                self.e2eNumber($0, "observedRate") == 0 && $0["timeControlStatus"] as? String == "paused"
+            }
+        }
+        let pausedPositions = e2eEngines(paused).reduce(into: [String: Double]()) {
+            $0[$1["id"] as? String ?? ""] = e2eNumber($1, "position")
+        }
+        XCTAssertEqual(pausedPositions.count, 2)
+        let stableUntil = ProcessInfo.processInfo.systemUptime + 2
+        _ = try awaitE2EProbe(module, timeout: 4) { probe in
+            let engines = self.e2eEngines(probe)
+            XCTAssertEqual(engines.count, 2)
+            for engine in engines {
+                XCTAssertEqual(self.e2eNumber(engine, "observedRate"), 0)
+                XCTAssertEqual(engine["timeControlStatus"] as? String, "paused")
+                let start = pausedPositions[engine["id"] as? String ?? ""] ?? .nan
+                XCTAssertLessThanOrEqual(abs(self.e2eNumber(engine, "position") - start), 0.25)
+            }
+            return ProcessInfo.processInfo.systemUptime >= stableUntil
+        }
+    }
+
     func test_standardRemovalDeduplicatesOriginalIndexes() throws {
         try assertRemovalContract(pingPong: false, invalid: false)
     }
@@ -1889,6 +2017,118 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         })
         XCTAssertNotEqual(orchestrator.state, .crossfading)
         orchestrator.pause()
+    }
+
+    private func makeE2EProbeModule(crossfade: Bool) -> RNTrackPlayer {
+        let module = onMain { () -> RNTrackPlayer in
+            let module = RNTrackPlayer()
+            module.setValue(RNTrackPlayerTestEventSink.shared, forKey: "callableJSModules")
+            module.setupPlayer(config: ["crossfade": crossfade, "autoUpdateMetadata": false],
+                resolve: { _ in }, reject: rejecting("setupPlayer"))
+            return module
+        }
+        addTeardownBlock {
+            self.awaitE2ECommand("reset") { module.reset(resolve: $0, reject: $1) }
+        }
+        return module
+    }
+
+    private func addE2EProbeTracks(_ module: RNTrackPlayer) throws {
+        let url = try bundledAudioURL().absoluteString
+        let tracks = ["probe-a", "probe-b"].map {
+            ["id": $0, "url": url, "title": "probe-private-metadata", "duration": 28.2,
+             "headers": ["X-Probe-Fixture": "probe-private-metadata"]] as [String: Any]
+        }
+        awaitE2ECommand("add") { module.add(trackDicts: tracks, before: -1, resolve: $0, reject: $1) }
+    }
+
+    private func awaitE2ECommand(
+        _ name: String,
+        _ operation: (@escaping RCTPromiseResolveBlock, @escaping RCTPromiseRejectBlock) -> Void
+    ) {
+        let finished = expectation(description: name)
+        onMain { operation({ _ in finished.fulfill() }, rejecting(name, fulfilling: finished)) }
+        wait(for: [finished], timeout: 15)
+    }
+
+    private func awaitE2EProbe(
+        _ module: RNTrackPlayer,
+        timeout: TimeInterval = 10,
+        matching: @escaping ([String: Any]) -> Bool = { _ in true }
+    ) throws -> [String: Any] {
+        let finished = expectation(description: "getPlayerLifecycle physical observation")
+        let deadline = ProcessInfo.processInfo.systemUptime + timeout
+        var latest: [String: Any]?
+        func read() {
+            module.getPlayerLifecycle(resolve: { value in
+                guard let lifecycle = value as? [String: Any], let probe = lifecycle["_e2e"] as? [String: Any] else {
+                    finished.fulfill()
+                    return
+                }
+                latest = probe
+                if matching(probe) || ProcessInfo.processInfo.systemUptime >= deadline {
+                    finished.fulfill()
+                } else {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { read() }
+                }
+            }, reject: rejecting("getPlayerLifecycle", fulfilling: finished))
+        }
+        onMain { read() }
+        wait(for: [finished], timeout: timeout + 3)
+        let probe = try XCTUnwrap(latest, "RNTP_E2E_PROBES _e2e snapshot is missing from getPlayerLifecycle")
+        XCTAssertTrue(matching(probe), "Physical observation did not reach its bounded condition: \(probe)")
+        return probe
+    }
+
+    private func e2eEngines(_ probe: [String: Any], live: Bool = false) -> [[String: Any]] {
+        probe[live ? "liveCrossfadeEngines" : "engines"] as? [[String: Any]] ?? []
+    }
+
+    private func e2eEngineIDs(_ probe: [String: Any], live: Bool = false) -> Set<String> {
+        Set(e2eEngines(probe, live: live).compactMap { $0["id"] as? String })
+    }
+
+    private func e2eNumber(_ engine: [String: Any], _ key: String) -> Double {
+        (engine[key] as? NSNumber)?.doubleValue ?? .nan
+    }
+
+    private func assertE2EProbeShape(_ probe: [String: Any]) {
+        XCTAssertEqual(Set(probe.keys), Set(["schemaVersion", "backendId", "backendKind", "generation", "state", "currentIndex",
+            "engineAId", "engineBId", "activeEngineId", "standbyEngineId", "activeEngineIndex", "standbyEngineIndex", "engines", "liveCrossfadeEngines"]))
+        XCTAssertEqual(probe["schemaVersion"] as? Int, 1)
+        XCTAssertNotNil(UUID(uuidString: probe["backendId"] as? String ?? ""))
+        XCTAssertNotNil(probe["generation"] as? Int)
+        XCTAssertNotNil(probe["state"] as? String)
+        XCTAssertNotNil(probe["currentIndex"] as? Int)
+        if probe["backendKind"] as? String == "pingPong" {
+            let ids = e2eEngineIDs(probe)
+            XCTAssertEqual(ids.count, 2)
+            XCTAssertTrue(ids.contains(probe["engineAId"] as? String ?? ""))
+            XCTAssertTrue(ids.contains(probe["engineBId"] as? String ?? ""))
+            XCTAssertNotEqual(probe["engineAId"] as? String, probe["engineBId"] as? String)
+            XCTAssertTrue(ids.contains(probe["activeEngineId"] as? String ?? ""))
+            XCTAssertTrue(ids.contains(probe["standbyEngineId"] as? String ?? ""))
+            XCTAssertNotEqual(probe["activeEngineId"] as? String, probe["standbyEngineId"] as? String)
+        }
+        let keys = Set(["id", "generation", "state", "volume", "observedRate", "timeControlStatus", "position", "duration", "currentItemPresent"])
+        for engine in e2eEngines(probe) + e2eEngines(probe, live: true) {
+            XCTAssertEqual(Set(engine.keys), keys)
+            XCTAssertNotNil(UUID(uuidString: engine["id"] as? String ?? ""))
+            XCTAssertNotNil(engine["generation"] as? Int)
+            for key in ["volume", "observedRate", "position", "duration"] {
+                XCTAssertTrue(engine[key] is NSNull || e2eNumber(engine, key).isFinite, "Nonfinite physical values must be null")
+            }
+            if let status = engine["timeControlStatus"] as? String {
+                XCTAssertTrue(["paused", "waiting", "playing"].contains(status))
+            } else {
+                XCTAssertTrue(engine["timeControlStatus"] is NSNull)
+            }
+        }
+        let serialized = (try? JSONSerialization.data(withJSONObject: probe)).flatMap { String(data: $0, encoding: .utf8) }
+        XCTAssertNotNil(serialized)
+        XCTAssertFalse(serialized?.contains("probe-private-metadata") ?? true)
+        XCTAssertFalse(serialized?.contains("pure.m4a") ?? true)
+        XCTAssertFalse(serialized?.contains("headers") ?? true)
     }
 
     private func makeStandardSeekFixture() throws -> StandardSeekFixture {
