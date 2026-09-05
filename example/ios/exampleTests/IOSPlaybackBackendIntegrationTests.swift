@@ -35,7 +35,10 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
     func test_realStandardSameIndexSkipWaitsForItsExplicitInitialTime() throws {
         let fixture = try makeStandardSeekFixture()
         let captured = expectation(description: "native skip position reached")
-        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        fixture.gate.didCapture = { seconds in
+            XCTAssertNotEqual(seconds, 0, "An explicit same-index skip emitted a redundant seek-to-zero callback")
+            if seconds == 5 { captured.fulfill() }
+        }
         let completed = expectation(description: "skip completion")
         let results = StandardSeekResults()
 
@@ -51,6 +54,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
 
         onMain { fixture.gate.releaseFirst(seconds: 5) }
         wait(for: [completed], timeout: 5)
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertFalse(fixture.gate.capturedSeconds.contains(0), "A late redundant seek-to-zero callback escaped the initial assertion")
         XCTAssertTrue(results.succeeded)
         XCTAssertEqual(onMain { fixture.backend.currentIndex }, 0)
     }
