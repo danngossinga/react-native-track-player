@@ -117,19 +117,40 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                 self.e2eNumber($0, "observedRate") == 0 && $0["timeControlStatus"] as? String == "paused"
             }
         }
+        let activeID = try XCTUnwrap(paused["activeEngineId"] as? String, "Paused probe: \(paused)")
+        let standbyID = try XCTUnwrap(paused["standbyEngineId"] as? String, "Paused probe: \(paused)")
+        XCTAssertNotEqual(activeID, standbyID, "Paused probe: \(paused)")
+        XCTAssertEqual(e2eEngineIDs(paused), e2eEngineIDs(overlap), "Paused probe: \(paused)")
         let pausedPositions = e2eEngines(paused).reduce(into: [String: Double]()) {
-            $0[$1["id"] as? String ?? ""] = e2eNumber($1, "position")
+            if $1["currentItemPresent"] as? Bool == true {
+                $0[$1["id"] as? String ?? ""] = e2eNumber($1, "position")
+            }
         }
-        XCTAssertEqual(pausedPositions.count, 2)
+        XCTAssertTrue(pausedPositions[activeID]?.isFinite == true, "Active item position is unavailable: \(paused)")
         let stableUntil = ProcessInfo.processInfo.systemUptime + 2
         _ = try awaitE2EProbe(module, timeout: 4) { probe in
+            let evidence = "Paused probe: \(probe)"
             let engines = self.e2eEngines(probe)
-            XCTAssertEqual(engines.count, 2)
+            XCTAssertEqual(engines.count, 2, evidence)
+            XCTAssertEqual(self.e2eEngineIDs(probe), self.e2eEngineIDs(overlap), evidence)
+            XCTAssertEqual(probe["activeEngineId"] as? String, activeID, evidence)
+            XCTAssertEqual(probe["standbyEngineId"] as? String, standbyID, evidence)
             for engine in engines {
-                XCTAssertEqual(self.e2eNumber(engine, "observedRate"), 0)
-                XCTAssertEqual(engine["timeControlStatus"] as? String, "paused")
-                let start = pausedPositions[engine["id"] as? String ?? ""] ?? .nan
-                XCTAssertLessThanOrEqual(abs(self.e2eNumber(engine, "position") - start), 0.25)
+                let id = engine["id"] as? String ?? ""
+                XCTAssertEqual(self.e2eNumber(engine, "observedRate"), 0, evidence)
+                XCTAssertEqual(engine["timeControlStatus"] as? String, "paused", evidence)
+                if engine["currentItemPresent"] as? Bool == false {
+                    // Pause deliberately releases the outgoing standby item.
+                    // Its position may be null; its identity and silence may not.
+                    XCTAssertEqual(id, standbyID, evidence)
+                    XCTAssertEqual(self.e2eNumber(engine, "volume"), 0, evidence)
+                } else {
+                    XCTAssertEqual(engine["currentItemPresent"] as? Bool, true, evidence)
+                    let position = self.e2eNumber(engine, "position")
+                    let start = pausedPositions[id] ?? .nan
+                    XCTAssertTrue(position.isFinite && start.isFinite, evidence)
+                    XCTAssertLessThanOrEqual(abs(position - start), 0.25, evidence)
+                }
             }
             return ProcessInfo.processInfo.systemUptime >= stableUntil
         }
