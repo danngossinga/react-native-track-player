@@ -1,7 +1,4 @@
-import type {
-  PlaybackBackendConfig,
-  PlayerLifecycleState,
-} from './interfaces';
+import type { PlaybackBackendConfig, PlayerLifecycleState } from './interfaces';
 
 type PlaybackBackendBridge = {
   setPlaybackBackend(
@@ -9,7 +6,9 @@ type PlaybackBackendBridge = {
   ): Promise<PlayerLifecycleState>;
 };
 
-function isPlaybackBackendConfig(value: unknown): value is PlaybackBackendConfig {
+function isPlaybackBackendConfig(
+  value: unknown
+): value is PlaybackBackendConfig {
   if (value === null || typeof value !== 'object' || Array.isArray(value)) {
     return false;
   }

@@ -6,10 +6,7 @@ export type PlayerLifecycleBackend =
   | 'pingPong'
   | 'crossfade';
 
-export type PlayerLifecyclePhase =
-  | 'uninitialized'
-  | 'settingUp'
-  | 'ready';
+export type PlayerLifecyclePhase = 'uninitialized' | 'settingUp' | 'ready';
 
 export type PlayerLifecycleState = {
   phase: PlayerLifecyclePhase;
