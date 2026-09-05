@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { scanFiles, trackedPaths } from '../verify-repository-secrets.mjs';
 
-const repositoryRoot = resolve(import.meta.dirname, '../..');
 function fixture(t, files) {
   const root = mkdtempSync(join(tmpdir(), 'rntp-secret-scan-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
@@ -16,8 +16,13 @@ function fixture(t, files) {
   return root;
 }
 
-test('tracked repository has no signing identity or private key', () => {
-  assert.deepEqual(scanFiles({ root: repositoryRoot, paths: trackedPaths(repositoryRoot) }), []);
+test('tracked inventory scans indexed files without relying on the test checkout Git metadata', t => {
+  const root = fixture(t, { 'tracked.txt': 'safe', 'untracked.txt': 'safe', 'indexed.pfx': 'synthetic' });
+  execFileSync('git', ['init', '--quiet', root]);
+  execFileSync('git', ['add', 'tracked.txt', 'indexed.pfx'], { cwd: root });
+  const paths = trackedPaths(root).sort();
+  assert.deepEqual(paths, ['indexed.pfx', 'tracked.txt']);
+  assert.deepEqual(scanFiles({ root, paths }), [{ path: 'indexed.pfx', code: 'CREDENTIAL_FILE' }]);
 });
 
 test('rejects signing containers and credential filenames without printing bytes', t => {
