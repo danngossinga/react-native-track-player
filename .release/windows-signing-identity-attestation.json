@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "artifactId": "program-008/windows-signing-identity/v1",
+  "identity": "example_TemporaryKey.pfx",
+  "assessment": "unknown",
+  "remediation": "pending",
+  "basis": [
+    "The tracked Windows example contained a signing container and certificate properties before consolidation.",
+    "The consolidation removes the container and identity properties and disables signing by default.",
+    "The container is present in the locally available origin/main history of the public danngossinga/react-native-track-player fork; trust for distributed binaries is not established.",
+    "No provider revocation or rotation evidence is available; deleting tracked files does not revoke an identity."
+  ]
+}

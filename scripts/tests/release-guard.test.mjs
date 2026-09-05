@@ -19,7 +19,7 @@ const repositoryRoot = resolve(dirname(fileURLToPath(import.meta.url)), '../..')
 const guardPath = join(repositoryRoot, 'scripts/release-guard.mjs');
 const frozenToken = 'RELEASE_BLOCKED program=008 status=frozen';
 const expectedLockSha256 =
-  'a849ed2fe2d7e53e166bbc55488805ce196508a033323cad34d842864f3f81f0';
+  'fb751ae2be74717854426fe15d3dbea0825343f5c861a5d7612c0ae0192b54de';
 const expectedBaselines = {
   proxy: '176b5c8a8183c53343d3a6ec82595352c5d970c5',
   player: 'edafba80fa1c5cbf64bb0c52ce4104a3cf9cc5f9',
@@ -279,17 +279,41 @@ test('release decision blocks every unsafe shared state and allows only approved
     );
   }
 
-  assert.deepEqual(
-    evaluateReleaseDecision({
-      packageManifest: publicPackage,
-      releaseRecord: releaseRecord(),
-    }),
-    {
-      allowed: true,
-      code: 'RELEASE_ALLOWED',
-      message: 'RELEASE_ALLOWED program=008 status=approved',
-    },
-  );
+  assert.equal(evaluateReleaseDecision({
+    packageManifest: publicPackage,
+    releaseRecord: releaseRecord(),
+  }).allowed, false, 'approval cannot omit the mandatory signing prerequisite');
+});
+
+test('cannot move or rename all matching signing artifacts to bypass the fixed identity contract', async () => {
+  const { verifySecurityPrerequisites } = await loadGuard();
+  for (const options of [
+    { artifactId: 'another-identity/v1' },
+    { artifactPath: '.release/another-attestation.json' },
+    { assessmentPath: '.release/another-assessment.json' },
+  ]) {
+    const root = mkdtempSync(join(tmpdir(), 'program-008-fixed-identity-'));
+    const { prerequisite } = createBoundPrerequisite(root, options);
+    assert.equal((await verifySecurityPrerequisites({ repositoryRoot: root, prerequisites: [prerequisite] })).ok, false);
+  }
+});
+
+test('real removed identity stays byte-bound and unresolved for any future unfreeze', async () => {
+  const { evaluateReleaseDecision, verifySecurityPrerequisites } = await loadGuard();
+  const record = JSON.parse(readFileSync(join(repositoryRoot, '.release/program-008.json'), 'utf8'));
+  assert.equal(record.status, 'frozen');
+  assert.equal(record.securityPrerequisites.length, 1);
+  const prerequisite = record.securityPrerequisites[0];
+  const artifactBytes = readFileSync(join(repositoryRoot, prerequisite.artifactPath));
+  const attestation = JSON.parse(artifactBytes);
+  const assessment = JSON.parse(readFileSync(join(repositoryRoot, prerequisite.assessmentPath), 'utf8'));
+  assert.equal(sha256(artifactBytes), prerequisite.artifactSha256);
+  assert.equal(sha256(artifactBytes), assessment.attestation.sha256);
+  assert.equal(attestation.assessment, 'unknown');
+  assert.equal(attestation.remediation, 'pending');
+  const verification = await verifySecurityPrerequisites({ repositoryRoot, prerequisites: record.securityPrerequisites });
+  assert.equal(verification.ok, false);
+  assert.equal(evaluateReleaseDecision({ packageManifest: { private: false }, releaseRecord: { ...record, status: 'approved' }, prerequisiteVerification: verification }).allowed, false);
 });
 
 test('non-empty security prerequisites require verified, satisfied artifact evidence', async (t) => {

@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "identity": "example_TemporaryKey.pfx",
+  "assessment": "unknown",
+  "remediation": "pending",
+  "attestation": {
+    "artifactId": "program-008/windows-signing-identity/v1",
+    "path": ".release/windows-signing-identity-attestation.json",
+    "sha256": "bbfd0b87c965127737ecbf8532cf6fbff1f1f5337aa305658c8803253b4d82ce"
+  }
+}

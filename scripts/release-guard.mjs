@@ -7,6 +7,9 @@ const PROGRAM = '008';
 const RELEASE_RECORD_PATH = '.release/program-008.json';
 const FROZEN_MESSAGE = 'RELEASE_BLOCKED program=008 status=frozen';
 const APPROVED_MESSAGE = 'RELEASE_ALLOWED program=008 status=approved';
+const SIGNING_ARTIFACT_ID = 'program-008/windows-signing-identity/v1';
+const SIGNING_ARTIFACT_PATH = '.release/windows-signing-identity-attestation.json';
+const SIGNING_ASSESSMENT_PATH = '.release/windows-signing-identity-assessment.json';
 
 export const EXPECTED_BASELINES = Object.freeze({
   proxy: '176b5c8a8183c53343d3a6ec82595352c5d970c5',
@@ -116,9 +119,9 @@ function prerequisiteShapeIsValid(prerequisite) {
   return (
     hasExactKeys(prerequisite, PREREQUISITE_KEYS) &&
     prerequisite.id === 'windows_signing_identity' &&
-    isNonEmptyString(prerequisite.assessmentPath) &&
-    isNonEmptyString(prerequisite.artifactId) &&
-    isNonEmptyString(prerequisite.artifactPath) &&
+    prerequisite.assessmentPath === SIGNING_ASSESSMENT_PATH &&
+    prerequisite.artifactId === SIGNING_ARTIFACT_ID &&
+    prerequisite.artifactPath === SIGNING_ARTIFACT_PATH &&
     isLowercaseSha256(prerequisite.artifactSha256)
   );
 }
@@ -133,7 +136,8 @@ function releaseRecordShapeIsValid(releaseRecord, expectedBaselines) {
     releaseRecord.reason !== 'hardening_program_in_progress' ||
     !baselinesEqual(releaseRecord.baselines, expectedBaselines) ||
     !arraysEqual(releaseRecord.exitGates, EXPECTED_EXIT_GATES) ||
-    !Array.isArray(releaseRecord.securityPrerequisites)
+    !Array.isArray(releaseRecord.securityPrerequisites) ||
+    releaseRecord.securityPrerequisites.length !== 1
   ) {
     return false;
   }
@@ -281,7 +285,7 @@ export async function verifySecurityPrerequisites({
     };
   }
   if (prerequisites.length === 0) {
-    return { ok: true, failures };
+    return { ok: false, failures: [{ id: 'windows_signing_identity', code: 'MISSING_PREREQUISITE' }] };
   }
   if (!isNonEmptyString(repositoryRoot) || !isAbsolute(repositoryRoot)) {
     return {

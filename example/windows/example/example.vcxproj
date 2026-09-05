@@ -3,6 +3,7 @@
   <Import Project="$(SolutionDir)\ExperimentalFeatures.props" Condition="Exists('$(SolutionDir)\ExperimentalFeatures.props')" />
   <Import Project="..\packages\Microsoft.Windows.CppWinRT.2.0.210312.4\build\native\Microsoft.Windows.CppWinRT.props" Condition="Exists('..\packages\Microsoft.Windows.CppWinRT.2.0.210312.4\build\native\Microsoft.Windows.CppWinRT.props')" />
   <PropertyGroup Label="Globals">
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
     <CppWinRTOptimized>true</CppWinRTOptimized>
     <CppWinRTRootNamespaceAutoMerge>true</CppWinRTRootNamespaceAutoMerge>
     <MinimalCoreWin>true</MinimalCoreWin>
@@ -16,9 +17,6 @@
     <ApplicationTypeRevision>10.0</ApplicationTypeRevision>
     <WindowsTargetPlatformVersion Condition=" '$(WindowsTargetPlatformVersion)' == '' ">10.0.18362.0</WindowsTargetPlatformVersion>
     <WindowsTargetPlatformMinVersion>10.0.16299.0</WindowsTargetPlatformMinVersion>
-    <PackageCertificateKeyFile>example_TemporaryKey.pfx</PackageCertificateKeyFile>
-    <PackageCertificateThumbprint>454655D177214CD3828D2BE3A30B538D0BA5BF8A</PackageCertificateThumbprint>
-    <PackageCertificatePassword>password</PackageCertificatePassword>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Label="ReactNativeWindowsProps">

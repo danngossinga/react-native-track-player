@@ -21,5 +21,13 @@
     "global_review",
     "explicit_unfreeze"
   ],
-  "securityPrerequisites": []
+  "securityPrerequisites": [
+    {
+      "id": "windows_signing_identity",
+      "assessmentPath": ".release/windows-signing-identity-assessment.json",
+      "artifactId": "program-008/windows-signing-identity/v1",
+      "artifactPath": ".release/windows-signing-identity-attestation.json",
+      "artifactSha256": "bbfd0b87c965127737ecbf8532cf6fbff1f1f5337aa305658c8803253b4d82ce"
+    }
+  ]
 }
