@@ -269,6 +269,38 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             }
             XCTAssertTrue(fixture.backend.publicPlayWhenReady)
         }
+
+        let skipResults = StandardSeekResults()
+        let skipCompleted = expectation(description: "same-index skip after a second stop finishes silently")
+        fixture.gate.didCapture = { seconds in
+            XCTAssertEqual(seconds, 6, "Reloading a stopped same-index skip must not issue an implicit seek")
+            XCTAssertEqual(skipResults.count, 0, "The skip completed before its actual native callback")
+            self.onMain {
+                XCTAssertFalse(fixture.backend.publicPlayWhenReady)
+                fixture.gate.releaseFirst(seconds: 6)
+            }
+        }
+        onMain {
+            fixture.backend.stop()
+            XCTAssertEqual(fixture.player.duration, 0)
+            fixture.backend.skip(to: 0, initialTime: 6) {
+                skipResults.append($0)
+                skipCompleted.fulfill()
+            }
+        }
+        wait(for: [skipCompleted], timeout: 30)
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertTrue(skipResults.succeeded)
+        XCTAssertEqual(skipResults.count, 1)
+        XCTAssertEqual(fixture.gate.capturedSeconds, [5, 6])
+        onMain {
+            XCTAssertEqual(fixture.player.items.count, 2)
+            XCTAssertTrue((fixture.player.items[0] as? Track) === originalTrack)
+            XCTAssertTrue((fixture.player.items[1] as? Track) === nextTrack)
+            XCTAssertEqual(fixture.backend.currentIndex, 0)
+            XCTAssertEqual(fixture.backend.position, 6, accuracy: 0.25)
+            XCTAssertFalse(fixture.backend.publicPlayWhenReady)
+        }
     }
 
     func test_iosPlaybackStateErrorContractUsesBackendReadLease() throws {

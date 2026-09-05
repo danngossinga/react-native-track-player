@@ -212,6 +212,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private var pendingSeeks: [PendingSeek] = []
     private var issuedSeek: PendingSeek?
     private var seekReadinessPoll: DispatchWorkItem?
+    // SwiftAudioEx retains the listener during asynchronous removal. Use a
+    // separate identity so deinit never passes its dying self to that closure.
+    private let seekListener = NSObject()
     private(set) var queueReloadCount = 0
 
     init(
@@ -250,7 +253,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             self.incomingQueueProvider = nil
         }
         self.queueProvider = queueProvider
-        player.event.seek.addListener(self) { [weak self] event in
+        player.event.seek.addListener(seekListener) { [weak self] event in
             DispatchQueue.main.async {
                 self?.didCompleteNativeSeek(position: event.seconds, didFinish: event.didFinish)
             }
@@ -259,7 +262,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     deinit {
         seekReadinessPoll?.cancel()
-        player.event.seek.removeListener(self)
+        player.event.seek.removeListener(seekListener)
     }
 
     private func onMain<Value>(_ operation: () throws -> Value) rethrows -> Value {
@@ -309,6 +312,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 pendingSeeks.removeFirst()
                 request.finish(.failure(seekError("standard_seek_unavailable", "The active track failed to load.")))
                 continue
+            }
+            if player.playerState == .stopped {
+                // stop retains the queue but unloads its native item. Reload
+                // silently, without the SDK issuing a retained-position seek.
+                player.playWhenReady = false
+                player.reload(startFromCurrentTime: false)
             }
             // This is the native item's duration, not Track metadata. Without
             // an AVPlayerItem, SwiftAudioEx stores a deferred seek and may never
