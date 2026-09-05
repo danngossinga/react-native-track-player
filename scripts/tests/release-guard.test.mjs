@@ -543,9 +543,13 @@ test('tracked package scripts guard every version, push, tag, and publication en
   );
 });
 
-test('nightly workflow runs the guard before build, version mutation, and publication', () => {
+test('upstream automation is inactive and archived nightly retains its publication guard', () => {
+  for (const name of ['nightly.yml', 'publish-docs.yml', 'stale-bot.yml', 'delete-buildjet-cache.yml']) {
+    assert.equal(existsSync(join(repositoryRoot, '.github/workflows', name)), false);
+    assert.equal(existsSync(join(repositoryRoot, '.github/disabled-upstream-workflows', name)), true);
+  }
   const workflow = readFileSync(
-    join(repositoryRoot, '.github/workflows/nightly.yml'),
+    join(repositoryRoot, '.github/disabled-upstream-workflows/nightly.yml'),
     'utf8',
   );
   const install = workflow.indexOf('run: yarn install --frozen-lockfile');
