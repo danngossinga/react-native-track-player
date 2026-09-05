@@ -96,7 +96,12 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         let newResults = StandardSeekResults()
         let newCompleted = expectation(description: "replacement seek completion")
         onMain {
-            XCTAssertNoThrow(try fixture.backend.replaceQueue([replacement]))
+            do {
+                try fixture.backend.replaceQueue([replacement])
+            } catch {
+                XCTFail("Replacing the fixture queue failed: \(error)")
+                return
+            }
             fixture.backend.seek(to: 5) { result in
                 newResults.append(result)
                 newCompleted.fulfill()
@@ -127,7 +132,13 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         onMain { fixture.backend.seek(to: 5) { results.append($0) } }
         wait(for: [captured], timeout: 10)
 
-        onMain { XCTAssertNoThrow(try fixture.backend.dispose()) }
+        onMain {
+            do {
+                try fixture.backend.dispose()
+            } catch {
+                XCTFail("Disposing the fixture backend failed: \(error)")
+            }
+        }
         XCTAssertEqual(results.count, 1)
         XCTAssertTrue(results.failed)
         onMain { fixture.gate.releaseFirst(seconds: 5) }
