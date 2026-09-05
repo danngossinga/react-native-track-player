@@ -6,6 +6,70 @@ import React
 @testable import react_native_track_player
 
 final class IOSPlaybackBackendIntegrationTests: XCTestCase {
+    func test_standardRemovalDeduplicatesOriginalIndexes() throws {
+        try assertRemovalContract(pingPong: false, invalid: false)
+    }
+
+    func test_pingPongRemovalDeduplicatesOriginalIndexes() throws {
+        try assertRemovalContract(pingPong: true, invalid: false)
+    }
+
+    func test_standardRemovalRejectsInvalidBatchBeforeMutation() throws {
+        try assertRemovalContract(pingPong: false, invalid: true)
+    }
+
+    func test_pingPongRemovalRejectsInvalidBatchBeforeMutation() throws {
+        try assertRemovalContract(pingPong: true, invalid: true)
+    }
+
+    private func assertRemovalContract(pingPong: Bool, invalid: Bool) throws {
+        let url = try bundledAudioURL()
+        let tracks = ["removal-a", "removal-b", "removal-c"].map {
+            makeTrack(id: $0, url: url, duration: 28.2)
+        }
+        try onMain {
+            let player = QueuedAudioPlayer()
+            try player.add(items: tracks)
+            let backend: IOSPlaybackBackendRouting
+            if pingPong {
+                let orchestrator = IOSPlaybackOrchestrator()
+                orchestrator.setQueue(tracks)
+                backend = PingPongPlaybackBackend(
+                    player: player, orchestrator: orchestrator,
+                    transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                    onCommitted: { _, _ in }, onActivated: { _ in },
+                    onDisposed: { _, _ in }, initiallyAuthoritative: true,
+                    queueProvider: { player.items.compactMap { $0 as? Track } }
+                )
+            } else {
+                backend = StandardPlaybackBackend(
+                    player: player,
+                    transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                    automaticallyUpdateNowPlayingInfo: { false },
+                    onCommitted: { _ in }, onActivated: { _ in },
+                    onDisposed: { _ in }, initiallyAuthoritative: true,
+                    queueProvider: { player.items.compactMap { $0 as? Track } }
+                )
+            }
+            defer { try? backend.dispose(); player.stop(); player.clear() }
+            let before = backend.queue.map(playbackBackendTrackID)
+            if invalid {
+                // Descending removal would delete index 2 before discovering -1.
+                XCTAssertThrowsError(try backend.remove(at: [-1, 2]))
+                XCTAssertEqual(backend.queue.map(playbackBackendTrackID), before)
+                XCTAssertThrowsError(try backend.remove(at: [0, 3]))
+                XCTAssertEqual(backend.queue.map(playbackBackendTrackID), before)
+            } else {
+                try backend.remove(at: [1, 1])
+                XCTAssertEqual(backend.queue.map(playbackBackendTrackID), ["removal-a", "removal-c"])
+                try backend.remove(at: [])
+                XCTAssertEqual(backend.queue.map(playbackBackendTrackID), ["removal-a", "removal-c"])
+            }
+            XCTAssertEqual(player.items.compactMap { $0 as? Track }.map(playbackBackendTrackID), backend.queue.map(playbackBackendTrackID))
+            XCTAssertFalse(backend.publicPlayWhenReady)
+        }
+    }
+
     func test_realStandardSeekWaitsForActualNativeCompletionExactlyOnce() throws {
         let fixture = try makeStandardSeekFixture()
         let captured = expectation(description: "AVFoundation finished the retained seek")
@@ -1963,9 +2027,9 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         }
     }
 
-    private func onMain<Value>(_ operation: () -> Value) -> Value {
-        if Thread.isMainThread { return operation() }
-        return DispatchQueue.main.sync(execute: operation)
+    private func onMain<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        if Thread.isMainThread { return try operation() }
+        return try DispatchQueue.main.sync(execute: operation)
     }
 }
 
