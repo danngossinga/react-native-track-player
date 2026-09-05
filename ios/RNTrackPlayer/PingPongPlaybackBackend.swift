@@ -266,7 +266,13 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func remove(at indexes: [Int]) throws {
-        for index in indexes.sorted().reversed() {
+        let indexes = Array(Set(indexes)).sorted(by: >)
+        guard !indexes.isEmpty else { return }
+        let validIndexes = player.items.indices
+        if let invalid = indexes.first(where: { !validIndexes.contains($0) }) {
+            throw AudioPlayerError.QueueError.invalidIndex(index: invalid, message: "One or more indexes were out of bounds.")
+        }
+        for index in indexes {
             try player.removeItem(at: index)
         }
         orchestrator.setQueue(queueProvider())

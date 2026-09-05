@@ -592,8 +592,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func remove(at indexes: [Int]) throws {
         try onMain {
+            let indexes = Array(Set(indexes)).sorted(by: >)
+            guard !indexes.isEmpty else { return }
+            let validIndexes = player.items.indices
+            if let invalid = indexes.first(where: { !validIndexes.contains($0) }) {
+                throw AudioPlayerError.QueueError.invalidIndex(index: invalid, message: "One or more indexes were out of bounds.")
+            }
             if indexes.contains(player.currentIndex) { cancelPendingSeeks() }
-            for index in indexes.sorted().reversed() {
+            for index in indexes {
                 try player.removeItem(at: index)
             }
             if player.items.isEmpty { idleWithoutActiveTrack = false }
