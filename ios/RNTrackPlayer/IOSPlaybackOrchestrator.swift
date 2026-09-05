@@ -163,6 +163,29 @@ final class IOSPlaybackOrchestrator {
         return logicalEngine.volume
     }
 
+#if RNTP_E2E_PROBES
+    func e2eSnapshot(backendIdentity: String) -> [String: Any] {
+        precondition(Thread.isMainThread)
+        crossfadeMutationLock.lock()
+        defer { crossfadeMutationLock.unlock() }
+        return [
+            "schemaVersion": 1,
+            "backendId": backendIdentity,
+            "backendKind": "pingPong",
+            "generation": runId,
+            "state": String(describing: state),
+            "currentIndex": currentIndex,
+            "engineAId": engineA.e2eIdentity,
+            "engineBId": engineB.e2eIdentity,
+            "activeEngineId": activeEngine.e2eIdentity,
+            "standbyEngineId": standbyEngine.e2eIdentity,
+            "activeEngineIndex": activeEngineIndex.map { $0 as Any } ?? NSNull(),
+            "standbyEngineIndex": standbyEngineIndex.map { $0 as Any } ?? NSNull(),
+            "engines": [engineA.e2eSnapshot(), engineB.e2eSnapshot()]
+        ]
+    }
+#endif
+
     init(
         seekOperation: @escaping SeekOperation = { engine, position, completion in
             engine.seek(to: position, completion: completion)

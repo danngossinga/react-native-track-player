@@ -81,6 +81,10 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
     var publicRepeatMode: Int { get }
     var queue: [Track] { get }
 
+#if RNTP_E2E_PROBES
+    func e2eSnapshot() -> [String: Any]
+#endif
+
     func syncQueue(_ tracks: [Track])
     func add(_ tracks: [Track], at index: Int) throws
     func remove(at indexes: [Int]) throws
@@ -168,6 +172,44 @@ func iosPlaybackErrorSnapshot(
 final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     let kind = PlaybackBackendKind.standard
     var identity: AnyObject { return player }
+
+#if RNTP_E2E_PROBES
+    private let e2eIdentity = UUID().uuidString
+    private let e2eEngineIdentity = UUID().uuidString
+
+    func e2eSnapshot() -> [String: Any] {
+        precondition(Thread.isMainThread)
+        // These are SDK getters. SwiftAudioEx does not expose its AVPlayer:
+        // configured volume/rate and playWhenReady cannot prove physical rate,
+        // timeControlStatus, native generation, or AVPlayerItem presence.
+        let engine: [String: Any] = [
+            "id": e2eEngineIdentity,
+            "generation": NSNull(),
+            "state": String(describing: player.playerState),
+            "volume": IOSPlaybackE2EProbe.finite(Double(player.volume)),
+            "observedRate": NSNull(),
+            "timeControlStatus": NSNull(),
+            "position": IOSPlaybackE2EProbe.finite(player.currentTime),
+            "duration": IOSPlaybackE2EProbe.finite(player.duration),
+            "currentItemPresent": NSNull()
+        ]
+        return [
+            "schemaVersion": 1,
+            "backendId": e2eIdentity,
+            "backendKind": "standard",
+            "generation": transitionGenerationSidecar.current,
+            "state": playbackState.rawValue,
+            "currentIndex": currentIndex,
+            "engineAId": NSNull(),
+            "engineBId": NSNull(),
+            "activeEngineId": e2eEngineIdentity,
+            "standbyEngineId": NSNull(),
+            "activeEngineIndex": currentIndex >= 0 ? currentIndex as Any : NSNull(),
+            "standbyEngineIndex": NSNull(),
+            "engines": [engine]
+        ]
+    }
+#endif
 
     private let player: QueuedAudioPlayer
     private let transitionGenerationSidecar: PlaybackTransitionGenerationSidecar

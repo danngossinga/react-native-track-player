@@ -894,7 +894,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         let backendName = backend?.kind.rawValue ?? "none"
         let playWhenReady = backend?.publicPlayWhenReady ?? false
 
-        return [
+        var lifecycle: [String: Any] = [
             "phase": phase,
             "serviceBound": hasInitialized,
             "playerInitialized": hasInitialized,
@@ -906,6 +906,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             "queueSize": queueSize,
             "activeTrackIndex": normalizedActiveIndex
         ]
+#if RNTP_E2E_PROBES
+        // The caller's existing backend read lease remains held through this
+        // main-thread observation. No playback command or readiness wait runs.
+        let observe = {
+            if let backend {
+                var probe = backend.e2eSnapshot()
+                probe["liveCrossfadeEngines"] = IOSCrossfadeEngine.e2eLiveSnapshots()
+                lifecycle["_e2e"] = probe
+            }
+        }
+        if Thread.isMainThread { observe() }
+        else { DispatchQueue.main.sync(execute: observe) }
+#endif
+        return lifecycle
     }
 
     @objc(setPlaybackBackend:resolver:rejecter:)

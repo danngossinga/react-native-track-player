@@ -5,6 +5,14 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     let kind = PlaybackBackendKind.pingPong
     var identity: AnyObject { return orchestrator }
 
+#if RNTP_E2E_PROBES
+    private let e2eIdentity = UUID().uuidString
+
+    func e2eSnapshot() -> [String: Any] {
+        orchestrator.e2eSnapshot(backendIdentity: e2eIdentity)
+    }
+#endif
+
     private let player: QueuedAudioPlayer
     private let orchestrator: IOSPlaybackOrchestrator
     private let transitionGenerationSidecar: PlaybackTransitionGenerationSidecar

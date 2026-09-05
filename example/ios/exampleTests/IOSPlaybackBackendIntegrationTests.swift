@@ -23,7 +23,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertEqual(again["backendId"] as? String, empty["backendId"] as? String)
         XCTAssertEqual(again["generation"] as? Int, empty["generation"] as? Int)
         XCTAssertEqual(e2eEngines(again).first?["id"] as? String, standard["id"] as? String)
-        XCTAssertEqual(e2eEngines(again).first?["generation"] as? Int, standard["generation"] as? Int)
+        XCTAssertTrue(standard["generation"] is NSNull)
+        XCTAssertTrue(e2eEngines(again).first?["generation"] is NSNull)
         XCTAssertEqual(again["currentIndex"] as? Int, empty["currentIndex"] as? Int)
         XCTAssertTrue(e2eEngineIDs(again, live: true).isSubset(of: e2eEngineIDs(empty, live: true)), "Reading the probe created a crossfade engine")
 
@@ -2114,7 +2115,14 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         for engine in e2eEngines(probe) + e2eEngines(probe, live: true) {
             XCTAssertEqual(Set(engine.keys), keys)
             XCTAssertNotNil(UUID(uuidString: engine["id"] as? String ?? ""))
-            XCTAssertNotNil(engine["generation"] as? Int)
+            // Standard exposes only a backend sidecar generation; the SDK's
+            // native engine generation is unavailable. Registry entries are A/B.
+            if probe["backendKind"] as? String == "standard",
+               engine["id"] as? String == e2eEngines(probe).first?["id"] as? String {
+                XCTAssertTrue(engine["generation"] is NSNull)
+            } else {
+                XCTAssertNotNil(engine["generation"] as? Int)
+            }
             for key in ["volume", "observedRate", "position", "duration"] {
                 XCTAssertTrue(engine[key] is NSNull || e2eNumber(engine, key).isFinite, "Nonfinite physical values must be null")
             }

@@ -7,6 +7,14 @@ import AVFoundation
 import Foundation
 import QuartzCore
 
+#if RNTP_E2E_PROBES
+enum IOSPlaybackE2EProbe {
+    static func finite(_ value: Double) -> Any {
+        value.isFinite ? value as Any : NSNull()
+    }
+}
+#endif
+
 enum IOSPlaybackLog {
     static func log(_ message: String) {
         let time = CACurrentMediaTime()
@@ -25,6 +33,48 @@ enum IOSCrossfadeEngineState {
 }
 
 final class IOSCrossfadeEngine {
+#if RNTP_E2E_PROBES
+    let e2eIdentity = UUID().uuidString
+    private final class WeakEngine {
+        weak var value: IOSCrossfadeEngine?
+        init(_ value: IOSCrossfadeEngine) { self.value = value }
+    }
+    private static let e2eRegistryLock = NSLock()
+    private static var e2eRegistry: [String: WeakEngine] = [:]
+
+    /// Includes retained engines from former backends, not just current A/B.
+    /// Copy weak entries under the registry lock; inspect AVPlayer only on main
+    /// and after releasing that lock. Reading never creates or resets an engine.
+    static func e2eLiveSnapshots() -> [[String: Any]] {
+        precondition(Thread.isMainThread)
+        e2eRegistryLock.lock()
+        let engines = e2eRegistry.values.compactMap(\.value)
+        e2eRegistryLock.unlock()
+        return engines.sorted { $0.e2eIdentity < $1.e2eIdentity }.map { $0.e2eSnapshot() }
+    }
+
+    func e2eSnapshot() -> [String: Any] {
+        precondition(Thread.isMainThread)
+        let status: Any
+        switch player.timeControlStatus {
+        case .paused: status = "paused"
+        case .waitingToPlayAtSpecifiedRate: status = "waiting"
+        case .playing: status = "playing"
+        @unknown default: status = NSNull()
+        }
+        return [
+            "id": e2eIdentity,
+            "generation": generation,
+            "state": String(describing: state),
+            "volume": IOSPlaybackE2EProbe.finite(Double(player.volume)),
+            "observedRate": IOSPlaybackE2EProbe.finite(Double(player.rate)),
+            "timeControlStatus": status,
+            "position": IOSPlaybackE2EProbe.finite(player.currentTime().seconds),
+            "duration": player.currentItem.map { IOSPlaybackE2EProbe.finite($0.duration.seconds) } ?? NSNull(),
+            "currentItemPresent": player.currentItem != nil
+        ]
+    }
+#endif
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
@@ -39,7 +89,20 @@ final class IOSCrossfadeEngine {
         player.automaticallyWaitsToMinimizeStalling = true
         player.actionAtItemEnd = .pause
         player.volume = 0
+#if RNTP_E2E_PROBES
+        Self.e2eRegistryLock.lock()
+        Self.e2eRegistry[e2eIdentity] = WeakEngine(self)
+        Self.e2eRegistryLock.unlock()
+#endif
     }
+
+#if RNTP_E2E_PROBES
+    deinit {
+        Self.e2eRegistryLock.lock()
+        Self.e2eRegistry.removeValue(forKey: e2eIdentity)
+        Self.e2eRegistryLock.unlock()
+    }
+#endif
 
     var volume: Float {
         get { player.volume }
