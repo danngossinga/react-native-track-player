@@ -186,6 +186,32 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
+    // SwiftAudioEx's seek event has no item or command identifier. Only one
+    // native seek may be outstanding, including a cancelled seek whose actual
+    // AVFoundation callback has not arrived yet.
+    private final class PendingSeek {
+        let track: Track
+        let position: Double
+        var completion: ((Result<Void, Error>) -> Void)?
+        var timeout: DispatchWorkItem?
+
+        init(track: Track, position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+            self.track = track
+            self.position = position
+            self.completion = completion
+        }
+
+        func finish(_ result: Result<Void, Error>) {
+            let callback = completion
+            completion = nil
+            timeout?.cancel()
+            timeout = nil
+            callback?(result)
+        }
+    }
+    private var pendingSeeks: [PendingSeek] = []
+    private var issuedSeek: PendingSeek?
+    private var seekReadinessPoll: DispatchWorkItem?
     private(set) var queueReloadCount = 0
 
     init(
@@ -224,6 +250,101 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             self.incomingQueueProvider = nil
         }
         self.queueProvider = queueProvider
+        player.event.seek.addListener(self) { [weak self] event in
+            DispatchQueue.main.async {
+                self?.didCompleteNativeSeek(position: event.seconds, didFinish: event.didFinish)
+            }
+        }
+    }
+
+    deinit {
+        seekReadinessPoll?.cancel()
+        player.event.seek.removeListener(self)
+    }
+
+    private func onMain<Value>(_ operation: () throws -> Value) rethrows -> Value {
+        if Thread.isMainThread { return try operation() }
+        return try DispatchQueue.main.sync(execute: operation)
+    }
+
+    private func seekError(_ code: String, _ message: String) -> Error {
+        playbackBackendError(code: code, message: message)
+    }
+
+    private func enqueueSeek(to position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
+        guard !disposed, let track = player.currentItem as? Track else {
+            completion(.failure(seekError("standard_seek_unavailable", "No active track is available for seeking.")))
+            return
+        }
+        guard position.isFinite else {
+            completion(.failure(seekError("standard_seek_invalid_position", "The seek position must be finite.")))
+            return
+        }
+        let request = PendingSeek(track: track, position: max(0, position), completion: completion)
+        let timeout = DispatchWorkItem { [weak self, weak request] in
+            guard let self = self, let request = request, request.completion != nil else { return }
+            self.pendingSeeks.removeAll { $0 === request }
+            // If already emitted, keep the ticket until its real callback. A
+            // timeout does not make a late, identical SDK event distinguishable.
+            request.finish(.failure(self.seekError("standard_seek_timeout", "The native seek did not complete in time.")))
+            self.pumpSeeks()
+        }
+        request.timeout = timeout
+        pendingSeeks.append(request)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: timeout)
+        pumpSeeks()
+    }
+
+    private func pumpSeeks() {
+        seekReadinessPoll?.cancel()
+        seekReadinessPoll = nil
+        guard issuedSeek == nil, !disposed else { return }
+        while let request = pendingSeeks.first {
+            guard (player.currentItem as? Track) === request.track else {
+                pendingSeeks.removeFirst()
+                request.finish(.failure(seekError("standard_seek_cancelled", "The active track changed before seeking.")))
+                continue
+            }
+            if player.playerState == .failed {
+                pendingSeeks.removeFirst()
+                request.finish(.failure(seekError("standard_seek_unavailable", "The active track failed to load.")))
+                continue
+            }
+            // This is the native item's duration, not Track metadata. Without
+            // an AVPlayerItem, SwiftAudioEx stores a deferred seek and may never
+            // call back (for example after a 404). Check and issue on main so a
+            // queue replacement cannot run between them.
+            guard player.duration > 0 else {
+                let poll = DispatchWorkItem { [weak self] in self?.pumpSeeks() }
+                seekReadinessPoll = poll
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: poll)
+                return
+            }
+            pendingSeeks.removeFirst()
+            issuedSeek = request
+            player.seek(to: request.position)
+            return
+        }
+    }
+
+    private func didCompleteNativeSeek(position: Double, didFinish: Bool) {
+        guard let request = issuedSeek, request.position == position else { return }
+        issuedSeek = nil
+        let sameTrack = (player.currentItem as? Track) === request.track
+        request.finish(didFinish && sameTrack && !disposed
+            ? .success(())
+            : .failure(seekError("standard_seek_cancelled", "The native seek was interrupted.")))
+        pumpSeeks()
+    }
+
+    private func cancelPendingSeeks() {
+        seekReadinessPoll?.cancel()
+        seekReadinessPoll = nil
+        let waiting = pendingSeeks
+        pendingSeeks.removeAll()
+        let error = seekError("standard_seek_cancelled", "Playback changed before the native seek completed.")
+        issuedSeek?.finish(.failure(error))
+        waiting.forEach { $0.finish(.failure(error)) }
     }
 
     var playbackState: State {
@@ -274,31 +395,34 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
-        transitionGenerationSidecar.restore(snapshot.transitionGeneration)
-        let queue = isAuthoritative ? queueState.authoritative : queueState.pending
-        let queueChanged = !samePlaybackBackendTrackObjects(queueProvider(), queue)
-        if queueChanged {
-            queueReloadCount += 1
-            player.stop()
-            player.clear()
-            try player.add(items: queue)
-        }
-        idleWithoutActiveTrack = snapshot.activeIndex == nil && !queue.isEmpty
-        player.rate = snapshot.rate
-        player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
-        if let index = snapshot.activeIndex,
-           queue.indices.contains(index) {
-            let indexChanged = player.currentIndex != index
-            if queueChanged || indexChanged {
-                try player.jumpToItem(atIndex: index, playWhenReady: false)
+        try onMain {
+            cancelPendingSeeks()
+            transitionGenerationSidecar.restore(snapshot.transitionGeneration)
+            let queue = isAuthoritative ? queueState.authoritative : queueState.pending
+            let queueChanged = !samePlaybackBackendTrackObjects(queueProvider(), queue)
+            if queueChanged {
+                queueReloadCount += 1
+                player.stop()
+                player.clear()
+                try player.add(items: queue)
             }
-            if queueChanged || indexChanged ||
-                abs(player.currentTime - max(0, snapshot.position)) > 0.75 {
-                player.seek(to: snapshot.position)
+            idleWithoutActiveTrack = snapshot.activeIndex == nil && !queue.isEmpty
+            player.rate = snapshot.rate
+            player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
+            player.playWhenReady = false
+            player.pause()
+            if let index = snapshot.activeIndex,
+               queue.indices.contains(index) {
+                let indexChanged = player.currentIndex != index
+                if indexChanged {
+                    try player.jumpToItem(atIndex: index, playWhenReady: false)
+                }
+                if queueChanged || indexChanged ||
+                    abs(player.currentTime - max(0, snapshot.position)) > 0.75 {
+                    enqueueSeek(to: snapshot.position) { _ in }
+                }
             }
         }
-        player.playWhenReady = false
-        player.pause()
     }
 
     func prepareActivation(_ snapshot: PlaybackBackendSnapshot) throws {
@@ -324,6 +448,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func beginHandoffQuiescence() throws -> PlaybackBackendSnapshot {
         return try performPlaybackBackendOnMainSync {
+            cancelPendingSeeks()
             let intendedPlayWhenReady = player.playWhenReady
             let intendedVolume = player.volume
             player.volume = 0
@@ -348,8 +473,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func stopAndMute() throws {
-        player.volume = 0
-        player.stop()
+        onMain {
+            cancelPendingSeeks()
+            player.volume = 0
+            player.stop()
+        }
     }
 
     func suspendEventDeliveryForHandoff() throws {
@@ -409,14 +537,23 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func play() throws {
-        let wasIdle = idleWithoutActiveTrack
-        beginIdleTrackActivationIfNeeded(wasIdle)
-        if wasIdle { idleWithoutActiveTrack = false }
-        player.play()
-        publishIdleTrackActivationIfNeeded(wasIdle)
+        onMain {
+            let wasIdle = idleWithoutActiveTrack
+            beginIdleTrackActivationIfNeeded(wasIdle)
+            if wasIdle { idleWithoutActiveTrack = false }
+            player.play()
+            publishIdleTrackActivationIfNeeded(wasIdle)
+        }
     }
-    func pause() { player.pause() }
-    func seek(to position: Double) throws { player.seek(to: position) }
+    func pause() {
+        onMain {
+            cancelPendingSeeks()
+            player.pause()
+        }
+    }
+    func seek(to position: Double) throws {
+        onMain { enqueueSeek(to: position) { _ in } }
+    }
 
     func startTransition(_ request: PlaybackTransitionRequest) throws {
         throw playbackBackendError(
@@ -426,135 +563,189 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     func dispose() throws {
-        if disposed { return }
-        disposed = true
-        isAuthoritative = false
-        if !controlSurfaceRelinquished {
-            player.remoteCommands = []
+        onMain {
+            if disposed { return }
+            disposed = true
+            cancelPendingSeeks()
+            isAuthoritative = false
+            if !controlSurfaceRelinquished {
+                player.remoteCommands = []
+            }
+            onDisposed(player)
         }
-        onDisposed(player)
     }
 
     func syncQueue(_ tracks: [Track]) {}
 
     func add(_ tracks: [Track], at index: Int) throws {
-        try player.add(items: tracks, at: index)
+        try onMain { try player.add(items: tracks, at: index) }
     }
 
     func remove(at indexes: [Int]) throws {
-        for index in indexes.sorted().reversed() {
-            try player.removeItem(at: index)
+        try onMain {
+            if indexes.contains(player.currentIndex) { cancelPendingSeeks() }
+            for index in indexes.sorted().reversed() {
+                try player.removeItem(at: index)
+            }
+            if player.items.isEmpty { idleWithoutActiveTrack = false }
         }
-        if player.items.isEmpty { idleWithoutActiveTrack = false }
     }
 
     func move(from: Int, to: Int) throws {
-        try player.moveItem(fromIndex: from, toIndex: to)
+        try onMain { try player.moveItem(fromIndex: from, toIndex: to) }
     }
 
     func removeUpcomingTracks() {
-        guard !idleWithoutActiveTrack else { return }
-        player.removeUpcomingItems()
+        onMain {
+            guard !idleWithoutActiveTrack else { return }
+            player.removeUpcomingItems()
+        }
     }
 
     func replaceQueue(_ tracks: [Track]) throws {
-        player.clear()
-        try player.add(items: tracks)
-        if tracks.isEmpty { idleWithoutActiveTrack = false }
+        try onMain {
+            cancelPendingSeeks()
+            player.clear()
+            try player.add(items: tracks)
+            if tracks.isEmpty { idleWithoutActiveTrack = false }
+        }
     }
 
     func clearQueue() {
-        player.clear()
-        idleWithoutActiveTrack = false
+        onMain {
+            cancelPendingSeeks()
+            player.clear()
+            idleWithoutActiveTrack = false
+        }
     }
 
     func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {
-        let wasIdle = idleWithoutActiveTrack
-        beginIdleTrackActivationIfNeeded(wasIdle)
-        if wasIdle { idleWithoutActiveTrack = false }
-        player.load(item: track)
-        publishIdleTrackActivationIfNeeded(wasIdle)
-        completion(.success(player.currentIndex))
+        onMain {
+            cancelPendingSeeks()
+            let wasIdle = idleWithoutActiveTrack
+            beginIdleTrackActivationIfNeeded(wasIdle)
+            if wasIdle { idleWithoutActiveTrack = false }
+            player.load(item: track)
+            publishIdleTrackActivationIfNeeded(wasIdle)
+            completion(.success(player.currentIndex))
+        }
     }
 
     func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        let wasIdle = idleWithoutActiveTrack
-        beginIdleTrackActivationIfNeeded(wasIdle)
-        do {
-            if wasIdle { idleWithoutActiveTrack = false }
-            try player.jumpToItem(atIndex: index, playWhenReady: player.playerState == .playing)
-            if initialTime >= 0 { player.seek(to: initialTime) }
-            publishIdleTrackActivationIfNeeded(wasIdle)
-            completion(.success(()))
-        } catch {
-            if wasIdle { idleWithoutActiveTrack = true }
-            cancelIdleTrackActivationIfNeeded(wasIdle)
-            completion(.failure(error))
+        onMain {
+            let wasIdle = idleWithoutActiveTrack
+            beginIdleTrackActivationIfNeeded(wasIdle)
+            do {
+                guard player.items.indices.contains(index) else {
+                    throw seekError("index_out_of_bounds", "The track index is out of bounds.")
+                }
+                cancelPendingSeeks()
+                if wasIdle { idleWithoutActiveTrack = false }
+                let sameIndex = player.currentIndex == index
+                if !sameIndex {
+                    try player.jumpToItem(atIndex: index, playWhenReady: player.playWhenReady)
+                }
+                publishIdleTrackActivationIfNeeded(wasIdle)
+                if sameIndex || initialTime >= 0 {
+                    // jumpToItem on the same item emits its own seek(0). Issue
+                    // only the requested seek, and wait for its real callback.
+                    enqueueSeek(to: initialTime >= 0 ? initialTime : 0, completion: completion)
+                } else {
+                    completion(.success(()))
+                }
+            } catch {
+                if wasIdle { idleWithoutActiveTrack = true }
+                cancelIdleTrackActivationIfNeeded(wasIdle)
+                completion(.failure(error))
+            }
         }
     }
 
     func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        if idleWithoutActiveTrack {
-            beginIdleTrackActivationIfNeeded(true)
-            do {
-                idleWithoutActiveTrack = false
-                try player.jumpToItem(atIndex: 0, playWhenReady: false)
-                if initialTime >= 0 { player.seek(to: initialTime) }
-                publishIdleTrackActivationIfNeeded(true)
-                completion(.success(()))
-            } catch {
-                idleWithoutActiveTrack = true
-                cancelIdleTrackActivationIfNeeded(true)
-                completion(.failure(error))
+        onMain {
+            cancelPendingSeeks()
+            if idleWithoutActiveTrack {
+                beginIdleTrackActivationIfNeeded(true)
+                do {
+                    idleWithoutActiveTrack = false
+                    if player.currentIndex != 0 {
+                        try player.jumpToItem(atIndex: 0, playWhenReady: false)
+                    }
+                    publishIdleTrackActivationIfNeeded(true)
+                    if initialTime >= 0 {
+                        enqueueSeek(to: initialTime, completion: completion)
+                    } else {
+                        completion(.success(()))
+                    }
+                } catch {
+                    idleWithoutActiveTrack = true
+                    cancelIdleTrackActivationIfNeeded(true)
+                    completion(.failure(error))
+                }
+                return
             }
-            return
+            player.next()
+            if initialTime >= 0 {
+                enqueueSeek(to: initialTime, completion: completion)
+            } else {
+                completion(.success(()))
+            }
         }
-        player.next()
-        if initialTime >= 0 { player.seek(to: initialTime) }
-        completion(.success(()))
     }
 
     func skipToPrevious(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        guard !idleWithoutActiveTrack else {
-            completion(.failure(playbackBackendError(
-                code: "index_out_of_bounds",
-                message: "The previous track index is out of bounds."
-            )))
-            return
+        onMain {
+            guard !idleWithoutActiveTrack else {
+                completion(.failure(playbackBackendError(
+                    code: "index_out_of_bounds",
+                    message: "The previous track index is out of bounds."
+                )))
+                return
+            }
+            cancelPendingSeeks()
+            player.previous()
+            if initialTime >= 0 {
+                enqueueSeek(to: initialTime, completion: completion)
+            } else {
+                completion(.success(()))
+            }
         }
-        player.previous()
-        if initialTime >= 0 { player.seek(to: initialTime) }
-        completion(.success(()))
     }
 
     func play(completion: @escaping (Result<Void, Error>) -> Void) {
-        let wasIdle = idleWithoutActiveTrack
-        beginIdleTrackActivationIfNeeded(wasIdle)
-        if wasIdle { idleWithoutActiveTrack = false }
-        player.play()
-        publishIdleTrackActivationIfNeeded(wasIdle)
-        completion(.success(()))
+        do {
+            try play()
+            completion(.success(()))
+        } catch {
+            completion(.failure(error))
+        }
     }
 
-    func stop() { player.stop() }
+    func stop() {
+        onMain {
+            cancelPendingSeeks()
+            player.stop()
+        }
+    }
 
     func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
-        let wasIdle = value && idleWithoutActiveTrack
-        beginIdleTrackActivationIfNeeded(wasIdle)
-        if wasIdle { idleWithoutActiveTrack = false }
-        player.playWhenReady = value
-        publishIdleTrackActivationIfNeeded(wasIdle)
-        completion(.success(()))
+        onMain {
+            if !value { cancelPendingSeeks() }
+            let wasIdle = value && idleWithoutActiveTrack
+            beginIdleTrackActivationIfNeeded(wasIdle)
+            if wasIdle { idleWithoutActiveTrack = false }
+            player.playWhenReady = value
+            publishIdleTrackActivationIfNeeded(wasIdle)
+            completion(.success(()))
+        }
     }
 
     func seek(to position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        player.seek(to: position)
-        completion(.success(()))
+        onMain { enqueueSeek(to: position, completion: completion) }
     }
 
     func seek(by offset: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        player.seek(by: offset)
-        completion(.success(()))
+        onMain { enqueueSeek(to: player.currentTime + offset, completion: completion) }
     }
 
     func setVolume(_ value: Float) { player.volume = value }

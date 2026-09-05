@@ -146,6 +146,83 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertEqual(results.count, 1)
     }
 
+    func test_realStandardStopBeforeItemReadinessDoesNotLeakDeferredSeekIntoNextLoad() throws {
+        let fixture = try makeStandardSeekFixture()
+        let loadingTrack = makeTrack(id: "cancel-before-ready", url: try bundledAudioURL(), duration: 28.2)
+        let nextTrack = makeTrack(id: "after-cancel-before-ready", url: try bundledAudioURL(), duration: 28.2)
+        let cancelled = StandardSeekResults()
+        let nextResult = StandardSeekResults()
+        let captured = expectation(description: "only the new item's native seek is issued")
+        fixture.gate.didCapture = { seconds in
+            XCTAssertEqual(seconds, 7, "A cancelled pre-readiness seek escaped into a later load")
+            if seconds == 7 { captured.fulfill() }
+        }
+        let completed = expectation(description: "new seek completes after its actual callback")
+        onMain {
+            fixture.backend.load(loadingTrack) { _ in }
+            XCTAssertEqual(fixture.player.duration, 0, "Fixture must still have no native item in this main block")
+            fixture.backend.seek(to: 5) { cancelled.append($0) }
+            XCTAssertEqual(cancelled.count, 0)
+            fixture.backend.stop()
+            XCTAssertTrue(cancelled.failed)
+            fixture.backend.load(nextTrack) { _ in }
+            fixture.backend.seek(to: 7) {
+                nextResult.append($0)
+                completed.fulfill()
+            }
+        }
+        wait(for: [captured], timeout: 10)
+        XCTAssertEqual(nextResult.count, 0)
+        onMain { fixture.gate.releaseFirst(seconds: 7) }
+        wait(for: [completed], timeout: 5)
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertTrue(nextResult.succeeded)
+        XCTAssertEqual(cancelled.count, 1)
+        XCTAssertEqual(fixture.gate.capturedSeconds, [7])
+    }
+
+    func test_realStandardFailedLoadSeekDoesNotQuarantineNextValidLoad() throws {
+        let fixture = try makeStandardSeekFixture()
+        let invalid = makeTrack(
+            id: "missing-native-fixture",
+            url: URL(fileURLWithPath: "/missing-rntp-fixture-\(UUID().uuidString).m4a"),
+            duration: 28.2
+        )
+        let valid = makeTrack(id: "recovered-native-fixture", url: try bundledAudioURL(), duration: 28.2)
+        let failed = expectation(description: "seek reports actual load failure")
+        let failedResult = StandardSeekResults()
+        onMain {
+            fixture.backend.load(invalid) { _ in }
+            fixture.backend.seek(to: 5) {
+                failedResult.append($0)
+                failed.fulfill()
+            }
+        }
+        wait(for: [failed], timeout: 10)
+        XCTAssertTrue(failedResult.failed)
+        XCTAssertTrue(fixture.gate.capturedSeconds.isEmpty, "No SDK seek should have been emitted without a native item")
+
+        let captured = expectation(description: "recovered item's native seek")
+        fixture.gate.didCapture = { seconds in if seconds == 5 { captured.fulfill() } }
+        let completed = expectation(description: "recovery seek completion")
+        let recovered = StandardSeekResults()
+        onMain {
+            fixture.backend.load(valid) { _ in }
+            fixture.backend.seek(to: 5) {
+                recovered.append($0)
+                completed.fulfill()
+            }
+        }
+        wait(for: [captured], timeout: 10)
+        XCTAssertEqual(recovered.count, 0)
+        onMain { fixture.gate.releaseFirst(seconds: 5) }
+        wait(for: [completed], timeout: 5)
+        drainStandardSeekEvents(fixture.player)
+        XCTAssertTrue(recovered.succeeded)
+        XCTAssertEqual(failedResult.count, 1)
+        XCTAssertEqual(fixture.gate.capturedSeconds, [5])
+    }
+
     func test_iosPlaybackStateErrorContractUsesBackendReadLease() throws {
         let source = try sourceFile("ios/RNTrackPlayer/RNTrackPlayer.swift")
         let getter = source
