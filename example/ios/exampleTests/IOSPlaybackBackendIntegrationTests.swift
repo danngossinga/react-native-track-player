@@ -1091,6 +1091,45 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         orchestrator.pause()
     }
 
+    func test_explicitPrepareReusesReadyStandbyButHonorsDifferentPositionAndTarget() throws {
+        let url = try bundledAudioURL()
+        let preloaded = expectation(description: "automatic standby preload finished")
+        var preparations = 0
+        let orchestrator = IOSPlaybackOrchestrator(standbyPrepareOperation: { engine, track, position, completion in
+            preparations += 1
+            let first = preparations == 1
+            engine.prepare(track: track, position: position) { result in
+                completion(result)
+                if first { DispatchQueue.main.async { preloaded.fulfill() } }
+            }
+        })
+        orchestrator.setVolume(0)
+        defer { orchestrator.stop() }
+        orchestrator.replaceQueue((0..<3).map { makeTrack(id: "reuse-\($0)", url: url, duration: 28.2) }, currentIndex: 1)
+        let playing = expectation(description: "source playing")
+        orchestrator.play { result in
+            if case .failure(let error) = result { XCTFail("Playback failed: \(error)") }
+            playing.fulfill()
+        }
+        wait(for: [playing, preloaded], timeout: 10)
+        XCTAssertEqual(preparations, 1)
+        func prepare(previous: Bool = false, position: Double = 0) {
+            let done = expectation(description: "explicit preparation")
+            orchestrator.prepareCrossfade(previous: previous, seekTo: position) { result in
+                if case .failure(let error) = result { XCTFail("Preparation failed: \(error)") }
+                done.fulfill()
+            }
+            wait(for: [done], timeout: 10)
+        }
+        prepare()
+        prepare()
+        XCTAssertEqual(preparations, 1, "Ready standby must not reset/reload for repeated preparation")
+        prepare(position: 2)
+        XCTAssertEqual(preparations, 2, "A different requested position must still be prepared")
+        prepare(previous: true)
+        XCTAssertEqual(preparations, 3, "Previous-track preparation must still select the other track")
+    }
+
     func test_realOrchestratorQueueSyncPromotesRetainedIncomingCrossfadeTrack() throws {
         let fixtureURL = try bundledAudioURL()
         let outgoing = makeTrack(id: "crossfade-outgoing", url: fixtureURL, duration: 28.2)

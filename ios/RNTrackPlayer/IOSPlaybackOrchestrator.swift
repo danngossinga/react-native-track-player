@@ -1661,7 +1661,7 @@ final class IOSPlaybackOrchestrator {
                 completion(.failure(supersededError))
                 return
             }
-            operation(engine, track, position) { [weak self] result in
+            let finish: (Result<Void, Error>) -> Void = { [weak self] result in
                 // Always defer terminal processing. Test doubles may complete
                 // synchronously while the native invocation still owns the lock.
                 terminalQueue.async {
@@ -1686,6 +1686,15 @@ final class IOSPlaybackOrchestrator {
                     self.crossfadeMutationLock.unlock()
                     completion(resolvedResult)
                 }
+            }
+            // Explicit preparation often follows automatic preload. Replacing a
+            // ready AVPlayerItem here can interrupt the other, audible engine.
+            if self.standbyEngineIndex == index,
+               engine.state == .ready, engine.isReady,
+               engine.currentTime == position {
+                finish(.success(()))
+            } else {
+                operation(engine, track, position, finish)
             }
             self.crossfadeMutationLock.unlock()
         }
