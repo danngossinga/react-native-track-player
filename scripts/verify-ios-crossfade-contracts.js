@@ -191,10 +191,9 @@ assert(
 );
 assert(
   finishCrossfade.includes('activeEngine.setVolume(0)') &&
-    finishCrossfade.includes('DispatchQueue.main.asyncAfter') &&
-    finishCrossfade.includes('outgoingEngine.pause()') &&
+    finishCrossfade.includes('activeEngine.pause()') &&
     !finishCrossfade.includes('activeEngine.reset()'),
-  'iOS finishCrossfade must mute the outgoing engine and defer its pause without resetting its AVPlayer synchronously.'
+  'iOS finishCrossfade must mute/pause the outgoing engine without resetting its AVPlayer synchronously.'
 );
 assert(
   cancelAllWork.includes('cancelStandbyMaintenanceLocked()') &&

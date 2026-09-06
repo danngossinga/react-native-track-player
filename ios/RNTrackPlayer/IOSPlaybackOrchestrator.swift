@@ -1402,6 +1402,7 @@ final class IOSPlaybackOrchestrator {
         }
         IOSPlaybackLog.log("crossfade completed from=\(context.fromIndex) to=\(context.toIndex)")
         activeEngine.setVolume(0)
+        activeEngine.pause()
 
         let outgoingEngine = activeEngine
         activeEngine = standbyEngine
@@ -1435,13 +1436,6 @@ final class IOSPlaybackOrchestrator {
         refreshNowPlaying()
         scheduleEndObserver()
         schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs: context.durationMs)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self, weak outgoingEngine] in
-            guard let self, let outgoingEngine,
-                  self.standbyEngine === outgoingEngine,
-                  self.standbyEngineIndex == nil,
-                  self.state == .playingSingle else { return }
-            outgoingEngine.pause()
-        }
     }
 
     private func schedulePostCrossfadeStandbyMaintenance(afterCrossfadeDurationMs crossfadeDurationMs: Int) {
