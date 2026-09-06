@@ -156,6 +156,44 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         }
     }
 
+    func test_manualCrossfadeStartsAnAlreadyScheduledMatchingTransitionImmediately() throws {
+        let module = makeE2EProbeModule(crossfade: true)
+        try addE2EProbeTracks(module)
+        awaitE2ECommand("play") { module.play(resolve: $0, reject: $1) }
+        awaitE2ECommand("crossFadePrepare") { module.crossFadePrepare(previous: false, seekTo: 0, resolve: $0, reject: $1) }
+
+        let scheduledTerminal = expectation(description: "scheduled crossfade is cancelled during cleanup")
+        onMain {
+            module.crossFade(fadeDuration: 2_000, fadeInterval: 50, fadeToVolume: 1, waitUntil: 20_000,
+                resolve: { _ in XCTFail("scheduled crossfade completed before cleanup") },
+                reject: { _, _, _ in scheduledTerminal.fulfill() })
+        }
+        _ = try awaitE2EProbe(module) { probe in
+            self.e2eEngines(probe).count == 2 && self.e2eEngines(probe).allSatisfy {
+                $0["currentItemPresent"] as? Bool == true
+            }
+        }
+
+        let manual = expectation(description: "manual crossfade is admitted")
+        let manualResult = ObjectBox<Result<Void, Error>>()
+        onMain {
+            module.crossFade(fadeDuration: 2_000, fadeInterval: 50, fadeToVolume: 1, waitUntil: 0,
+                resolve: { _ in manualResult.value = .success(()); manual.fulfill() },
+                reject: { _, _, error in manualResult.value = .failure(error ?? NSError(domain: "test", code: 1)); manual.fulfill() })
+        }
+        wait(for: [manual], timeout: 5)
+        XCTAssertNoThrow(try XCTUnwrap(manualResult.value).get())
+
+        let overlap = try awaitE2EProbe(module) { probe in
+            self.e2eEngines(probe).count == 2 && self.e2eEngines(probe).allSatisfy {
+                self.e2eNumber($0, "observedRate") > 0 && $0["currentItemPresent"] as? Bool == true
+            }
+        }
+        XCTAssertEqual(e2eEngines(overlap).count, 2)
+        awaitE2ECommand("pause") { module.pause(resolve: $0, reject: $1) }
+        wait(for: [scheduledTerminal], timeout: 5)
+    }
+
     func test_standardRemovalDeduplicatesOriginalIndexes() throws {
         try assertRemovalContract(pingPong: false, invalid: false)
     }

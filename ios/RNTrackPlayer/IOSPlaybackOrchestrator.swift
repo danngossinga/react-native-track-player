@@ -823,6 +823,7 @@ final class IOSPlaybackOrchestrator {
         var normalizedPreloadState = false
         var currentRunId = -1
         var scheduledFromVolume: Float = 0
+        var forcedScheduledCrossfade: IOSScheduledCrossfade?
 
         crossfadeMutationLock.lock()
         fromIndex = currentIndex
@@ -830,11 +831,20 @@ final class IOSPlaybackOrchestrator {
             ? preparedToIndex!
             : fromIndex + 1
         if crossfadeCommandSlot.isOccupied {
-            rejection = (
-                "error",
-                "crossfade_in_progress",
-                makeError("crossfade_in_progress", "A crossfade is already scheduled or in progress.")
-            )
+            if let scheduled = scheduledCrossfade,
+               scheduled.fromIndex == fromIndex,
+               scheduled.toIndex == toIndex,
+               waitUntil <= currentTime * 1_000 {
+                scheduledStartWorkItem?.cancel()
+                scheduledStartWorkItem = nil
+                forcedScheduledCrossfade = scheduled
+            } else {
+                rejection = (
+                    "error",
+                    "crossfade_in_progress",
+                    makeError("crossfade_in_progress", "A crossfade is already scheduled or in progress.")
+                )
+            }
         } else if !playWhenReady || (state != .playingSingle && state != .preloadingNext) {
             rejection = (
                 "cancelled",
@@ -889,6 +899,39 @@ final class IOSPlaybackOrchestrator {
                 errorCode: rejection.code
             )
             completion(.failure(rejection.error))
+            return
+        }
+        if let forcedScheduledCrossfade {
+            completion(.success(()))
+            let forcedRunId = forcedScheduledCrossfade.runId
+            let forcedCompletionGate = forcedScheduledCrossfade.completionGate
+            let forcedCompletion: (Result<Void, Error>) -> Void = { [weak self, forcedCompletionGate] result in
+                guard let self else { return }
+                self.crossfadeMutationLock.lock()
+                let terminalResolver = self.crossfadeCommandSlot.takeResolver(
+                    forcedCompletionGate,
+                    result: result
+                )
+                if terminalResolver != nil,
+                   self.scheduledCrossfade?.runId == forcedRunId,
+                   self.scheduledCrossfade?.completionGate === forcedCompletionGate {
+                    self.scheduledCrossfade = nil
+                    self.scheduledStartWorkItem?.cancel()
+                    self.scheduledStartWorkItem = nil
+                }
+                self.crossfadeMutationLock.unlock()
+                terminalResolver?()
+            }
+            startCrossfade(
+                runId: forcedRunId,
+                fromIndex: fromIndex,
+                toIndex: toIndex,
+                durationMs: durationMs,
+                intervalMs: max(10, Int(fadeInterval)),
+                targetVolume: Float(max(0, min(1, fadeToVolume))),
+                completionGate: forcedCompletionGate,
+                completion: forcedCompletion
+            )
             return
         }
         guard let completionGate else { return }
