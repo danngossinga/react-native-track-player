@@ -891,7 +891,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         let queueSize = backend?.queue.count ?? 0
         let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < queueSize ? activeIndex : NSNull()
         let phase = setupInProgress ? "settingUp" : (hasInitialized ? "ready" : "uninitialized")
-        let backendName = backend?.kind.rawValue ?? "none"
+        let backendName = backend?.kind == .pingPong ? "crossfade" : (backend?.kind.rawValue ?? "none")
         let playWhenReady = backend?.publicPlayWhenReady ?? false
 
         var lifecycle: [String: Any] = [

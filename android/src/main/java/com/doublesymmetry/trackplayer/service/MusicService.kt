@@ -1106,7 +1106,7 @@ class MusicService : HeadlessJsTaskService() {
             putBoolean("canAcceptCommands", serviceBound && playerInitialized && !setupInProgress)
             putString("playbackState", snapshot.playbackState.asLibState.state)
             putBoolean("playWhenReady", snapshot.playWhenReady)
-            putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "pingPong" else "standard")
+            putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "crossfade" else "standard")
             putInt("queueSize", items.size)
             if (activeIndex in items.indices) {
                 putInt("activeTrackIndex", activeIndex)

@@ -8,6 +8,17 @@ import React
 final class IOSPlaybackBackendIntegrationTests: XCTestCase {
     // These tests run in the private RNTP integration host with RNTP_E2E_PROBES
     // enabled for its Pods. The production module exposes no additional API.
+    func test_legacyLifecycleReportsCrossfadeForPingPongBackend() throws {
+        let module = makeE2EProbeModule(crossfade: false)
+
+        let lifecycle = awaitBackendSwap(module, config: [
+            "type": "pingPong",
+            "engineMode": "orchestratedDualEngine",
+        ])
+
+        XCTAssertEqual(lifecycle?["backend"] as? String, "crossfade")
+    }
+
     func test_e2eLifecycleProbeIsReadOnlyAndRetiredEnginesAreSilentAfterModeSwitch() throws {
         let module = makeE2EProbeModule(crossfade: false)
         let empty = try awaitE2EProbe(module)
@@ -610,7 +621,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                 "engineMode": "orchestratedDualEngine"
             ]
         )
-        XCTAssertEqual(pingPong?["backend"] as? String, "pingPong")
+        XCTAssertEqual(pingPong?["backend"] as? String, "crossfade")
         XCTAssertEqual((pingPong?["queueSize"] as? NSNumber)?.intValue, 1)
         XCTAssertEqual((pingPong?["activeTrackIndex"] as? NSNumber)?.intValue, 0)
 

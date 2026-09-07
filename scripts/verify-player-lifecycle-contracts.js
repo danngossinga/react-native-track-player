@@ -113,8 +113,9 @@ assert(
   androidService.includes('suspend fun getPlayerLifecycleBundle(') &&
     androidService.includes('val snapshot = getPlaybackBackendReadSnapshot()') &&
     androidService.includes('putString("playbackState", snapshot.playbackState.asLibState.state)') &&
-    androidService.includes('putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "pingPong" else "standard")'),
-  'Android service must report playback state and backend in lifecycle.'
+    androidService.includes('putString("backend", if (snapshot.backendType == PlaybackBackendType.PING_PONG) "crossfade" else "standard")') &&
+    iosPlayer.includes('let backendName = backend?.kind == .pingPong ? "crossfade" : (backend?.kind.rawValue ?? "none")'),
+  'Native lifecycle must preserve the legacy crossfade backend discriminator.'
 );
 assert(
   !consumerApp.includes('TrackPlayer.isServiceRunning') &&
