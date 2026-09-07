@@ -84,6 +84,8 @@ jobs:
   build-ios:
     runs-on: macos-14
     needs: check-changes
+    env:
+      NO_FLIPPER: '1'
     steps:
       - name: Checkout Repo
         if: ${{ needs.check-changes.outputs.should-build-ios }}
