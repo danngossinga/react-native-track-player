@@ -389,7 +389,7 @@ final class IOSCrossfadeEngine {
         let timeout = DispatchWorkItem { [weak self] in
             guard let self = self, self.generation == generation else { return }
             self.state = .failed
-            IOSPlaybackLog.log("\(self.name) playing timeout")
+            IOSPlaybackLog.log("\(self.name) playing timeout status=\(self.player.timeControlStatus.rawValue) waitingReason=\(self.player.reasonForWaitingToPlay?.rawValue ?? "none") itemError=\(self.player.currentItem?.error?.localizedDescription ?? "none")")
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 6,
