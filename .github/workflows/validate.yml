@@ -50,10 +50,15 @@ jobs:
       - name: Checkout Repo
         if: ${{ needs.check-changes.outputs.should-check-types }}
         uses: actions/checkout@v4
-      - name: Setup Environment
-        uses: pkgxdev/setup@v2
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          +: classic.yarnpkg.com
+          node-version-file: .node-version
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
       - name: Install Dependencies
         if: ${{ needs.check-changes.outputs.should-check-types }}
         run: |-
@@ -77,18 +82,25 @@ jobs:
           yarn run ci:format
           yarn run types
   build-ios:
-    runs-on: blaze/macos-14
+    runs-on: macos-14
     needs: check-changes
     steps:
       - name: Checkout Repo
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         uses: actions/checkout@v4
-      - name: Setup Environment
-        uses: pkgxdev/setup@v2
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          +: ruby-lang.org@3.1.0
-            classic.yarnpkg.com
-            tuist.io/xcbeautify
+          node-version-file: .node-version
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: '3.1.0'
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
       - name: Install Library Dependencies
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: yarn install --frozen-lockfile
@@ -104,12 +116,12 @@ jobs:
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: |-
           cd example/ios
-          pkgx +ruby-lang.org@3.1.0 gem install bundler
-          pkgx +ruby-lang.org@3.1.0 bundle config set --local path 'vendor/bundle'
-          pkgx +ruby-lang.org@3.1.0 bundle install
+          gem install bundler -v 2.3.3
+          bundle _2.3.3_ config set --local path 'vendor/bundle'
+          bundle _2.3.3_ install
       - name: Cache Cocoapods Dependencies
         if: ${{ needs.check-changes.outputs.should-build-ios }}
-        uses: buildjet/cache@v4
+        uses: actions/cache@v4
         with:
           path: example/ios/Pods
           key: ${{ runner.os }}-pods-${{ hashFiles('example/ios/Podfile.lock') }}
@@ -119,12 +131,12 @@ jobs:
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: |-
           cd example/ios
-          pkgx +ruby-lang.org@3.1.0 bundle exec pod install
+          bundle _2.3.3_ exec pod install
       - name: Build App
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: |-
           cd example/ios
-          set -o pipefail && xcodebuild build -workspace RNTPExample.xcworkspace -scheme RNTPExample -destination 'platform=iOS Simulator,name=iPhone 15 Pro' | xcbeautify --renderer github-actions
+          xcodebuild build -workspace RNTPExample.xcworkspace -scheme RNTPExample -destination 'platform=iOS Simulator,name=iPhone 15 Pro'
   build-android:
     runs-on: ubuntu-latest
     needs: check-changes
@@ -132,10 +144,15 @@ jobs:
       - name: Checkout Repo
         if: ${{ needs.check-changes.outputs.should-build-android }}
         uses: actions/checkout@v4
-      - name: Setup Environment
-        uses: pkgxdev/setup@v2
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          +: classic.yarnpkg.com
+          node-version-file: .node-version
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
       - name: Install Library Dependencies
         if: ${{ needs.check-changes.outputs.should-build-android }}
         run: yarn install --frozen-lockfile
@@ -176,10 +193,15 @@ jobs:
       - name: Checkout Repo
         if: ${{ needs.check-changes.outputs.should-build-docs }}
         uses: actions/checkout@v4
-      - name: Setup Environment
-        uses: pkgxdev/setup@v2
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
         with:
-          +: classic.yarnpkg.com
+          node-version-file: .node-version
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
       - name: Install Dependencies
         if: ${{ needs.check-changes.outputs.should-build-docs }}
         run: |-
