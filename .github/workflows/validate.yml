@@ -131,6 +131,16 @@ jobs:
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: |-
           cd example/ios
+          python3 - <<'PY'
+          from pathlib import Path
+          podspec = Path('../node_modules/react-native/third-party-podspecs/boost.podspec')
+          jfrog = 'https://boostorg.jfrog.io/artifactory/main/release/1.76.0/source/boost_1_76_0.tar.bz2'
+          archive = 'https://archives.boost.io/release/1.76.0/source/boost_1_76_0.tar.bz2'
+          contents = podspec.read_text()
+          if jfrog not in contents:
+              raise SystemExit('Expected React Native Boost JFrog source was not found')
+          podspec.write_text(contents.replace(jfrog, archive))
+          PY
           bundle _2.3.3_ exec pod install
       - name: Build App
         if: ${{ needs.check-changes.outputs.should-build-ios }}
