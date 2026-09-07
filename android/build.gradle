@@ -29,6 +29,7 @@ android {
         versionName '3.0'
 
         consumerProguardFiles 'proguard-rules.txt'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
     }
 
     compileOptions {
@@ -70,7 +71,14 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.github.doublesymmetry:kotlinaudio:v2.1.0'
+    implementation('com.github.doublesymmetry:kotlinaudio:v2.1.0') {
+        // KotlinAudio v2.1.0 accidentally publishes its Android test stack as
+        // runtime dependencies. Keep those out of the library graph so the
+        // instrumented contract test can use the maintained runner/JUnit pair.
+        exclude group: 'androidx.test', module: 'rules'
+        exclude group: 'androidx.test', module: 'runner'
+        exclude group: 'junit', module: 'junit'
+    }
     // used when building against local maven
 //    implementation "com.github.doublesymmetry:kotlin-audio:2.1.0"
 
@@ -83,4 +91,8 @@ dependencies {
     implementation "androidx.localbroadcastmanager:localbroadcastmanager:1.1.0"
     implementation "androidx.lifecycle:lifecycle-process:2.5.1"
     implementation "org.jetbrains.kotlinx:kotlinx-coroutines-core:1.6.3"
+    testImplementation "junit:junit:4.13.2"
+    testImplementation "org.jetbrains.kotlinx:kotlinx-coroutines-test:1.6.3"
+    androidTestImplementation "androidx.test:runner:1.6.2"
+    androidTestImplementation "junit:junit:4.13.2"
 }

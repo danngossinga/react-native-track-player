@@ -11,6 +11,40 @@ import MediaPlayer
 import QuartzCore
 import SwiftAudioEx
 
+func orchestratedActiveTrackEventBody(
+    index: Int?,
+    lastIndex: Int?,
+    lastTrack: Track?,
+    lastPosition: Double,
+    queue: [Track]
+) -> [String: Any] {
+    var body: [String: Any] = ["lastPosition": lastPosition]
+    if let lastIndex = lastIndex {
+        body["lastIndex"] = lastIndex
+    }
+    if let lastTrack = lastTrack?.toObject() {
+        body["lastTrack"] = lastTrack
+    }
+    if let index = index {
+        body["index"] = index
+        if queue.indices.contains(index) {
+            body["track"] = queue[index].toObject()
+        }
+    }
+    return body
+}
+
+private struct StandardActiveTrackEventKey: Equatable {
+    let source: ObjectIdentifier
+    let trackID: String?
+    let index: Int?
+}
+
+private struct PendingStandardIdleTrackActivation {
+    let source: ObjectIdentifier
+    var emittedByPhysicalPlayer: Bool
+}
+
 @objc(RNTrackPlayer)
 public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOSPlaybackOrchestratorDelegate {
 
@@ -18,26 +52,26 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     private var hasInitialized = false
     private var setupInProgress = false
-    private let player = QueuedAudioPlayer()
-    private let crossfadeCoordinator = IOSCrossfadeCoordinator()
-    private let playbackOrchestrator = IOSPlaybackOrchestrator()
+    private var player = QueuedAudioPlayer()
+    private var playbackOrchestrator = IOSPlaybackOrchestrator()
+    private let playbackBackendAuthority = PlaybackBackendAuthority()
+    private let playerEventTokensLock = NSLock()
+    private var playerEventTokens: [ObjectIdentifier: PlaybackBackendEventToken] = [:]
+    private let transitionGenerationSidecar = PlaybackTransitionGenerationSidecar()
+    private var playbackBackendFacade: PlaybackBackendFacade? = nil
     private let audioSessionController = AudioSessionController.shared
     private var shouldEmitProgressEvent: Bool = false
     private var progressUpdateInterval: Double = 0
     private var orchestratedProgressWorkItem: DispatchWorkItem? = nil
     private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
     private var crossfadeEnabled: Bool = false
-    private var crossfadeEngineMode: String = "orchestratedDualEngine"
-    private var crossfadeStartWorkItem: DispatchWorkItem? = nil
-    private var crossfadeRunId: Int = 0
-    private var crossfadePendingReject: RCTPromiseRejectBlock? = nil
-    private var crossfadePendingFromIndex: Int? = nil
-    private var crossfadePendingToIndex: Int? = nil
-    private var preparedCrossfadeSeekTo: Double = 0
     private var autoUpdateNowPlayingInfo: Bool = true
     private var forwardJumpInterval: NSNumber? = nil;
     private var backwardJumpInterval: NSNumber? = nil;
     private var configuredCapabilityValues: Set<String> = []
+    private var configuredRemoteCommands: [RemoteCommand] = []
+    private var pendingStandardIdleTrackActivation: PendingStandardIdleTrackActivation? = nil
+    private var standardIdleActivationDuplicateGuard: StandardActiveTrackEventKey? = nil
     private var sessionCategory: AVAudioSession.Category = .playback
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
@@ -48,11 +82,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public override init() {
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
-        playbackOrchestrator.delegate = self
         audioSessionController.delegate = self
-        configurePlayerEvents()
         configureSystemLifecycleEvents()
-        player.playWhenReady = false;
     }
 
     deinit {
@@ -60,30 +91,53 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         reset(resolve: { _ in }, reject: { _, _, _  in })
     }
 
-    private func configurePlayerEvents() {
-        player.event.receiveChapterMetadata.addListener(self) { [weak self] metadata in
-            guard let self = self else { return }
-            self.handleAudioPlayerChapterMetadataReceived(metadata: metadata)
+    private func configurePlayerEvents(_ source: QueuedAudioPlayer) {
+        let identity = ObjectIdentifier(source)
+        let token = PlaybackBackendEventToken()
+        playerEventTokensLock.lock()
+        guard playerEventTokens[identity] == nil else {
+            playerEventTokensLock.unlock()
+            return
         }
-        player.event.receiveTimedMetadata.addListener(self) { [weak self] metadata in
+        playerEventTokens[identity] = token
+        playerEventTokensLock.unlock()
+
+        source.event.receiveChapterMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerTimedMetadataReceived(metadata: metadata)
+            self.handleAudioPlayerChapterMetadataReceived(source: source, metadata: metadata)
         }
-        player.event.receiveCommonMetadata.addListener(self) { [weak self] metadata in
+        source.event.receiveTimedMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerCommonMetadataReceived(metadata: metadata)
+            self.handleAudioPlayerTimedMetadataReceived(source: source, metadata: metadata)
         }
-        player.event.stateChange.addListener(self) { [weak self] state in
+        source.event.receiveCommonMetadata.addListener(self) { [weak self, weak source, token] metadata in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerStateChange(state: state)
+            self.handleAudioPlayerCommonMetadataReceived(source: source, metadata: metadata)
         }
-        player.event.fail.addListener(self) { [weak self] error in
+        source.event.stateChange.addListener(self) { [weak self, weak source, token] state in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerFailed(error: error)
+            self.handleAudioPlayerStateChange(source: source, state: state)
         }
-        player.event.currentItem.addListener(self) { [weak self] data in
+        source.event.fail.addListener(self) { [weak self, weak source, token] error in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
+            guard let self = self else { return }
+            self.handleAudioPlayerFailed(source: source, error: error)
+        }
+        source.event.currentItem.addListener(self) { [weak self, weak source, token] data in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
             self.handleAudioPlayerCurrentItemChange(
+                source: source,
                 item: data.item,
                 index: data.index,
                 lastItem: data.lastItem,
@@ -91,14 +145,35 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 lastPosition: data.lastPosition
             )
         }
-        player.event.secondElapse.addListener(self) { [weak self] seconds in
+        source.event.secondElapse.addListener(self) { [weak self, weak source, token] seconds in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerSecondElapse(seconds: seconds)
+            self.handleAudioPlayerSecondElapse(source: source, seconds: seconds)
         }
-        player.event.playWhenReadyChange.addListener(self) { [weak self] playWhenReady in
+        source.event.playWhenReadyChange.addListener(self) { [weak self, weak source, token] playWhenReady in
+            guard token.acceptsDelivery else { return }
+            guard let source = source else { return }
             guard let self = self else { return }
-            self.handlePlayWhenReadyChange(playWhenReady: playWhenReady)
+            self.handlePlayWhenReadyChange(source: source, playWhenReady: playWhenReady)
         }
+        token.activate()
+    }
+
+    private func removePlayerEvents(_ source: QueuedAudioPlayer) {
+        playerEventTokensLock.lock()
+        let token = playerEventTokens.removeValue(forKey: ObjectIdentifier(source))
+        token?.invalidate()
+        playerEventTokensLock.unlock()
+
+        source.event.receiveChapterMetadata.removeListener(self)
+        source.event.receiveTimedMetadata.removeListener(self)
+        source.event.receiveCommonMetadata.removeListener(self)
+        source.event.stateChange.removeListener(self)
+        source.event.fail.removeListener(self)
+        source.event.currentItem.removeListener(self)
+        source.event.secondElapse.removeListener(self)
+        source.event.playWhenReadyChange.removeListener(self)
     }
 
     private func configureSystemLifecycleEvents() {
@@ -256,7 +331,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         case let .ended(shouldResume):
             if shouldResume {
                 if (shouldResumePlaybackAfterInterruptionEnds) {
-                    player.play()
+                    withActivePlaybackBackendSerialized({ try $0.play() }) { _ in }
                 }
                 // Interruption Ended - playback should resume
                 emit(event: EventType.RemoteDuck, body: [
@@ -289,7 +364,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         message : String? = "The track index is out of bounds",
         reject: RCTPromiseRejectBlock
     ) -> Bool {
-        let rejected = index < (min ?? 0) || index > (max ?? player.items.count - 1);
+        let queueSize = hasInitialized ? activePlaybackBackend.queue.count : player.items.count
+        let rejected = index < (min ?? 0) || index > (max ?? queueSize - 1);
         if (rejected) {
             reject("index_out_of_bounds", message, nil)
         }
@@ -297,16 +373,380 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     private var useOrchestratedCrossfade: Bool {
-        return crossfadeEnabled && crossfadeEngineMode != "legacyHybrid"
+        return playbackBackendAuthority.isAuthoritative(.pingPong, identity: playbackOrchestrator)
     }
 
     private func playerTracks() -> [Track] {
         return player.items.compactMap { $0 as? Track }
     }
 
-    private func syncOrchestratorQueue() {
-        guard useOrchestratedCrossfade else { return }
-        playbackOrchestrator.setQueue(playerTracks())
+    private var activePlaybackBackend: IOSPlaybackBackendRouting {
+        guard let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting else {
+            fatalError("Playback backend is not initialized. Call setupPlayer first.")
+        }
+        return backend
+    }
+
+    private func withActivePlaybackBackendAsync<Value>(
+        _ operation: @escaping (
+            IOSPlaybackBackendRouting,
+            @escaping (Result<Value, Error>) -> Void
+        ) throws -> Void,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        playbackBackendFacade!.withCurrentBackendAsync({ backend, routedCompletion in
+            try operation(backend as! IOSPlaybackBackendRouting, routedCompletion)
+        }, completion: completion)
+    }
+
+    private func withActivePlaybackBackendSerialized<Value>(
+        _ operation: @escaping (IOSPlaybackBackendRouting) throws -> Value,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        withActivePlaybackBackendAsync({ backend, routedCompletion in
+            do {
+                routedCompletion(.success(try operation(backend)))
+            } catch {
+                routedCompletion(.failure(error))
+            }
+        }, completion: completion)
+    }
+
+    private func withActivePlaybackBackendRead<Value>(
+        _ operation: @escaping (IOSPlaybackBackendRouting) throws -> Value,
+        completion: @escaping (Result<Value, Error>) -> Void
+    ) {
+        playbackBackendFacade!.withCurrentBackendRead({ backend in
+            try operation(backend as! IOSPlaybackBackendRouting)
+        }, completion: completion)
+    }
+
+    private func resolveActivePlaybackBackendRead<Value>(
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock,
+        message: String,
+        _ operation: @escaping (IOSPlaybackBackendRouting) throws -> Value
+    ) {
+        withActivePlaybackBackendRead(operation) { result in
+            switch result {
+            case .success(let value): resolve(value)
+            case .failure(let error): reject("playback_read_failed", message, error)
+            }
+        }
+    }
+
+    private func makePlaybackBackend(
+        _ kind: PlaybackBackendKind,
+        initiallyAuthoritative: Bool = false
+    ) -> PlaybackBackend {
+        switch kind {
+        case .standard:
+            let incomingQueueProvider: (() -> [Track])?
+            if initiallyAuthoritative {
+                incomingQueueProvider = nil
+            } else {
+                incomingQueueProvider = { [weak self] in self?.playerTracks() ?? [] }
+            }
+            let source = initiallyAuthoritative ? player : makeStandardPlayerCandidate()
+            return StandardPlaybackBackend(
+                player: source,
+                transitionGenerationSidecar: transitionGenerationSidecar,
+                automaticallyUpdateNowPlayingInfo: { [weak self] in
+                    self?.autoUpdateNowPlayingInfo ?? true
+                },
+                onCommitted: { [weak self] committed in
+                    self?.commitStandardPlayer(committed)
+                },
+                onActivated: { [weak self] committed in
+                    self?.publishCanonicalStandardState(committed)
+                },
+                onDisposed: { [weak self] disposed in
+                    self?.removePlayerEvents(disposed)
+                },
+                onIdleTrackActivationWillBegin: { [weak self] source in
+                    self?.beginStandardIdleTrackActivation(source: source)
+                },
+                onIdleTrackActivated: { [weak self] source, index in
+                    self?.finishStandardIdleTrackActivation(source: source, index: index)
+                },
+                initiallyAuthoritative: initiallyAuthoritative,
+                incomingQueueProvider: incomingQueueProvider,
+                queueProvider: { [weak source] in
+                    return source?.items.compactMap { $0 as? Track } ?? []
+                })
+        case .pingPong:
+            let queuePlayer = player
+            let orchestrator = IOSPlaybackOrchestrator()
+            return PingPongPlaybackBackend(
+                player: queuePlayer,
+                orchestrator: orchestrator,
+                transitionGenerationSidecar: transitionGenerationSidecar,
+                onCommitted: { [weak self] committed, queuePlayer in
+                    self?.commitPingPongOrchestrator(committed, queuePlayer: queuePlayer)
+                },
+                onActivated: { [weak self] committed in
+                    self?.publishCanonicalPingPongState(committed)
+                },
+                onDisposed: { [weak self] disposed, _ in
+                    disposed.delegate = nil
+                    if self?.playbackOrchestrator === disposed {
+                        self?.stopOrchestratedProgressUpdates()
+                    }
+                },
+                initiallyAuthoritative: initiallyAuthoritative,
+                queueProvider: { [weak queuePlayer] in
+                    queuePlayer?.items.compactMap { $0 as? Track } ?? []
+                }
+            )
+        }
+    }
+
+    private func makeStandardPlayerCandidate() -> QueuedAudioPlayer {
+        let candidate = QueuedAudioPlayer()
+        candidate.automaticallyUpdateNowPlayingInfo = false
+        candidate.playWhenReady = false
+        candidate.bufferDuration = player.bufferDuration
+        candidate.automaticallyWaitsToMinimizeStalling = player.automaticallyWaitsToMinimizeStalling
+        candidate.timeEventFrequency = player.timeEventFrequency
+        return candidate
+    }
+
+    private func performOnMainSync(_ operation: () -> Void) {
+        if Thread.isMainThread {
+            operation()
+        } else {
+            DispatchQueue.main.sync(execute: operation)
+        }
+    }
+
+    private func commitStandardPlayer(_ committed: QueuedAudioPlayer) {
+        performOnMainSync {
+            pendingStandardIdleTrackActivation = nil
+            standardIdleActivationDuplicateGuard = nil
+            player = committed
+            configurePlayerEvents(committed)
+            committed.automaticallyUpdateNowPlayingInfo = autoUpdateNowPlayingInfo
+            configureRemoteCommandHandlers(committed, kind: .standard, identity: committed)
+            committed.remoteCommands = configuredRemoteCommands
+            if autoUpdateNowPlayingInfo {
+                committed.loadNowPlayingMetaValues()
+            }
+            refreshRemoteCommandAvailability(kind: .standard, sourcePlayer: committed)
+        }
+    }
+
+    private func commitPingPongOrchestrator(
+        _ committed: IOSPlaybackOrchestrator,
+        queuePlayer: QueuedAudioPlayer
+    ) {
+        performOnMainSync {
+            player = queuePlayer
+            playbackOrchestrator = committed
+            committed.delegate = self
+            queuePlayer.automaticallyUpdateNowPlayingInfo = false
+            configureRemoteCommandHandlers(queuePlayer, kind: .pingPong, identity: committed)
+            queuePlayer.remoteCommands = configuredRemoteCommands
+            refreshRemoteCommandAvailability(
+                kind: .pingPong,
+                sourcePlayer: queuePlayer,
+                sourceOrchestrator: committed
+            )
+            updateNowPlayingForOrchestrator(force: true)
+        }
+    }
+
+    private func publishCanonicalStandardState(_ committed: QueuedAudioPlayer) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: committed),
+              committed === player else { return }
+        let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
+        stopOrchestratedProgressUpdates()
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(
+                state: backend?.playbackState ?? State.fromPlayerState(state: committed.playerState),
+                error: backend?.publicPlaybackError
+            )
+        )
+        configureAudioSession()
+        emit(
+            event: EventType.PlaybackPlayWhenReadyChanged,
+            body: ["playWhenReady": backend?.publicPlayWhenReady ?? committed.playWhenReady]
+        )
+    }
+
+    private func standardActiveTrackEventKey(
+        source: QueuedAudioPlayer,
+        item: AudioItem?,
+        index: Int?
+    ) -> StandardActiveTrackEventKey {
+        return StandardActiveTrackEventKey(
+            source: ObjectIdentifier(source),
+            trackID: (item as? Track).map(playbackBackendTrackID),
+            index: index
+        )
+    }
+
+    private func beginStandardIdleTrackActivation(source: QueuedAudioPlayer) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              source === player else { return }
+        standardIdleActivationDuplicateGuard = nil
+        pendingStandardIdleTrackActivation = PendingStandardIdleTrackActivation(
+            source: ObjectIdentifier(source),
+            emittedByPhysicalPlayer: false
+        )
+    }
+
+    private func finishStandardIdleTrackActivation(source: QueuedAudioPlayer, index: Int?) {
+        let sourceID = ObjectIdentifier(source)
+        guard let pending = pendingStandardIdleTrackActivation,
+              pending.source == sourceID else { return }
+        pendingStandardIdleTrackActivation = nil
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              source === player,
+              let index = index,
+              source.items.indices.contains(index),
+              !pending.emittedByPhysicalPlayer else { return }
+        let item = source.items[index]
+        let key = standardActiveTrackEventKey(source: source, item: item, index: index)
+
+        handleAudioPlayerCurrentItemChange(
+            source: source,
+            item: item,
+            index: index,
+            lastItem: nil,
+            lastIndex: nil,
+            lastPosition: 0
+        )
+        standardIdleActivationDuplicateGuard = key
+        DispatchQueue.main.async { [weak self] in
+            guard self?.standardIdleActivationDuplicateGuard == key else { return }
+            self?.standardIdleActivationDuplicateGuard = nil
+        }
+    }
+
+    private func publishCanonicalPingPongState(_ committed: IOSPlaybackOrchestrator) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: committed),
+              committed === playbackOrchestrator else { return }
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(state: committed.playbackState)
+        )
+        configureAudioSession()
+        emit(
+            event: EventType.PlaybackPlayWhenReadyChanged,
+            body: ["playWhenReady": committed.playWhenReady]
+        )
+        if committed.playbackState == .playing {
+            startOrchestratedProgressUpdates()
+        } else {
+            stopOrchestratedProgressUpdates()
+        }
+        updateNowPlayingForOrchestrator(committed, force: true)
+    }
+
+    private func configureRemoteCommandHandlers(
+        _ source: QueuedAudioPlayer,
+        kind: PlaybackBackendKind,
+        identity: AnyObject
+    ) {
+        let expectedIdentity = ObjectIdentifier(identity)
+        func isAuthoritative() -> Bool {
+            return playbackBackendAuthority.isAuthoritative(kind, identity: expectedIdentity)
+        }
+
+        source.remoteCommandController.handleChangePlaybackPositionCommand = { [weak self] event in
+            guard let self = self, isAuthoritative(),
+                  let event = event as? MPChangePlaybackPositionCommandEvent else {
+                return .commandFailed
+            }
+            self.emit(event: .RemoteSeek, body: ["position": event.positionTime])
+            return .success
+        }
+        source.remoteCommandController.handleNextTrackCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemoteNext)
+            return .success
+        }
+        source.remoteCommandController.handlePauseCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemotePause)
+            return .success
+        }
+        source.remoteCommandController.handlePlayCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemotePlay)
+            return .success
+        }
+        source.remoteCommandController.handlePreviousTrackCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemotePrevious)
+            return .success
+        }
+        source.remoteCommandController.handleSkipBackwardCommand = { [weak self] event in
+            guard let self = self, isAuthoritative(),
+                  let command = event.command as? MPSkipIntervalCommand,
+                  let interval = command.preferredIntervals.first else {
+                return .commandFailed
+            }
+            self.emit(event: .RemoteJumpBackward, body: ["interval": interval])
+            return .success
+        }
+        source.remoteCommandController.handleSkipForwardCommand = { [weak self] event in
+            guard let self = self, isAuthoritative(),
+                  let command = event.command as? MPSkipIntervalCommand,
+                  let interval = command.preferredIntervals.first else {
+                return .commandFailed
+            }
+            self.emit(event: .RemoteJumpForward, body: ["interval": interval])
+            return .success
+        }
+        source.remoteCommandController.handleStopCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemoteStop)
+            return .success
+        }
+        source.remoteCommandController.handleTogglePlayPauseCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: self.activePlaybackBackend.playbackState == .paused ? .RemotePlay : .RemotePause)
+            return .success
+        }
+        source.remoteCommandController.handleLikeCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemoteLike)
+            return .success
+        }
+        source.remoteCommandController.handleDislikeCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemoteDislike)
+            return .success
+        }
+        source.remoteCommandController.handleBookmarkCommand = { [weak self] _ in
+            guard let self = self, isAuthoritative() else { return .commandFailed }
+            self.emit(event: .RemoteBookmark)
+            return .success
+        }
+    }
+
+    private func installPlaybackBackendFacade(initialKind: PlaybackBackendKind) {
+        let factory = IOSPlaybackBackendFactory { [weak self] kind in
+            guard let self = self else {
+                fatalError("RNTrackPlayer was released during playback backend creation.")
+            }
+            return self.makePlaybackBackend(kind)
+        }
+        playbackBackendFacade = PlaybackBackendFacade(
+            initial: makePlaybackBackend(initialKind, initiallyAuthoritative: true),
+            factory: factory,
+            authority: playbackBackendAuthority,
+            onCleanupDiagnostic: { [weak self] diagnostic in
+                DispatchQueue.main.async {
+                    self?.emit(event: EventType.PlaybackError, body: [
+                        "code": diagnostic.code,
+                        "message": diagnostic.message
+                    ])
+                }
+            }
+        )
     }
 
     private func activateAudioSessionForPlayback() {
@@ -337,7 +777,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         defer { setupInProgress = false }
 
         crossfadeEnabled = config["crossfade"] as? Bool ?? false
-        crossfadeEngineMode = config["crossfadeEngineMode"] as? String ?? "orchestratedDualEngine"
+        let initialBackend: PlaybackBackendKind = crossfadeEnabled ? .pingPong : .standard
+        installPlaybackBackendFacade(initialKind: initialBackend)
 
         // configure buffer size
         if let bufferDuration = config["minBuffer"] as? TimeInterval {
@@ -387,93 +828,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         configureAudioSession()
 
-        // setup event listeners
-        player.remoteCommandController.handleChangePlaybackPositionCommand = { [weak self] event in
-            if let event = event as? MPChangePlaybackPositionCommandEvent {
-                self?.emit(event: EventType.RemoteSeek, body: ["position": event.positionTime])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleNextTrackCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteNext)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePauseCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePause)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePlayCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePlay)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handlePreviousTrackCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemotePrevious)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleSkipBackwardCommand = { [weak self] event in
-            if let command = event.command as? MPSkipIntervalCommand,
-               let interval = command.preferredIntervals.first {
-                self?.emit(event: EventType.RemoteJumpBackward, body: ["interval": interval])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleSkipForwardCommand = { [weak self] event in
-            if let command = event.command as? MPSkipIntervalCommand,
-               let interval = command.preferredIntervals.first {
-                self?.emit(event: EventType.RemoteJumpForward, body: ["interval": interval])
-                return MPRemoteCommandHandlerStatus.success
-            }
-
-            return MPRemoteCommandHandlerStatus.commandFailed
-        }
-
-        player.remoteCommandController.handleStopCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteStop)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleTogglePlayPauseCommand = { [weak self] _ in
-            guard let self = self else { return MPRemoteCommandHandlerStatus.commandFailed }
-            if self.useOrchestratedCrossfade {
-                self.emit(event: self.playbackOrchestrator.playbackState == .paused
-                    ? EventType.RemotePlay
-                    : EventType.RemotePause
-                )
-            } else {
-                self.emit(event: self.player.playerState == .paused
-                    ? EventType.RemotePlay
-                    : EventType.RemotePause
-                )
-            }
-
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleLikeCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteLike)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleDislikeCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteDislike)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
-        player.remoteCommandController.handleBookmarkCommand = { [weak self] _ in
-            self?.emit(event: EventType.RemoteBookmark)
-            return MPRemoteCommandHandlerStatus.success
-        }
-
         hasInitialized = true
         resolve(NSNull())
     }
@@ -481,7 +835,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     private func configureAudioSession() {
         if useOrchestratedCrossfade {
-            if !playbackOrchestrator.hasCurrentItem {
+            if playbackOrchestrator.currentIndex < 0 {
                 try? audioSessionController.deactivateSession()
                 return
             }
@@ -491,15 +845,18 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             return
         }
 
-        // deactivate the session when there is no current item to be played
-        if (player.currentItem == nil) {
+        let routedBackend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
+        let hasLogicalCurrentItem = routedBackend?.kind == .standard
+            ? (routedBackend!.currentIndex >= 0)
+            : (player.currentItem != nil)
+        if !hasLogicalCurrentItem {
             try? audioSessionController.deactivateSession()
             return
         }
         
         // activate the audio session when there is an item to be played
         // and the player has been configured to start when it is ready loading:
-        if (player.playWhenReady) {
+        if (routedBackend?.publicPlayWhenReady ?? player.playWhenReady) {
             activateAudioSessionForPlayback()
         }
     }
@@ -510,20 +867,34 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     @objc(getPlayerLifecycle:rejecter:)
-    public func getPlayerLifecycle(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
-        let playbackState: State = {
-            if !hasInitialized { return .none }
-            return useOrchestratedCrossfade ? playbackOrchestrator.playbackState : State.fromPlayerState(state: player.playerState)
-        }()
-        let activeIndex = useOrchestratedCrossfade ? playbackOrchestrator.currentIndex : player.currentIndex
-        let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < player.items.count ? activeIndex : NSNull()
-        let phase = setupInProgress ? "settingUp" : (hasInitialized ? "ready" : "uninitialized")
-        let backend = hasInitialized ? (useOrchestratedCrossfade ? "crossfade" : "standard") : "none"
-        let playWhenReady = hasInitialized
-            ? (useOrchestratedCrossfade ? playbackOrchestrator.playWhenReady : player.playWhenReady)
-            : false
+    public func getPlayerLifecycle(
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
+    ) {
+        guard hasInitialized else {
+            resolve(playerLifecycleDictionary(backend: nil))
+            return
+        }
+        withActivePlaybackBackendRead({ self.playerLifecycleDictionary(backend: $0) }) { result in
+            switch result {
+            case .success(let lifecycle): resolve(lifecycle)
+            case .failure(let error): reject("playback_read_failed", "Unable to read player lifecycle.", error)
+            }
+        }
+    }
 
-        resolve([
+    private func playerLifecycleDictionary(
+        backend: IOSPlaybackBackendRouting?
+    ) -> [String: Any] {
+        let playbackState = backend?.playbackState ?? .none
+        let activeIndex = backend?.currentIndex ?? -1
+        let queueSize = backend?.queue.count ?? 0
+        let normalizedActiveIndex: Any = activeIndex >= 0 && activeIndex < queueSize ? activeIndex : NSNull()
+        let phase = setupInProgress ? "settingUp" : (hasInitialized ? "ready" : "uninitialized")
+        let backendName = backend?.kind == .pingPong ? "crossfade" : (backend?.kind.rawValue ?? "none")
+        let playWhenReady = backend?.publicPlayWhenReady ?? false
+
+        var lifecycle: [String: Any] = [
             "phase": phase,
             "serviceBound": hasInitialized,
             "playerInitialized": hasInitialized,
@@ -531,10 +902,63 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             "canAcceptCommands": hasInitialized,
             "playbackState": playbackState.rawValue,
             "playWhenReady": playWhenReady,
-            "backend": backend,
-            "queueSize": player.items.count,
+            "backend": backendName,
+            "queueSize": queueSize,
             "activeTrackIndex": normalizedActiveIndex
-        ])
+        ]
+#if RNTP_E2E_PROBES
+        // The caller's existing backend read lease remains held through this
+        // main-thread observation. No playback command or readiness wait runs.
+        let observe = {
+            if let backend {
+                var probe = backend.e2eSnapshot()
+                probe["liveCrossfadeEngines"] = IOSCrossfadeEngine.e2eLiveSnapshots()
+                lifecycle["_e2e"] = probe
+            }
+        }
+        if Thread.isMainThread { observe() }
+        else { DispatchQueue.main.sync(execute: observe) }
+#endif
+        return lifecycle
+    }
+
+    @objc(setPlaybackBackend:resolver:rejecter:)
+    public func setPlaybackBackend(
+        config: [String: Any],
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
+    ) {
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+        guard let type = config["type"] as? String,
+              let kind = PlaybackBackendKind(rawValue: type),
+              Set(config.keys).isSubset(of: kind == .standard
+                ? Set(["type"])
+                : Set(["type", "engineMode"])),
+              type != PlaybackBackendKind.pingPong.rawValue ||
+                config["engineMode"] == nil ||
+                config["engineMode"] as? String == "orchestratedDualEngine",
+              let facade = playbackBackendFacade else {
+            reject("invalid_playback_backend_config", "Invalid playback backend config.", nil)
+            return
+        }
+
+        facade.setPlaybackBackend(kind) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success:
+                    self.withActivePlaybackBackendRead({ self.playerLifecycleDictionary(backend: $0) }) {
+                        switch $0 {
+                        case .success(let lifecycle): resolve(lifecycle)
+                        case .failure(let error):
+                            reject("playback_read_failed", "Unable to read player lifecycle.", error)
+                        }
+                    }
+                case .failure(let error):
+                    reject("playback_backend_swap_failed", "Unable to change playback backend.", error)
+                }
+            }
+        }
     }
 
     @objc(updateOptions:resolver:rejecter:)
@@ -561,6 +985,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 )
             }
         configuredCapabilityValues = Set(capabilitiesStr)
+        configuredRemoteCommands = remoteCommands
         player.remoteCommands = remoteCommands
         refreshRemoteCommandAvailability()
 
@@ -582,17 +1007,27 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
     }
 
-    private func refreshRemoteCommandAvailability() {
+    private func refreshRemoteCommandAvailability(
+        kind: PlaybackBackendKind? = nil,
+        sourcePlayer: QueuedAudioPlayer? = nil,
+        sourceOrchestrator: IOSPlaybackOrchestrator? = nil
+    ) {
+        let queuePlayer = sourcePlayer ?? player
+        let orchestrator = sourceOrchestrator ?? playbackOrchestrator
+        let backendKind = kind ?? (useOrchestratedCrossfade ? .pingPong : .standard)
+        let routedBackend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
         let center = MPRemoteCommandCenter.shared()
-        let logicalIndex = useOrchestratedCrossfade ? playbackOrchestrator.currentIndex : player.currentIndex
-        let hasCurrentItem = useOrchestratedCrossfade
-            ? playbackOrchestrator.hasCurrentItem
-            : player.currentItem != nil
+        let logicalIndex = backendKind == .pingPong
+            ? orchestrator.currentIndex
+            : (routedBackend?.kind == .standard ? routedBackend!.currentIndex : queuePlayer.currentIndex)
+        let hasCurrentItem = backendKind == .pingPong
+            ? orchestrator.hasCurrentItem
+            : logicalIndex >= 0
 
         center.nextTrackCommand.isEnabled = configuredCapabilityValues.contains(Capability.next.rawValue)
             && hasCurrentItem
             && logicalIndex >= 0
-            && logicalIndex < player.items.count - 1
+            && logicalIndex < queuePlayer.items.count - 1
         center.previousTrackCommand.isEnabled = configuredCapabilityValues.contains(Capability.previous.rawValue)
             && hasCurrentItem
             && logicalIndex > 0
@@ -601,13 +1036,17 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private func startOrchestratedProgressUpdates() {
         orchestratedProgressWorkItem?.cancel()
         orchestratedProgressWorkItem = nil
-        guard useOrchestratedCrossfade, playbackOrchestrator.hasCurrentItem else { return }
-        guard playbackOrchestrator.playbackState == .playing else { return }
+        let owner = playbackOrchestrator
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: owner),
+              owner.hasCurrentItem else { return }
+        guard owner.playbackState == .playing else { return }
 
         let interval = shouldEmitProgressEvent ? max(0.25, progressUpdateInterval) : 1
         let workItem = DispatchWorkItem { [weak self] in
             guard let self = self else { return }
-            self.emitOrchestratedProgress()
+            guard self.playbackBackendAuthority.isAuthoritative(.pingPong, identity: owner),
+                  self.playbackOrchestrator === owner else { return }
+            self.emitOrchestratedProgress(owner)
             self.startOrchestratedProgressUpdates()
         }
         orchestratedProgressWorkItem = workItem
@@ -619,46 +1058,21 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         orchestratedProgressWorkItem = nil
     }
 
-    private func emitOrchestratedProgress() {
-        guard useOrchestratedCrossfade, playbackOrchestrator.hasCurrentItem else { return }
-        updateNowPlayingForOrchestrator()
+    private func emitOrchestratedProgress(_ orchestrator: IOSPlaybackOrchestrator) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              playbackOrchestrator === orchestrator,
+              orchestrator.hasCurrentItem else { return }
+        updateNowPlayingForOrchestrator(orchestrator)
         guard shouldEmitProgressEvent else { return }
         emit(
             event: EventType.PlaybackProgressUpdated,
             body: [
-                "position": playbackOrchestrator.currentTime,
-                "duration": playbackOrchestrator.duration,
-                "buffered": playbackOrchestrator.bufferedPosition,
-                "track": playbackOrchestrator.currentIndex,
+                "position": orchestrator.currentTime,
+                "duration": orchestrator.duration,
+                "buffered": orchestrator.bufferedPosition,
+                "track": orchestrator.currentIndex,
             ]
         )
-    }
-
-    private func cancelCrossfadeWork(errorCode: String = "cancelled", resetActivePlayback: Bool = false) {
-        crossfadeRunId += 1
-        crossfadeStartWorkItem?.cancel()
-        crossfadeStartWorkItem = nil
-        crossfadeCoordinator.cancelTransition(keepActivePlayback: false)
-        player.volume = 1
-        if let reject = crossfadePendingReject {
-            if let fromIndex = crossfadePendingFromIndex, let toIndex = crossfadePendingToIndex {
-                emitCrossfadeState(
-                    state: "cancelled",
-                    fromIndex: fromIndex,
-                    toIndex: toIndex,
-                    errorCode: errorCode
-                )
-            }
-            reject(errorCode, "Crossfade was cancelled.", nil)
-        }
-        clearCrossfadePromise()
-    }
-
-    private func clearCrossfadePromise() {
-        crossfadePendingReject = nil
-        crossfadePendingFromIndex = nil
-        crossfadePendingToIndex = nil
-        preparedCrossfadeSeekTo = 0
     }
 
     private func emitCrossfadeState(
@@ -690,138 +1104,24 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         emit(event: EventType.PlaybackCrossfadeState, body: body)
     }
 
-    private func xfadeLog(_ message: String) {
-        let time = CACurrentMediaTime()
-        print("[XF][\(String(format: "%.6f", time))] \(message)")
-    }
-
-    private func cancelCrossfadeForManualAction() {
-        if useOrchestratedCrossfade {
-            player.volume = 0
-            return
-        }
-        if crossfadeEnabled {
-            cancelCrossfadeWork(resetActivePlayback: true)
-            crossfadeCoordinator.reset()
-            player.volume = 1
-        }
-    }
-
-    private func mutePublicPlayerForInternalCrossfade() {
-        player.volume = 0
-        xfadeLog("onStarted: public player muted without jumpToItem")
-        refreshRemoteCommandAvailability()
-    }
-
-    private func startPublicPlayerForHandback(
-        toIndex: Int,
-        targetVolume: Float,
-        shouldContinue: @escaping () -> Bool,
-        completion: @escaping () -> Void
-    ) {
-        guard shouldContinue(), toIndex >= 0, toIndex < player.items.count else { return }
-
-        let livePosition = max(0, crossfadeCoordinator.incomingCurrentTime)
-        xfadeLog("handback: prepare public player index=\(toIndex) position=\(livePosition)")
-
-        player.volume = 0
-        if player.currentIndex != toIndex {
-            xfadeLog("handback: before public jumpToItem")
-            try? player.jumpToItem(atIndex: toIndex, playWhenReady: false)
-            xfadeLog("handback: after public jumpToItem")
-        }
-
-        xfadeLog("handback: before public seek")
-        player.seek(to: livePosition)
-        xfadeLog("handback: after public seek call")
-        player.play()
-        player.volume = 0
-
-        waitUntilPublicPlayerStable(
-            expectedIndex: toIndex,
-            expectedPosition: livePosition,
-            shouldContinue: shouldContinue
-        ) { [weak self] stable in
-            guard let self = self, shouldContinue() else { return }
-            self.xfadeLog("handback: public stable=\(stable) state=\(self.player.playerState) index=\(self.player.currentIndex) position=\(self.player.currentTime)")
-            self.crossfadeCoordinator.handbackToPublicPlayer(
-                durationMs: 150,
-                targetVolume: targetVolume,
-                setPublicVolume: { [weak self] volume in
-                    self?.player.volume = volume
-                },
-                completion: completion
-            )
-        }
-    }
-
-    private func waitUntilPublicPlayerStable(
-        expectedIndex: Int,
-        expectedPosition: Double,
-        shouldContinue: @escaping () -> Bool,
-        completion: @escaping (Bool) -> Void
-    ) {
-        let startedAt = CACurrentMediaTime()
-        let timeoutSeconds = 2.0
-
-        func poll() {
-            guard shouldContinue() else { return }
-
-            let state = player.playerState
-            let stateAllowsHandback = state == .playing || state == .ready || state == .buffering
-            let indexMatches = player.currentIndex == expectedIndex
-            let positionDelta = abs(player.currentTime - expectedPosition)
-            let positionMatches = positionDelta <= 0.75
-
-            if indexMatches && stateAllowsHandback && positionMatches {
-                completion(true)
-                return
-            }
-
-            if CACurrentMediaTime() - startedAt >= timeoutSeconds {
-                completion(false)
-                return
-            }
-
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(50)) {
-                poll()
-            }
-        }
-
-        poll()
-        refreshRemoteCommandAvailability()
-    }
-
     private func publicPlaybackPosition() -> Double {
-        if useOrchestratedCrossfade {
-            return playbackOrchestrator.currentTime
-        }
-        return player.currentTime
+        return activePlaybackBackend.position
     }
 
     private func publicPlaybackDuration() -> Double {
-        if useOrchestratedCrossfade {
-            return playbackOrchestrator.duration
-        }
-        return player.duration
+        return activePlaybackBackend.duration
     }
 
     private func publicBufferedPosition() -> Double {
-        if useOrchestratedCrossfade {
-            return playbackOrchestrator.bufferedPosition
-        }
-        return player.bufferedPosition
+        return activePlaybackBackend.bufferedPosition
     }
 
     private func publicPlaybackVolume() -> Float {
-        if useOrchestratedCrossfade {
-            return playbackOrchestrator.volume
-        }
-        return player.volume
+        return activePlaybackBackend.publicVolume
     }
 
     private func crossfadePlaybackRate() -> Float {
-        let rate = player.rate
+        let rate = activePlaybackBackend.publicRate
         return rate.isFinite && rate > 0.01 ? rate : 1
     }
 
@@ -832,12 +1132,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         resolve: @escaping RCTPromiseResolveBlock,
         reject: @escaping RCTPromiseRejectBlock
     ) {
-        // -1 means no index was passed and therefore should be inserted at the end.
-        let index = trackIndex.intValue == -1 ? player.items.count : trackIndex.intValue;
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        // -1 means no index was passed and therefore should be inserted at the end.
+        let index = trackIndex.intValue == -1 ? activePlaybackBackend.queue.count : trackIndex.intValue;
         if (rejectWhenTrackIndexOutOfBounds(
             index: index,
-            max: player.items.count,
+            max: activePlaybackBackend.queue.count,
             reject: reject
         )) { return }
 
@@ -851,12 +1151,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             tracks.append(track)
         }
 
-        try? player.add(
-            items: tracks,
-            at: index
-        )
-        syncOrchestratorQueue()
-        resolve(index)
+        withActivePlaybackBackendSerialized({ try $0.add(tracks, at: index) }) { result in
+            switch result {
+            case .success:
+                resolve(index)
+            case .failure(let error):
+                reject("queue_add_failed", "Unable to add tracks to the playback backend.", error)
+            }
+        }
     }
 
     @objc(load:resolver:rejecter:)
@@ -872,25 +1174,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             return
         }
 
-        cancelCrossfadeForManualAction()
-        player.load(item: track)
-        if useOrchestratedCrossfade {
-            player.volume = 0
-            playbackOrchestrator.load(track: track) { result in
-                switch result {
-                case .success(let index):
-                    resolve(index)
-                case .failure(let error):
-                    reject("ios_orchestrator_load_failed", "Unable to load the track.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.load(track, completion: completion)
+        }) { result in
+            switch result {
+            case .success(let index):
+                resolve(index)
+            case .failure(let error):
+                reject("playback_backend_load_failed", "Unable to load the track.", error)
             }
-            return
         }
-        resolve(player.currentIndex)
     }
 
     @objc(remove:resolver:rejecter:)
-    public func remove(tracks indexes: [Int], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func remove(tracks indexes: [Int], resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
         for index in indexes {
             if (rejectWhenTrackIndexOutOfBounds(index: index, message: "One or more of the indexes were out of bounds.", reject: reject)) {
@@ -898,15 +1195,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             }
         }
 
-        // Sort the indexes in descending order so we can safely remove them one by one
-        // without having the next index possibly newly pointing to another item than intended:
-        cancelCrossfadeForManualAction()
-        for index in indexes.sorted().reversed() {
-            try? player.removeItem(at: index)
+        withActivePlaybackBackendSerialized({ try $0.remove(at: indexes) }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("queue_remove_failed", "Unable to remove tracks from the playback backend.", error)
+            }
         }
-        syncOrchestratorQueue()
-
-        resolve(NSNull())
     }
 
     @objc(move:toIndex:resolver:rejecter:)
@@ -928,21 +1224,30 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             message: "The toIndex is out of bounds",
             reject: reject)
         ) { return }
-        cancelCrossfadeForManualAction()
-        try? player.moveItem(fromIndex: fromIndex.intValue, toIndex: toIndex.intValue)
-        syncOrchestratorQueue()
-        resolve(NSNull())
+        withActivePlaybackBackendSerialized({
+            try $0.move(from: fromIndex.intValue, to: toIndex.intValue)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("queue_move_failed", "Unable to move the track in the playback backend.", error)
+            }
+        }
     }
 
 
     @objc(removeUpcomingTracks:rejecter:)
-    public func removeUpcomingTracks(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func removeUpcomingTracks(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        cancelCrossfadeForManualAction()
-        player.removeUpcomingItems()
-        syncOrchestratorQueue()
-        resolve(NSNull())
+        withActivePlaybackBackendSerialized({ $0.removeUpcomingTracks() }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error):
+                reject("queue_remove_failed", "Unable to remove upcoming tracks.", error)
+            }
+        }
     }
 
     @objc(skip:initialTime:resolver:rejecter:)
@@ -957,25 +1262,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenTrackIndexOutOfBounds(index: index, reject: reject)) { return }
 
         print("Skipping to track:", index)
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.skip(to: index, initialTime: initialTime) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("skip_failed", "Unable to skip to track.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.skip(to: index, initialTime: initialTime, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("skip_failed", "Unable to skip to track.", error)
             }
-            return
-        }
-        cancelCrossfadeForManualAction()
-        try? player.jumpToItem(atIndex: index, playWhenReady: player.playerState == .playing)
-
-        // if an initialTime is passed the seek to it
-        if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
-        } else {
-            resolve(NSNull())
         }
     }
 
@@ -987,25 +1282,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.skipToNext(initialTime: initialTime) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("skip_failed", "Unable to skip to next track.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.skipToNext(initialTime: initialTime, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("skip_failed", "Unable to skip to next track.", error)
             }
-            return
-        }
-        cancelCrossfadeForManualAction()
-        player.next()
-
-        // if an initialTime is passed the seek to it
-        if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
-        } else {
-            resolve(NSNull())
         }
     }
 
@@ -1017,211 +1302,176 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.skipToPrevious(initialTime: initialTime) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("skip_failed", "Unable to skip to previous track.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.skipToPrevious(initialTime: initialTime, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("skip_failed", "Unable to skip to previous track.", error)
             }
-            return
-        }
-        cancelCrossfadeForManualAction()
-        player.previous()
-
-        // if an initialTime is passed the seek to it
-        if (initialTime >= 0) {
-            self.seekTo(time: initialTime, resolve: resolve, reject: reject)
-        } else {
-            resolve(NSNull())
         }
     }
 
     @objc(reset:rejecter:)
-    public func reset(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func reset(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if crossfadeEnabled {
-            cancelCrossfadeWork(resetActivePlayback: true)
-            crossfadeCoordinator.reset()
-            playbackOrchestrator.stop()
+        withActivePlaybackBackendSerialized({ backend in
+            backend.stop()
+            backend.clearQueue()
+        }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("reset_failed", "Unable to reset playback.", error)
+            }
         }
-        player.stop()
-        player.clear()
-        player.volume = 1
-        resolve(NSNull())
     }
 
     @objc(play:rejecter:)
     public func play(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        if useOrchestratedCrossfade {
-            player.volume = 0
-            syncOrchestratorQueue()
-            activateAudioSessionForPlayback()
-            playbackOrchestrator.play { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("playback_failed", "Unable to start playback.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.syncQueue(self.playerTracks())
+            if backend.kind == .pingPong {
+                self.activateAudioSessionForPlayback()
             }
-            return
+            backend.play(completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("playback_failed", "Unable to start playback.", error)
+            }
         }
-        player.play()
-        resolve(NSNull())
     }
 
     @objc(pause:rejecter:)
-    public func pause(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func pause(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.pause()
-            resolve(NSNull())
-            return
+        withActivePlaybackBackendSerialized({ $0.pause() }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("playback_failed", "Unable to pause playback.", error)
+            }
         }
-        if crossfadeEnabled {
-            cancelCrossfadeWork()
-            crossfadeCoordinator.pause()
-            player.pause()
-            resolve(NSNull())
-            return
-        }
-
-        player.pause()
-        resolve(NSNull())
     }
 
     @objc(setPlayWhenReady:resolver:rejecter:)
     public func setPlayWhenReady(playWhenReady: Bool, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.setPlayWhenReady(playWhenReady) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("playback_failed", "Unable to update playWhenReady.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.setPlayWhenReady(playWhenReady, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("playback_failed", "Unable to update playWhenReady.", error)
             }
-            return
         }
-        if crossfadeEnabled && !playWhenReady {
-            cancelCrossfadeWork()
-            crossfadeCoordinator.pause()
-            player.pause()
-            resolve(NSNull())
-            return
-        }
-        player.playWhenReady = playWhenReady
-        resolve(NSNull())
     }
 
     @objc(getPlayWhenReady:rejecter:)
-    public func getPlayWhenReady(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPlayWhenReady(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        if useOrchestratedCrossfade {
-            resolve(playbackOrchestrator.playWhenReady)
-            return
-        }
-        resolve(player.playWhenReady)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read playWhenReady."
+        ) { $0.publicPlayWhenReady }
     }
 
     @objc(stop:rejecter:)
-    public func stop(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func stop(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if crossfadeEnabled {
-            cancelCrossfadeWork(resetActivePlayback: true)
-            crossfadeCoordinator.reset()
-            playbackOrchestrator.stop()
-            player.volume = 1
+        withActivePlaybackBackendSerialized({ $0.stop() }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("playback_failed", "Unable to stop playback.", error)
+            }
         }
-        player.stop()
-        resolve(NSNull())
     }
 
     @objc(seekTo:resolver:rejecter:)
     public func seekTo(time: Double, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.seek(to: time) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("seek_failed", "Unable to seek.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.seek(to: time, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("seek_failed", "Unable to seek.", error)
             }
-            return
         }
-        if crossfadeEnabled {
-            cancelCrossfadeWork(resetActivePlayback: false)
-        }
-        player.seek(to: time)
-        resolve(NSNull())
     }
 
     @objc(seekBy:resolver:rejecter:)
     public func seekBy(offset: Double, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.seek(by: offset) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("seek_failed", "Unable to seek.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            backend.seek(by: offset, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("seek_failed", "Unable to seek.", error)
             }
-            return
         }
-        if crossfadeEnabled {
-            cancelCrossfadeWork(resetActivePlayback: false)
-        }
-        player.seek(by: offset)
-        resolve(NSNull())
     }
 
     @objc(retry:rejecter:)
-    public func retry(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func retry(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        player.reload(startFromCurrentTime: true)
-        resolve(NSNull())
+        withActivePlaybackBackendSerialized({ $0.retry() }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("retry_failed", "Unable to retry playback.", error)
+            }
+        }
     }
 
     @objc(setRepeatMode:resolver:rejecter:)
-    public func setRepeatMode(repeatMode: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func setRepeatMode(repeatMode: NSNumber, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: repeatMode.intValue) ?? .off
-        resolve(NSNull())
+        withActivePlaybackBackendSerialized({ $0.setRepeatMode(repeatMode.intValue) }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("repeat_mode_failed", "Unable to set repeat mode.", error)
+            }
+        }
     }
 
     @objc(getRepeatMode:rejecter:)
-    public func getRepeatMode(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getRepeatMode(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(player.repeatMode.rawValue)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read repeat mode."
+        ) { $0.publicRepeatMode }
     }
 
     @objc(setVolume:resolver:rejecter:)
-    public func setVolume(level: Float, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func setVolume(level: Float, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.setVolume(level)
-            resolve(NSNull())
-            return
+        withActivePlaybackBackendSerialized({ $0.setVolume(level) }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("volume_failed", "Unable to set volume.", error)
+            }
         }
-        player.volume = level
-        resolve(NSNull())
     }
 
     @objc(crossFadePrepare:seekTo:resolver:rejecter:)
@@ -1232,63 +1482,18 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         reject: @escaping RCTPromiseRejectBlock
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        guard crossfadeEnabled else {
-            resolve(NSNull())
-            return
-        }
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.prepareCrossfade(previous: previous, seekTo: seekTo) { result in
-                switch result {
-                case .success:
-                    resolve(NSNull())
-                case .failure(let error):
-                    reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
-                }
+        withActivePlaybackBackendAsync({ backend, completion in
+            guard backend.kind == .pingPong else {
+                completion(.success(()))
+                return
             }
-            return
-        }
-        cancelCrossfadeWork()
-
-        let fromIndex = player.currentIndex
-        let toIndex = previous ? fromIndex - 1 : fromIndex + 1
-        guard fromIndex >= 0, toIndex >= 0, toIndex < player.items.count else {
-            reject("crossfade_target_unavailable", "No crossfade target track is available.", nil)
-            return
-        }
-
-        guard let outgoingTrack = player.items[fromIndex] as? Track,
-              let incomingTrack = player.items[toIndex] as? Track else {
-            reject("crossfade_target_unavailable", "No crossfade target track is available.", nil)
-            return
-        }
-
-        let prepareRunId = crossfadeRunId
-        preparedCrossfadeSeekTo = max(0, seekTo)
-        crossfadeCoordinator.prepare(
-            outgoingTrack: outgoingTrack,
-            outgoingPosition: publicPlaybackPosition(),
-            fromIndex: fromIndex,
-            incomingTrack: incomingTrack,
-            incomingPosition: preparedCrossfadeSeekTo,
-            toIndex: toIndex
-        ) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self, self.crossfadeRunId == prepareRunId else { return }
-                switch result {
-                case .success:
-                    self.emitCrossfadeState(
-                        state: "prepared",
-                        fromIndex: fromIndex,
-                        toIndex: toIndex,
-                        elapsedMs: 0,
-                        fromVolume: self.publicPlaybackVolume(),
-                        toVolume: 0
-                    )
-                    resolve(NSNull())
-                case .failure(let error):
-                    self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
-                    reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
-                }
+            backend.prepareCrossfade(previous: previous, seekTo: seekTo, completion: completion)
+        }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
             }
         }
     }
@@ -1303,17 +1508,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         reject: @escaping RCTPromiseRejectBlock
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        guard crossfadeEnabled else {
-            resolve(NSNull())
-            return
-        }
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.crossFade(
-                fadeDuration: fadeDuration,
-                fadeInterval: fadeInterval,
-                fadeToVolume: fadeToVolume,
-                waitUntil: waitUntil
-            ) { result in
+        do {
+            withActivePlaybackBackendAsync({ backend, completion in
+                guard backend.kind == .pingPong else {
+                    completion(.success(()))
+                    return
+                }
+                backend.crossFade(
+                    fadeDuration: fadeDuration,
+                    fadeInterval: fadeInterval,
+                    fadeToVolume: fadeToVolume,
+                    waitUntil: waitUntil,
+                    completion: completion
+                )
+            }) { result in
                 switch result {
                 case .success:
                     resolve(NSNull())
@@ -1324,239 +1532,70 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             return
         }
 
-        let fromIndex = player.currentIndex
-        let preparedMatchesCurrent = crossfadeCoordinator.preparedFromIndex == fromIndex
-            && crossfadeCoordinator.preparedToIndex != nil
-        let toIndex = preparedMatchesCurrent
-            ? crossfadeCoordinator.preparedToIndex!
-            : fromIndex + 1
-
-        guard fromIndex >= 0, toIndex >= 0, toIndex < player.items.count else {
-            reject("crossfade_target_unavailable", "No prepared crossfade target track is available.", nil)
-            return
-        }
-        guard let outgoingTrack = player.items[fromIndex] as? Track,
-              let incomingTrack = player.items[toIndex] as? Track else {
-            reject("crossfade_target_unavailable", "No prepared crossfade target track is available.", nil)
-            return
-        }
-
-        let durationMs = max(0, Int(fadeDuration))
-        let intervalMs = max(10, Int(fadeInterval))
-        let targetVolume = Float(max(0, min(1, fadeToVolume)))
-
-        let scheduleCrossfade = { [weak self] in
-            guard let self = self else { return }
-            self.crossfadeRunId += 1
-            let runId = self.crossfadeRunId
-            self.crossfadePendingReject = reject
-            self.crossfadePendingFromIndex = fromIndex
-            self.crossfadePendingToIndex = toIndex
-
-            emitCrossfadeState(
-                state: "scheduled",
-                fromIndex: fromIndex,
-                toIndex: toIndex,
-                elapsedMs: 0,
-                fromVolume: self.publicPlaybackVolume(),
-                toVolume: 0
-            )
-
-            let start = DispatchWorkItem { [weak self] in
-                guard let self = self, self.crossfadeRunId == runId else { return }
-                self.crossfadeCoordinator.start(
-                    fromIndex: fromIndex,
-                    toIndex: toIndex,
-                    durationMs: durationMs,
-                    intervalMs: intervalMs,
-                    targetVolume: targetVolume,
-                    rate: self.crossfadePlaybackRate(),
-                    publicVolume: self.publicPlaybackVolume(),
-                    currentPublicPosition: { [weak self] in self?.player.currentTime ?? 0 },
-                    onStarted: { [weak self] fromVolume, toVolume in
-                        guard let self = self, self.crossfadeRunId == runId else { return }
-                        self.mutePublicPlayerForInternalCrossfade()
-                        self.emitCrossfadeState(
-                            state: "started",
-                            fromIndex: fromIndex,
-                            toIndex: toIndex,
-                            elapsedMs: 0,
-                            fromVolume: fromVolume,
-                            toVolume: toVolume
-                        )
-                    },
-                    onRunning: { [weak self] elapsedMs, fromVolume, toVolume in
-                        guard let self = self, self.crossfadeRunId == runId else { return }
-                        self.emitCrossfadeState(
-                            state: "running",
-                            fromIndex: fromIndex,
-                            toIndex: toIndex,
-                            elapsedMs: elapsedMs,
-                            fromVolume: fromVolume,
-                            toVolume: toVolume
-                        )
-                    },
-                    onCompleted: { [weak self] elapsedMs, fromVolume, toVolume, incomingPosition in
-                        guard let self = self, self.crossfadeRunId == runId else { return }
-                        self.xfadeLog("internal fade completed incomingPosition=\(incomingPosition)")
-                        self.startPublicPlayerForHandback(
-                            toIndex: toIndex,
-                            targetVolume: toVolume,
-                            shouldContinue: { [weak self] in
-                                self?.crossfadeRunId == runId
-                            }
-                        ) { [weak self] in
-                            guard let self = self, self.crossfadeRunId == runId else { return }
-                            self.emitCrossfadeState(
-                                state: "completed",
-                                fromIndex: fromIndex,
-                                toIndex: toIndex,
-                                elapsedMs: elapsedMs,
-                                fromVolume: fromVolume,
-                                toVolume: toVolume
-                            )
-                            self.refreshRemoteCommandAvailability()
-                            self.clearCrossfadePromise()
-                            resolve(NSNull())
-                        }
-                    },
-                    onError: { [weak self] error in
-                        guard let self = self, self.crossfadeRunId == runId else { return }
-                        self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_failed")
-                        self.clearCrossfadePromise()
-                        reject("crossfade_failed", "Unable to complete crossfade.", error)
-                    }
-                )
-            }
-
-            func scheduleStartCheck() {
-                guard self.crossfadeRunId == runId else { return }
-                guard self.player.currentIndex == fromIndex else {
-                    self.emitCrossfadeState(
-                        state: "cancelled",
-                        fromIndex: fromIndex,
-                        toIndex: toIndex,
-                        errorCode: "current_track_changed"
-                    )
-                    self.clearCrossfadePromise()
-                    reject("cancelled", "Crossfade source track changed before start.", nil)
-                    return
-                }
-
-                let remainingMs = Int(waitUntil - self.publicPlaybackPosition() * 1000)
-                if remainingMs <= 0 {
-                    self.crossfadeStartWorkItem = start
-                    DispatchQueue.main.async(execute: start)
-                    return
-                }
-
-                let check = DispatchWorkItem { [weak self] in
-                    guard let self = self else { return }
-                    scheduleStartCheck()
-                }
-                self.crossfadeStartWorkItem = check
-                DispatchQueue.main.asyncAfter(
-                    deadline: .now() + .milliseconds(max(50, min(250, remainingMs))),
-                    execute: check
-                )
-            }
-
-            scheduleStartCheck()
-        }
-
-        if preparedMatchesCurrent {
-            scheduleCrossfade()
-            return
-        }
-
-        cancelCrossfadeWork()
-        let prepareRunId = crossfadeRunId
-        preparedCrossfadeSeekTo = 0
-        crossfadeCoordinator.prepare(
-            outgoingTrack: outgoingTrack,
-            outgoingPosition: publicPlaybackPosition(),
-            fromIndex: fromIndex,
-            incomingTrack: incomingTrack,
-            incomingPosition: 0,
-            toIndex: toIndex
-        ) { [weak self] result in
-            DispatchQueue.main.async {
-                guard let self = self, self.crossfadeRunId == prepareRunId else { return }
-                switch result {
-                case .success:
-                    self.emitCrossfadeState(
-                        state: "prepared",
-                        fromIndex: fromIndex,
-                        toIndex: toIndex,
-                        elapsedMs: 0,
-                        fromVolume: self.publicPlaybackVolume(),
-                        toVolume: 0
-                    )
-                    scheduleCrossfade()
-                case .failure(let error):
-                    self.emitCrossfadeState(state: "error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "prepare_failed")
-                    reject("crossfade_prepare_failed", "Unable to prepare the crossfade target.", error)
-                }
-            }
-        }
     }
 
     @objc(getVolume:rejecter:)
-    public func getVolume(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getVolume(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackVolume())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read volume."
+        ) { $0.publicVolume }
     }
 
     @objc(setRate:resolver:rejecter:)
-    public func setRate(rate: Float, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func setRate(rate: Float, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.setRate(rate)
-            resolve(NSNull())
-            return
+        withActivePlaybackBackendSerialized({ $0.setRate(rate) }) { result in
+            switch result {
+            case .success: resolve(NSNull())
+            case .failure(let error): reject("rate_failed", "Unable to set playback rate.", error)
+            }
         }
-        player.rate = rate
-        resolve(NSNull())
     }
 
     @objc(getRate:rejecter:)
-    public func getRate(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getRate(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        if useOrchestratedCrossfade {
-            resolve(playbackOrchestrator.rate)
-            return
-        }
-        resolve(player.rate)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read playback rate."
+        ) { $0.publicRate }
     }
 
     @objc(getTrack:resolver:rejecter:)
-    public func getTrack(index: NSNumber, resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getTrack(index: NSNumber, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        if (index.intValue >= 0 && index.intValue < player.items.count) {
-            let track = player.items[index.intValue]
-            resolve((track as? Track)?.toObject())
-        } else {
-            resolve(NSNull())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read track."
+        ) { backend -> Any in
+            let queue = backend.queue
+            return queue.indices.contains(index.intValue)
+                ? queue[index.intValue].toObject()
+                : NSNull()
         }
     }
 
     @objc(getQueue:rejecter:)
-    public func getQueue(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getQueue(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let serializedQueue = player.items.map { ($0 as! Track).toObject() }
-        resolve(serializedQueue)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read queue."
+        ) { $0.queue.map { $0.toObject() } }
     }
 
     @objc(setQueue:resolver:rejecter:)
     public func setQueue(
         trackDicts: [[String: Any]],
-        resolve: RCTPromiseResolveBlock,
-        reject: RCTPromiseRejectBlock
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
     ) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
@@ -1569,80 +1608,88 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
             tracks.append(track)
         }
-        cancelCrossfadeForManualAction()
-        player.clear()
-        try? player.add(items: tracks)
-        if useOrchestratedCrossfade {
-            playbackOrchestrator.replaceQueue(tracks, currentIndex: -1)
-            player.volume = 0
+        withActivePlaybackBackendSerialized({ try $0.replaceQueue(tracks) }) { result in
+            switch result {
+            case .success:
+                resolve(NSNull())
+            case .failure(let error):
+                reject("queue_replace_failed", "Unable to replace the playback backend queue.", error)
+            }
         }
-        resolve(NSNull())
     }
 
     @objc(getActiveTrack:rejecter:)
-    public func getActiveTrack(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getActiveTrack(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let index = useOrchestratedCrossfade ? playbackOrchestrator.currentIndex : player.currentIndex
-        if (index >= 0 && index < player.items.count) {
-            let track = player.items[index]
-            resolve((track as? Track)?.toObject())
-        } else {
-            resolve(NSNull())
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read active track."
+        ) { backend -> Any in
+            let index = backend.currentIndex
+            let queue = backend.queue
+            return queue.indices.contains(index) ? queue[index].toObject() : NSNull()
         }
     }
 
     @objc(getActiveTrackIndex:rejecter:)
-    public func getActiveTrackIndex(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getActiveTrackIndex(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        let index = useOrchestratedCrossfade ? playbackOrchestrator.currentIndex : player.currentIndex
-        if index < 0 || index >= player.items.count {
-            resolve(NSNull())
-        } else {
-            resolve(index)
+        resolveActivePlaybackBackendRead(
+            resolve: resolve,
+            reject: reject,
+            message: "Unable to read active track index."
+        ) { backend -> Any in
+            let index = backend.currentIndex
+            return backend.queue.indices.contains(index) ? index : NSNull()
         }
     }
 
     @objc(getDuration:rejecter:)
-    public func getDuration(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getDuration(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackDuration())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read duration.") {
+            $0.duration
+        }
     }
 
     @objc(getBufferedPosition:rejecter:)
-    public func getBufferedPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getBufferedPosition(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicBufferedPosition())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read buffered position.") {
+            $0.bufferedPosition
+        }
     }
 
     @objc(getPosition:rejecter:)
-    public func getPosition(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPosition(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-
-        resolve(publicPlaybackPosition())
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read position.") {
+            $0.position
+        }
     }
 
     @objc(getProgress:rejecter:)
-    public func getProgress(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getProgress(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        resolve([
-            "position": publicPlaybackPosition(),
-            "duration": publicPlaybackDuration(),
-            "buffered": publicBufferedPosition()
-        ])
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read progress.") {
+            [
+                "position": $0.position,
+                "duration": $0.duration,
+                "buffered": $0.bufferedPosition
+            ]
+        }
     }
 
     @objc(getPlaybackState:rejecter:)
-    public func getPlaybackState(resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
+    public func getPlaybackState(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        if useOrchestratedCrossfade {
-            resolve(getPlaybackStateBodyKeyValues(state: playbackOrchestrator.playbackState))
-            return
+        resolveActivePlaybackBackendRead(resolve: resolve, reject: reject, message: "Unable to read playback state.") {
+            self.getPlaybackStateBodyKeyValues(
+                state: $0.playbackState,
+                error: $0.publicPlaybackError
+            )
         }
-        resolve(getPlaybackStateBodyKeyValues(state: player.playerState))
     }
 
     @objc(updateMetadataForTrack:metadata:resolver:rejecter:)
@@ -1677,71 +1724,61 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         resolve(NSNull())
     }
 
-    private func getPlaybackStateErrorKeyValues() -> Dictionary<String, Any> {
-        switch player.playbackError {
-            case .failedToLoadKeyValue: return [
-                "message": "Failed to load resource",
-                "code": "ios_failed_to_load_resource"
-            ]
-            case .invalidSourceUrl: return [
-                "message": "The source url was invalid",
-                "code": "ios_invalid_source_url"
-            ]
-            case .notConnectedToInternet: return [
-                "message": "A network resource was requested, but an internet connection has not been established and can’t be established automatically.",
-                "code": "ios_not_connected_to_internet"
-            ]
-            case .playbackFailed: return [
-                "message": "Playback of the track failed",
-                "code": "ios_playback_failed"
-            ]
-            case .itemWasUnplayable: return [
-                "message": "The track could not be played",
-                "code": "ios_track_unplayable"
-            ]
-            default: return [
-                "message": "A playback error occurred",
-                "code": "ios_playback_error"
-            ]
-        }
-    }
-
-    private func getPlaybackStateBodyKeyValues(state: AudioPlayerState) -> Dictionary<String, Any> {
+    private func getPlaybackStateBodyKeyValues(
+        state: AudioPlayerState,
+        error: IOSPlaybackErrorSnapshot? = nil
+    ) -> Dictionary<String, Any> {
         var body: Dictionary<String, Any> = ["state": State.fromPlayerState(state: state).rawValue]
         if (state == AudioPlayerState.failed) {
-            body["error"] = getPlaybackStateErrorKeyValues()
+            body["error"] = error?.dictionary ?? [:]
         }
         return body
     }
 
-    private func getPlaybackStateBodyKeyValues(state: State) -> Dictionary<String, Any> {
-        return ["state": state.rawValue]
+    private func getPlaybackStateBodyKeyValues(
+        state: State,
+        error: IOSPlaybackErrorSnapshot? = nil
+    ) -> Dictionary<String, Any> {
+        var body: Dictionary<String, Any> = ["state": state.rawValue]
+        if state == .error {
+            body["error"] = error?.dictionary ?? [:]
+        }
+        return body
     }
 
     // MARK: - QueuedAudioPlayer Event Handlers
 
-    func handleAudioPlayerStateChange(state: AVPlayerWrapperState) {
-        if useOrchestratedCrossfade { return }
-        emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
+    func handleAudioPlayerStateChange(source: QueuedAudioPlayer, state: AVPlayerWrapperState) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+        emit(
+            event: EventType.PlaybackState,
+            body: getPlaybackStateBodyKeyValues(
+                state: state,
+                error: iosPlaybackErrorSnapshot(from: source.playbackError)
+            )
+        )
         if (state == .ended) {
             emit(event: EventType.PlaybackQueueEnded, body: [
-                "track": player.currentIndex,
-                "position": player.currentTime,
+                "track": source.currentIndex,
+                "position": source.currentTime,
             ] as [String : Any])
         }
     }
     
-    func handleAudioPlayerCommonMetadataReceived(metadata: [AVMetadataItem]) {
+    func handleAudioPlayerCommonMetadataReceived(source: QueuedAudioPlayer, metadata: [AVMetadataItem]) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         let commonMetadata = MetadataAdapter.convertToCommonMetadata(metadata: metadata, skipRaw: true)
         emit(event: EventType.MetadataCommonReceived, body: ["metadata": commonMetadata])
     }
     
-    func handleAudioPlayerChapterMetadataReceived(metadata: [AVTimedMetadataGroup]) {
+    func handleAudioPlayerChapterMetadataReceived(source: QueuedAudioPlayer, metadata: [AVTimedMetadataGroup]) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         let metadataItems = MetadataAdapter.convertToGroupedMetadata(metadataGroups: metadata);
         emit(event: EventType.MetadataChapterReceived, body:  ["metadata": metadataItems])
     }
 
-    func handleAudioPlayerTimedMetadataReceived(metadata: [AVTimedMetadataGroup]) {
+    func handleAudioPlayerTimedMetadataReceived(source: QueuedAudioPlayer, metadata: [AVTimedMetadataGroup]) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         let metadataItems = MetadataAdapter.convertToGroupedMetadata(metadataGroups: metadata);
         emit(event: EventType.MetadataTimedReceived, body: ["metadata": metadataItems])
         
@@ -1752,27 +1789,39 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         emit(event: EventType.PlaybackMetadataReceived, body: metadataItem)
     }
 
-    func handleAudioPlayerFailed(error: Error?) {
+    func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         emit(event: EventType.PlaybackError, body: ["error": error?.localizedDescription])
     }
 
     func handleAudioPlayerCurrentItemChange(
+        source: QueuedAudioPlayer,
         item: AudioItem?,
         index: Int?,
         lastItem: AudioItem?,
         lastIndex: Int?,
         lastPosition: Double?
     ) {
-        if useOrchestratedCrossfade { return }
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+
+        if pendingStandardIdleTrackActivation?.source == ObjectIdentifier(source) {
+            pendingStandardIdleTrackActivation?.emittedByPhysicalPlayer = true
+        }
+
+        let eventKey = standardActiveTrackEventKey(source: source, item: item, index: index)
+        if standardIdleActivationDuplicateGuard == eventKey {
+            standardIdleActivationDuplicateGuard = nil
+            return
+        }
 
         if let item = item {
             DispatchQueue.main.async {
                 UIApplication.shared.beginReceivingRemoteControlEvents();
             }
             // Update now playing controller with isLiveStream option from track
-            if self.player.automaticallyUpdateNowPlayingInfo {
+            if source.automaticallyUpdateNowPlayingInfo {
                 let isTrackLiveStream = (item as? Track)?.isLiveStream ?? false
-                self.player.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
+                source.nowPlayingInfoController.set(keyValue: NowPlayingInfoProperty.isLiveStream(isTrackLiveStream))
             }
         } else {
             DispatchQueue.main.async {
@@ -1783,7 +1832,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if ((item != nil && lastItem == nil) || item == nil) {
             configureAudioSession();
         }
-        refreshRemoteCommandAvailability()
+        refreshRemoteCommandAvailability(kind: .standard, sourcePlayer: source)
 
         var a: Dictionary<String, Any> = ["lastPosition": lastPosition ?? 0]
         if let lastIndex = lastIndex {
@@ -1814,27 +1863,27 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         emit(event: EventType.PlaybackTrackChanged, body: b)
     }
 
-    func handleAudioPlayerSecondElapse(seconds: Double) {
-        if useOrchestratedCrossfade { return }
+    func handleAudioPlayerSecondElapse(source: QueuedAudioPlayer, seconds: Double) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         // because you cannot prevent the `event.secondElapse` from firing
         // do not emit an event if `progressUpdateEventInterval` is nil
         // additionally, there are certain instances in which this event is emitted
         // _after_ a manipulation to the queu causing no currentItem to exist (see reset)
         // in which case we shouldn't emit anything or we'll get an exception.
-        if !shouldEmitProgressEvent || player.currentItem == nil { return }
+        if !shouldEmitProgressEvent || source.currentItem == nil { return }
         emit(
             event: EventType.PlaybackProgressUpdated,
             body: [
-                "position": publicPlaybackPosition(),
-                "duration": publicPlaybackDuration(),
-                "buffered": publicBufferedPosition(),
-                "track": player.currentIndex,
+                "position": source.currentTime,
+                "duration": source.duration,
+                "buffered": source.bufferedPosition,
+                "track": source.currentIndex,
             ]
         )
     }
 
-    func handlePlayWhenReadyChange(playWhenReady: Bool) {
-        if useOrchestratedCrossfade { return }
+    func handlePlayWhenReadyChange(source: QueuedAudioPlayer, playWhenReady: Bool) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         configureAudioSession();
         emit(
             event: EventType.PlaybackPlayWhenReadyChanged,
@@ -1847,6 +1896,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     // MARK: - IOSPlaybackOrchestratorDelegate
 
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangeState state: State) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
         emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
         configureAudioSession()
         if state == .playing {
@@ -1861,8 +1912,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         _ orchestrator: IOSPlaybackOrchestrator,
         didChangeActiveTrack index: Int?,
         lastIndex: Int?,
+        lastTrack: Track?,
         lastPosition: Double
     ) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
         if index != nil {
             DispatchQueue.main.async {
                 UIApplication.shared.beginReceivingRemoteControlEvents()
@@ -1876,21 +1930,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         refreshRemoteCommandAvailability()
         updateNowPlayingForOrchestrator()
 
-        var activeTrackBody: Dictionary<String, Any> = ["lastPosition": lastPosition]
-        if let lastIndex = lastIndex {
-            activeTrackBody["lastIndex"] = lastIndex
-            if lastIndex >= 0 && lastIndex < player.items.count,
-               let lastTrack = (player.items[lastIndex] as? Track)?.toObject() {
-                activeTrackBody["lastTrack"] = lastTrack
-            }
-        }
-        if let index = index {
-            activeTrackBody["index"] = index
-            if index >= 0 && index < player.items.count,
-               let track = (player.items[index] as? Track)?.toObject() {
-                activeTrackBody["track"] = track
-            }
-        }
+        let activeTrackBody = orchestratedActiveTrackEventBody(
+            index: index,
+            lastIndex: lastIndex,
+            lastTrack: lastTrack,
+            lastPosition: lastPosition,
+            queue: player.items.compactMap { $0 as? Track }
+        )
         emit(event: EventType.PlaybackActiveTrackChanged, body: activeTrackBody)
 
         var trackChangedBody: Dictionary<String, Any> = ["position": lastPosition]
@@ -1904,6 +1950,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didEndQueueAt index: Int, position: Double) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
         emit(event: EventType.PlaybackQueueEnded, body: [
             "track": index,
             "position": position,
@@ -1920,6 +1968,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         toVolume: Float?,
         errorCode: String?
     ) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
         emitCrossfadeState(
             state: state,
             fromIndex: fromIndex,
@@ -1932,30 +1982,38 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     func playbackOrchestratorDidUpdateNowPlaying(_ orchestrator: IOSPlaybackOrchestrator) {
-        updateNowPlayingForOrchestrator()
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
+        updateNowPlayingForOrchestrator(orchestrator)
     }
 
-    private func updateNowPlayingForOrchestrator() {
-        guard useOrchestratedCrossfade else { return }
+    private func updateNowPlayingForOrchestrator(
+        _ orchestrator: IOSPlaybackOrchestrator? = nil,
+        queuePlayer: QueuedAudioPlayer? = nil,
+        force: Bool = false
+    ) {
+        let source = orchestrator ?? playbackOrchestrator
+        let sourcePlayer = queuePlayer ?? player
+        guard force || playbackBackendAuthority.isAuthoritative(.pingPong, identity: source) else { return }
         guard autoUpdateNowPlayingInfo else { return }
-        let index = playbackOrchestrator.currentIndex
-        guard index >= 0 && index < player.items.count,
-              let track = player.items[index] as? Track else { return }
+        let index = source.currentIndex
+        guard index >= 0 && index < sourcePlayer.items.count,
+              let track = sourcePlayer.items[index] as? Track else { return }
 
         var metadata = track.toObject()
-        metadata["elapsedTime"] = playbackOrchestrator.currentTime
-        if metadata["duration"] == nil, playbackOrchestrator.duration > 0 {
-            metadata["duration"] = playbackOrchestrator.duration
+        metadata["elapsedTime"] = source.currentTime
+        if metadata["duration"] == nil, source.duration > 0 {
+            metadata["duration"] = source.duration
         }
-        Metadata.update(for: player, with: metadata)
+        Metadata.update(for: sourcePlayer, with: metadata)
 
         var nowPlayingInfo = MPNowPlayingInfoCenter.default().nowPlayingInfo ?? [:]
-        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = playbackOrchestrator.currentTime
-        if playbackOrchestrator.duration > 0 {
-            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = playbackOrchestrator.duration
+        nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = source.currentTime
+        if source.duration > 0 {
+            nowPlayingInfo[MPMediaItemPropertyPlaybackDuration] = source.duration
         }
-        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = Double(playbackOrchestrator.nowPlayingPlaybackRate)
+        nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = Double(source.nowPlayingPlaybackRate)
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
-        IOSPlaybackLog.log("nowPlaying center index=\(index) elapsed=\(playbackOrchestrator.currentTime)")
+        IOSPlaybackLog.log("nowPlaying center index=\(index) elapsed=\(source.currentTime)")
     }
 }

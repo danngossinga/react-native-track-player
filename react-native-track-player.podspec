@@ -14,6 +14,7 @@ Pod::Spec.new do |s|
 
   s.source = { :git => package["repository"]["url"], :tag => "v#{s.version}" }
   s.source_files = "ios/**/*.{h,m,mm,swift}"
+  s.exclude_files = "ios/RNTrackPlayerTests/**/*"
   s.pod_target_xcconfig = {
     "GCC_PREPROCESSOR_DEFINITIONS" => "$(inherited) RCT_NEW_ARCH_ENABLED=1"
   } if ENV["RCT_NEW_ARCH_ENABLED"] == "1"

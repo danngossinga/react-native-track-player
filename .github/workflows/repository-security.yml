@@ -1,0 +1,39 @@
+name: Repository security
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: repository-security-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  repository-security:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      COREPACK_ENABLE_AUTO_PIN: '0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: '24.5.0'
+      - name: Install locked dependencies without lifecycle scripts
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+          yarn install --frozen-lockfile --ignore-scripts
+      - name: Check source files and publication guard regressions
+        run: |
+          npm run test:secrets
+          npm run test:release
+          npm run verify:secrets
+          git diff --exit-code -- package.json yarn.lock

@@ -54,6 +54,7 @@ export interface Spec extends TurboModule {
   setupPlayer(data?: NullableUnsafeObject): Promise<void>;
   isServiceRunning(): Promise<boolean>;
   getPlayerLifecycle(): Promise<PlayerLifecycleState>;
+  setPlaybackBackend(config: UnsafeObject): Promise<PlayerLifecycleState>;
   updateOptions(options?: NullableUnsafeObject): Promise<void>;
   add(
     objects?: NullableUnsafeObjectArray,

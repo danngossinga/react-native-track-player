@@ -75,6 +75,8 @@ internal interface AndroidOrchestratedMediaSurfaceDelegate {
 internal class AndroidOrchestratedMediaSurface(
     private val service: MusicService,
     private val scope: CoroutineScope,
+    private val activateExclusiveControlSurface: (() -> Unit) -> Unit,
+    private val deactivateExclusiveControlSurface: (() -> Unit) -> Unit,
     private val delegate: AndroidOrchestratedMediaSurfaceDelegate
 ) {
     private val notificationManager =
@@ -83,6 +85,7 @@ internal class AndroidOrchestratedMediaSurface(
     private var artworkJob: Job? = null
     private var loadingArtworkKey: String? = null
     private var lastSnapshot: AndroidPlaybackSnapshot? = null
+    private var ownsActiveControlSurface = false
     private var config = AndroidOrchestratedMediaSurfaceConfig(
         forwardJumpInterval = DEFAULT_JUMP_INTERVAL,
         backwardJumpInterval = DEFAULT_JUMP_INTERVAL
@@ -101,7 +104,7 @@ internal class AndroidOrchestratedMediaSurface(
             override fun onRewind() = delegate.onRemoteJumpBackward(config.backwardJumpInterval)
             override fun onSetRating(rating: RatingCompat) = delegate.onRemoteSetRating(rating)
         })
-        isActive = true
+        isActive = false
     }
 
     fun updateConfig(value: AndroidOrchestratedMediaSurfaceConfig) {
@@ -110,6 +113,7 @@ internal class AndroidOrchestratedMediaSurface(
     }
 
     fun handleIntent(intent: Intent?): Boolean {
+        if (!mediaSession.isActive) return false
         val action = intent?.action ?: return false
         return when (action) {
             Intent.ACTION_MEDIA_BUTTON -> {
@@ -150,19 +154,28 @@ internal class AndroidOrchestratedMediaSurface(
 
     fun publish(snapshot: AndroidPlaybackSnapshot, reason: String) {
         lastSnapshot = snapshot
-        ensureNotificationChannel()
-        mediaSession.isActive = true
-        mediaSession.setMetadata(buildMetadata(snapshot.currentItem, artworkFor(snapshot.currentItem)))
-        mediaSession.setPlaybackState(buildPlaybackState(snapshot))
+        try {
+            ensureNotificationChannel()
+            if (!ownsActiveControlSurface) {
+                activateExclusiveControlSurface.invoke {
+                    mediaSession.isActive = true
+                }
+                ownsActiveControlSurface = true
+            }
+            mediaSession.setMetadata(buildMetadata(snapshot.currentItem, artworkFor(snapshot.currentItem)))
+            mediaSession.setPlaybackState(buildPlaybackState(snapshot))
 
-        val notification = buildNotification(snapshot)
-        if (shouldBeForeground(snapshot)) {
-            startForeground(notification)
-        } else {
-            stopForegroundButKeepNotification()
-            notificationManager.notify(NOTIFICATION_ID, notification)
+            val notification = buildNotification(snapshot)
+            if (shouldBeForeground(snapshot)) {
+                startForeground(notification)
+            } else {
+                stopForegroundButKeepNotification()
+                notificationManager.notify(NOTIFICATION_ID, notification)
+            }
+            maybeLoadArtwork(snapshot.currentItem)
+        } catch (error: Exception) {
+            runCatching { delegate.onForegroundServiceStartError(error) }
         }
-        maybeLoadArtwork(snapshot.currentItem)
         androidXfadeLog(
             "media surface publish reason=$reason index=${snapshot.currentIndex} " +
                 "state=${snapshot.playbackState} hasBitmap=${artworkFor(snapshot.currentItem) != null}"
@@ -179,6 +192,14 @@ internal class AndroidOrchestratedMediaSurface(
                 .build()
         )
         mediaSession.setMetadata(MediaMetadataCompat.Builder().build())
+        if (ownsActiveControlSurface) {
+            deactivateExclusiveControlSurface.invoke {
+                mediaSession.isActive = false
+            }
+            ownsActiveControlSurface = false
+        } else {
+            mediaSession.isActive = false
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
             service.stopForeground(Service.STOP_FOREGROUND_REMOVE)
         } else {

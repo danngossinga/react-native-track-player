@@ -1,0 +1,33 @@
+{
+  "schemaVersion": 1,
+  "program": "008",
+  "status": "frozen",
+  "baselines": {
+    "proxy": "176b5c8a8183c53343d3a6ec82595352c5d970c5",
+    "player": "edafba80fa1c5cbf64bb0c52ce4104a3cf9cc5f9",
+    "rntp": "9e67ef896b2fdcecae2aaad5cd357e56a83fa629"
+  },
+  "reason": "hardening_program_in_progress",
+  "exitGates": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    "global_review",
+    "explicit_unfreeze"
+  ],
+  "securityPrerequisites": [
+    {
+      "id": "windows_signing_identity",
+      "assessmentPath": ".release/windows-signing-identity-assessment.json",
+      "artifactId": "program-008/windows-signing-identity/v1",
+      "artifactPath": ".release/windows-signing-identity-attestation.json",
+      "artifactSha256": "bbfd0b87c965127737ecbf8532cf6fbff1f1f5337aa305658c8803253b4d82ce"
+    }
+  ]
+}

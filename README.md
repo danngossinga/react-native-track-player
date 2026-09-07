@@ -225,6 +225,14 @@ All the documentation on how to work on the library and it's dependencies is
 
 ## Release
 
+Program 008 freezes every release path while the hardening program is in
+progress. Versioning, Git/tag pushes, npm publication, and the nightly workflow
+all run `yarn release:guard` first and stop with
+`RELEASE_BLOCKED program=008 status=frozen`. Build and pack workflows remain
+available for candidate validation. Unfreezing requires a separate, explicitly
+authorized change after all listed gates, global review, and security
+prerequisites are satisfied.
+
 The standard release command for this project is [`yarn version`](https://classic.yarnpkg.com/lang/en/docs/cli/version/).
 
 ```

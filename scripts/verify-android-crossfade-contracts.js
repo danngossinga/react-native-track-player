@@ -24,6 +24,12 @@ function assert(condition, message) {
 
 const orchestrator = read('android/src/main/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestrator.kt');
 const musicService = read('android/src/main/java/com/doublesymmetry/trackplayer/service/MusicService.kt');
+const facade = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackend.kt');
+const standardBackend = read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt');
+const pingPongBackend = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PingPongPlaybackBackend.kt');
+const mediaSurface = read('android/src/main/java/com/doublesymmetry/trackplayer/service/AndroidOrchestratedMediaSurface.kt');
+const sharedFlowAdmission = read('android/src/main/java/com/doublesymmetry/trackplayer/service/SharedFlowAdmission.kt');
+const mediaSessionInstrumentation = read('android/src/androidTest/java/com/doublesymmetry/trackplayer/service/KotlinAudioMediaSessionControlInstrumentationTest.kt');
 
 const prepareCrossfade = section(
   orchestrator,
@@ -40,16 +46,6 @@ const postCrossfadeMaintenance = section(
   'private fun schedulePostCrossfadeStandbyMaintenance(',
   'fun release()'
 );
-const setupPlayer = section(
-  musicService,
-  'fun setupPlayer(playerOptions: Bundle?)',
-  'private fun AudioContentType.toExoAudioContentType()'
-);
-const crossfadeSetupBranch = section(
-  setupPlayer,
-  'if (crossfadeEnabled) {',
-  '} else {'
-);
 const refreshOrchestratedMediaSurface = section(
   musicService,
   'private fun refreshOrchestratedMediaSurface(',
@@ -60,10 +56,81 @@ const startTrackAt = section(
   'private suspend fun startTrackAt(',
   'private suspend fun ensureActivePrepared('
 );
+const setupPlayer = section(
+  musicService,
+  'fun setupPlayer(playerOptions: Bundle?)',
+  'override fun onBind('
+);
+const createPlaybackBackend = section(
+  musicService,
+  'private fun createPlaybackBackend(',
+  '@MainThread\n    fun setupPlayer('
+);
+const progressUpdateEvent = section(
+  musicService,
+  'private suspend fun progressUpdateEvent()',
+  'private fun getPendingIntentFlags()'
+);
+const standardRelinquish = section(
+  standardBackend,
+  'override fun relinquishExclusiveControlSurfaceBeforeCommit()',
+  'override fun commitQueue('
+);
+const standardDispose = section(
+  standardBackend,
+  'override suspend fun dispose()',
+  'private fun releasePlayer()'
+);
 
 assert(
   prepareCrossfade.includes('crossfade_not_playing'),
   'Android crossFadePrepare must reject when playback is not active.'
+);
+assert(
+  setupPlayer.includes('standardPlayerFactory = {') &&
+    !setupPlayer.includes('createStandardPlayerBinding()') &&
+    setupPlayer.includes('createPlaybackBackend(initialType, initiallyAuthoritative = true)'),
+  'Android initial PingPong setup must keep the standard player factory lazy.'
+);
+assert(
+  mediaSurface.includes('isActive = false') &&
+    facade.includes('initialBackend.activateInitialControlSurface()') &&
+    pingPongBackend.includes('override fun activateInitialControlSurface()'),
+  'Android PingPong media control surface must start inactive and be explicitly activated by the facade.'
+);
+assert(
+  facade.indexOf('previous.relinquishExclusiveControlSurfaceBeforeCommit()') <
+    facade.indexOf('finalReplacement.commitQueue(snapshot)') &&
+    facade.indexOf('finalReplacement.commitQueue(snapshot)') < facade.indexOf('backend = finalReplacement') &&
+    facade.indexOf('backend = finalReplacement') < facade.indexOf('authority.publish(finalReplacement)') &&
+    facade.indexOf('backend = finalReplacement') < facade.indexOf('finalReplacement.activateAfterCommit(snapshot)') &&
+    !standardRelinquish.includes('releasePlayer()') &&
+    standardDispose.includes('releasePlayer()'),
+  'Android must defer standard-player destruction until post-commit disposal and activate the replacement only after commit.'
+);
+assert(
+  facade.includes('owner?.let { it.type == type && it.identity === identity }') &&
+    facade.includes('suspend fun routeIfAuthoritative(') &&
+    facade.includes('val identity = Any()') &&
+    facade.indexOf('candidateRemoteProxy = identity') <
+      facade.indexOf('replacement = factory.create(type, identity)') &&
+    createPlaybackBackend.includes('identity: Any = Any()') &&
+    setupPlayer.includes('PlaybackBackendFactory { type, identity ->') &&
+    setupPlayer.includes('createPlaybackBackend(type, identity = identity)') &&
+    createPlaybackBackend.includes('createOrchestratedMediaSurface(identity)'),
+  'Android authority, remotes, and media surfaces must pre-admit one exact identity per backend generation.'
+);
+assert(
+  progressUpdateEvent.includes('withActivePlaybackBackendRead { backend ->') &&
+    progressUpdateEvent.includes('backend.playbackState != AudioPlayerState.PLAYING') &&
+    progressUpdateEvent.includes('backend.positionMs.toSeconds()') &&
+    progressUpdateEvent.includes('backend.bufferedMs.toSeconds()'),
+  'Android progress events must read one coherent backend snapshot under the facade mutex.'
+);
+assert(
+  musicService.includes('withActivePlaybackBackend {\n            if (it.type == PlaybackBackendType.PING_PONG)') &&
+    musicService.includes('withActivePlaybackBackend {\n            if (it.type == PlaybackBackendType.PING_PONG) {'),
+  'Android legacy crossfade calls must decide their PingPong no-op inside the serialized facade route.'
 );
 assert(
   crossFade.includes('crossfade_not_playing'),
@@ -80,6 +147,12 @@ assert(
 assert(
   crossFade.includes('error.code != "crossfade_not_playing"'),
   'Android crossFade must treat pause/not-playing cancellation as non-fatal.'
+);
+assert(
+  orchestrator.includes('private var activeCrossfadeCancellation: CompletableDeferred<Unit>?') &&
+    orchestrator.includes('cancelCrossfade("pause", promoteIncoming = true)') &&
+    crossFade.includes('delayCrossfade(intervalMs, runId, cancellation)'),
+  'Android pause must cancel and release the exact active crossfade lease without waiting for its full duration.'
 );
 assert(
   crossFade.indexOf('delegate.onActiveTrackChanged(toIndex, fromIndex, oldPositionMs)') >= 0 &&
@@ -125,12 +198,7 @@ assert(
   'Crossfade mode must not use reflection to deactivate KotlinAudio private MediaSession state.'
 );
 assert(
-  !crossfadeSetupBranch.includes('QueuedAudioPlayer('),
-  'Crossfade setup must not instantiate KotlinAudio QueuedAudioPlayer.'
-);
-assert(
-  !crossfadeSetupBranch.includes('notificationManager') &&
-    !refreshOrchestratedMediaSurface.includes('notificationManager'),
+  !refreshOrchestratedMediaSurface.includes('notificationManager'),
   'Crossfade publication must use AndroidOrchestratedMediaSurface, not KotlinAudio notificationManager.'
 );
 assert(
@@ -138,6 +206,57 @@ assert(
     startTrackAt.indexOf('delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)') <
       startTrackAt.indexOf('activeEngine.play(rate)'),
   'Direct Android crossfade skips must publish the active track before starting audible playback.'
+);
+assert(
+  facade.includes('suspend fun <T> withCurrentBackend(') &&
+    facade.includes('activeCommandLeases') &&
+    facade.includes('withContext(NonCancellable)') &&
+    musicService.includes('withActivePlaybackBackend { backend ->'),
+  'Android playback commands must use cancellable operations with non-leaking facade leases.'
+);
+assert(
+  standardBackend.includes('private val queueState = PlaybackBackendQueueState<TrackAudioItem>()') &&
+    standardBackend.includes('queueState.captureAuthoritative(queue)') &&
+    standardBackend.includes('queueStore.replaceWith(queueState.rollback())') &&
+    pingPongBackend.includes('private val queueState = PlaybackBackendQueueState<TrackAudioItem>()') &&
+    pingPongBackend.includes('queueState.captureAuthoritative(queue)') &&
+    pingPongBackend.includes('queueStore.replaceWith(queueState.rollback())') &&
+    facade.includes('rollbackHandoffQuiescence(') &&
+    facade.includes('previous.cancelHandoffQuiescence(snapshot)') &&
+    facade.includes('previous.resumeControlSurface(snapshot)'),
+  'Android backend rollback must retain full TrackAudioItem identity and restore the authoritative queue.'
+);
+assert(
+  standardBackend.includes('private val logicalPlaybackState = KotlinAudioLogicalPlaybackStateSidecar()') &&
+    standardBackend.includes('override val currentIndex: Int\n        get() = logicalPlaybackState.currentIndex(player.currentIndex)') &&
+    standardBackend.includes('selectFirstPhysicalItemIfNeeded()') &&
+    standardBackend.includes('if (logicalPlaybackState.shouldIgnorePrevious()) return') &&
+    mediaSessionInstrumentation.includes('testRestoredIdlePlayPublishesCanonicalFirstTrack') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleRetryPublishesCanonicalFirstTrack') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleLoadPublishesCanonicalCallbackAndQueue') &&
+    mediaSessionInstrumentation.includes('testRestoredIdleQueueActivatesPhysicalZeroOnlyOnNext') &&
+    mediaSessionInstrumentation.includes('canonicalActivationIndices()'),
+  'Android restored standard-idle activation must publish exactly canonical index 0 and guard previous/double activation.'
+);
+assert(
+  sharedFlowAdmission.includes('CoroutineStart.UNDISPATCHED') &&
+    sharedFlowAdmission.includes('if (gate.acceptsEvents())') &&
+    musicService.includes('val productAdmission = SharedFlowAdmissionGate()') &&
+    musicService.includes('binding.productAdmission.suspendAdmission()') &&
+    musicService.includes('binding.productAdmission.admitAfterProducerDrain(binding.ownerScope)'),
+  'Android standard candidates must subscribe before restore and quarantine replayed product events until post-commit admission.'
+);
+assert(
+  facade.includes('capturePhysicalRemoteTicket(') &&
+    facade.includes('routePhysicalRemote(') &&
+    musicService.includes('facade.capturePhysicalRemoteTicket(identity)') &&
+    musicService.includes('facade.routePhysicalRemote(ticket)'),
+  'Android physical remotes must use generation tickets that survive successful handoff and reject rollback generations.'
+);
+assert(
+  musicService.includes('val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD') &&
+    musicService.includes('initiallyAuthoritative = true'),
+  'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
 console.log('Android crossfade contracts OK');

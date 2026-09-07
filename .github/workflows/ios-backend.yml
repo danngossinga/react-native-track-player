@@ -1,0 +1,83 @@
+name: iOS backend transactions
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ios-backend-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-transactions:
+    runs-on: macos-26
+    timeout-minutes: 20
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Record source and native toolchain
+        run: |
+          mkdir -p artifacts
+          git rev-parse HEAD > artifacts/source-sha.txt
+          xcodebuild -version > artifacts/xcode-version.txt
+          xcrun simctl list devices available --json > artifacts/simulators.json
+      - name: Test native backend transaction core
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project ios/RNTrackPlayer.xcodeproj \
+            -scheme RNTrackPlayerTests \
+            -configuration Debug \
+            -sdk iphonesimulator \
+            -destination 'platform=iOS Simulator,name=iPhone 17 Pro,OS=26.5' \
+            -derivedDataPath "$RUNNER_TEMP/rntp-backend-derived-data" \
+            -resultBundlePath artifacts/BackendTransactions.xcresult \
+            -parallel-testing-enabled NO \
+            CODE_SIGNING_ALLOWED=NO 2>&1 | tee artifacts/xcodebuild.log
+      - name: Require all transaction tests without skips
+        run: |
+          xcrun xcresulttool get test-results summary --path artifacts/BackendTransactions.xcresult --compact > artifacts/summary.json
+          xcrun xcresulttool get test-results tests --path artifacts/BackendTransactions.xcresult --compact > artifacts/tests.json
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          source = Path('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').read_text()
+          expected = ['PlaybackBackendTransactionTests/' + name + '()' for name in re.findall(r'^\s*func (test\w+)\s*\(', source, re.M)]
+          assert len(expected) == len(set(expected)) == 47, 'Expected 47 unique transaction methods'
+          summary = json.loads(Path('artifacts/summary.json').read_text())
+          assert summary['result'] == 'Passed', 'Native suite did not pass'
+          assert summary['totalTestCount'] == summary['passedTests'] == len(expected), 'Missing passing tests'
+          assert all(summary[key] == 0 for key in ('failedTests', 'skippedTests', 'expectedFailures')), 'Failures or skips are forbidden'
+          cases = []
+          def visit(node):
+              if isinstance(node, dict):
+                  if node.get('nodeType') == 'Test Case':
+                      cases.append(node)
+                  for value in node.values():
+                      visit(value)
+              elif isinstance(node, list):
+                  for value in node:
+                      visit(value)
+          visit(json.loads(Path('artifacts/tests.json').read_text()))
+          assert len(cases) == len(expected), 'Missing or duplicate native results'
+          assert all(case.get('result') == 'Passed' for case in cases), 'A transaction test did not pass'
+          assert sorted(case.get('nodeIdentifier', '') for case in cases) == sorted(expected), 'Native test identities differ from source'
+          PY
+      - name: Retain native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-backend-${{ github.sha }}
+          path: artifacts/
+          if-no-files-found: error
+          retention-days: 14

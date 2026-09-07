@@ -8,6 +8,7 @@ export * from './PlaybackCrossfadeStateEvent';
 export * from './PlaybackQueueEndedEvent';
 export * from './PlaybackTrackChangedEvent';
 export * from './RemoteDuckEvent';
+export * from './RemoteHandledEvent';
 export * from './RemoteJumpBackwardEvent';
 export * from './RemoteJumpForwardEvent';
 export * from './RemotePlayIdEvent';

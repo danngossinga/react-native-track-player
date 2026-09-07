@@ -30,22 +30,55 @@ internal enum class AndroidCrossfadeEngineState {
 }
 
 internal fun androidXfadeLog(message: String) {
-    val formatted = "[XF-ORCH][${SystemClock.elapsedRealtimeNanos()}] $message"
-    Log.i("RNTP-Crossfade", formatted)
-    Timber.tag("RNTP-Crossfade").d(formatted)
+    val timestamp = runCatching { SystemClock.elapsedRealtimeNanos() }
+        .getOrElse { System.nanoTime() }
+    val formatted = "[XF-ORCH][$timestamp] $message"
+    runCatching { Log.i("RNTP-Crossfade", formatted) }
+    runCatching { Timber.tag("RNTP-Crossfade").d(formatted) }
+}
+
+internal interface AndroidCrossfadeEnginePort {
+    val name: String
+    val positionMs: Long
+    val durationMs: Long
+    val bufferedMs: Long
+    val isReady: Boolean
+    val playbackState: Int
+    val currentVolume: Float
+    val playerErrorMessage: String?
+
+    fun isPreparedFor(item: TrackAudioItem): Boolean
+    suspend fun prepare(
+        item: TrackAudioItem,
+        positionMs: Long = 0L,
+        timeoutMs: Long = 5000L,
+        ticket: PlaybackOperationTicket? = null
+    )
+    fun play(rate: Float = 1f)
+    fun pause()
+    fun reset()
+    fun release()
+    suspend fun seekTo(
+        positionMs: Long,
+        timeoutMs: Long = 5000L,
+        ticket: PlaybackOperationTicket? = null
+    )
+    fun setVolume(value: Float)
+    fun setRate(value: Float)
 }
 
 internal class AndroidCrossfadeEngine(
     context: Context,
-    val name: String,
+    override val name: String,
     audioContentType: Int,
     handleAudioFocus: Boolean
-) {
+) : AndroidCrossfadeEnginePort {
     private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
     private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
     private val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
     private var preparedItem: TrackAudioItem? = null
     private var preparedTrackKey: String? = null
+    private var operationGeneration = 0L
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
@@ -68,24 +101,38 @@ internal class AndroidCrossfadeEngine(
     val preparedQueueId: Long?
         get() = preparedItem?.track?.queueId
 
-    fun isPreparedFor(item: TrackAudioItem): Boolean = preparedTrackKey == trackKeyFor(item)
+    override fun isPreparedFor(item: TrackAudioItem): Boolean = preparedTrackKey == trackKeyFor(item)
 
-    val positionMs: Long
+    override val positionMs: Long
         get() = max(0L, player.currentPosition)
 
-    val durationMs: Long
+    override val durationMs: Long
         get() = player.duration.takeIf { it != C.TIME_UNSET && it > 0 } ?: 0L
 
-    val bufferedMs: Long
+    override val bufferedMs: Long
         get() = max(positionMs, player.bufferedPosition)
 
-    val isReady: Boolean
+    override val isReady: Boolean
         get() = player.playbackState == Player.STATE_READY
 
-    val playbackState: Int
+    override val playbackState: Int
         get() = player.playbackState
 
-    suspend fun prepare(item: TrackAudioItem, positionMs: Long = 0L, timeoutMs: Long = PREPARE_TIMEOUT_MS) {
+    override val currentVolume: Float
+        get() = player.volume
+
+    override val playerErrorMessage: String?
+        get() = player.playerError?.message
+
+    override suspend fun prepare(
+        item: TrackAudioItem,
+        positionMs: Long,
+        timeoutMs: Long,
+        ticket: PlaybackOperationTicket?
+    ) {
+        operationGeneration += 1
+        val generation = operationGeneration
+        ticket?.ensureActive()
         val trackKey = trackKeyFor(item)
         androidXfadeLog("$name prepare start trackKey=$trackKey positionMs=$positionMs")
         state = AndroidCrossfadeEngineState.LOADING
@@ -103,25 +150,29 @@ internal class AndroidCrossfadeEngine(
         val startedAt = SystemClock.elapsedRealtime()
         while (player.playbackState != Player.STATE_READY) {
             if (player.playbackState == Player.STATE_ENDED) {
-                state = AndroidCrossfadeEngineState.ENDED
+                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
                 throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
             }
             if (player.playerError != null) {
-                state = AndroidCrossfadeEngineState.FAILED
+                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
                 throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
             }
             if (SystemClock.elapsedRealtime() - startedAt > timeoutMs) {
-                state = AndroidCrossfadeEngineState.FAILED
+                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
                 throw RejectionException("$name did not become ready.", "crossfade_prepare_timeout")
             }
-            delay(25)
+            if (ticket == null) delay(25) else ticket.delayOrThrow(25)
         }
 
+        ticket?.ensureActive()
+        if (operationGeneration != generation) {
+            throw PlaybackOperationCancelledException("engine_reset")
+        }
         state = AndroidCrossfadeEngineState.READY
         androidXfadeLog("$name prepare end ready=true durationMs=$durationMs bufferedMs=$bufferedMs")
     }
 
-    fun play(rate: Float = 1f) {
+    override fun play(rate: Float) {
         androidXfadeLog("$name play positionMs=$positionMs volume=${player.volume} rate=$rate")
         player.setPlaybackSpeed(max(0.1f, rate))
         player.playWhenReady = true
@@ -129,7 +180,7 @@ internal class AndroidCrossfadeEngine(
         state = AndroidCrossfadeEngineState.PLAYING
     }
 
-    fun pause() {
+    override fun pause() {
         androidXfadeLog("$name pause positionMs=$positionMs")
         player.playWhenReady = false
         player.pause()
@@ -144,7 +195,8 @@ internal class AndroidCrossfadeEngine(
         state = AndroidCrossfadeEngineState.IDLE
     }
 
-    fun reset() {
+    override fun reset() {
+        operationGeneration += 1
         androidXfadeLog("$name reset")
         player.playWhenReady = false
         player.pause()
@@ -156,7 +208,8 @@ internal class AndroidCrossfadeEngine(
         state = AndroidCrossfadeEngineState.IDLE
     }
 
-    fun release() {
+    override fun release() {
+        operationGeneration += 1
         androidXfadeLog("$name release")
         player.release()
         preparedItem = null
@@ -164,7 +217,13 @@ internal class AndroidCrossfadeEngine(
         state = AndroidCrossfadeEngineState.IDLE
     }
 
-    suspend fun seekTo(positionMs: Long, timeoutMs: Long = PREPARE_TIMEOUT_MS) {
+    override suspend fun seekTo(
+        positionMs: Long,
+        timeoutMs: Long,
+        ticket: PlaybackOperationTicket?
+    ) {
+        val generation = operationGeneration
+        ticket?.ensureActive()
         val target = max(0L, positionMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
@@ -173,13 +232,21 @@ internal class AndroidCrossfadeEngine(
             if (SystemClock.elapsedRealtime() - startedAt > timeoutMs) {
                 throw RejectionException("$name did not finish seeking.", "crossfade_seek_timeout")
             }
-            delay(25)
+            if (ticket == null) delay(25) else ticket.delayOrThrow(25)
+        }
+        ticket?.ensureActive()
+        if (operationGeneration != generation) {
+            throw PlaybackOperationCancelledException("engine_reset")
         }
         androidXfadeLog("$name seek end positionMs=${this.positionMs} state=${player.playbackState}")
     }
 
-    fun setVolume(value: Float) {
+    override fun setVolume(value: Float) {
         player.volume = value
+    }
+
+    override fun setRate(value: Float) {
+        player.setPlaybackSpeed(max(0.1f, value))
     }
 
     private fun configureRequestOptions(item: TrackAudioItem) {
