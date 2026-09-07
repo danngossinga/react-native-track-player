@@ -239,7 +239,7 @@ final class IOSCrossfadeEngine {
 
     func play(
         rate: Float,
-        timeoutMs: Int = 5000,
+        timeoutMs: Int = 8000,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         let currentGeneration = generation
@@ -354,7 +354,7 @@ final class IOSCrossfadeEngine {
 
     private func waitForPlaying(
         generation: Int,
-        timeoutMs: Int = 5000,
+        timeoutMs: Int = 8000,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         var didComplete = false
