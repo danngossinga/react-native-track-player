@@ -8,6 +8,10 @@ import com.doublesymmetry.trackplayer.module.completePlaybackCommand
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -408,8 +412,15 @@ class AndroidPlaybackOrchestratorCancellationTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
         val delegate = RecordingOrchestratorDelegate()
+        // The app runs the orchestrator in MainScope, where an exception thrown by a background
+        // job crashes the process. Record such exceptions here so the test fails on them explicitly.
+        val uncaught = mutableListOf<Throwable>()
+        val scope = CoroutineScope(
+            backgroundScope.coroutineContext + SupervisorJob(backgroundScope.coroutineContext[Job]) +
+                CoroutineExceptionHandler { _, error -> uncaught += error }
+        )
         val orchestrator = AndroidPlaybackOrchestrator.forTesting(
-            backgroundScope,
+            scope,
             delegate,
             engineA,
             engineB
@@ -441,6 +452,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 runCatching { next.await() }
             }
             assertTrue(delegate.playbackErrors.isEmpty())
+            assertTrue("background job threw: $uncaught", uncaught.isEmpty())
         } finally {
             orchestrator.release()
         }
