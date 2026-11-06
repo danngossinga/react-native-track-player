@@ -399,6 +399,53 @@ class AndroidPlaybackOrchestratorCancellationTest {
         }
     }
 
+    // Bug seen in the Djeeloo app (Android): after a completed crossfade, the player schedules a
+    // "standby maintenance" for later in the song. The JS player arms the next crossfade right away,
+    // which changes the crossfade run id. When the maintenance woke up it threw "Crossfade was
+    // cancelled." outside any caller, and the app crashed. It must now step aside quietly.
+    @Test
+    fun standbyMaintenanceStepsAsideWhenTheNextCrossfadeIsAlreadyScheduled() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+
+            // First crossfade (0 -> 1) runs to the end: the maintenance is scheduled for later.
+            orchestrator.crossFade(fadeDuration = 1_000.0)
+            assertEquals(1, delegate.crossfadeEvents.count { it.state == "completed" })
+            assertTrue(orchestrator.privateField("standbyMaintenanceJob") != null)
+
+            supervisorScope {
+                // The next crossfade (1 -> 2) is armed right away and waits for the end of the song.
+                val next = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 1_000.0, waitUntil = 59_000.0)
+                }
+                assertEquals(2, delegate.crossfadeEvents.count { it.state == "scheduled" })
+
+                // Let the maintenance wake up (it waits about 50 s here): it must not throw.
+                testScheduler.advanceTimeBy(55_000)
+                runCurrent()
+                assertTrue(next.isActive)
+
+                orchestrator.pause()
+                runCurrent()
+                runCatching { next.await() }
+            }
+            assertTrue(delegate.playbackErrors.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
     private data class CrossfadeEvent(
         val state: String,
         val fromIndex: Int,
