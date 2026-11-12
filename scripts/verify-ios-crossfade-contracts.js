@@ -250,4 +250,22 @@ assert(
   'iOS legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
+const pingPongStateDelegate = section(
+  player,
+  'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangeState state: State)',
+  'func playbackOrchestrator('
+);
+const publishPingPongPlayWhenReady = section(
+  player,
+  'private func publishPingPongPlayWhenReadyIfChanged(',
+  '// MARK: - IOSPlaybackOrchestratorDelegate'
+);
+assert(
+  pingPongStateDelegate.includes('publishPingPongPlayWhenReadyIfChanged(orchestrator)') &&
+    publishPingPongPlayWhenReady.includes('guard lastPublishedPingPongPlayWhenReady != playWhenReady') &&
+    publishPingPongPlayWhenReady.includes('EventType.PlaybackPlayWhenReadyChanged') &&
+    player.includes('lastPublishedPingPongPlayWhenReady = committed.playWhenReady'),
+  'iOS pingPong must emit PlaybackPlayWhenReadyChanged when play/pause flips playWhenReady, or useIsPlaying stays stale.'
+);
+
 console.log('iOS crossfade contracts OK');

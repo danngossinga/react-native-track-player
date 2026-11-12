@@ -76,6 +76,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
     private var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
+    /// Last playWhenReady published to JS for the ping-pong backend, so a state change that also
+    /// flips playWhenReady (play, pause, end of queue) emits PlaybackPlayWhenReadyChanged once.
+    private var lastPublishedPingPongPlayWhenReady: Bool? = nil
 
     // MARK: - Lifecycle Methods
 
@@ -632,6 +635,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             body: getPlaybackStateBodyKeyValues(state: committed.playbackState)
         )
         configureAudioSession()
+        lastPublishedPingPongPlayWhenReady = committed.playWhenReady
         emit(
             event: EventType.PlaybackPlayWhenReadyChanged,
             body: ["playWhenReady": committed.playWhenReady]
@@ -1893,6 +1897,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         )
     }
 
+    private func publishPingPongPlayWhenReadyIfChanged(_ orchestrator: IOSPlaybackOrchestrator) {
+        let playWhenReady = orchestrator.playWhenReady
+        guard lastPublishedPingPongPlayWhenReady != playWhenReady else { return }
+        lastPublishedPingPongPlayWhenReady = playWhenReady
+        emit(
+            event: EventType.PlaybackPlayWhenReadyChanged,
+            body: ["playWhenReady": playWhenReady]
+        )
+    }
+
     // MARK: - IOSPlaybackOrchestratorDelegate
 
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangeState state: State) {
@@ -1900,6 +1914,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
               orchestrator === playbackOrchestrator else { return }
         emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state))
         configureAudioSession()
+        publishPingPongPlayWhenReadyIfChanged(orchestrator)
         if state == .playing {
             startOrchestratedProgressUpdates()
         } else {
