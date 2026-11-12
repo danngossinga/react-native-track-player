@@ -115,6 +115,10 @@ internal class AndroidPlaybackOrchestrator private constructor(
     private var activeCrossfadeFromIndex: Int? = null
     private var activeCrossfadeToIndex: Int? = null
     private var activeCrossfadeCancellation: CompletableDeferred<Unit>? = null
+    // Set while an armed crossfade is still waiting for its start position. Completing it makes
+    // the fade start right away: a manual "next" asks for that (crossFade with waitUntil already
+    // reached), like the iOS orchestrator does with its scheduled crossfade.
+    private var scheduledCrossfadeStartNow: CompletableDeferred<Unit>? = null
     private var preparedCrossfadeFromIndex: Int? = null
     private var preparedCrossfadeToIndex: Int? = null
     private var preparedCrossfadeSeekToMs: Long = 0L
@@ -543,10 +547,19 @@ internal class AndroidPlaybackOrchestrator private constructor(
             throw RejectionException("No crossfade target track is available.", "crossfade_target_unavailable")
         }
         val requestedSeekToMs = (max(0.0, seekTo) * 1000).toLong()
-        preloadJob?.cancelAndJoin()
-        ticket.ensureActive()
-        prepareStandby(toIndex, requestedSeekToMs, ticket)
-        ticket.ensureActive()
+        try {
+            preloadJob?.cancelAndJoin()
+            ticket.ensureActive()
+            prepareStandby(toIndex, requestedSeekToMs, ticket)
+            ticket.ensureActive()
+        } catch (error: PlaybackOperationCancelledException) {
+            // Another playback command (seek, skip, pause, queue change...) took over while the next
+            // song was being prepared. Say so with an event, like crossFade does, so JS listeners learn
+            // why the preparation stopped. The reason is the one the operation was cancelled with:
+            // 'superseded' when a newer command started (as on iOS), 'pause', 'queue'... otherwise.
+            emitCrossfade("cancelled", fromIndex, toIndex, errorCode = error.reason)
+            throw error
+        }
         preparedCrossfadeFromIndex = fromIndex
         preparedCrossfadeToIndex = toIndex
         preparedCrossfadeSeekToMs = requestedSeekToMs
@@ -567,6 +580,20 @@ internal class AndroidPlaybackOrchestrator private constructor(
         waitUntil: Double = 0.0
     ) {
         val fromIndex = currentIndex
+        val startNow = scheduledCrossfadeStartNow
+        if (activeCrossfadeCancellation != null &&
+            startNow != null &&
+            activeCrossfadeFromIndex == fromIndex &&
+            activeCrossfadeToIndex != null &&
+            (preparedCrossfadeFromIndex != fromIndex || preparedCrossfadeToIndex == activeCrossfadeToIndex) &&
+            waitUntil <= activeEngine.positionMs.toDouble()
+        ) {
+            // The same fade is armed and only waiting: start it now instead of refusing. This call
+            // resolves at once; the armed fade keeps reporting its own events and result.
+            androidXfadeLog("crossfade forced start fromIndex=$fromIndex toIndex=$activeCrossfadeToIndex")
+            startNow.complete(Unit)
+            return
+        }
         if (activeCrossfadeCancellation != null) {
             emitCrossfade("error", fromIndex, activeCrossfadeToIndex ?: -1, errorCode = "crossfade_in_progress")
             throw RejectionException("A crossfade is already in progress.", "crossfade_in_progress")
@@ -608,7 +635,13 @@ internal class AndroidPlaybackOrchestrator private constructor(
             emitCrossfade("scheduled", fromIndex, toIndex, elapsedMs = 0, fromVolume = outgoingStartVolume, toVolume = 0f)
 
             if (waitDelayMs > 0) {
-                delayChecked(waitDelayMs, runId, cancellation)
+                val startNowSignal = CompletableDeferred<Unit>()
+                scheduledCrossfadeStartNow = startNowSignal
+                try {
+                    delayChecked(waitDelayMs, runId, cancellation, startNowSignal)
+                } finally {
+                    if (scheduledCrossfadeStartNow === startNowSignal) scheduledCrossfadeStartNow = null
+                }
                 ticket.ensureActive()
             }
             ensureCrossfadeRunActive(runId)
@@ -1122,10 +1155,13 @@ internal class AndroidPlaybackOrchestrator private constructor(
     private suspend fun delayChecked(
         durationMs: Long,
         runId: Int,
-        cancellation: CompletableDeferred<Unit>
+        cancellation: CompletableDeferred<Unit>,
+        startNow: CompletableDeferred<Unit>? = null
     ) {
         var remaining = durationMs
         while (remaining > 0) {
+            // A manual "next" asked for the armed fade to start right away.
+            if (startNow?.isCompleted == true) return
             ensureCrossfadeRunActive(runId)
             activeEngine.playerErrorMessage?.let { message ->
                 androidXfadeLog("crossfade wait interrupted by active engine error=$message")
@@ -1135,7 +1171,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
                 )
             }
             val slice = min(remaining, 100L)
-            delayCrossfade(slice, runId, cancellation)
+            delayCrossfade(slice, runId, cancellation, startNow)
             remaining -= slice
         }
     }
@@ -1144,11 +1180,13 @@ internal class AndroidPlaybackOrchestrator private constructor(
     private suspend fun delayCrossfade(
         durationMs: Long,
         runId: Int,
-        cancellation: CompletableDeferred<Unit>
+        cancellation: CompletableDeferred<Unit>,
+        startNow: CompletableDeferred<Unit>? = null
     ) {
         select<Unit> {
             onTimeout(durationMs) { }
             cancellation.onAwait { ensureCrossfadeRunActive(runId) }
+            startNow?.onAwait { }
         }
         ensureCrossfadeRunActive(runId)
     }

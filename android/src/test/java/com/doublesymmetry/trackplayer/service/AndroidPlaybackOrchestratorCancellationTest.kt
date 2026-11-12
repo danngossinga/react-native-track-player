@@ -351,6 +351,11 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 assertNull(orchestrator.privateField("preparedCrossfadeFromIndex"))
                 assertNull(orchestrator.privateField("preparedCrossfadeToIndex"))
                 assertFalse(delegate.playbackStates.contains(AudioPlayerState.ERROR))
+                // The cancelled preparation is reported with an event (like iOS), never as prepared.
+                assertEquals(
+                    listOf(CrossfadeEvent("cancelled", 1, 0, "superseded")),
+                    delegate.crossfadeEvents.filter { it.state == "cancelled" || it.state == "prepared" }
+                )
             }
         } finally {
             orchestrator.release()
@@ -379,8 +384,10 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 }
                 assertEquals(1, delegate.crossfadeEvents.count { it.state == "scheduled" })
 
+                // A second call whose start is still ahead is refused. (One with its start already
+                // reached starts the armed fade instead: see manualNextStartsTheArmedCrossfadeImmediately.)
                 val secondError = runCatching {
-                    orchestrator.crossFade()
+                    orchestrator.crossFade(waitUntil = 40_000.0)
                 }.exceptionOrNull()
                 assertTrue(secondError is RejectionException)
                 assertEquals("crossfade_in_progress", (secondError as RejectionException).code)
@@ -453,6 +460,48 @@ class AndroidPlaybackOrchestratorCancellationTest {
             }
             assertTrue(delegate.playbackErrors.isEmpty())
             assertTrue("background job threw: $uncaught", uncaught.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    // Manual "next" while the automatic fade is armed and waiting for the end of the song: JS
+    // calls crossFade again with waitUntil already reached. Android used to refuse it
+    // (crossfade_in_progress) so "next" did nothing until the planned start; it must now start
+    // the armed fade right away, as iOS does.
+    @Test
+    fun manualNextStartsTheArmedCrossfadeImmediately() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(2))
+            orchestrator.play()
+            runCurrent()
+
+            supervisorScope {
+                val armed = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 1_000.0, waitUntil = 50_000.0)
+                }
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "scheduled" })
+                val startedAt = testScheduler.currentTime
+
+                // The forced start resolves at once and does not report an error.
+                orchestrator.crossFade(fadeDuration = 1_000.0, waitUntil = 0.0)
+                armed.await()
+
+                assertTrue(delegate.crossfadeEvents.none { it.errorCode == "crossfade_in_progress" })
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "started" })
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "completed" })
+                // Started right away, not after the 50 s wait.
+                assertTrue(testScheduler.currentTime - startedAt < 5_000)
+            }
         } finally {
             orchestrator.release()
         }
