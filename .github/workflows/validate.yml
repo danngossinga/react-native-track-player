@@ -82,7 +82,9 @@ jobs:
           yarn run ci:format
           yarn run types
   build-ios:
-    runs-on: macos-14
+    # macos-14 runners are no longer handed out (the job was cancelled before any step ran);
+    # macos-26 is the image the iOS backend workflow already uses successfully.
+    runs-on: macos-26
     needs: check-changes
     env:
       NO_FLIPPER: '1'
@@ -148,7 +150,11 @@ jobs:
         if: ${{ needs.check-changes.outputs.should-build-ios }}
         run: |-
           cd example/ios
-          xcodebuild build -workspace RNTPExample.xcworkspace -scheme RNTPExample -destination 'platform=iOS Simulator,name=iPhone 15 Pro'
+          # Generic simulator destination: does not depend on which iPhone models the image ships.
+          # The example's old React Native (yoga) trips a warning that Xcode 26's clang treats as an
+          # error (-Werror,-Wdeprecated-literal-operator); it is not in this library's code.
+          xcodebuild build -workspace RNTPExample.xcworkspace -scheme RNTPExample -destination 'generic/platform=iOS Simulator' \
+            OTHER_CPLUSPLUSFLAGS='$(inherited) -Wno-deprecated-literal-operator'
   build-android:
     runs-on: ubuntu-latest
     needs: check-changes
@@ -165,6 +171,14 @@ jobs:
           npm install --global corepack@0.34.0
           corepack enable
           corepack prepare yarn@1.22.22 --activate
+      # The example app builds with Gradle 7.5.1, which cannot run on the runner's default JDK
+      # (now Java 25: "Unsupported class file major version 69"). Pin the JDK it supports.
+      - name: Setup Java 17
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
       - name: Install Library Dependencies
         if: ${{ needs.check-changes.outputs.should-build-android }}
         run: yarn install --frozen-lockfile

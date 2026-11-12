@@ -8,6 +8,10 @@ import com.doublesymmetry.trackplayer.module.completePlaybackCommand
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.Player
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -394,6 +398,61 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertEquals(AndroidPlaybackOrchestratorState.PAUSED, orchestrator.state)
             assertFalse(delegate.playbackStates.contains(AudioPlayerState.ERROR))
             assertTrue(delegate.playbackErrors.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    // Bug seen in the Djeeloo app (Android): after a completed crossfade, the player schedules a
+    // "standby maintenance" for later in the song. The JS player arms the next crossfade right away,
+    // which changes the crossfade run id. When the maintenance woke up it threw "Crossfade was
+    // cancelled." outside any caller, and the app crashed. It must now step aside quietly.
+    @Test
+    fun standbyMaintenanceStepsAsideWhenTheNextCrossfadeIsAlreadyScheduled() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        // The app runs the orchestrator in MainScope, where an exception thrown by a background
+        // job crashes the process. Record such exceptions here so the test fails on them explicitly.
+        val uncaught = mutableListOf<Throwable>()
+        val scope = CoroutineScope(
+            backgroundScope.coroutineContext + SupervisorJob(backgroundScope.coroutineContext[Job]) +
+                CoroutineExceptionHandler { _, error -> uncaught += error }
+        )
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            scope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+
+            // First crossfade (0 -> 1) runs to the end: the maintenance is scheduled for later.
+            orchestrator.crossFade(fadeDuration = 1_000.0)
+            assertEquals(1, delegate.crossfadeEvents.count { it.state == "completed" })
+            assertTrue(orchestrator.privateField("standbyMaintenanceJob") != null)
+
+            supervisorScope {
+                // The next crossfade (1 -> 2) is armed right away and waits for the end of the song.
+                val next = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 1_000.0, waitUntil = 59_000.0)
+                }
+                assertEquals(2, delegate.crossfadeEvents.count { it.state == "scheduled" })
+
+                // Let the maintenance wake up (it waits about 50 s here): it must not throw.
+                testScheduler.advanceTimeBy(55_000)
+                runCurrent()
+                assertTrue(next.isActive)
+
+                orchestrator.pause()
+                runCurrent()
+                runCatching { next.await() }
+            }
+            assertTrue(delegate.playbackErrors.isEmpty())
+            assertTrue("background job threw: $uncaught", uncaught.isEmpty())
         } finally {
             orchestrator.release()
         }

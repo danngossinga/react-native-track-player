@@ -804,7 +804,10 @@ internal class AndroidPlaybackOrchestrator private constructor(
         standbyMaintenanceJob = scope.launch {
             delay(delayMs)
             if (scheduledQueueGeneration != queueGeneration) return@launch
-            ensureCrossfadeRunActive(runId)
+            // A newer crossfade (usually the next one, armed by JS right after this one completed)
+            // now owns the standby engine and will prepare it itself. Step aside quietly: throwing
+            // here would escape this background coroutine and crash the app.
+            if (runId != crossfadeRunId) return@launch
             if (!playWhenReady || state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE) return@launch
             standbyEngine.reset()
             preloadTargetIndex = null
