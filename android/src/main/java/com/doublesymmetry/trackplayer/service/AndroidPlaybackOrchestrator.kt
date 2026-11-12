@@ -553,10 +553,11 @@ internal class AndroidPlaybackOrchestrator private constructor(
             prepareStandby(toIndex, requestedSeekToMs, ticket)
             ticket.ensureActive()
         } catch (error: PlaybackOperationCancelledException) {
-            // Another playback command (seek, skip, pause, queue change) took over while the next
-            // song was being prepared. Say so with an event, like crossFade does and like iOS does
-            // ('superseded'), so JS listeners learn why the preparation stopped.
-            emitCrossfade("cancelled", fromIndex, toIndex, errorCode = "superseded")
+            // Another playback command (seek, skip, pause, queue change...) took over while the next
+            // song was being prepared. Say so with an event, like crossFade does, so JS listeners learn
+            // why the preparation stopped. The reason is the one the operation was cancelled with:
+            // 'superseded' when a newer command started (as on iOS), 'pause', 'queue'... otherwise.
+            emitCrossfade("cancelled", fromIndex, toIndex, errorCode = error.reason)
             throw error
         }
         preparedCrossfadeFromIndex = fromIndex
