@@ -67,8 +67,9 @@ Added fork surface:
   bounds the whole load and every seek. iOS bounds the wait from a playable
   asset to a ready item; a backend switch and the play used to resume after an
   interruption wait this long plus 5 s (at least 10 s). A new value applies to
-  the next load at once. Options left out of an `updateOptions` call are reset,
-  as usual, so pass it together with your usual options.
+  the next load at once. Left out, the current value is kept. Other options
+  left out of an `updateOptions` call (capabilities, progress interval…) are
+  reset, so pass it together with your usual options.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.
