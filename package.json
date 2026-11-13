@@ -19,6 +19,7 @@
     "test:player-lifecycle-contracts": "node scripts/verify-player-lifecycle-contracts.js",
     "test:playback-backend-runtime": "node --test scripts/tests/playback-backend-runtime.test.js",
     "test:module-fallback": "node scripts/verify-track-player-module-fallback.js",
+    "test:contracts": "npm run -s test:android-crossfade-contracts && npm run -s test:ios-crossfade-contracts && npm run -s test:module-fallback && npm run -s test:playback-backend-runtime && node --test scripts/tests/remote-handled-event-contract.test.mjs",
     "lint": "eslint src",
     "format": "prettier --write src",
     "types": "tsc --noEmit true",

@@ -209,6 +209,35 @@ jobs:
         run: |-
           cd example/android
           ./gradlew assembleDebug --no-daemon
+      - name: Library Unit Tests
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        run: |-
+          cd example/android
+          ./gradlew :react-native-track-player:testDebugUnitTest --no-daemon
+  check-contracts:
+    # The crossfade and module contracts (source checks and node tests). They pin native wiring that
+    # no compiler or unit test sees, so they run on every change. test:player-lifecycle-contracts is
+    # left out: it also reads the expo-smart-hls-proxy repository next to this one, which a runner
+    # does not have; run it locally.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+      - name: Install Library Dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build Library
+        run: yarn build
+      - name: Run Contract Checks
+        run: yarn test:contracts
   build-docs:
     runs-on: ubuntu-latest
     needs: check-changes
