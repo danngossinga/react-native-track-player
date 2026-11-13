@@ -44,7 +44,7 @@ class PrepareTimeoutOptionTest {
 
     @Test
     fun theSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
-        val setting = PrepareTimeoutSetting()
+        val setting = TimeoutSetting(DEFAULT_PREPARE_TIMEOUT_MS)
         assertEquals(5_000L, setting.milliseconds)
         assertTrue(setting.apply(15_000.0))
         assertEquals(15_000L, setting.milliseconds)
@@ -54,5 +54,15 @@ class PrepareTimeoutOptionTest {
         assertEquals(15_000L, setting.milliseconds)
         assertTrue(setting.apply(30_000.0))
         assertEquals(30_000L, setting.milliseconds)
+    }
+
+    @Test
+    fun theStandardReadinessWaitKeepsItsOldValueUntilTheAppSetsIt() {
+        assertEquals("standardReadyTimeoutMs", STANDARD_READY_TIMEOUT_KEY)
+        assertEquals(5_000L, DEFAULT_STANDARD_READY_TIMEOUT_MS)
+        val setting = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
+        assertEquals(5_000L, setting.milliseconds)
+        assertTrue(setting.apply(20_000.0))
+        assertEquals(20_000L, setting.milliseconds)
     }
 }

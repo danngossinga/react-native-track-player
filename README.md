@@ -70,6 +70,9 @@ Added fork surface:
   the next load at once. Left out, the current value is kept. Other options
   left out of an `updateOptions` call (capabilities, progress interval…) are
   reset, so pass it together with your usual options.
+- `playStartTimeoutMs` (iOS crossfade, default 8000), `standardReadyTimeoutMs`
+  (standard backend, default 5000) and `standardSeekTimeoutMs` (iOS standard,
+  default 25000): the player's other waits, with the same rules.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

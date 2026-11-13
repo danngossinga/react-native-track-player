@@ -5,26 +5,26 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     // The crossfade engines' load timeout (`prepareTimeoutMs`): parser, stored value, backend step.
 
     func testPrepareTimeoutOptionTakesMillisecondsFromOneTo2147483646() {
-        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 12_000)), 12_000)
-        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 8_000.9)), 8_000)
-        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 1)), 1)
-        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 2_147_483_646)), 2_147_483_646)
+        XCTAssertEqual(timeoutOption(NSNumber(value: 12_000)), 12_000)
+        XCTAssertEqual(timeoutOption(NSNumber(value: 8_000.9)), 8_000)
+        XCTAssertEqual(timeoutOption(NSNumber(value: 1)), 1)
+        XCTAssertEqual(timeoutOption(NSNumber(value: 2_147_483_646)), 2_147_483_646)
     }
 
     func testPrepareTimeoutOptionIgnoresEverythingElse() {
-        XCTAssertNil(prepareTimeoutOption(nil))
-        XCTAssertNil(prepareTimeoutOption("12000"))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: true)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 0)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: -5_000)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 0.5)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: Double.nan)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: Double.infinity)))
-        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 2_147_483_647)))
+        XCTAssertNil(timeoutOption(nil))
+        XCTAssertNil(timeoutOption("12000"))
+        XCTAssertNil(timeoutOption(NSNumber(value: true)))
+        XCTAssertNil(timeoutOption(NSNumber(value: 0)))
+        XCTAssertNil(timeoutOption(NSNumber(value: -5_000)))
+        XCTAssertNil(timeoutOption(NSNumber(value: 0.5)))
+        XCTAssertNil(timeoutOption(NSNumber(value: Double.nan)))
+        XCTAssertNil(timeoutOption(NSNumber(value: Double.infinity)))
+        XCTAssertNil(timeoutOption(NSNumber(value: 2_147_483_647)))
     }
 
     func testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
-        let setting = PrepareTimeoutSetting()
+        let setting = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)
         XCTAssertEqual(setting.milliseconds, 5_000)
         XCTAssertNil(setting.apply(["capabilities": ["play"]]))
         XCTAssertEqual(setting.milliseconds, 5_000)
@@ -36,6 +36,23 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(setting.milliseconds, 15_000)
         XCTAssertEqual(setting.apply(["prepareTimeoutMs": NSNumber(value: 30_000)]), true)
         XCTAssertEqual(setting.milliseconds, 30_000)
+    }
+
+    func testThePlayerTimeoutsKeepTheirOldValuesUntilTheAppSetsThem() {
+        // The waits that were fixed numbers keep them by default, each read from its own option.
+        let cases: [(String, Int, Int)] = [
+            ("playStartTimeoutMs", playStartTimeoutDefaultMs, 8_000),
+            ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 5_000),
+            ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 25_000),
+        ]
+        for (key, defaultMs, expectedDefault) in cases {
+            XCTAssertEqual(defaultMs, expectedDefault, key)
+            let setting = TimeoutSetting(optionKey: key, defaultMs: defaultMs)
+            XCTAssertEqual(setting.milliseconds, expectedDefault, key)
+            XCTAssertNil(setting.apply(["prepareTimeoutMs": NSNumber(value: 1_234)]), key)
+            XCTAssertEqual(setting.apply([key: NSNumber(value: 40_000)]), true, key)
+            XCTAssertEqual(setting.milliseconds, 40_000, key)
+        }
     }
 
     func testBackendStepTimeoutIsTheLoadTimeoutPlusFiveSecondsAndNeverBelowTen() {

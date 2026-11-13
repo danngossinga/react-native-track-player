@@ -4,6 +4,7 @@ import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -137,7 +138,7 @@ class PlaybackBackendRuntimePrimitivesTest {
             StandardPlaybackReadinessObservation(AudioPlayerState.READY, 1, 12_345L)
         )
         var readCount = 0
-        val gate = StandardPlaybackReadinessGate(timeoutMs = 100L, pollIntervalMs = 1L)
+        val gate = StandardPlaybackReadinessGate(timeoutMs = { 100L }, pollIntervalMs = 1L)
 
         gate.await(expectedIndex = 1, expectedPositionMs = 12_345L) {
             observations[minOf(readCount++, observations.lastIndex)]
@@ -155,7 +156,7 @@ class PlaybackBackendRuntimePrimitivesTest {
         )
         var readCount = 0
         val gate = StandardPlaybackReadinessGate(
-            timeoutMs = 100L,
+            timeoutMs = { 100L },
             pollIntervalMs = 1L,
             positionToleranceMs = 750L
         )
@@ -170,7 +171,7 @@ class PlaybackBackendRuntimePrimitivesTest {
     @Test
     fun standardReadinessAcceptsPausedAndPlayingAfterRestore() = runTest {
         for (state in listOf(AudioPlayerState.PAUSED, AudioPlayerState.PLAYING)) {
-            val gate = StandardPlaybackReadinessGate(timeoutMs = 5L, pollIntervalMs = 1L)
+            val gate = StandardPlaybackReadinessGate(timeoutMs = { 5L }, pollIntervalMs = 1L)
 
             gate.await(expectedIndex = 1, expectedPositionMs = 12_345L) {
                 StandardPlaybackReadinessObservation(state, 1, 12_345L)
@@ -180,7 +181,7 @@ class PlaybackBackendRuntimePrimitivesTest {
 
     @Test
     fun standardReadinessRejectsPlayerError() = runTest {
-        val gate = StandardPlaybackReadinessGate(timeoutMs = 100L, pollIntervalMs = 1L)
+        val gate = StandardPlaybackReadinessGate(timeoutMs = { 100L }, pollIntervalMs = 1L)
 
         try {
             gate.await(expectedIndex = 1, expectedPositionMs = 12_345L) {
@@ -195,7 +196,7 @@ class PlaybackBackendRuntimePrimitivesTest {
     @Test
     fun standardReadinessRejectsLoadingAndBufferingUntilBoundedTimeout() = runTest {
         for (state in listOf(AudioPlayerState.LOADING, AudioPlayerState.BUFFERING)) {
-            val gate = StandardPlaybackReadinessGate(timeoutMs = 5L, pollIntervalMs = 1L)
+            val gate = StandardPlaybackReadinessGate(timeoutMs = { 5L }, pollIntervalMs = 1L)
 
             try {
                 gate.await(expectedIndex = 1, expectedPositionMs = 12_345L) {
@@ -251,5 +252,21 @@ class PlaybackBackendRuntimePrimitivesTest {
 
         assertEquals(listOf("old-a", "old-b"), rollback)
         assertEquals(listOf("old-a", "old-b"), state.authoritative())
+    }
+
+    @Test
+    fun standardReadinessGateReadsItsTimeoutAtEveryWait() = runTest {
+        var setting = 50L
+        var reads = 0
+        val gate = StandardPlaybackReadinessGate(timeoutMs = { reads += 1; setting }, pollIntervalMs = 1L)
+        val notReady = StandardPlaybackReadinessObservation(AudioPlayerState.LOADING, 0, 0L)
+        val started = currentTime
+        runCatching { gate.await(expectedIndex = 0, expectedPositionMs = 0L) { notReady } }
+        assertEquals(50L, currentTime - started)
+        setting = 200L
+        val again = currentTime
+        runCatching { gate.await(expectedIndex = 0, expectedPositionMs = 0L) { notReady } }
+        assertEquals(200L, currentTime - again)
+        assertEquals(2, reads)
     }
 }

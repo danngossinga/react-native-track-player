@@ -270,16 +270,26 @@ assert(
 // service is already set up) and from updateOptions.
 const setupPlayerSection = section(musicService, 'fun setupPlayer(playerOptions: Bundle?)', 'val bufferConfig');
 const updateOptionsSection = section(musicService, 'fun updateOptions(options: Bundle)', 'val androidOptions');
-const applyTimeoutSection = section(musicService, 'private fun applyPrepareTimeout(options: Bundle?)', '@MainThread');
+const applyTimeoutSection = section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread');
 assert(
-  musicService.includes('private val prepareTimeout = PrepareTimeoutSetting()') &&
+  musicService.includes('private val prepareTimeout = TimeoutSetting(DEFAULT_PREPARE_TIMEOUT_MS)') &&
     musicService.includes('created.prepareTimeoutMs = { prepareTimeout.milliseconds }') &&
-    setupPlayerSection.indexOf('applyPrepareTimeout(playerOptions)') >= 0 &&
-    setupPlayerSection.indexOf('applyPrepareTimeout(playerOptions)') < setupPlayerSection.indexOf('if (isPrimaryPlayerInitialized())') &&
-    updateOptionsSection.includes('applyPrepareTimeout(options)') &&
-    applyTimeoutSection.includes('options.get(PREPARE_TIMEOUT_KEY)') &&
-    applyTimeoutSection.includes('prepareTimeout.apply(value)'),
+    setupPlayerSection.indexOf('applyTimeouts(playerOptions)') >= 0 &&
+    setupPlayerSection.indexOf('applyTimeouts(playerOptions)') < setupPlayerSection.indexOf('if (isPrimaryPlayerInitialized())') &&
+    updateOptionsSection.includes('applyTimeouts(options)') &&
+    applyTimeoutSection.includes('applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)') &&
+    applyTimeoutSection.includes('applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)') &&
+    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('setting.apply(value)'),
   'Android prepareTimeoutMs must be taken at setup (before the early return) and on updateOptions, and read by every orchestrator.'
+);
+
+// The standard backend's readiness wait reads the app's setting (standardReadyTimeoutMs).
+assert(
+  musicService.includes('private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)') &&
+    musicService.includes('readinessGate = StandardPlaybackReadinessGate(timeoutMs = { standardReadyTimeout.milliseconds })') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('private val timeoutMs: () -> Long,') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt').includes('private val readinessGate: StandardPlaybackReadinessGate,'),
+  'Android standard readiness wait must read standardReadyTimeoutMs, not a fixed 5 s.'
 );
 
 console.log('Android crossfade contracts OK');

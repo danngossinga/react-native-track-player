@@ -26,6 +26,21 @@ export interface UpdateOptions {
    * a number from 1 to 2147483646 is ignored.
    */
   prepareTimeoutMs?: number;
+  /**
+   * iOS crossfade backend: how long, in milliseconds, playback may take to start after `play`
+   * before the play fails. Defaults to 8000. Same rules as `prepareTimeoutMs` (bounds, kept when left out).
+   */
+  playStartTimeoutMs?: number;
+  /**
+   * Standard backend (iOS and Android): how long, in milliseconds, a track restored by a backend
+   * switch may take to be ready. Defaults to 5000.
+   */
+  standardReadyTimeoutMs?: number;
+  /**
+   * iOS standard backend: how long, in milliseconds, a seek may take before it fails
+   * (`standard_seek_timeout`). Defaults to 25000.
+   */
+  standardSeekTimeoutMs?: number;
 
   // android
   /**

@@ -260,7 +260,10 @@ assert(
 // Parser, stored setting and step formula live in PlaybackBackend.swift, tested by RNTrackPlayerTests.
 assert(
   facade.includes('let prepareTimeoutDefaultMs = 5000') &&
-    facade.includes('final class PrepareTimeoutSetting') &&
+    facade.includes('final class TimeoutSetting') &&
+    facade.includes('let playStartTimeoutDefaultMs = 8000') &&
+    facade.includes('let standardReadyTimeoutDefaultMs = 5000') &&
+    facade.includes('let standardSeekTimeoutDefaultMs = 25000') &&
     facade.includes('func backendStepTimeout(loadTimeoutMs: Int) -> TimeInterval') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue'),
   'iOS prepareTimeoutMs parsing, setting and step formula must stay in the tested core.'
@@ -280,12 +283,12 @@ assert(
 const pingPongFactory = section(player, 'case .pingPong:', 'return PingPongPlaybackBackend(');
 const setupPlayerTimeout = section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:');
 assert(
-  player.includes('private let prepareTimeout = PrepareTimeoutSetting()') &&
-    section(player, 'private func applyPrepareTimeout(', '@objc(updateOptions:').includes('prepareTimeout.apply(options)') &&
+  player.includes('private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)') &&
+    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout]') &&
     pingPongFactory.includes('orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
-    setupPlayerTimeout.includes('applyPrepareTimeout(config)') &&
+    setupPlayerTimeout.includes('applyTimeouts(config)') &&
     setupPlayerTimeout.includes('playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
-    section(player, 'public func update(options:', 'var capabilitiesStr').includes('applyPrepareTimeout(options)'),
+    section(player, 'public func update(options:', 'var capabilitiesStr').includes('applyTimeouts(options)'),
   'iOS setupPlayer and updateOptions must take prepareTimeoutMs, and every orchestrator must read it.'
 );
 assert(
@@ -293,6 +296,26 @@ assert(
     read('docs/docs/api/objects/update-options.md').includes('| `prepareTimeoutMs` |') &&
     read('src/interfaces/UpdateOptions.ts').includes('prepareTimeoutMs?: number;'),
   'prepareTimeoutMs must be typed and documented.'
+);
+
+// The player's other waits (play start, standard readiness, standard seek) read the app's settings.
+const standardBackend2 = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
+assert(
+  engine.includes('waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)') &&
+    !/timeoutMs: Int = \d/.test(engine) &&
+    orchestrator.includes('engineA.playStartTimeoutMs = playStartTimeoutMs') &&
+    orchestrator.includes('engineB.playStartTimeoutMs = playStartTimeoutMs') &&
+    player.includes('orchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }') &&
+    player.includes('private let playStartTimeout = TimeoutSetting(optionKey: "playStartTimeoutMs", defaultMs: playStartTimeoutDefaultMs)') &&
+    player.includes('private let standardReadyTimeout = TimeoutSetting(optionKey: "standardReadyTimeoutMs", defaultMs: standardReadyTimeoutDefaultMs)') &&
+    player.includes('private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)') &&
+    player.includes('readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs }') &&
+    player.includes('seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs }') &&
+    standardBackend2.includes('DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seekTimeoutMs()), execute: timeout)') &&
+    !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
+    !/timeout: TimeInterval = \d/.test(standardBackend2) &&
+    standardBackend2.includes('timeoutMs: readinessTimeoutMs()'),
+  'iOS play-start, standard readiness and standard seek waits must read the app\'s settings, not fixed numbers.'
 );
 
 console.log('iOS crossfade contracts OK');

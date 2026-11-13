@@ -3,22 +3,34 @@ import Foundation
 /// How long a crossfade engine waits for a track to become ready before giving up, unless the app
 /// sets `prepareTimeoutMs` (setupPlayer or updateOptions).
 let prepareTimeoutDefaultMs = 5000
+/// How long a crossfade engine waits for playback to start after `play` (`playStartTimeoutMs`).
+let playStartTimeoutDefaultMs = 8000
+/// How long the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`).
+let standardReadyTimeoutDefaultMs = 5000
+/// How long the standard backend waits for a seek to complete (`standardSeekTimeoutMs`).
+let standardSeekTimeoutDefaultMs = 25000
 
-/// The `prepareTimeoutMs` option, in milliseconds: nil when it is not a number from 1 to
-/// 2147483646 (booleans refused), so the current value is kept. Same bounds as Android.
-func prepareTimeoutOption(_ value: Any?) -> Int? {
+/// A timeout option (`prepareTimeoutMs`, `playStartTimeoutMs`...), in milliseconds: nil when it is
+/// not a number from 1 to 2147483646 (booleans refused), so the current value is kept. Same bounds
+/// as Android.
+func timeoutOption(_ value: Any?) -> Int? {
     guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
     let ms = number.doubleValue
     guard ms.isFinite, ms >= 1, ms < Double(Int32.max) else { return nil }
     return Int(ms)
 }
 
-/// The app's load timeout: one value, written from the module's queue and read by the engines
-/// (main) and the backend steps (facade queues), so it is locked.
-final class PrepareTimeoutSetting {
-    static let optionKey = "prepareTimeoutMs"
+/// One of the app's timeouts: one value, written from the module's queue and read by the engines
+/// (main) and the backends (facade queues), so it is locked.
+final class TimeoutSetting {
+    let optionKey: String
     private let lock = NSLock()
-    private var value = prepareTimeoutDefaultMs
+    private var value: Int
+
+    init(optionKey: String, defaultMs: Int) {
+        self.optionKey = optionKey
+        self.value = defaultMs
+    }
 
     var milliseconds: Int {
         lock.lock()
@@ -26,12 +38,12 @@ final class PrepareTimeoutSetting {
         return value
     }
 
-    /// Takes a valid `prepareTimeoutMs` from setup or update options. Returns what happened:
+    /// Takes a valid value of its option from setup or update options. Returns what happened:
     /// nil when the options do not carry it, false when its value was ignored, true when taken.
     @discardableResult
     func apply(_ options: [String: Any]) -> Bool? {
-        guard let raw = options[Self.optionKey] else { return nil }
-        guard let timeout = prepareTimeoutOption(raw) else { return false }
+        guard let raw = options[optionKey] else { return nil }
+        guard let timeout = timeoutOption(raw) else { return false }
         lock.lock()
         value = timeout
         lock.unlock()

@@ -78,6 +78,9 @@ final class IOSCrossfadeEngine {
     /// How long a track may take to become ready (`prepareTimeoutMs` option, 5000 ms by default).
     /// Read at every load, so a new value from the app applies to the next load at once.
     var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs }
+    /// How long playback may take to start after `play` (`playStartTimeoutMs`, 8000 ms by
+    /// default). Read at every play, so a new value from the app applies to the next one at once.
+    var playStartTimeoutMs: () -> Int = { playStartTimeoutDefaultMs }
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
@@ -242,13 +245,12 @@ final class IOSCrossfadeEngine {
 
     func play(
         rate: Float,
-        timeoutMs: Int = 8000,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         let currentGeneration = generation
         IOSPlaybackLog.log("\(name) play rate=\(rate) volume=\(player.volume)")
         player.playImmediately(atRate: max(rate, 0.1))
-        waitForPlaying(generation: currentGeneration, timeoutMs: timeoutMs, completion: completion)
+        waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)
     }
 
     func play(rate: Float = 1) {
@@ -357,7 +359,7 @@ final class IOSCrossfadeEngine {
 
     private func waitForPlaying(
         generation: Int,
-        timeoutMs: Int = 8000,
+        timeoutMs: Int,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         var didComplete = false
