@@ -66,10 +66,16 @@ Added fork surface:
   the crossfade path waits for a track to become ready before it fails. Android
   bounds the whole load and every seek. iOS bounds the wait from a playable
   asset to a ready item; a backend switch and the play used to resume after an
-  interruption wait this long plus 5 s (at least 10 s). A new value applies to
+  interruption wait at least this long plus 5 s (at least 10 s). A new value applies to
   the next load at once. Left out, the current value is kept. Other options
   left out of an `updateOptions` call (capabilities, progress interval…) are
   reset, so pass it together with your usual options.
+- `playStartTimeoutMs` (iOS crossfade, default 8000: how long playback may take
+  to start), `standardReadyTimeoutMs` (standard backend, default 5000) and
+  `standardSeekTimeoutMs` (iOS standard, default 25000): the player's other
+  waits, with the same rules. A backend switch and the play used to resume after
+  an interruption wait the longer of the load timeout plus 5 s and the
+  play-start timeout plus 2 s (at least 10 s).
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

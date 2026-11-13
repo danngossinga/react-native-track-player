@@ -208,7 +208,8 @@ class KotlinAudioMediaSessionControlInstrumentationTest {
                     onCommitted = {},
                     onActivated = {},
                     onDisposed = {},
-                    onLogicalActiveItemActivated = activatedIndices::add
+                    onLogicalActiveItemActivated = activatedIndices::add,
+                    readinessGate = StandardPlaybackReadinessGate(timeoutMs = { DEFAULT_STANDARD_READY_TIMEOUT_MS })
                 )
                 val snapshot = PlaybackBackendSnapshot.empty().copy(
                     queueIds = items.map { it.track.queueId.toString() },

@@ -75,7 +75,9 @@ class MusicService : HeadlessJsTaskService() {
     private var progressUpdateJob: Job? = null
     private var crossfadeEnabled = false
     /** The crossfade engines' load timeout (`prepareTimeoutMs`), read by every orchestrator. */
-    private val prepareTimeout = PrepareTimeoutSetting()
+    private val prepareTimeout = TimeoutSetting(DEFAULT_PREPARE_TIMEOUT_MS)
+    /** The standard backend's readiness wait (`standardReadyTimeoutMs`), read at every activation. */
+    private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
@@ -446,6 +448,7 @@ class MusicService : HeadlessJsTaskService() {
                     binding.identity,
                     crossfadeQueue,
                     transitionGenerationSidecar,
+                    readinessGate = StandardPlaybackReadinessGate(timeoutMs = { standardReadyTimeout.milliseconds }),
                     onCommitted = { committed ->
                         if (committed === binding.player) commitStandardPlayerBinding(binding)
                     },
@@ -546,7 +549,7 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     fun setupPlayer(playerOptions: Bundle?) {
         // Taken even when the player is already set up (a reloaded app meeting a running service).
-        applyPrepareTimeout(playerOptions)
+        applyTimeouts(playerOptions)
         if (isPrimaryPlayerInitialized()) {
             print("Player was initialized. Prevent re-initializing again")
             return
@@ -603,20 +606,25 @@ class MusicService : HeadlessJsTaskService() {
         )
     }
 
-    /** Takes a valid `prepareTimeoutMs` from setup or update options; any other value is ignored. */
-    private fun applyPrepareTimeout(options: Bundle?) {
-        val value = if (options?.containsKey(PREPARE_TIMEOUT_KEY) == true) options.get(PREPARE_TIMEOUT_KEY) else return
-        if (prepareTimeout.apply(value)) {
-            androidXfadeLog("prepare timeout set to ${prepareTimeout.milliseconds}ms")
+    /** Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`) from setup or update options; any other value is ignored. */
+    private fun applyTimeouts(options: Bundle?) {
+        applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)
+        applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
+    }
+
+    private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting) {
+        val value = if (options?.containsKey(key) == true) options.get(key) else return
+        if (setting.apply(value)) {
+            androidXfadeLog("$key set to ${setting.milliseconds}ms")
         } else {
-            androidXfadeLog("prepare timeout ignored value=$value kept=${prepareTimeout.milliseconds}ms")
+            androidXfadeLog("$key ignored value=$value kept=${setting.milliseconds}ms")
         }
     }
 
     @MainThread
     fun updateOptions(options: Bundle) {
         latestOptions = options
-        applyPrepareTimeout(options)
+        applyTimeouts(options)
         val androidOptions = options.getBundle(ANDROID_OPTIONS_KEY)
 
         appKilledPlaybackBehavior = AppKilledPlaybackBehavior::string.find(androidOptions?.getString(APP_KILLED_PLAYBACK_BEHAVIOR_KEY)) ?: AppKilledPlaybackBehavior.CONTINUE_PLAYBACK

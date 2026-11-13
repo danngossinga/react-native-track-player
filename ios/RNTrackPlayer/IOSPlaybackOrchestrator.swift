@@ -123,6 +123,13 @@ final class IOSPlaybackOrchestrator {
             engineB.prepareTimeoutMs = prepareTimeoutMs
         }
     }
+    /// How long playback may take to start after `play` (ms); both engines read it at every play.
+    var playStartTimeoutMs: () -> Int = { playStartTimeoutDefaultMs } {
+        didSet {
+            engineA.playStartTimeoutMs = playStartTimeoutMs
+            engineB.playStartTimeoutMs = playStartTimeoutMs
+        }
+    }
     private var activeEngine: IOSCrossfadeEngine
     private var standbyEngine: IOSCrossfadeEngine
     private var queue: [Track] = []

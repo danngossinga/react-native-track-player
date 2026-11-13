@@ -36,12 +36,12 @@ internal object StandardPlaybackActivationSnapshotValidator {
 }
 
 internal class StandardPlaybackReadinessGate(
-    private val timeoutMs: Long = 5_000L,
+    /** The app's `standardReadyTimeoutMs`, read at every wait (no default: the caller passes it). */
+    private val timeoutMs: () -> Long,
     private val pollIntervalMs: Long = 25L,
     private val positionToleranceMs: Long = 750L
 ) {
     init {
-        require(timeoutMs > 0L)
         require(pollIntervalMs > 0L)
         require(positionToleranceMs >= 0L)
     }
@@ -51,7 +51,7 @@ internal class StandardPlaybackReadinessGate(
         expectedPositionMs: Long,
         observe: () -> StandardPlaybackReadinessObservation
     ) {
-        val ready = withTimeoutOrNull(timeoutMs) {
+        val ready = withTimeoutOrNull(timeoutMs().coerceAtLeast(1L)) {
             while (true) {
                 val current = observe()
                 if (current.state == AudioPlayerState.ERROR) throw notReadyError()

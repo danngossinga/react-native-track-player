@@ -55,7 +55,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var player = QueuedAudioPlayer()
     private var playbackOrchestrator = IOSPlaybackOrchestrator()
     /// The crossfade engines' load timeout (`prepareTimeoutMs` option); every orchestrator reads it.
-    private let prepareTimeout = PrepareTimeoutSetting()
+    private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)
+    /// The app's other waits: crossfade play start, standard readiness and standard seek.
+    private let playStartTimeout = TimeoutSetting(optionKey: "playStartTimeoutMs", defaultMs: playStartTimeoutDefaultMs)
+    private let standardReadyTimeout = TimeoutSetting(optionKey: "standardReadyTimeoutMs", defaultMs: standardReadyTimeoutDefaultMs)
+    private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)
     private let playbackBackendAuthority = PlaybackBackendAuthority()
     private let playerEventTokensLock = NSLock()
     private var playerEventTokens: [ObjectIdentifier: PlaybackBackendEventToken] = [:]
@@ -457,6 +461,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             return StandardPlaybackBackend(
                 player: source,
                 transitionGenerationSidecar: transitionGenerationSidecar,
+                readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs },
+                seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
                     self?.autoUpdateNowPlayingInfo ?? true
                 },
@@ -484,6 +490,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             let queuePlayer = player
             let orchestrator = IOSPlaybackOrchestrator()
             orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
+            orchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }
             return PingPongPlaybackBackend(
                 player: queuePlayer,
                 orchestrator: orchestrator,
@@ -785,8 +792,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         defer { setupInProgress = false }
 
         crossfadeEnabled = config["crossfade"] as? Bool ?? false
-        applyPrepareTimeout(config)
+        applyTimeouts(config)
         playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
+        playbackOrchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }
         let initialBackend: PlaybackBackendKind = crossfadeEnabled ? .pingPong : .standard
         installPlaybackBackendFacade(initialKind: initialBackend)
 
@@ -971,19 +979,22 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
     }
 
-    /// Takes a valid `prepareTimeoutMs` from setup or update options; any other value is ignored.
-    private func applyPrepareTimeout(_ options: [String: Any]) {
-        switch prepareTimeout.apply(options) {
-        case true?: IOSPlaybackLog.log("prepare timeout set to \(prepareTimeout.milliseconds)ms")
-        case false?: IOSPlaybackLog.log("prepare timeout ignored, kept \(prepareTimeout.milliseconds)ms")
-        case nil: break
+    /// Takes the valid timeouts (`prepareTimeoutMs`, `playStartTimeoutMs`, `standardReadyTimeoutMs`,
+    /// `standardSeekTimeoutMs`) from setup or update options; any other value is ignored.
+    private func applyTimeouts(_ options: [String: Any]) {
+        for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout] {
+            switch setting.apply(options) {
+            case true?: IOSPlaybackLog.log("\(setting.optionKey) set to \(setting.milliseconds)ms")
+            case false?: IOSPlaybackLog.log("\(setting.optionKey) ignored, kept \(setting.milliseconds)ms")
+            case nil: break
+            }
         }
     }
 
     @objc(updateOptions:resolver:rejecter:)
     public func update(options: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        applyPrepareTimeout(options)
+        applyTimeouts(options)
 
         var capabilitiesStr = options["capabilities"] as? [String] ?? []
         if (capabilitiesStr.contains("play") && capabilitiesStr.contains("pause")) {

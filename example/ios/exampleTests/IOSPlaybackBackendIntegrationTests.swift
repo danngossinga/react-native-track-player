@@ -244,6 +244,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                 backend = StandardPlaybackBackend(
                     player: player,
                     transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                    readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+                    seekTimeoutMs: { standardSeekTimeoutDefaultMs },
                     automaticallyUpdateNowPlayingInfo: { false },
                     onCommitted: { _ in }, onActivated: { _ in },
                     onDisposed: { _ in }, initiallyAuthoritative: true,
@@ -674,6 +676,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         let candidate = StandardPlaybackBackend(
             player: player,
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+            readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+            seekTimeoutMs: { standardSeekTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in committedCount += 1 },
             onActivated: { _ in activatedCount += 1 },
@@ -725,6 +729,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         let backend = StandardPlaybackBackend(
             player: player,
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+            readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+            seekTimeoutMs: { standardSeekTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in },
             onActivated: { _ in },
@@ -839,6 +845,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         let candidate = StandardPlaybackBackend(
             player: player,
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+            readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+            seekTimeoutMs: { standardSeekTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in },
             onActivated: { _ in },
@@ -904,6 +912,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             let candidate = StandardPlaybackBackend(
                 player: player,
                 transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+                seekTimeoutMs: { standardSeekTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { false },
                 onCommitted: { _ in },
                 onActivated: { _ in },
@@ -1788,6 +1798,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         let initial = StandardPlaybackBackend(
             player: player,
             transitionGenerationSidecar: sidecar,
+            readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+            seekTimeoutMs: { standardSeekTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { committed in
                 XCTAssertTrue(authority.isAuthoritative(.standard, identity: committed))
@@ -2277,6 +2289,8 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             let backend = StandardPlaybackBackend(
                 player: player,
                 transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
+                readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
+                seekTimeoutMs: { standardSeekTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { false },
                 onCommitted: { _ in },
                 onActivated: { _ in },
