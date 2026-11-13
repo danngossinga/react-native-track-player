@@ -1,6 +1,8 @@
 package com.doublesymmetry.trackplayer.service
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -32,5 +34,19 @@ class PrepareTimeoutOptionTest {
     @Test
     fun defaultsToFiveSeconds() {
         assertEquals(5_000L, DEFAULT_PREPARE_TIMEOUT_MS)
+    }
+
+    @Test
+    fun theSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
+        val setting = PrepareTimeoutSetting()
+        assertEquals(5_000L, setting.milliseconds)
+        assertTrue(setting.apply(15_000.0))
+        assertEquals(15_000L, setting.milliseconds)
+        // An invalid value keeps the current one; a new valid value replaces it.
+        assertFalse(setting.apply("30000"))
+        assertFalse(setting.apply(null))
+        assertEquals(15_000L, setting.milliseconds)
+        assertTrue(setting.apply(30_000.0))
+        assertEquals(30_000L, setting.milliseconds)
     }
 }

@@ -55,7 +55,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var player = QueuedAudioPlayer()
     private var playbackOrchestrator = IOSPlaybackOrchestrator()
     /// The crossfade engines' load timeout (`prepareTimeoutMs` option); every orchestrator reads it.
-    private var prepareTimeoutMs = prepareTimeoutDefaultMs
+    private let prepareTimeout = PrepareTimeoutSetting()
     private let playbackBackendAuthority = PlaybackBackendAuthority()
     private let playerEventTokensLock = NSLock()
     private var playerEventTokens: [ObjectIdentifier: PlaybackBackendEventToken] = [:]
@@ -479,7 +479,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         case .pingPong:
             let queuePlayer = player
             let orchestrator = IOSPlaybackOrchestrator()
-            orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeoutMs ?? prepareTimeoutDefaultMs }
+            orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
             return PingPongPlaybackBackend(
                 player: queuePlayer,
                 orchestrator: orchestrator,
@@ -781,7 +781,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         crossfadeEnabled = config["crossfade"] as? Bool ?? false
         applyPrepareTimeout(config)
-        playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeoutMs ?? prepareTimeoutDefaultMs }
+        playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
         let initialBackend: PlaybackBackendKind = crossfadeEnabled ? .pingPong : .standard
         installPlaybackBackendFacade(initialKind: initialBackend)
 
@@ -968,13 +968,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     /// Takes a valid `prepareTimeoutMs` from setup or update options; any other value is ignored.
     private func applyPrepareTimeout(_ options: [String: Any]) {
-        guard let value = options["prepareTimeoutMs"] else { return }
-        guard let timeout = prepareTimeoutOption(value) else {
-            IOSPlaybackLog.log("prepare timeout ignored value=\(value) kept=\(prepareTimeoutMs)ms")
-            return
+        switch prepareTimeout.apply(options) {
+        case true?: IOSPlaybackLog.log("prepare timeout set to \(prepareTimeout.milliseconds)ms")
+        case false?: IOSPlaybackLog.log("prepare timeout ignored, kept \(prepareTimeout.milliseconds)ms")
+        case nil: break
         }
-        prepareTimeoutMs = timeout
-        IOSPlaybackLog.log("prepare timeout set to \(timeout)ms")
     }
 
     @objc(updateOptions:resolver:rejecter:)

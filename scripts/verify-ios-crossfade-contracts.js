@@ -257,11 +257,13 @@ assert(
     !/\.milliseconds\(\d+\)/.test(waitForReadyItem),
   'iOS engine ready wait must use the prepareTimeoutMs provider, not a fixed delay.'
 );
+// Parser, stored setting and step formula live in PlaybackBackend.swift, tested by RNTrackPlayerTests.
 assert(
-  engine.includes('let prepareTimeoutDefaultMs = 5000') &&
-    engine.includes('ms >= 1, ms < Double(Int32.max)') &&
-    engine.includes('CFGetTypeID(number) != CFBooleanGetTypeID()'),
-  'iOS prepareTimeoutMs must default to 5000 ms and accept 1 to 2147483646 ms, booleans refused.'
+  facade.includes('let prepareTimeoutDefaultMs = 5000') &&
+    facade.includes('final class PrepareTimeoutSetting') &&
+    facade.includes('func backendStepTimeout(loadTimeoutMs: Int) -> TimeInterval') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue'),
+  'iOS prepareTimeoutMs parsing, setting and step formula must stay in the tested core.'
 );
 assert(
   orchestrator.includes('engineA.prepareTimeoutMs = prepareTimeoutMs') &&
@@ -270,22 +272,26 @@ assert(
 );
 const awaitResult = section(pingPongBackend, 'private func awaitResult(', 'let semaphore');
 assert(
-  awaitResult.includes('timeout: TimeInterval? = nil') &&
-    awaitResult.includes('timeout ?? backendStepTimeout') &&
-    pingPongBackend.includes('max(10, TimeInterval(orchestrator.prepareTimeoutMs()) / 1000 + 5)'),
+  !awaitResult.includes('timeout:') &&
+    awaitResult.includes('let timeout = backendStepTimeout(loadTimeoutMs: orchestrator.prepareTimeoutMs())') &&
+    !/awaitResult\(timeout/.test(pingPongBackend),
   'iOS ping-pong backend steps must wait the load timeout plus 5 s (at least 10 s), not a fixed 10 s.'
 );
 const pingPongFactory = section(player, 'case .pingPong:', 'return PingPongPlaybackBackend(');
 const setupPlayerTimeout = section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:');
 assert(
-  pingPongFactory.includes('orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeoutMs ?? prepareTimeoutDefaultMs }') &&
+  player.includes('private let prepareTimeout = PrepareTimeoutSetting()') &&
+    section(player, 'private func applyPrepareTimeout(', '@objc(updateOptions:').includes('prepareTimeout.apply(options)') &&
+    pingPongFactory.includes('orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
     setupPlayerTimeout.includes('applyPrepareTimeout(config)') &&
-    setupPlayerTimeout.includes('playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeoutMs ?? prepareTimeoutDefaultMs }') &&
+    setupPlayerTimeout.includes('playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
     section(player, 'public func update(options:', 'var capabilitiesStr').includes('applyPrepareTimeout(options)'),
   'iOS setupPlayer and updateOptions must take prepareTimeoutMs, and every orchestrator must read it.'
 );
 assert(
-  playerOptionsDocs.includes('| `prepareTimeoutMs` |') && playerOptions.includes('prepareTimeoutMs?: number;'),
+  playerOptionsDocs.includes('| `prepareTimeoutMs` |') && playerOptions.includes('prepareTimeoutMs?: number;') &&
+    read('docs/docs/api/objects/update-options.md').includes('| `prepareTimeoutMs` |') &&
+    read('src/interfaces/UpdateOptions.ts').includes('prepareTimeoutMs?: number;'),
   'prepareTimeoutMs must be typed and documented.'
 );
 

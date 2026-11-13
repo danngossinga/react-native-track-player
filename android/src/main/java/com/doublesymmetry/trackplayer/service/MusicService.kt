@@ -75,7 +75,7 @@ class MusicService : HeadlessJsTaskService() {
     private var progressUpdateJob: Job? = null
     private var crossfadeEnabled = false
     /** The crossfade engines' load timeout (`prepareTimeoutMs`), read by every orchestrator. */
-    private var prepareTimeoutMs = DEFAULT_PREPARE_TIMEOUT_MS
+    private val prepareTimeout = PrepareTimeoutSetting()
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
@@ -339,7 +339,7 @@ class MusicService : HeadlessJsTaskService() {
             }
         )
         // Reads the service's setting at every load: a later updateOptions reaches every engine.
-        created.prepareTimeoutMs = { prepareTimeoutMs }
+        created.prepareTimeoutMs = { prepareTimeout.milliseconds }
         Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
         return created
     }
@@ -589,12 +589,11 @@ class MusicService : HeadlessJsTaskService() {
     /** Takes a valid `prepareTimeoutMs` from setup or update options; any other value is ignored. */
     private fun applyPrepareTimeout(options: Bundle?) {
         val value = if (options?.containsKey(PREPARE_TIMEOUT_KEY) == true) options.get(PREPARE_TIMEOUT_KEY) else return
-        val timeout = prepareTimeoutFrom(value) ?: run {
-            androidXfadeLog("prepare timeout ignored value=$value kept=${prepareTimeoutMs}ms")
-            return
+        if (prepareTimeout.apply(value)) {
+            androidXfadeLog("prepare timeout set to ${prepareTimeout.milliseconds}ms")
+        } else {
+            androidXfadeLog("prepare timeout ignored value=$value kept=${prepareTimeout.milliseconds}ms")
         }
-        prepareTimeoutMs = timeout
-        androidXfadeLog("prepare timeout set to ${timeout}ms")
     }
 
     @MainThread

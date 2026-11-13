@@ -259,4 +259,20 @@ assert(
   'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
+// The app's load timeout (prepareTimeoutMs) reaches every orchestrator, from setup (even when the
+// service is already set up) and from updateOptions.
+const setupPlayerSection = section(musicService, 'fun setupPlayer(playerOptions: Bundle?)', 'val bufferConfig');
+const updateOptionsSection = section(musicService, 'fun updateOptions(options: Bundle)', 'val androidOptions');
+const applyTimeoutSection = section(musicService, 'private fun applyPrepareTimeout(options: Bundle?)', '@MainThread');
+assert(
+  musicService.includes('private val prepareTimeout = PrepareTimeoutSetting()') &&
+    musicService.includes('created.prepareTimeoutMs = { prepareTimeout.milliseconds }') &&
+    setupPlayerSection.indexOf('applyPrepareTimeout(playerOptions)') >= 0 &&
+    setupPlayerSection.indexOf('applyPrepareTimeout(playerOptions)') < setupPlayerSection.indexOf('if (isPrimaryPlayerInitialized())') &&
+    updateOptionsSection.includes('applyPrepareTimeout(options)') &&
+    applyTimeoutSection.includes('options.get(PREPARE_TIMEOUT_KEY)') &&
+    applyTimeoutSection.includes('prepareTimeout.apply(value)'),
+  'Android prepareTimeoutMs must be taken at setup (before the early return) and on updateOptions, and read by every orchestrator.'
+);
+
 console.log('Android crossfade contracts OK');

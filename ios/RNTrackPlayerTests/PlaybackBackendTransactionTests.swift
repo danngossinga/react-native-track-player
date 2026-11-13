@@ -2,6 +2,49 @@ import XCTest
 @testable import RNTrackPlayerBackendCore
 
 final class PlaybackBackendTransactionTests: XCTestCase {
+    // The crossfade engines' load timeout (`prepareTimeoutMs`): parser, stored value, backend step.
+
+    func testPrepareTimeoutOptionTakesMillisecondsFromOneTo2147483646() {
+        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 12_000)), 12_000)
+        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 8_000.9)), 8_000)
+        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 1)), 1)
+        XCTAssertEqual(prepareTimeoutOption(NSNumber(value: 2_147_483_646)), 2_147_483_646)
+    }
+
+    func testPrepareTimeoutOptionIgnoresEverythingElse() {
+        XCTAssertNil(prepareTimeoutOption(nil))
+        XCTAssertNil(prepareTimeoutOption("12000"))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: true)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 0)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: -5_000)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 0.5)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: Double.nan)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: Double.infinity)))
+        XCTAssertNil(prepareTimeoutOption(NSNumber(value: 2_147_483_647)))
+    }
+
+    func testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
+        let setting = PrepareTimeoutSetting()
+        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertNil(setting.apply(["capabilities": ["play"]]))
+        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertEqual(setting.apply(["prepareTimeoutMs": NSNumber(value: 15_000)]), true)
+        XCTAssertEqual(setting.milliseconds, 15_000)
+        // An invalid or missing value keeps the current one; a new valid value replaces it.
+        XCTAssertEqual(setting.apply(["prepareTimeoutMs": "30000"]), false)
+        XCTAssertNil(setting.apply([:]))
+        XCTAssertEqual(setting.milliseconds, 15_000)
+        XCTAssertEqual(setting.apply(["prepareTimeoutMs": NSNumber(value: 30_000)]), true)
+        XCTAssertEqual(setting.milliseconds, 30_000)
+    }
+
+    func testBackendStepTimeoutIsTheLoadTimeoutPlusFiveSecondsAndNeverBelowTen() {
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000), 10)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000), 10)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000), 35)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500), 17.5)
+    }
+
     private let snapshot = PlaybackBackendSnapshot(
         queueIDs: ["first", "second"],
         activeIndex: 1,

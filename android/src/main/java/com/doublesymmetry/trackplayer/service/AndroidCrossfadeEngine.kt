@@ -297,3 +297,19 @@ internal fun prepareTimeoutFrom(value: Any?): Long? {
 }
 
 internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
+
+/** The app's load timeout: one value, kept until a valid new one comes (main thread only). */
+internal class PrepareTimeoutSetting {
+    var milliseconds: Long = DEFAULT_PREPARE_TIMEOUT_MS
+        private set
+
+    /**
+     * Takes a valid `prepareTimeoutMs` (the option's raw value). Returns false when the value is
+     * ignored and the current one kept.
+     */
+    fun apply(value: Any?): Boolean {
+        val timeout = prepareTimeoutFrom(value) ?: return false
+        milliseconds = timeout
+        return true
+    }
+}

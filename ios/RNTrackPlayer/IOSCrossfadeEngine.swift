@@ -403,17 +403,3 @@ final class IOSCrossfadeEngine {
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeout)
     }
 }
-
-/// How long a crossfade engine waits for a track to become ready before giving up, unless the app
-/// sets `prepareTimeoutMs` (setupPlayer or updateOptions).
-let prepareTimeoutDefaultMs = 5000
-
-/// The `prepareTimeoutMs` option, in milliseconds: nil when it is absent or not a positive number
-/// (the current value is then kept).
-func prepareTimeoutOption(_ value: Any?) -> Int? {
-    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
-    let ms = number.doubleValue
-    // Same bounds as Android: 1 ms to 2^31 - 2 ms.
-    guard ms.isFinite, ms >= 1, ms < Double(Int32.max) else { return nil }
-    return Int(ms)
-}
