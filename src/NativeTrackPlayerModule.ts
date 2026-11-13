@@ -86,6 +86,7 @@ export interface Spec extends TurboModule {
     fadeToVolume: Double,
     waitUntil: Double
   ): Promise<void>;
+  crossFadeCancelScheduled(): Promise<boolean>;
   getVolume(): Promise<Double>;
   setRate(rate: Float): Promise<void>;
   getRate(): Promise<Double>;

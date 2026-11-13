@@ -1115,6 +1115,28 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
     }
 
+    /**
+     * Cancels the crossfade that is scheduled but has not started yet: the music plays on,
+     * untouched. As after a seek, the next song loaded for the fade is unloaded and the prepared
+     * target forgotten; the caller arms a new fade (for example with a new length the listener
+     * just chose), which prepares it again. The waiting fade reports `cancelled`, as after a
+     * seek. A fade already under way is left to finish. Answers whether a scheduled fade was
+     * cancelled. Runs on the orchestrator's thread, like the waiting fade, so the fade cannot
+     * start in between.
+     */
+    fun cancelScheduledCrossfade(): Boolean {
+        val startNow = scheduledCrossfadeStartNow
+        if (startNow == null || activeCrossfadeCancellation == null) return false
+        // A forced start ("next" during the wait) already asked this fade to begin: leave it.
+        if (startNow.isCompleted) return false
+        if (state == AndroidPlaybackOrchestratorState.CROSSFADING ||
+            state == AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE
+        ) return false
+        androidXfadeLog("crossfade scheduled cancelled reason=rescheduled")
+        cancelCrossfade("rescheduled", promoteIncoming = false)
+        return true
+    }
+
     private fun cancelCrossfade(errorCode: String, promoteIncoming: Boolean) {
         val fromIndex = activeCrossfadeFromIndex
         val toIndex = activeCrossfadeToIndex

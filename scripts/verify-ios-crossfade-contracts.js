@@ -268,4 +268,25 @@ assert(
   'iOS pingPong must emit PlaybackPlayWhenReadyChanged when play/pause flips playWhenReady, or useIsPlaying stays stale.'
 );
 
+const turboModule = read('ios/RNTrackPlayer/RNTrackPlayerTurboModule.mm');
+const bridge = read('ios/RNTrackPlayer/RNTrackPlayerBridge.m');
+const nativeSpec = read('src/NativeTrackPlayerModule.ts');
+const scheduledCancel = section(
+  orchestrator,
+  'func cancelScheduledCrossfade(reason: String) -> Bool {',
+  'private func cancelActiveCrossfade('
+);
+assert(
+  scheduledCancel.includes('guard let scheduled = scheduledCrossfade,') &&
+    scheduledCancel.includes('startingCrossfadeRunId != scheduled.runId') &&
+    orchestrator.includes('if admitted { self.startingCrossfadeRunId = runId }') &&
+    pingPongBackend.includes('orchestrator.cancelScheduledCrossfade(reason: reason)') &&
+    standardBackend.includes('func cancelScheduledCrossfade(reason: String) -> Bool { false }') &&
+    player.includes('@objc(crossFadeCancelScheduled:rejecter:)') &&
+    turboModule.includes('- (void)crossFadeCancelScheduled:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;') &&
+    bridge.includes('RCT_EXTERN_METHOD(crossFadeCancelScheduled:') &&
+    nativeSpec.includes('crossFadeCancelScheduled(): Promise<boolean>;'),
+  'iOS must cancel only a scheduled fade whose start was not admitted, through crossFadeCancelScheduled wired from the spec to the orchestrator.'
+);
+
 console.log('iOS crossfade contracts OK');

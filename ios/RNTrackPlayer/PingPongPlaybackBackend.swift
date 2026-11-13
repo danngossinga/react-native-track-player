@@ -360,6 +360,10 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         orchestrator.prepareCrossfade(previous: previous, seekTo: seekTo, completion: completion)
     }
 
+    func cancelScheduledCrossfade(reason: String) -> Bool {
+        orchestrator.cancelScheduledCrossfade(reason: reason)
+    }
+
     func crossFade(
         fadeDuration: Double,
         fadeInterval: Double,

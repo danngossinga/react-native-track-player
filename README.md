@@ -65,6 +65,9 @@ Added fork surface:
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.
+- `crossFadeCancelScheduled()` cancels a crossfade armed with `waitUntil` that
+  has not started (the music plays on), so it can be armed again, for example
+  with a new length; resolves whether one was cancelled.
 - `playback-crossfade-state` reports sanitized native crossfade state.
 
 Current validated scope:

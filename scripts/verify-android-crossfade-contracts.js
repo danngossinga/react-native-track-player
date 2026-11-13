@@ -259,4 +259,23 @@ assert(
   'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
+const musicModule = read('android/src/main/java/com/doublesymmetry/trackplayer/module/MusicModule.kt');
+const jniSpec = read('android/src/main/jni/RNTrackPlayerSpec/RNTrackPlayerSpec-generated.cpp');
+const scheduledCancel = orchestrator.slice(
+  orchestrator.indexOf('fun cancelScheduledCrossfade(): Boolean {'),
+  orchestrator.indexOf('private fun cancelCrossfade(')
+);
+assert(
+  scheduledCancel.includes('if (startNow == null || activeCrossfadeCancellation == null) return false') &&
+    scheduledCancel.includes('if (startNow.isCompleted) return false') &&
+    scheduledCancel.includes('AndroidPlaybackOrchestratorState.CROSSFADING') &&
+    pingPongBackend.includes('override fun cancelScheduledCrossfade(): Boolean = orchestrator.cancelScheduledCrossfade()') &&
+    standardBackend.includes('override fun cancelScheduledCrossfade(): Boolean = false') &&
+    musicService.includes('suspend fun crossFadeCancelScheduled(): Boolean') &&
+    musicModule.includes('fun crossFadeCancelScheduled(callback: Promise)') &&
+    jniSpec.includes('TRACK_PLAYER_PROMISE_METHOD(crossFadeCancelScheduled, "(Lcom/facebook/react/bridge/Promise;)V")') &&
+    jniSpec.includes('methodMap_["crossFadeCancelScheduled"] = MethodMetadata {0,'),
+  'Android must cancel only a waiting (not started) fade through crossFadeCancelScheduled, wired from the module to the orchestrator.'
+);
+
 console.log('Android crossfade contracts OK');

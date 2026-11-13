@@ -393,6 +393,20 @@ export async function crossFadePrepare(
 }
 
 /**
+ * Cancels the crossfade that `crossFade` scheduled with `waitUntil` and that has not started yet.
+ * The music plays on untouched (on Android, as after a seek, the next song loaded for the fade is
+ * unloaded; the next `crossFadePrepare` loads it again); a fade already under way is left to
+ * finish. The cancelled fade ends with a `playback-crossfade-state` event `cancelled`, as after a
+ * seek (`errorCode` `rescheduled` on iOS, `cancelled` on Android), so the caller can arm a new one
+ * (for example with a new length).
+ *
+ * @returns Whether a scheduled fade was cancelled.
+ */
+export async function crossFadeCancelScheduled(): Promise<boolean> {
+  return TrackPlayer.crossFadeCancelScheduled();
+}
+
+/**
  * Performs a native two-player crossfade.
  *
  * Durations and waitUntil are in milliseconds. waitUntil is an absolute

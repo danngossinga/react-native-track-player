@@ -1502,6 +1502,30 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
     }
 
+    /// Cancels the crossfade that is scheduled but has not started (the music plays on), so the
+    /// caller can arm a new one, for example with a new length. Resolves whether one was cancelled.
+    @objc(crossFadeCancelScheduled:rejecter:)
+    public func crossFadeCancelScheduled(
+        resolve: @escaping RCTPromiseResolveBlock,
+        reject: @escaping RCTPromiseRejectBlock
+    ) {
+        if (rejectWhenNotInitialized(reject: reject)) { return }
+        withActivePlaybackBackendAsync({ backend, completion in
+            guard backend.kind == .pingPong else {
+                completion(.success(false))
+                return
+            }
+            completion(.success(backend.cancelScheduledCrossfade(reason: "rescheduled")))
+        }) { (result: Result<Bool, Error>) in
+            switch result {
+            case .success(let cancelled):
+                resolve(cancelled)
+            case .failure(let error):
+                reject("crossfade_cancel_failed", "Unable to cancel the scheduled crossfade.", error)
+            }
+        }
+    }
+
     @objc(crossFade:fadeInterval:fadeToVolume:waitUntil:resolver:rejecter:)
     public func crossFade(
         fadeDuration: Double,
