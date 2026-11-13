@@ -32,6 +32,12 @@ class PrepareTimeoutOptionTest {
     }
 
     @Test
+    fun isReadFromTheOptionTheAppGives() {
+        // The key of setupPlayer / updateOptions, as on iOS and in the TypeScript options.
+        assertEquals("prepareTimeoutMs", PREPARE_TIMEOUT_KEY)
+    }
+
+    @Test
     fun defaultsToFiveSeconds() {
         assertEquals(5_000L, DEFAULT_PREPARE_TIMEOUT_MS)
     }

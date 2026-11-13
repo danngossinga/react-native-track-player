@@ -259,6 +259,13 @@ assert(
   'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
+// Every engine load and seek passes the app's setting, never a number.
+assert(
+  !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6,
+  'Android engine loads and seeks must all pass prepareTimeoutMs(), never a fixed timeout.'
+);
+
 // The app's load timeout (prepareTimeoutMs) reaches every orchestrator, from setup (even when the
 // service is already set up) and from updateOptions.
 const setupPlayerSection = section(musicService, 'fun setupPlayer(playerOptions: Bundle?)', 'val bufferConfig');
