@@ -412,6 +412,47 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun everyLoadUsesTheLoadTimeoutSetAtThatMoment() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            RecordingOrchestratorDelegate(),
+            engineA,
+            engineB
+        )
+        try {
+            // The service's setting, read at each load and seek: the first load, the song loaded by
+            // a skip, the next one preloaded on the standby engine and a seek use it, and a new
+            // value applies to the next one.
+            var setting = 9_000L
+            orchestrator.prepareTimeoutMs = { setting }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            assertEquals(9_000L, engineA.lastPrepareTimeoutMs)
+
+            setting = 12_000L
+            val standbyLoads = engineB.prepareCalls
+            orchestrator.skip(1)
+            runCurrent()
+            assertEquals(12_000L, engineA.lastPrepareTimeoutMs)
+            assertTrue(engineB.prepareCalls > standbyLoads)
+            assertEquals(12_000L, engineB.lastPrepareTimeoutMs)
+            setting = 30_000L
+            orchestrator.skip(0)
+            runCurrent()
+            assertEquals(30_000L, engineA.lastPrepareTimeoutMs)
+            setting = 40_000L
+            orchestrator.seekTo(20_000L)
+            runCurrent()
+            assertEquals(40_000L, engineA.lastSeekTimeoutMs)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -719,6 +760,10 @@ class AndroidPlaybackOrchestratorCancellationTest {
             private set
         var lastPrepareTicket: PlaybackOperationTicket? = null
             private set
+        var lastPrepareTimeoutMs: Long? = null
+            private set
+        var lastSeekTimeoutMs: Long? = null
+            private set
 
         override val positionMs: Long
             get() = position
@@ -744,6 +789,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
         ) {
             prepareCalls += 1
             lastPrepareTicket = ticket
+            lastPrepareTimeoutMs = timeoutMs
             val block = blockNextPrepare.also { blockNextPrepare = null }
             if (block != null) {
                 block.entered.complete(Unit)
@@ -790,6 +836,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             ticket: PlaybackOperationTicket?
         ) {
             ticket?.ensureActive()
+            lastSeekTimeoutMs = timeoutMs
             position = positionMs
         }
 
