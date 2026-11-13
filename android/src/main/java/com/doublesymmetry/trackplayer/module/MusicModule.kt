@@ -655,6 +655,21 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
     }
 
     @ReactMethod
+    fun crossFadeCancelScheduled(callback: Promise) {
+        scope.launch {
+        if (verifyServiceBoundOrReject(callback)) return@launch
+
+        try {
+            callback.resolve(musicService.crossFadeCancelScheduled())
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            rejectWithException(callback, error)
+        }
+    }
+    }
+
+    @ReactMethod
     fun getVolume(callback: Promise) {
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch

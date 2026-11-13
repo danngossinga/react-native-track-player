@@ -1013,6 +1013,13 @@ class MusicService : HeadlessJsTaskService() {
         }
     }
 
+    /** Cancels the scheduled crossfade that has not started (see the orchestrator). */
+    @MainThread
+    suspend fun crossFadeCancelScheduled(): Boolean =
+        withActivePlaybackBackend {
+            it.type == PlaybackBackendType.PING_PONG && it.cancelScheduledCrossfade()
+        }
+
     @MainThread
     suspend fun crossFade(
         fadeDuration: Double = 5000.0,

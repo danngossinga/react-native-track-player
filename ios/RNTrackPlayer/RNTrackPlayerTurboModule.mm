@@ -38,6 +38,7 @@
 - (void)setVolume:(float)volume resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)crossFadePrepare:(BOOL)previous seekTo:(double)seekTo resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)crossFade:(double)fadeDuration fadeInterval:(double)fadeInterval fadeToVolume:(double)fadeToVolume waitUntil:(double)waitUntil resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
+- (void)crossFadeCancelScheduled:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)getVolume:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)setRate:(float)rate resolver:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
 - (void)getRate:(RCTPromiseResolveBlock)resolve rejecter:(RCTPromiseRejectBlock)reject;
@@ -206,6 +207,11 @@
 - (void)crossFade:(double)fadeDuration fadeInterval:(double)fadeInterval fadeToVolume:(double)fadeToVolume waitUntil:(double)waitUntil resolve:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
 {
   [self crossFade:fadeDuration fadeInterval:fadeInterval fadeToVolume:fadeToVolume waitUntil:waitUntil resolver:resolve rejecter:reject];
+}
+
+- (void)crossFadeCancelScheduled:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject
+{
+  [self crossFadeCancelScheduled:resolve rejecter:reject];
 }
 
 - (void)getVolume:(RCTPromiseResolveBlock)resolve reject:(RCTPromiseRejectBlock)reject

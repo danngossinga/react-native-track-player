@@ -40,6 +40,8 @@ internal interface AndroidPlaybackBackendRouting : PlaybackBackend {
     fun setRate(value: Float)
     fun setRepeatMode(value: RepeatMode)
     suspend fun prepareCrossfade(previous: Boolean, seekTo: Double)
+    /** Cancels a scheduled crossfade that has not started; answers whether there was one. */
+    fun cancelScheduledCrossfade(): Boolean
 }
 
 internal data class AndroidPlaybackErrorSnapshot(
@@ -454,6 +456,7 @@ internal class KotlinAudioPlaybackBackend(
     override fun setRepeatMode(value: RepeatMode) {
         (player.playerOptions as? QueuedPlayerOptions)?.repeatMode = value
     }
+    override fun cancelScheduledCrossfade(): Boolean = false
     override suspend fun prepareCrossfade(previous: Boolean, seekTo: Double) {
         throw RejectionException(
             "The standard playback backend does not own a crossfade engine.",

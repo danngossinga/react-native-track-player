@@ -226,4 +226,5 @@ internal class PingPongPlaybackBackend(
     override suspend fun prepareCrossfade(previous: Boolean, seekTo: Double) {
         orchestrator.crossFadePrepare(previous, seekTo)
     }
+    override fun cancelScheduledCrossfade(): Boolean = orchestrator.cancelScheduledCrossfade()
 }

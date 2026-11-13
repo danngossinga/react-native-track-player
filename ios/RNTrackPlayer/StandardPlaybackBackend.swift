@@ -117,6 +117,8 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
         waitUntil: Double,
         completion: @escaping (Result<Void, Error>) -> Void
     )
+    /// Cancels a scheduled crossfade that has not started; answers whether there was one.
+    func cancelScheduledCrossfade(reason: String) -> Bool
 }
 
 struct IOSPlaybackErrorSnapshot: Equatable {
@@ -817,6 +819,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func setRepeatMode(_ rawValue: Int) {
         player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: rawValue) ?? .off
     }
+
+    func cancelScheduledCrossfade(reason: String) -> Bool { false }
 
     func prepareCrossfade(
         previous: Bool,
