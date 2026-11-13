@@ -75,6 +75,9 @@ final class IOSCrossfadeEngine {
         ]
     }
 #endif
+    /// How long a track may take to become ready (`prepareTimeoutMs` option, 5000 ms by default).
+    /// Read at every load, so a new value from the app applies to the next load at once.
+    var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs }
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
@@ -349,7 +352,7 @@ final class IOSCrossfadeEngine {
             )))
         }
         timeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(5000), execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(prepareTimeoutMs()), execute: timeout)
     }
 
     private func waitForPlaying(
@@ -399,4 +402,17 @@ final class IOSCrossfadeEngine {
         timeoutWorkItem = timeout
         DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeout)
     }
+}
+
+/// How long a crossfade engine waits for a track to become ready before giving up, unless the app
+/// sets `prepareTimeoutMs` (setupPlayer or updateOptions).
+let prepareTimeoutDefaultMs = 5000
+
+/// The `prepareTimeoutMs` option, in milliseconds: nil when it is absent or not a positive number
+/// (the current value is then kept).
+func prepareTimeoutOption(_ value: Any?) -> Int? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    let ms = number.doubleValue
+    guard ms.isFinite, ms >= 1, ms < Double(Int32.max) else { return nil }
+    return Int(ms)
 }

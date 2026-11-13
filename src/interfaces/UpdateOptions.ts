@@ -17,6 +17,13 @@ export interface UpdateOptions {
 
   capabilities?: Capability[];
 
+  /**
+   * Crossfade backend (iOS and Android): how long, in milliseconds, a track may take to load before
+   * the load fails (on Android with `crossfade_prepare_timeout`). Defaults to 5000. Slow phones and networks may
+   * need more. A value that is not a positive number is ignored. Applies to the next load at once.
+   */
+  prepareTimeoutMs?: number;
+
   // android
   /**
    * @deprecated Use `android` options and `appKilledPlaybackMode` instead.

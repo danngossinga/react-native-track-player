@@ -110,6 +110,13 @@ export interface PlayerOptions {
    */
   crossfade?: boolean;
   /**
+   * Crossfade backend (iOS and Android): how long, in milliseconds, a track may take to load before
+   * the load fails (on Android with `crossfade_prepare_timeout`). Defaults to 5000. Slow phones and networks may
+   * need more. A value that is not a positive number is ignored. Also accepted by `updateOptions`,
+   * where it applies to the next load at once.
+   */
+  prepareTimeoutMs?: number;
+  /**
    * Compatibility alias for selecting the iOS crossfade engine.
    * Both values now use the RNTP-owned orchestrated dual engine.
    * @deprecated RNTP owns a single crossfade engine; omit this option.

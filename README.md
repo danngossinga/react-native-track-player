@@ -62,6 +62,9 @@ Local release tag: `v4.1.2-bface-pingpong.0`
 Added fork surface:
 
 - `setupPlayer({ crossfade: true })` enables the fork crossfade path.
+- `prepareTimeoutMs` (`setupPlayer` and `updateOptions`, default 5000): how long
+  the crossfade path waits for a track to load before the load fails. A new
+  value applies to the next load at once.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

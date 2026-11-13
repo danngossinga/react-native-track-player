@@ -74,6 +74,8 @@ class MusicService : HeadlessJsTaskService() {
     private val scope = MainScope()
     private var progressUpdateJob: Job? = null
     private var crossfadeEnabled = false
+    /** The crossfade engines' load timeout (`prepareTimeoutMs`), read by every orchestrator. */
+    private var prepareTimeoutMs = DEFAULT_PREPARE_TIMEOUT_MS
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
@@ -336,6 +338,8 @@ class MusicService : HeadlessJsTaskService() {
                 }
             }
         )
+        // Reads the service's setting at every load: a later updateOptions reaches every engine.
+        created.prepareTimeoutMs = { prepareTimeoutMs }
         Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
         return created
     }
@@ -554,6 +558,7 @@ class MusicService : HeadlessJsTaskService() {
         )
 
         crossfadeEnabled = playerOptions?.getBoolean(CROSSFADE_KEY, false) ?: false
+        applyPrepareTimeout(playerOptions)
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
         standardPlayerFactory = {
@@ -580,9 +585,21 @@ class MusicService : HeadlessJsTaskService() {
         )
     }
 
+    /** Takes a valid `prepareTimeoutMs` from setup or update options; any other value is ignored. */
+    private fun applyPrepareTimeout(options: Bundle?) {
+        val value = if (options?.containsKey(PREPARE_TIMEOUT_KEY) == true) options.get(PREPARE_TIMEOUT_KEY) else return
+        val timeout = prepareTimeoutFrom(value) ?: run {
+            androidXfadeLog("prepare timeout ignored value=$value kept=${prepareTimeoutMs}ms")
+            return
+        }
+        prepareTimeoutMs = timeout
+        androidXfadeLog("prepare timeout set to ${timeout}ms")
+    }
+
     @MainThread
     fun updateOptions(options: Bundle) {
         latestOptions = options
+        applyPrepareTimeout(options)
         val androidOptions = options.getBundle(ANDROID_OPTIONS_KEY)
 
         appKilledPlaybackBehavior = AppKilledPlaybackBehavior::string.find(androidOptions?.getString(APP_KILLED_PLAYBACK_BEHAVIOR_KEY)) ?: AppKilledPlaybackBehavior.CONTINUE_PLAYBACK

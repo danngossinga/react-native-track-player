@@ -51,7 +51,7 @@ internal interface AndroidCrossfadeEnginePort {
     suspend fun prepare(
         item: TrackAudioItem,
         positionMs: Long = 0L,
-        timeoutMs: Long = 5000L,
+        timeoutMs: Long = DEFAULT_PREPARE_TIMEOUT_MS,
         ticket: PlaybackOperationTicket? = null
     )
     fun play(rate: Float = 1f)
@@ -276,7 +276,22 @@ internal class AndroidCrossfadeEngine(
             ?: item.audioUrl
     }
 
-    private companion object {
-        const val PREPARE_TIMEOUT_MS = 5000L
-    }
 }
+
+/**
+ * How long a crossfade engine waits for a track to become ready before giving up
+ * (`crossfade_prepare_timeout`), unless the app sets `prepareTimeoutMs`.
+ */
+internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
+
+/**
+ * The `prepareTimeoutMs` option (milliseconds) read from setup or update options: null when it is
+ * absent or not a positive number, so the current value is kept.
+ */
+internal fun prepareTimeoutFrom(value: Any?): Long? {
+    val ms = (value as? Number)?.toDouble() ?: return null
+    if (!ms.isFinite() || ms < 1.0 || ms >= Long.MAX_VALUE.toDouble()) return null
+    return ms.toLong()
+}
+
+internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
