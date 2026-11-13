@@ -1,5 +1,51 @@
 import Foundation
 
+/// How long a crossfade engine waits for a track to become ready before giving up, unless the app
+/// sets `prepareTimeoutMs` (setupPlayer or updateOptions).
+let prepareTimeoutDefaultMs = 5000
+
+/// The `prepareTimeoutMs` option, in milliseconds: nil when it is not a number from 1 to
+/// 2147483646 (booleans refused), so the current value is kept. Same bounds as Android.
+func prepareTimeoutOption(_ value: Any?) -> Int? {
+    guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
+    let ms = number.doubleValue
+    guard ms.isFinite, ms >= 1, ms < Double(Int32.max) else { return nil }
+    return Int(ms)
+}
+
+/// The app's load timeout: one value, written from the module's queue and read by the engines
+/// (main) and the backend steps (facade queues), so it is locked.
+final class PrepareTimeoutSetting {
+    static let optionKey = "prepareTimeoutMs"
+    private let lock = NSLock()
+    private var value = prepareTimeoutDefaultMs
+
+    var milliseconds: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+
+    /// Takes a valid `prepareTimeoutMs` from setup or update options. Returns what happened:
+    /// nil when the options do not carry it, false when its value was ignored, true when taken.
+    @discardableResult
+    func apply(_ options: [String: Any]) -> Bool? {
+        guard let raw = options[Self.optionKey] else { return nil }
+        guard let timeout = prepareTimeoutOption(raw) else { return false }
+        lock.lock()
+        value = timeout
+        lock.unlock()
+        return true
+    }
+}
+
+/// How long a synchronous ping-pong backend step may take (a backend switch, which may load a
+/// track, and the play used to resume after an interruption): the load timeout plus 5 s, never
+/// less than the 10 s it always had (5 s load timeout by default).
+func backendStepTimeout(loadTimeoutMs: Int) -> TimeInterval {
+    max(10, TimeInterval(loadTimeoutMs) / 1000 + 5)
+}
+
 enum PlaybackBackendKind: String {
     case standard
     case pingPong

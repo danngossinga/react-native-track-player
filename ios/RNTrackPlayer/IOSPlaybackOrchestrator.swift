@@ -109,6 +109,13 @@ final class IOSPlaybackOrchestrator {
 
     private let engineA = IOSCrossfadeEngine(name: "engineA")
     private let engineB = IOSCrossfadeEngine(name: "engineB")
+    /// How long an engine may take to load a track (ms); both engines read it at every load.
+    var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs } {
+        didSet {
+            engineA.prepareTimeoutMs = prepareTimeoutMs
+            engineB.prepareTimeoutMs = prepareTimeoutMs
+        }
+    }
     private var activeEngine: IOSCrossfadeEngine
     private var standbyEngine: IOSCrossfadeEngine
     private var queue: [Track] = []

@@ -53,7 +53,7 @@ jobs:
 
           source = Path('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').read_text()
           expected = ['PlaybackBackendTransactionTests/' + name + '()' for name in re.findall(r'^\s*func (test\w+)\s*\(', source, re.M)]
-          assert len(expected) == len(set(expected)) == 47, 'Expected 47 unique transaction methods'
+          assert len(expected) == len(set(expected)) == 51, 'Expected 51 unique transaction methods'
           summary = json.loads(Path('artifacts/summary.json').read_text())
           assert summary['result'] == 'Passed', 'Native suite did not pass'
           assert summary['totalTestCount'] == summary['passedTests'] == len(expected), 'Missing passing tests'

@@ -8,6 +8,7 @@ All parameters are optional. You also only need to specify the ones you want to 
 | `ratingType` | [RatingType](../constants/rating.md) | The rating type | ✅ | ❌ | ❌ |
 | `forwardJumpInterval` | `number` | The interval in seconds for the jump forward buttons (if only one is given then we use that value for both) | ✅ | ✅ | ✅ |
 | `backwardJumpInterval` | `number` | The interval in seconds for the jump backward buttons (if only one is given then we use that value for both) | ✅ | ✅ | ✅ |
+| `prepareTimeoutMs` | `number` | Crossfade backend: how long, in milliseconds, a track may take to become ready (see [`PlayerOptions`](./player-options.md)). Applies to the next load at once. A value that is not a number from 1 to 2147483646 is ignored. Left out, the current value is kept. Other options left out of an `updateOptions` call (capabilities, progress interval…) are reset, so pass it together with your usual options. | ✅ | ✅ | ❌ |
 | `android` | [`AndroidOptions`](./android-options.md) | Whether the player will pause playback when the app closes | ✅ | ❌ | ❌ |
 | `likeOptions` | [FeedbackOptions](../objects/feedback.md) | The media controls that will be enabled | ❌ | ✅ | ❌ |
 | `dislikeOptions` | [FeedbackOptions](../objects/feedback.md) | The media controls that will be enabled | ❌ | ✅ | ❌ |

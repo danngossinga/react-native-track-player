@@ -62,6 +62,14 @@ Local release tag: `v4.1.2-bface-pingpong.0`
 Added fork surface:
 
 - `setupPlayer({ crossfade: true })` enables the fork crossfade path.
+- `prepareTimeoutMs` (`setupPlayer` and `updateOptions`, default 5000): how long
+  the crossfade path waits for a track to become ready before it fails. Android
+  bounds the whole load and every seek. iOS bounds the wait from a playable
+  asset to a ready item; a backend switch and the play used to resume after an
+  interruption wait this long plus 5 s (at least 10 s). A new value applies to
+  the next load at once. Left out, the current value is kept. Other options
+  left out of an `updateOptions` call (capabilities, progress interval…) are
+  reset, so pass it together with your usual options.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

@@ -51,7 +51,8 @@ internal interface AndroidCrossfadeEnginePort {
     suspend fun prepare(
         item: TrackAudioItem,
         positionMs: Long = 0L,
-        timeoutMs: Long = 5000L,
+        // No default: every call passes the app's setting (prepareTimeoutMs).
+        timeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun play(rate: Float = 1f)
@@ -60,7 +61,7 @@ internal interface AndroidCrossfadeEnginePort {
     fun release()
     suspend fun seekTo(
         positionMs: Long,
-        timeoutMs: Long = 5000L,
+        timeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun setVolume(value: Float)
@@ -276,7 +277,39 @@ internal class AndroidCrossfadeEngine(
             ?: item.audioUrl
     }
 
-    private companion object {
-        const val PREPARE_TIMEOUT_MS = 5000L
+}
+
+/**
+ * How long a crossfade engine waits for a track to become ready (`crossfade_prepare_timeout`), or
+ * for a seek to finish buffering (`crossfade_seek_timeout`), unless the app sets `prepareTimeoutMs`.
+ */
+internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
+
+/**
+ * The `prepareTimeoutMs` option (milliseconds) read from setup or update options: null when it is
+ * absent or not a positive number, so the current value is kept.
+ */
+internal fun prepareTimeoutFrom(value: Any?): Long? {
+    val ms = (value as? Number)?.toDouble() ?: return null
+    // Same bounds as iOS: 1 ms to 2^31 - 2 ms.
+    if (!ms.isFinite() || ms < 1.0 || ms >= Int.MAX_VALUE.toDouble()) return null
+    return ms.toLong()
+}
+
+internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
+
+/** The app's load timeout: one value, kept until a valid new one comes (main thread only). */
+internal class PrepareTimeoutSetting {
+    var milliseconds: Long = DEFAULT_PREPARE_TIMEOUT_MS
+        private set
+
+    /**
+     * Takes a valid `prepareTimeoutMs` (the option's raw value). Returns false when the value is
+     * ignored and the current one kept.
+     */
+    fun apply(value: Any?): Boolean {
+        val timeout = prepareTimeoutFrom(value) ?: return false
+        milliseconds = timeout
+        return true
     }
 }
