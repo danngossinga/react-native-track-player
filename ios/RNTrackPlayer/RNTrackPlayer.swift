@@ -76,8 +76,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var sessionCategoryMode: AVAudioSession.Mode = .default
     private var sessionCategoryPolicy: AVAudioSession.RouteSharingPolicy = .default
     private var sessionCategoryOptions: AVAudioSession.CategoryOptions = []
-    /// Last playWhenReady published to JS for the ping-pong backend, so a state change that also
-    /// flips playWhenReady (play, pause, end of queue) emits PlaybackPlayWhenReadyChanged once.
+    /// Last playWhenReady published to JS for the ping-pong backend, so every change of it (play,
+    /// pause, stop, a cancelled load, play() on an empty queue) emits PlaybackPlayWhenReadyChanged
+    /// once, whether it comes with a state change or alone (didChangePlayWhenReady).
     private var lastPublishedPingPongPlayWhenReady: Bool? = nil
 
     // MARK: - Lifecycle Methods
@@ -1932,6 +1933,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     // MARK: - IOSPlaybackOrchestratorDelegate
+
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangePlayWhenReady playWhenReady: Bool) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
+        publishPingPongPlayWhenReadyIfChanged(orchestrator)
+    }
 
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangeState state: State) {
         guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
