@@ -261,6 +261,18 @@ class MusicService : HeadlessJsTaskService() {
         stopForeground(true)
     }
 
+    /** The playWhenReady sent to JS for the PingPong backend (see [PlayWhenReadyPublication]). */
+    private val pingPongPlayWhenReady = PlayWhenReadyPublication()
+
+    /** Sends `playback-play-when-ready-changed` for the PingPong backend when JS must hear it. */
+    private fun publishPingPongPlayWhenReady(playWhenReady: Boolean, force: Boolean) {
+        if (!pingPongPlayWhenReady.shouldPublish(playWhenReady, force)) return
+        Bundle().apply {
+            putBoolean("playWhenReady", playWhenReady)
+            emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)
+        }
+    }
+
     private fun createPlaybackOrchestrator(
         identity: Any,
         eventAdmission: SharedFlowAdmissionGate
@@ -332,6 +344,9 @@ class MusicService : HeadlessJsTaskService() {
 
                 override fun onSnapshotChanged(snapshot: AndroidPlaybackSnapshot) {
                     if (!isAuthoritative()) return
+                    // Sent on every state change (after its playback-state), not only when the
+                    // mapped state changes, so no play or pause flip of playWhenReady is lost.
+                    publishPingPongPlayWhenReady(created.playWhenReady, force = false)
                     orchestratedMediaSurface?.publish(snapshot, "orchestrator")
                 }
             }
@@ -476,6 +491,7 @@ class MusicService : HeadlessJsTaskService() {
                 fun publishInitialSurface() {
                     eventAdmission.admit()
                     emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(orchestrator.playbackState))
+                    publishPingPongPlayWhenReady(orchestrator.playWhenReady, force = true)
                     publishSurface("backend-initial")
                 }
                 suspend fun admitAndPublishSurface(reason: String) {
@@ -484,6 +500,7 @@ class MusicService : HeadlessJsTaskService() {
                             MusicEvents.PLAYBACK_STATE,
                             getPlayerStateBundle(orchestrator.playbackState)
                         )
+                        publishPingPongPlayWhenReady(orchestrator.playWhenReady, force = true)
                         publishSurface(reason)
                     }.join()
                 }
