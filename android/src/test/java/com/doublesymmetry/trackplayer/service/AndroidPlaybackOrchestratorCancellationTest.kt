@@ -507,6 +507,90 @@ class AndroidPlaybackOrchestratorCancellationTest {
         }
     }
 
+    @Test
+    fun cancelScheduledCrossfadeCancelsOnlyTheWaitingFadeAndLetsANewOneBeArmed() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(2))
+            orchestrator.play()
+            runCurrent()
+            val statesBefore = delegate.playbackStates.size
+
+            supervisorScope {
+                val armed = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 12_000.0, waitUntil = 50_000.0)
+                }
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "scheduled" })
+
+                assertTrue(orchestrator.cancelScheduledCrossfade())
+                val rejection = runCatching { armed.await() }.exceptionOrNull()
+                assertTrue(rejection is RejectionException && rejection.code == "cancelled")
+                assertEquals(
+                    listOf("scheduled", "cancelled"),
+                    delegate.crossfadeEvents.map { it.state }
+                )
+                // The music played on: no fade started, nothing paused, the song still plays.
+                assertTrue(delegate.crossfadeEvents.none { it.state == "started" })
+                assertEquals(AndroidPlaybackOrchestratorState.PLAYING_SINGLE, orchestrator.state)
+                assertTrue(delegate.playbackStates.drop(statesBefore).none { it == AudioPlayerState.PAUSED })
+                // Nothing left to cancel.
+                assertFalse(orchestrator.cancelScheduledCrossfade())
+
+                // A new fade (for example with a new length) can be armed at once.
+                val rearmed = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 4_000.0, waitUntil = 56_000.0)
+                }
+                assertTrue(delegate.crossfadeEvents.none { it.errorCode == "crossfade_in_progress" })
+                assertEquals(2, delegate.crossfadeEvents.count { it.state == "scheduled" })
+                assertTrue(orchestrator.cancelScheduledCrossfade())
+                runCatching { rearmed.await() }
+            }
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun cancelScheduledCrossfadeLeavesAFadeUnderWayAlone() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(2))
+            orchestrator.play()
+            runCurrent()
+            assertFalse(orchestrator.cancelScheduledCrossfade())
+
+            supervisorScope {
+                val running = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFade(fadeDuration = 1_000.0, waitUntil = 0.0)
+                }
+                runCurrent()
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "started" })
+                assertFalse(orchestrator.cancelScheduledCrossfade())
+                running.await()
+                assertEquals(1, delegate.crossfadeEvents.count { it.state == "completed" })
+                assertTrue(delegate.crossfadeEvents.none { it.state == "cancelled" })
+            }
+        } finally {
+            orchestrator.release()
+        }
+    }
+
     private data class CrossfadeEvent(
         val state: String,
         val fromIndex: Int,

@@ -142,6 +142,9 @@ final class IOSPlaybackOrchestrator {
     private let crossfadeFinishAfterCommitHook: SynchronizationTestHook
     private let scheduledCrossfadeTimerHook: ScheduledCrossfadeTimerHook
     private let scheduledCrossfadeCancellationAfterClaimHook: SynchronizationTestHook
+    /// The run whose scheduled fade is starting (its incoming player was told to play), under
+    /// `crossfadeMutationLock`: `cancelScheduledCrossfade` leaves that fade alone.
+    private var startingCrossfadeRunId: Int?
     private let crossfadeMutationLock = NSLock()
     private let standbyPreparationInvocationQueue = DispatchQueue.main
     private let crossfadeEventDeliveryQueue = DispatchQueue.main
@@ -1180,6 +1183,8 @@ final class IOSPlaybackOrchestrator {
                 toIndex: toIndex,
                 completionGate: completionGate
             )
+            // From here the incoming player starts: `cancelScheduledCrossfade` must not cancel it.
+            if admitted { self.startingCrossfadeRunId = runId }
             self.crossfadeMutationLock.unlock()
             guard admitted else { return }
             IOSPlaybackLog.log("crossfade start from=\(fromIndex) to=\(toIndex)")
@@ -1886,6 +1891,50 @@ final class IOSPlaybackOrchestrator {
     private func isStandbyPreparationSuperseded(_ error: Error) -> Bool {
         return (error as NSError).userInfo["code"] as? String ==
             "standby_preparation_superseded"
+    }
+
+    /// Cancels the crossfade that is scheduled but has not started yet, and nothing else: the
+    /// music plays on, untouched. The fade's caller then arms a new one, for example with a new
+    /// length the listener just chose. Same as what a seek does to it, without the seek. A fade
+    /// already under way is left to finish. Answers whether a scheduled fade was cancelled.
+    @discardableResult
+    func cancelScheduledCrossfade(reason: String) -> Bool {
+        let error = makeError(
+            "crossfade_cancelled",
+            "Crossfade was cancelled by \(reason)."
+        )
+        crossfadeMutationLock.lock()
+        // While `scheduledCrossfade` is set under this lock and its start was not admitted, the fade
+        // has not started: the start marks `startingCrossfadeRunId` under the same lock before the
+        // incoming player plays, and clears `scheduledCrossfade` before the volumes move.
+        guard let scheduled = scheduledCrossfade,
+              startingCrossfadeRunId != scheduled.runId,
+              let terminalResolver = crossfadeCommandSlot.takeResolver(
+                scheduled.completionGate,
+                result: .failure(error)
+              ) else {
+            crossfadeMutationLock.unlock()
+            return false
+        }
+        runId += 1
+        scheduledCrossfade = nil
+        scheduledStartWorkItem?.cancel()
+        scheduledStartWorkItem = nil
+        crossfadeEventGeneration &+= 1
+        enqueueCrossfadeEventLocked(
+            "cancelled",
+            fromIndex: scheduled.fromIndex,
+            toIndex: scheduled.toIndex,
+            elapsedMs: 0,
+            fromVolume: scheduled.fromVolume,
+            toVolume: 0,
+            errorCode: reason,
+            afterDelivery: terminalResolver
+        )
+        crossfadeMutationLock.unlock()
+        scheduledCrossfadeCancellationAfterClaimHook()
+        IOSPlaybackLog.log("crossfade scheduled cancelled reason=\(reason)")
+        return true
     }
 
     private func cancelActiveCrossfade(errorCode: String) {

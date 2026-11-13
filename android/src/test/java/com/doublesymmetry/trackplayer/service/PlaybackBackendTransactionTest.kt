@@ -1959,6 +1959,7 @@ class PlaybackBackendTransactionTest {
         override fun setRate(value: Float) = Unit
         override fun setRepeatMode(value: RepeatMode) = Unit
         override suspend fun prepareCrossfade(previous: Boolean, seekTo: Double) = Unit
+        override fun cancelScheduledCrossfade(): Boolean = false
 
         override suspend fun dispose() {
             protocolTrace += "$type:dispose"

@@ -56,6 +56,7 @@ TRACK_PLAYER_PROMISE_METHOD(getRepeatMode, "(Lcom/facebook/react/bridge/Promise;
 TRACK_PLAYER_PROMISE_METHOD(setVolume, "(DLcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(crossFadePrepare, "(ZDLcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(crossFade, "(DDDDLcom/facebook/react/bridge/Promise;)V")
+TRACK_PLAYER_PROMISE_METHOD(crossFadeCancelScheduled, "(Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(getVolume, "(Lcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(setRate, "(DLcom/facebook/react/bridge/Promise;)V")
 TRACK_PLAYER_PROMISE_METHOD(getRate, "(Lcom/facebook/react/bridge/Promise;)V")
@@ -106,6 +107,7 @@ NativeTrackPlayerModuleSpecJSI::NativeTrackPlayerModuleSpecJSI(
   methodMap_["setVolume"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_setVolume};
   methodMap_["crossFadePrepare"] = MethodMetadata {2, __hostFunction_NativeTrackPlayerModuleSpecJSI_crossFadePrepare};
   methodMap_["crossFade"] = MethodMetadata {4, __hostFunction_NativeTrackPlayerModuleSpecJSI_crossFade};
+  methodMap_["crossFadeCancelScheduled"] = MethodMetadata {0, __hostFunction_NativeTrackPlayerModuleSpecJSI_crossFadeCancelScheduled};
   methodMap_["getVolume"] = MethodMetadata {0, __hostFunction_NativeTrackPlayerModuleSpecJSI_getVolume};
   methodMap_["setRate"] = MethodMetadata {1, __hostFunction_NativeTrackPlayerModuleSpecJSI_setRate};
   methodMap_["getRate"] = MethodMetadata {0, __hostFunction_NativeTrackPlayerModuleSpecJSI_getRate};
