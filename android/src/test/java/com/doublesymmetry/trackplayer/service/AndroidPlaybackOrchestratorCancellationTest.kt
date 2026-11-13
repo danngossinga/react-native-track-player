@@ -363,6 +363,55 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun refusedCrossfadePrepareLeavesALoadingSkipToFinish() = runTest {
+        // A skip from the lock screen, a headset or the notification is still loading the next song
+        // when the JS library, seeing the track change, asks to prepare the following crossfade.
+        // The preparation is refused (playback is not active yet); it must not cancel the skip,
+        // which would leave the player loading in silence.
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+
+            val blockedPrepare = PrepareBlock(swallowCancellationUntilReleased = false)
+            engineA.blockNextPrepare = blockedPrepare
+            supervisorScope {
+                val skip = async(start = CoroutineStart.UNDISPATCHED) { orchestrator.skip(1) }
+                blockedPrepare.entered.await()
+                val skipTicket = requireNotNull(engineA.lastPrepareTicket)
+                assertEquals(AndroidPlaybackOrchestratorState.LOADING, orchestrator.state)
+
+                val refused = runCatching { orchestrator.crossFadePrepare() }.exceptionOrNull()
+                assertTrue(refused is RejectionException)
+                assertEquals("crossfade_not_playing", (refused as RejectionException).code)
+                assertEquals(0, skipTicket.cancellationCount)
+                assertFalse(blockedPrepare.cancellationObserved.isCompleted)
+
+                // The skip finishes loading and plays the new song.
+                skip.await()
+                assertEquals(1, orchestrator.currentIndex)
+                assertEquals(AndroidPlaybackOrchestratorState.PLAYING_SINGLE, orchestrator.state)
+                assertTrue(orchestrator.snapshot().playWhenReady)
+                assertEquals(
+                    listOf(CrossfadeEvent("cancelled", 1, 2, "not_playing")),
+                    delegate.crossfadeEvents.filter { it.state == "cancelled" }
+                )
+            }
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
