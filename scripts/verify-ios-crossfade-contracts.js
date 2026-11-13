@@ -276,6 +276,7 @@ assert(
 const awaitResult = section(pingPongBackend, 'private func awaitResult(', 'throw playbackBackendError(');
 assert(
   !awaitResult.includes('timeout: TimeInterval') &&
+    awaitResult.includes('let timeout = backendStepTimeout(\n') &&
     awaitResult.includes('loadTimeoutMs: orchestrator.prepareTimeoutMs(),') &&
     awaitResult.includes('playStartTimeoutMs: orchestrator.playStartTimeoutMs()') &&
     !/awaitResult\(timeout/.test(pingPongBackend) &&
@@ -306,6 +307,8 @@ const standardBackend2 = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift')
 assert(
   engine.includes('waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)') &&
     !/timeoutMs: Int = \d/.test(engine) &&
+    orchestrator.includes('var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs } {\n        didSet {\n            engineA.prepareTimeoutMs = prepareTimeoutMs\n            engineB.prepareTimeoutMs = prepareTimeoutMs\n        }\n    }') &&
+    orchestrator.includes('var playStartTimeoutMs: () -> Int = { playStartTimeoutDefaultMs } {\n        didSet {\n            engineA.playStartTimeoutMs = playStartTimeoutMs\n            engineB.playStartTimeoutMs = playStartTimeoutMs\n        }\n    }') &&
     orchestrator.includes('engineA.playStartTimeoutMs = playStartTimeoutMs') &&
     orchestrator.includes('engineB.playStartTimeoutMs = playStartTimeoutMs') &&
     player.includes('orchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }') &&

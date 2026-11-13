@@ -62,6 +62,8 @@ class PrepareTimeoutOptionTest {
         assertEquals(5_000L, DEFAULT_STANDARD_READY_TIMEOUT_MS)
         val setting = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
         assertEquals(5_000L, setting.milliseconds)
+        // A setting starts from the default it is given.
+        assertEquals(1_234L, TimeoutSetting(1_234L).milliseconds)
         assertTrue(setting.apply(20_000.0))
         assertEquals(20_000L, setting.milliseconds)
     }

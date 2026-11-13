@@ -289,7 +289,8 @@ assert(
   musicService.includes('private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)') &&
     musicService.includes('readinessGate = StandardPlaybackReadinessGate(timeoutMs = { standardReadyTimeout.milliseconds })') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('private val timeoutMs: () -> Long,') &&
-    read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt').includes('private val readinessGate: StandardPlaybackReadinessGate,'),
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt').includes('private val readinessGate: StandardPlaybackReadinessGate,') &&
+    standardBackend.includes('        readinessGate.await(index, snapshot.positionMs) {'),
   'Android standard readiness wait must read standardReadyTimeoutMs, not a fixed 5 s.'
 );
 
