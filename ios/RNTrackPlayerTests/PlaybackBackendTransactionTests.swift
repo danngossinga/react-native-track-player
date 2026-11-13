@@ -55,12 +55,13 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
-    func testBackendStepTimeoutIsTheLoadTimeoutPlusFiveSecondsAndNeverBelowTen() {
+    func testBackendStepTimeoutCoversTheLoadOrPlayStartTimeoutAndNeverBelowTen() {
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 8_000), 10)
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000, playStartTimeoutMs: 1_000), 10)
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 35)
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500, playStartTimeoutMs: 8_000), 17.5)
-        // A longer play-start wait makes the step wait longer too, so it is never cut short.
+        // A longer play-start wait makes the step wait longer too (a backend switch only starts
+        // playback; the resume after an interruption may load and start, beyond this margin).
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 22)
     }
 

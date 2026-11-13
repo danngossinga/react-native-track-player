@@ -279,7 +279,8 @@ assert(
     updateOptionsSection.includes('applyTimeouts(options)') &&
     applyTimeoutSection.includes('applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)') &&
     applyTimeoutSection.includes('applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)') &&
-    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('setting.apply(value)'),
+    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('setting.apply(value)') &&
+    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('if (options?.containsKey(key) == true) options.get(key) else return'),
   'Android prepareTimeoutMs must be taken at setup (before the early return) and on updateOptions, and read by every orchestrator.'
 );
 

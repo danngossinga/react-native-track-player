@@ -113,7 +113,7 @@ export interface PlayerOptions {
    * Crossfade backend: how long, in milliseconds, a track may take to become ready before the load
    * fails. Android bounds the whole load and every seek (`crossfade_prepare_timeout`,
    * `crossfade_seek_timeout`); iOS bounds the wait from a playable asset to a ready item, and a
-   * backend switch and the play used to resume after an interruption wait this long plus 5 s (at
+   * backend switch and the play used to resume after an interruption wait at least this long plus 5 s (at
    * least 10 s). Defaults to 5000. A value that is not
    * a number from 1 to 2147483646 is ignored.
    */

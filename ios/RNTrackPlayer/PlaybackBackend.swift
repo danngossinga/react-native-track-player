@@ -51,10 +51,10 @@ final class TimeoutSetting {
     }
 }
 
-/// How long a synchronous ping-pong backend step may take (a backend switch, which may load a
-/// track and start it, a rollback, and the play used to resume after an interruption): the load
-/// timeout plus 5 s, or the play-start timeout plus 2 s, whichever is longer, and never less than
-/// the 10 s it always had (10 s with both defaults).
+/// How long a synchronous ping-pong backend step may take (a backend switch, which loads or starts
+/// a track, a rollback, and the play used to resume after an interruption): the load timeout plus
+/// 5 s, or the play-start timeout plus 2 s, whichever is longer, and never less than the 10 s it
+/// always had (10 s with both defaults).
 func backendStepTimeout(loadTimeoutMs: Int, playStartTimeoutMs: Int) -> TimeInterval {
     max(10, TimeInterval(loadTimeoutMs) / 1000 + 5, TimeInterval(playStartTimeoutMs) / 1000 + 2)
 }
