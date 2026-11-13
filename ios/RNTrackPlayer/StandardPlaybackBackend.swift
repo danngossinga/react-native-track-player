@@ -266,14 +266,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     init(
         player: QueuedAudioPlayer,
         transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
+        // The app's standardReadyTimeoutMs and standardSeekTimeoutMs, read at every wait.
+        readinessTimeoutMs: @escaping () -> Int,
+        seekTimeoutMs: @escaping () -> Int,
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
         onDisposed: @escaping (QueuedAudioPlayer) -> Void,
         onIdleTrackActivationWillBegin: @escaping (QueuedAudioPlayer) -> Void = { _ in },
         onIdleTrackActivated: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
-        readinessTimeoutMs: @escaping () -> Int = { standardReadyTimeoutDefaultMs },
-        seekTimeoutMs: @escaping () -> Int = { standardSeekTimeoutDefaultMs },
         waitForActivationReadiness: (
             (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
         )? = nil,

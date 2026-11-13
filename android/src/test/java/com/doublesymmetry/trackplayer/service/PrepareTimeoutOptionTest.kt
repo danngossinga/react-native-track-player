@@ -9,26 +9,26 @@ import org.junit.Test
 class PrepareTimeoutOptionTest {
     @Test
     fun takesAPositiveNumberOfMilliseconds() {
-        assertEquals(12_000L, prepareTimeoutFrom(12_000.0))
-        assertEquals(8_000L, prepareTimeoutFrom(8_000))
-        assertEquals(1L, prepareTimeoutFrom(1.9))
-        assertEquals(2_147_483_646L, prepareTimeoutFrom(2_147_483_646.0))
+        assertEquals(12_000L, timeoutOptionFrom(12_000.0))
+        assertEquals(8_000L, timeoutOptionFrom(8_000))
+        assertEquals(1L, timeoutOptionFrom(1.9))
+        assertEquals(2_147_483_646L, timeoutOptionFrom(2_147_483_646.0))
     }
 
     @Test
     fun ignoresAnythingElse() {
         // The current value is then kept (5000 ms unless the app set another one).
-        assertNull(prepareTimeoutFrom(null))
-        assertNull(prepareTimeoutFrom("12000"))
-        assertNull(prepareTimeoutFrom(true))
-        assertNull(prepareTimeoutFrom(0.0))
-        assertNull(prepareTimeoutFrom(-5_000.0))
-        assertNull(prepareTimeoutFrom(0.5))
-        assertNull(prepareTimeoutFrom(Double.NaN))
-        assertNull(prepareTimeoutFrom(Double.POSITIVE_INFINITY))
-        assertNull(prepareTimeoutFrom(1e30))
+        assertNull(timeoutOptionFrom(null))
+        assertNull(timeoutOptionFrom("12000"))
+        assertNull(timeoutOptionFrom(true))
+        assertNull(timeoutOptionFrom(0.0))
+        assertNull(timeoutOptionFrom(-5_000.0))
+        assertNull(timeoutOptionFrom(0.5))
+        assertNull(timeoutOptionFrom(Double.NaN))
+        assertNull(timeoutOptionFrom(Double.POSITIVE_INFINITY))
+        assertNull(timeoutOptionFrom(1e30))
         // The same upper bound as iOS.
-        assertNull(prepareTimeoutFrom(2_147_483_647.0))
+        assertNull(timeoutOptionFrom(2_147_483_647.0))
     }
 
     @Test

@@ -376,13 +376,16 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         )
     }
 
-    /// Waits for a synchronous step for the load timeout plus 5 s, at least 10 s (see
-    /// `backendStepTimeout`). The margin does not cover the asset's playable stage or a full 8 s
-    /// wait for playback to start, as before. Other commands wait behind such a step.
+    /// Waits for a synchronous step (see `backendStepTimeout`): the load or play-start timeout
+    /// plus a margin, at least 10 s. The margin does not cover the asset's own playable stage.
+    /// Other commands wait behind such a step.
     private func awaitResult(
         _ start: (@escaping (Result<Void, Error>) -> Void) -> Void
     ) throws {
-        let timeout = backendStepTimeout(loadTimeoutMs: orchestrator.prepareTimeoutMs())
+        let timeout = backendStepTimeout(
+            loadTimeoutMs: orchestrator.prepareTimeoutMs(),
+            playStartTimeoutMs: orchestrator.playStartTimeoutMs()
+        )
         let semaphore = DispatchSemaphore(value: 0)
         var captured: Result<Void, Error>?
         start { result in

@@ -56,10 +56,12 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     }
 
     func testBackendStepTimeoutIsTheLoadTimeoutPlusFiveSecondsAndNeverBelowTen() {
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000), 10)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000), 10)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000), 35)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500), 17.5)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 8_000), 10)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000, playStartTimeoutMs: 1_000), 10)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 35)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500, playStartTimeoutMs: 8_000), 17.5)
+        // A longer play-start wait makes the step wait longer too, so it is never cut short.
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 22)
     }
 
     private let snapshot = PlaybackBackendSnapshot(
