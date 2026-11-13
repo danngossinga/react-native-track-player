@@ -376,10 +376,18 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         )
     }
 
+    /// How long a backend step that may load a track can take: the load timeout
+    /// (`prepareTimeoutMs`) plus 5 s for the seek, preroll and start around it, and never less
+    /// than the 10 s it always had (5 s load timeout by default).
+    private var backendStepTimeout: TimeInterval {
+        max(10, TimeInterval(orchestrator.prepareTimeoutMs()) / 1000 + 5)
+    }
+
     private func awaitResult(
-        timeout: TimeInterval = 10,
+        timeout: TimeInterval? = nil,
         _ start: (@escaping (Result<Void, Error>) -> Void) -> Void
     ) throws {
+        let timeout = timeout ?? backendStepTimeout
         let semaphore = DispatchSemaphore(value: 0)
         var captured: Result<Void, Error>?
         start { result in

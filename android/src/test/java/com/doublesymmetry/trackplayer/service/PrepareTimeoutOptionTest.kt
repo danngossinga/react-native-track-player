@@ -10,6 +10,7 @@ class PrepareTimeoutOptionTest {
         assertEquals(12_000L, prepareTimeoutFrom(12_000.0))
         assertEquals(8_000L, prepareTimeoutFrom(8_000))
         assertEquals(1L, prepareTimeoutFrom(1.9))
+        assertEquals(2_147_483_646L, prepareTimeoutFrom(2_147_483_646.0))
     }
 
     @Test
@@ -24,6 +25,8 @@ class PrepareTimeoutOptionTest {
         assertNull(prepareTimeoutFrom(Double.NaN))
         assertNull(prepareTimeoutFrom(Double.POSITIVE_INFINITY))
         assertNull(prepareTimeoutFrom(1e30))
+        // The same upper bound as iOS.
+        assertNull(prepareTimeoutFrom(2_147_483_647.0))
     }
 
     @Test

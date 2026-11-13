@@ -90,8 +90,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
     private val engineB: AndroidCrossfadeEnginePort
 ) {
     /**
-     * How long an engine may take to load a track (ms). Read at every load, so a new value from
-     * the app applies to the next load at once; the service points it at its own setting.
+     * How long an engine may take to load a track or finish a seek (ms). Read at every load and
+     * seek, so a new value from the app applies to the next one at once; the service points it at
+     * its own setting.
      */
     var prepareTimeoutMs: () -> Long = { DEFAULT_PREPARE_TIMEOUT_MS }
 
@@ -499,7 +500,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         setState(AndroidPlaybackOrchestratorState.SEEKING)
         ensureActivePrepared(currentIndex, this.positionMs, ticket)
         ticket.ensureActive()
-        activeEngine.seekTo(positionMs, ticket = ticket)
+        activeEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
         ticket.ensureActive()
         if (playWhenReady) {
             activeEngine.setVolume(volume)
@@ -925,7 +926,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (standbyEngine.isPreparedFor(item) && standbyEngine.isReady) {
             if (positionMs > 0L && abs(standbyEngine.positionMs - positionMs) > PREPARED_POSITION_TOLERANCE_MS) {
-                standbyEngine.seekTo(positionMs, ticket = ticket)
+                standbyEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
                 ticket?.ensureActive()
             }
             return

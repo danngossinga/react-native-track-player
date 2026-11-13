@@ -413,6 +413,7 @@ let prepareTimeoutDefaultMs = 5000
 func prepareTimeoutOption(_ value: Any?) -> Int? {
     guard let number = value as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() else { return nil }
     let ms = number.doubleValue
+    // Same bounds as Android: 1 ms to 2^31 - 2 ms.
     guard ms.isFinite, ms >= 1, ms < Double(Int32.max) else { return nil }
     return Int(ms)
 }

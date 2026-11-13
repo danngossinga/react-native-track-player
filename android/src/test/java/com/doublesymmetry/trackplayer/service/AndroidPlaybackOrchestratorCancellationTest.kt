@@ -373,16 +373,17 @@ class AndroidPlaybackOrchestratorCancellationTest {
             engineB
         )
         try {
-            // Without a setting, the default.
+            // The service's setting, read at each load and seek: the first load, the song loaded by
+            // a skip, the next one preloaded on the standby engine and a seek use it, and a new
+            // value applies to the next one.
+            var setting = 9_000L
+            orchestrator.prepareTimeoutMs = { setting }
             orchestrator.setQueue(testItems(3))
             orchestrator.play()
             runCurrent()
-            assertEquals(DEFAULT_PREPARE_TIMEOUT_MS, engineA.lastPrepareTimeoutMs)
+            assertEquals(9_000L, engineA.lastPrepareTimeoutMs)
 
-            // The service's setting, read at each load: the song loaded by a skip and the next
-            // one preloaded on the standby engine use it, and a new value applies to the next load.
-            var setting = 12_000L
-            orchestrator.prepareTimeoutMs = { setting }
+            setting = 12_000L
             val standbyLoads = engineB.prepareCalls
             orchestrator.skip(1)
             runCurrent()
@@ -393,6 +394,10 @@ class AndroidPlaybackOrchestratorCancellationTest {
             orchestrator.skip(0)
             runCurrent()
             assertEquals(30_000L, engineA.lastPrepareTimeoutMs)
+            setting = 40_000L
+            orchestrator.seekTo(20_000L)
+            runCurrent()
+            assertEquals(40_000L, engineA.lastSeekTimeoutMs)
         } finally {
             orchestrator.release()
         }
@@ -624,6 +629,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
             private set
         var lastPrepareTimeoutMs: Long? = null
             private set
+        var lastSeekTimeoutMs: Long? = null
+            private set
 
         override val positionMs: Long
             get() = position
@@ -696,6 +703,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             ticket: PlaybackOperationTicket?
         ) {
             ticket?.ensureActive()
+            lastSeekTimeoutMs = timeoutMs
             position = positionMs
         }
 

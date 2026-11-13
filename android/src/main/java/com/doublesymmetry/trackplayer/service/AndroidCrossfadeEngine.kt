@@ -60,7 +60,7 @@ internal interface AndroidCrossfadeEnginePort {
     fun release()
     suspend fun seekTo(
         positionMs: Long,
-        timeoutMs: Long = 5000L,
+        timeoutMs: Long = DEFAULT_PREPARE_TIMEOUT_MS,
         ticket: PlaybackOperationTicket? = null
     )
     fun setVolume(value: Float)
@@ -279,8 +279,8 @@ internal class AndroidCrossfadeEngine(
 }
 
 /**
- * How long a crossfade engine waits for a track to become ready before giving up
- * (`crossfade_prepare_timeout`), unless the app sets `prepareTimeoutMs`.
+ * How long a crossfade engine waits for a track to become ready (`crossfade_prepare_timeout`), or
+ * for a seek to finish buffering (`crossfade_seek_timeout`), unless the app sets `prepareTimeoutMs`.
  */
 internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
 
@@ -290,7 +290,8 @@ internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
  */
 internal fun prepareTimeoutFrom(value: Any?): Long? {
     val ms = (value as? Number)?.toDouble() ?: return null
-    if (!ms.isFinite() || ms < 1.0 || ms >= Long.MAX_VALUE.toDouble()) return null
+    // Same bounds as iOS: 1 ms to 2^31 - 2 ms.
+    if (!ms.isFinite() || ms < 1.0 || ms >= Int.MAX_VALUE.toDouble()) return null
     return ms.toLong()
 }
 

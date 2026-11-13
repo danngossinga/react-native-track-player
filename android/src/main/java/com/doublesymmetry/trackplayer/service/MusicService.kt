@@ -528,6 +528,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     fun setupPlayer(playerOptions: Bundle?) {
+        // Taken even when the player is already set up (a reloaded app meeting a running service).
+        applyPrepareTimeout(playerOptions)
         if (isPrimaryPlayerInitialized()) {
             print("Player was initialized. Prevent re-initializing again")
             return
@@ -558,7 +560,6 @@ class MusicService : HeadlessJsTaskService() {
         )
 
         crossfadeEnabled = playerOptions?.getBoolean(CROSSFADE_KEY, false) ?: false
-        applyPrepareTimeout(playerOptions)
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
         standardPlayerFactory = {
