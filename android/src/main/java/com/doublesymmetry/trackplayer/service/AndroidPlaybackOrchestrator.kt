@@ -528,8 +528,11 @@ internal class AndroidPlaybackOrchestrator private constructor(
         notifySnapshotChanged()
     }
 
-    suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) =
-        withPlaybackOperation { ticket ->
+    suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) {
+        // Refused before the operation is taken: taking it cancels the command in flight. A track
+        // change still loading (a skip from the lock screen, a headset or the notification) would
+        // otherwise be cancelled by a preparation that is then refused, and stay loading in silence.
+        // Nothing suspends between these checks and `begin()`, so they still hold when it runs.
         val fromIndex = currentIndex
         val toIndex = if (previous) previousIndexFor(fromIndex) else nextIndexFor(fromIndex)
         if (!isPlaybackActiveForCrossfade()) {
@@ -546,6 +549,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             emitCrossfade("error", fromIndex, toIndex ?: -1, errorCode = "crossfade_target_unavailable")
             throw RejectionException("No crossfade target track is available.", "crossfade_target_unavailable")
         }
+        withPlaybackOperation { ticket ->
         val requestedSeekToMs = (max(0.0, seekTo) * 1000).toLong()
         try {
             preloadJob?.cancelAndJoin()
@@ -572,6 +576,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             toVolume = 0f
         )
         }
+    }
 
     suspend fun crossFade(
         fadeDuration: Double = 5000.0,
