@@ -63,8 +63,11 @@ Added fork surface:
 
 - `setupPlayer({ crossfade: true })` enables the fork crossfade path.
 - `prepareTimeoutMs` (`setupPlayer` and `updateOptions`, default 5000): how long
-  the crossfade path waits for a track to become ready (Android: also every
-  seek) before it fails. A new value applies to the next load at once.
+  the crossfade path waits for a track to become ready before it fails. Android
+  bounds the whole load and every seek; iOS bounds the wait from a playable
+  asset to a ready item, and a backend switch waits this long plus 5 s (at
+  least 10 s). A new value applies to the next load at once. As usual,
+  `updateOptions` replaces the other options it carries.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

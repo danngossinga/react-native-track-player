@@ -51,7 +51,8 @@ internal interface AndroidCrossfadeEnginePort {
     suspend fun prepare(
         item: TrackAudioItem,
         positionMs: Long = 0L,
-        timeoutMs: Long = DEFAULT_PREPARE_TIMEOUT_MS,
+        // No default: every call passes the app's setting (prepareTimeoutMs).
+        timeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun play(rate: Float = 1f)
@@ -60,7 +61,7 @@ internal interface AndroidCrossfadeEnginePort {
     fun release()
     suspend fun seekTo(
         positionMs: Long,
-        timeoutMs: Long = DEFAULT_PREPARE_TIMEOUT_MS,
+        timeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun setVolume(value: Float)

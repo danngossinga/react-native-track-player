@@ -376,9 +376,11 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         )
     }
 
-    /// How long a backend step that may load a track can take: the load timeout
-    /// (`prepareTimeoutMs`) plus 5 s for the seek, preroll and start around it, and never less
-    /// than the 10 s it always had (5 s load timeout by default).
+    /// How long a synchronous backend step may take (a backend switch, which may load a track, and
+    /// the play used to resume after an interruption): the load timeout (`prepareTimeoutMs`) plus
+    /// 5 s, never less than the 10 s it always had (5 s load timeout by default). The 5 s do not
+    /// cover the asset's own playable stage or a full 8 s wait for playback to start, as before.
+    /// Other commands wait behind such a step for up to this long.
     private var backendStepTimeout: TimeInterval {
         max(10, TimeInterval(orchestrator.prepareTimeoutMs()) / 1000 + 5)
     }
