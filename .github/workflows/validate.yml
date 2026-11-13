@@ -215,8 +215,10 @@ jobs:
           cd example/android
           ./gradlew :react-native-track-player:testDebugUnitTest --no-daemon
   check-contracts:
-    # The crossfade, lifecycle and module contracts (source checks and node tests). They pin native
-    # wiring that no compiler or unit test sees, so they run on every change.
+    # The crossfade and module contracts (source checks and node tests). They pin native wiring that
+    # no compiler or unit test sees, so they run on every change. test:player-lifecycle-contracts is
+    # left out: it also reads the expo-smart-hls-proxy repository next to this one, which a runner
+    # does not have; run it locally.
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repo
