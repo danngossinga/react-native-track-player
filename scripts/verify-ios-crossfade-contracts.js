@@ -260,8 +260,11 @@ assert(
 // Parser, stored setting and step formula live in PlaybackBackend.swift, tested by RNTrackPlayerTests.
 assert(
   facade.includes('let prepareTimeoutDefaultMs = 5000') &&
-    facade.includes('final class PrepareTimeoutSetting') &&
-    facade.includes('func backendStepTimeout(loadTimeoutMs: Int) -> TimeInterval') &&
+    facade.includes('final class TimeoutSetting') &&
+    facade.includes('let playStartTimeoutDefaultMs = 8000') &&
+    facade.includes('let standardReadyTimeoutDefaultMs = 5000') &&
+    facade.includes('let standardSeekTimeoutDefaultMs = 25000') &&
+    facade.includes('func backendStepTimeout(loadTimeoutMs: Int, playStartTimeoutMs: Int) -> TimeInterval') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue'),
   'iOS prepareTimeoutMs parsing, setting and step formula must stay in the tested core.'
 );
@@ -270,22 +273,26 @@ assert(
     orchestrator.includes('engineB.prepareTimeoutMs = prepareTimeoutMs'),
   'iOS orchestrator must give its load timeout provider to both engines.'
 );
-const awaitResult = section(pingPongBackend, 'private func awaitResult(', 'let semaphore');
+const awaitResult = section(pingPongBackend, 'private func awaitResult(', 'throw playbackBackendError(');
 assert(
-  !awaitResult.includes('timeout:') &&
-    awaitResult.includes('let timeout = backendStepTimeout(loadTimeoutMs: orchestrator.prepareTimeoutMs())') &&
-    !/awaitResult\(timeout/.test(pingPongBackend),
-  'iOS ping-pong backend steps must wait the load timeout plus 5 s (at least 10 s), not a fixed 10 s.'
+  !awaitResult.includes('timeout: TimeInterval') &&
+    awaitResult.includes('let timeout = backendStepTimeout(\n') &&
+    awaitResult.includes('loadTimeoutMs: orchestrator.prepareTimeoutMs(),') &&
+    awaitResult.includes('playStartTimeoutMs: orchestrator.playStartTimeoutMs()') &&
+    !/awaitResult\(timeout/.test(pingPongBackend) &&
+    awaitResult.includes('guard semaphore.wait(timeout: .now() + timeout) == .success else {'),
+  'iOS ping-pong backend steps must wait backendStepTimeout (load or play-start timeout plus a margin, at least 10 s), not a fixed 10 s.'
 );
 const pingPongFactory = section(player, 'case .pingPong:', 'return PingPongPlaybackBackend(');
 const setupPlayerTimeout = section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:');
 assert(
-  player.includes('private let prepareTimeout = PrepareTimeoutSetting()') &&
-    section(player, 'private func applyPrepareTimeout(', '@objc(updateOptions:').includes('prepareTimeout.apply(options)') &&
+  player.includes('private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)') &&
+    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout]') &&
+    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('switch setting.apply(options) {') &&
     pingPongFactory.includes('orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
-    setupPlayerTimeout.includes('applyPrepareTimeout(config)') &&
+    setupPlayerTimeout.includes('applyTimeouts(config)') &&
     setupPlayerTimeout.includes('playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
-    section(player, 'public func update(options:', 'var capabilitiesStr').includes('applyPrepareTimeout(options)'),
+    section(player, 'public func update(options:', 'var capabilitiesStr').includes('applyTimeouts(options)'),
   'iOS setupPlayer and updateOptions must take prepareTimeoutMs, and every orchestrator must read it.'
 );
 assert(
@@ -293,6 +300,42 @@ assert(
     read('docs/docs/api/objects/update-options.md').includes('| `prepareTimeoutMs` |') &&
     read('src/interfaces/UpdateOptions.ts').includes('prepareTimeoutMs?: number;'),
   'prepareTimeoutMs must be typed and documented.'
+);
+
+// The player's other waits (play start, standard readiness, standard seek) read the app's settings.
+const standardBackend2 = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
+assert(
+  engine.includes('waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)') &&
+    !/timeoutMs: Int = \d/.test(engine) &&
+    orchestrator.includes('var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs } {\n        didSet {\n            engineA.prepareTimeoutMs = prepareTimeoutMs\n            engineB.prepareTimeoutMs = prepareTimeoutMs\n        }\n    }') &&
+    orchestrator.includes('var playStartTimeoutMs: () -> Int = { playStartTimeoutDefaultMs } {\n        didSet {\n            engineA.playStartTimeoutMs = playStartTimeoutMs\n            engineB.playStartTimeoutMs = playStartTimeoutMs\n        }\n    }') &&
+    orchestrator.includes('engineA.playStartTimeoutMs = playStartTimeoutMs') &&
+    orchestrator.includes('engineB.playStartTimeoutMs = playStartTimeoutMs') &&
+    player.includes('orchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }') &&
+    player.includes('private let playStartTimeout = TimeoutSetting(optionKey: "playStartTimeoutMs", defaultMs: playStartTimeoutDefaultMs)') &&
+    player.includes('private let standardReadyTimeout = TimeoutSetting(optionKey: "standardReadyTimeoutMs", defaultMs: standardReadyTimeoutDefaultMs)') &&
+    player.includes('private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)') &&
+    player.includes('readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs }') &&
+    player.includes('seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs }') &&
+    standardBackend2.includes('DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seekTimeoutMs()), execute: timeout)') &&
+    !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
+    !/timeout: TimeInterval = \d/.test(standardBackend2) &&
+    standardBackend2.includes('timeoutMs: readinessTimeoutMs()') &&
+    standardBackend2.includes('timeout: TimeInterval(timeoutMs) / 1000,') &&
+    standardBackend2.includes('self.seekTimeoutMs = seekTimeoutMs') &&
+    standardBackend2.includes('let deadline = Date().addingTimeInterval(timeout)') &&
+    standardBackend2.includes('try waitForStandardPlaybackActivation(player: player, snapshot: snapshot, timeoutMs: readinessTimeoutMs())') &&
+    standardBackend2.includes('readinessTimeoutMs: @escaping () -> Int,') &&
+    standardBackend2.includes('seekTimeoutMs: @escaping () -> Int,') &&
+    engine.slice(engine.indexOf('private func waitForPlaying(')).includes('.milliseconds(timeoutMs)') &&
+    !/\.milliseconds\(\d+\)/.test(engine.slice(engine.indexOf('private func waitForPlaying('))) &&
+    setupPlayerTimeout.includes('playbackOrchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }') &&
+    ['playStartTimeoutMs', 'standardReadyTimeoutMs', 'standardSeekTimeoutMs'].every((option) =>
+      playerOptions.includes(`${option}?: number;`) &&
+        read('src/interfaces/UpdateOptions.ts').includes(`${option}?: number;`) &&
+        playerOptionsDocs.includes(`| \`${option}\` |`) &&
+        read('docs/docs/api/objects/update-options.md').includes(`| \`${option}\` |`)),
+  'iOS play-start, standard readiness and standard seek waits must read the app\'s settings, not fixed numbers.'
 );
 
 console.log('iOS crossfade contracts OK');

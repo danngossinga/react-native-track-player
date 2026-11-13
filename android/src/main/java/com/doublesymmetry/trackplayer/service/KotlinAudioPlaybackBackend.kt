@@ -146,7 +146,7 @@ internal class KotlinAudioPlaybackBackend(
         { activated, _ -> onActivated(activated) },
     private val suspendControlSurface: () -> Unit = {},
     private val resumeControlSurface: suspend (AudioPlayerState) -> Unit = {},
-    private val readinessGate: StandardPlaybackReadinessGate = StandardPlaybackReadinessGate(),
+    private val readinessGate: StandardPlaybackReadinessGate,
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD

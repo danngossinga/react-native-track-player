@@ -285,11 +285,16 @@ internal class AndroidCrossfadeEngine(
  */
 internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
 
+/** How long the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`). */
+internal const val DEFAULT_STANDARD_READY_TIMEOUT_MS = 5000L
+internal const val STANDARD_READY_TIMEOUT_KEY = "standardReadyTimeoutMs"
+
 /**
- * The `prepareTimeoutMs` option (milliseconds) read from setup or update options: null when it is
- * absent or not a positive number, so the current value is kept.
+ * A timeout option (`prepareTimeoutMs`, `standardReadyTimeoutMs`), in milliseconds, read from setup
+ * or update options: null when it is absent or not a number from 1 to 2147483646, so the current
+ * value is kept.
  */
-internal fun prepareTimeoutFrom(value: Any?): Long? {
+internal fun timeoutOptionFrom(value: Any?): Long? {
     val ms = (value as? Number)?.toDouble() ?: return null
     // Same bounds as iOS: 1 ms to 2^31 - 2 ms.
     if (!ms.isFinite() || ms < 1.0 || ms >= Int.MAX_VALUE.toDouble()) return null
@@ -298,17 +303,17 @@ internal fun prepareTimeoutFrom(value: Any?): Long? {
 
 internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
 
-/** The app's load timeout: one value, kept until a valid new one comes (main thread only). */
-internal class PrepareTimeoutSetting {
-    var milliseconds: Long = DEFAULT_PREPARE_TIMEOUT_MS
+/** One of the app's timeouts: one value, kept until a valid new one comes (main thread only). */
+internal class TimeoutSetting(defaultMs: Long) {
+    var milliseconds: Long = defaultMs
         private set
 
     /**
-     * Takes a valid `prepareTimeoutMs` (the option's raw value). Returns false when the value is
-     * ignored and the current one kept.
+     * Takes a valid value (the option's raw value). Returns false when the value is ignored and
+     * the current one kept.
      */
     fun apply(value: Any?): Boolean {
-        val timeout = prepareTimeoutFrom(value) ?: return false
+        val timeout = timeoutOptionFrom(value) ?: return false
         milliseconds = timeout
         return true
     }

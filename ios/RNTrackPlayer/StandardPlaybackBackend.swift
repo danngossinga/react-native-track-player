@@ -11,7 +11,7 @@ enum StandardPlaybackReadinessGate {
     static func wait(
         expectedIndex: Int,
         expectedPosition: Double,
-        timeout: TimeInterval = 5,
+        timeout: TimeInterval,
         observe: () -> StandardPlaybackReadinessObservation,
         waitForNextPoll: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
     ) throws {
@@ -46,7 +46,8 @@ enum StandardPlaybackReadinessGate {
 
 private func waitForStandardPlaybackActivation(
     player: QueuedAudioPlayer,
-    snapshot: PlaybackBackendSnapshot
+    snapshot: PlaybackBackendSnapshot,
+    timeoutMs: Int
 ) throws {
     guard let expectedIndex = snapshot.activeIndex else { return }
     guard !Thread.isMainThread else {
@@ -58,6 +59,7 @@ private func waitForStandardPlaybackActivation(
     try StandardPlaybackReadinessGate.wait(
         expectedIndex: expectedIndex,
         expectedPosition: snapshot.position,
+        timeout: TimeInterval(timeoutMs) / 1000,
         observe: {
             StandardPlaybackReadinessObservation(
                 state: player.playerState,
@@ -222,6 +224,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let onIdleTrackActivationWillBegin: (QueuedAudioPlayer) -> Void
     private let onIdleTrackActivated: (QueuedAudioPlayer, Int?) -> Void
     private let waitForActivationReadiness: (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
+    /// How long a seek may take (`standardSeekTimeoutMs`, 25000 ms by default), read at every seek.
+    private let seekTimeoutMs: () -> Int
     private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
     private var idleWithoutActiveTrack = false
@@ -262,16 +266,18 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     init(
         player: QueuedAudioPlayer,
         transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
+        // The app's standardReadyTimeoutMs and standardSeekTimeoutMs, read at every wait.
+        readinessTimeoutMs: @escaping () -> Int,
+        seekTimeoutMs: @escaping () -> Int,
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
         onDisposed: @escaping (QueuedAudioPlayer) -> Void,
         onIdleTrackActivationWillBegin: @escaping (QueuedAudioPlayer) -> Void = { _ in },
         onIdleTrackActivated: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
-        waitForActivationReadiness: @escaping (
-            QueuedAudioPlayer,
-            PlaybackBackendSnapshot
-        ) throws -> Void = waitForStandardPlaybackActivation,
+        waitForActivationReadiness: (
+            (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
+        )? = nil,
         initiallyAuthoritative: Bool = false,
         incomingQueue: [Track]? = nil,
         incomingQueueProvider: (() -> [Track])? = nil,
@@ -285,7 +291,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.onDisposed = onDisposed
         self.onIdleTrackActivationWillBegin = onIdleTrackActivationWillBegin
         self.onIdleTrackActivated = onIdleTrackActivated
-        self.waitForActivationReadiness = waitForActivationReadiness
+        self.seekTimeoutMs = seekTimeoutMs
+        // The app's readiness timeout (standardReadyTimeoutMs), read at every activation.
+        self.waitForActivationReadiness = waitForActivationReadiness ?? { player, snapshot in
+            try waitForStandardPlaybackActivation(player: player, snapshot: snapshot, timeoutMs: readinessTimeoutMs())
+        }
         self.isAuthoritative = initiallyAuthoritative
         if let incomingQueueProvider = incomingQueueProvider {
             self.incomingQueueProvider = incomingQueueProvider
@@ -336,7 +346,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
         request.timeout = timeout
         pendingSeeks.append(request)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 25, execute: timeout)
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seekTimeoutMs()), execute: timeout)
         pumpSeeks()
     }
 
