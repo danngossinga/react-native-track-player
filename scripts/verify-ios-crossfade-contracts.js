@@ -268,4 +268,26 @@ assert(
   'iOS pingPong must emit PlaybackPlayWhenReadyChanged when play/pause flips playWhenReady, or useIsPlaying stays stale.'
 );
 
+const pingPongPlayWhenReadyDelegate = section(
+  player,
+  'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangePlayWhenReady playWhenReady: Bool) {',
+  'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangeState state: State)'
+);
+const orchestratorDelegateProtocol = section(
+  orchestrator,
+  'protocol IOSPlaybackOrchestratorDelegate: AnyObject {',
+  'extension IOSPlaybackOrchestratorDelegate {'
+);
+assert(
+  orchestratorDelegateProtocol.includes('func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangePlayWhenReady playWhenReady: Bool)') &&
+    pingPongPlayWhenReadyDelegate.includes('orchestrator === playbackOrchestrator else { return }') &&
+    !/\/\/\s*delegate\?\.playbackOrchestrator\(self, didChangePlayWhenReady/.test(orchestrator) &&
+    orchestrator.includes('private(set) var playWhenReady: Bool = false {') &&
+    orchestrator.includes('guard playWhenReady != oldValue else { return }') &&
+    orchestrator.includes('delegate?.playbackOrchestrator(self, didChangePlayWhenReady: playWhenReady)') &&
+    pingPongPlayWhenReadyDelegate.includes('playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator)') &&
+    pingPongPlayWhenReadyDelegate.includes('publishPingPongPlayWhenReadyIfChanged(orchestrator)'),
+  'iOS pingPong must publish every playWhenReady change, even one without a state change (play() on an empty queue).'
+);
+
 console.log('iOS crossfade contracts OK');

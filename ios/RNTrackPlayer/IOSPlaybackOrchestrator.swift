@@ -41,6 +41,13 @@ protocol IOSPlaybackOrchestratorDelegate: AnyObject {
         errorCode: String?
     )
     func playbackOrchestratorDidUpdateNowPlaying(_ orchestrator: IOSPlaybackOrchestrator)
+    /// playWhenReady changed, with or without a state change (for example `play()` on an empty
+    /// queue sets it and stays idle): JS's play/pause state follows this, not only the state.
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangePlayWhenReady playWhenReady: Bool)
+}
+
+extension IOSPlaybackOrchestratorDelegate {
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didChangePlayWhenReady playWhenReady: Bool) {}
 }
 
 private final class IOSCrossfadeContext {
@@ -147,7 +154,14 @@ final class IOSPlaybackOrchestrator {
     private let crossfadeEventDeliveryQueue = DispatchQueue.main
     private(set) var state: IOSPlaybackOrchestratorState = .idle
     private(set) var currentIndex: Int = -1
-    private(set) var playWhenReady: Bool = false
+    private(set) var playWhenReady: Bool = false {
+        // Some writes happen inside the operation registry's mutation: the delegate's handler must
+        // stay non-reentrant (no call back into this orchestrator, no synchronous queue hop).
+        didSet {
+            guard playWhenReady != oldValue else { return }
+            delegate?.playbackOrchestrator(self, didChangePlayWhenReady: playWhenReady)
+        }
+    }
     private(set) var volume: Float = 1
     private(set) var rate: Float = 1
 
