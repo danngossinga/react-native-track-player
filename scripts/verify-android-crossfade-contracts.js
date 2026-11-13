@@ -259,4 +259,19 @@ assert(
   'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
+const onPingPongSnapshot = musicService.slice(
+  musicService.indexOf('override fun onSnapshotChanged(snapshot: AndroidPlaybackSnapshot) {'),
+  musicService.indexOf('Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")')
+);
+assert(
+  onPingPongSnapshot.includes('if (!isAuthoritative()) return') &&
+    onPingPongSnapshot.indexOf('if (!isAuthoritative()) return') <
+    onPingPongSnapshot.indexOf('publishPingPongPlayWhenReady(created.playWhenReady, force = false)') &&
+    onPingPongSnapshot.includes('publishPingPongPlayWhenReady(created.playWhenReady, force = false)') &&
+    musicService.split('publishPingPongPlayWhenReady(orchestrator.playWhenReady, force = true)').length === 3 &&
+    musicService.includes('if (!pingPongPlayWhenReady.shouldPublish(playWhenReady, force)) return') &&
+    musicService.includes('emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)'),
+  'Android pingPong must emit PlaybackPlayWhenReadyChanged when play/pause flips playWhenReady, and on backend activation, or useIsPlaying stays stale.'
+);
+
 console.log('Android crossfade contracts OK');
