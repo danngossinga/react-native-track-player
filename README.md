@@ -77,8 +77,9 @@ Added fork surface:
   switch and the play used to resume after an interruption wait at most the load
   limit plus the play-start limit plus 5 s (at least 10 s).
 - `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` only, default
-  96000): the bandwidth a crossfade player assumes before it has measured any, so
-  an adaptive stream starts at its lowest rendition and climbs as it measures.
+  96000): the bandwidth a crossfade player assumes before it has measured any. An
+  adaptive stream starts at the highest rendition fitting about 70 % of it, or the
+  lowest when none fits, and climbs as the player measures the network.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

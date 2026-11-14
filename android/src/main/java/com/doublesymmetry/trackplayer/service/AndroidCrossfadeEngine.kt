@@ -83,7 +83,7 @@ internal class AndroidCrossfadeEngine(
     handleAudioFocus: Boolean,
     /**
      * The bandwidth the player assumes before it has measured any (`initialBitrateEstimateBps`):
-     * adaptive streams start at the highest rendition at or below it, then follow the measured
+     * adaptive streams start low (see [crossfadeBandwidthMeter]), then follow the measured
      * bandwidth.
      */
     initialBitrateEstimateBps: Long
@@ -107,11 +107,7 @@ internal class AndroidCrossfadeEngine(
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
-        .setBandwidthMeter(
-            DefaultBandwidthMeter.Builder(context)
-                .setInitialBitrateEstimate(initialBitrateEstimateBps)
-                .build()
-        )
+        .setBandwidthMeter(crossfadeBandwidthMeter(context, initialBitrateEstimateBps))
         .build()
         .apply {
             volume = 0f
@@ -358,6 +354,17 @@ internal const val STALL_TIMEOUT_KEY = "stallTimeoutMs"
  * rendition and climbs as the player measures the network.
  */
 internal const val DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS = 96_000L
+
+/**
+ * The bandwidth meter of a crossfade player: it reports [initialBitrateEstimateBps] until it has
+ * measured the network. ExoPlayer's adaptive selection then picks the highest rendition whose
+ * bitrate fits about 70 % of the estimate (its default bandwidth fraction), or the lowest when
+ * none fits.
+ */
+internal fun crossfadeBandwidthMeter(context: Context, initialBitrateEstimateBps: Long): DefaultBandwidthMeter =
+    DefaultBandwidthMeter.Builder(context)
+        .setInitialBitrateEstimate(initialBitrateEstimateBps)
+        .build()
 internal const val INITIAL_BITRATE_ESTIMATE_KEY = "initialBitrateEstimateBps"
 
 /**

@@ -144,7 +144,8 @@ export interface PlayerOptions {
   /**
    * Android crossfade backend, setup only: the bandwidth, in bits per second, a player assumes
    * before it has measured any. An adaptive (HLS/DASH) track then starts at the highest rendition
-   * at or below it, usually the lowest, and climbs as the player measures the network. Defaults
+   * whose bitrate fits about 70 % of it (ExoPlayer's bandwidth fraction), or at the lowest when
+   * none fits, and climbs as the player measures the network. Defaults
    * to 96000. Applies to the crossfade players built after setup. A value that is not a number from
    * 1 to 2147483646 is ignored.
    */

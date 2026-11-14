@@ -297,7 +297,9 @@ assert(
 
 // Crossfade players start from the app's low bandwidth estimate (initialBitrateEstimateBps).
 assert(
-  engineSource.includes('.setBandwidthMeter(\n            DefaultBandwidthMeter.Builder(context)\n                .setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
+  engineSource.includes('.setBandwidthMeter(crossfadeBandwidthMeter(context, initialBitrateEstimateBps))') &&
+    section(engineSource, 'internal fun crossfadeBandwidthMeter(', '/**').includes('.setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
+    read('android/src/androidTest/java/com/doublesymmetry/trackplayer/service/CrossfadeBandwidthMeterInstrumentationTest.kt').includes('crossfadeBandwidthMeter(context, estimate).bitrateEstimate') &&
     engineSource.includes('androidXfadeLog("$name built initialBitrateEstimateBps=$initialBitrateEstimateBps")') &&
     orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
     orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
