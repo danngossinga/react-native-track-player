@@ -75,12 +75,15 @@ final class IOSCrossfadeEngine {
         ]
     }
 #endif
-    /// How long a track may take to become ready (`prepareTimeoutMs` option, 5000 ms by default).
-    /// Read at every load, so a new value from the app applies to the next load at once.
+    /// How long a load may take in all, playable stage included (`prepareTimeoutMs` option,
+    /// 60000 ms by default). Read at every load, so a new value applies to the next load at once.
     var prepareTimeoutMs: () -> Int = { prepareTimeoutDefaultMs }
-    /// How long playback may take to start after `play` (`playStartTimeoutMs`, 8000 ms by
+    /// How long playback may take in all to start after `play` (`playStartTimeoutMs`, 60000 ms by
     /// default). Read at every play, so a new value from the app applies to the next one at once.
     var playStartTimeoutMs: () -> Int = { playStartTimeoutDefaultMs }
+    /// How long a load or a play start may go on with no new media loaded (`stallTimeoutMs`,
+    /// 10000 ms by default). Read at every load and play.
+    var stallTimeoutMs: () -> Int = { stallTimeoutDefaultMs }
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
@@ -167,10 +170,36 @@ final class IOSCrossfadeEngine {
         let currentGeneration = generation
         let asset = AVURLAsset(url: track.url.value, options: track.getAssetOptions())
         pendingAsset = asset
+        // One watch for the whole load: the playable stage has no progress signal, so only the
+        // total limit bounds it; the wait for a ready item also fails when it stalls.
+        let loadWatch = StallWatch(
+            stallTimeoutMs: stallTimeoutMs(),
+            totalTimeoutMs: prepareTimeoutMs(),
+            startedAt: Self.now()
+        )
+        var playableSettled = false
+        scheduleWaitCheck(generation: currentGeneration) { [weak self] in
+            guard let self = self, !playableSettled else { return false }
+            guard loadWatch.capVerdict(at: Self.now()) == .capExceeded else { return true }
+            playableSettled = true
+            self.pendingAsset?.cancelLoading()
+            self.pendingAsset = nil
+            self.state = .failed
+            IOSPlaybackLog.log("\(self.name) playable timeout limitMs=\(loadWatch.totalTimeoutMs)")
+            completion(.failure(NSError(
+                domain: "RNTP-Crossfade",
+                code: 5,
+                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not become playable within \(loadWatch.totalTimeoutMs) ms."]
+            )))
+            return false
+        }
 
         asset.loadValuesAsynchronously(forKeys: ["playable"]) { [weak self] in
             DispatchQueue.main.async {
-                guard let self = self, self.generation == currentGeneration else { return }
+                guard let self = self, self.generation == currentGeneration, !playableSettled else { return }
+                playableSettled = true
+                self.timeoutWorkItem?.cancel()
+                self.timeoutWorkItem = nil
 
                 var assetError: NSError?
                 let status = asset.statusOfValue(forKey: "playable", error: &assetError)
@@ -192,7 +221,9 @@ final class IOSCrossfadeEngine {
                 self.player.replaceCurrentItem(with: item)
                 self.player.volume = 0
 
-                self.waitForReadyItem(item: item, generation: currentGeneration) { [weak self] result in
+                var readyWatch = loadWatch
+                readyWatch.noteProgress(at: Self.now())
+                self.waitForReadyItem(item: item, generation: currentGeneration, watch: readyWatch) { [weak self] result in
                     guard let self = self, self.generation == currentGeneration else { return }
                     switch result {
                     case .failure(let error):
@@ -307,6 +338,7 @@ final class IOSCrossfadeEngine {
     private func waitForReadyItem(
         item: AVPlayerItem,
         generation: Int,
+        watch: StallWatch,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         var didComplete = false
@@ -343,18 +375,21 @@ final class IOSCrossfadeEngine {
             }
         }
 
-        let timeout = DispatchWorkItem { [weak self] in
-            guard let self = self, self.generation == generation else { return }
+        var watch = watch
+        scheduleWaitCheck(generation: generation) { [weak self] in
+            guard let self = self, !didComplete else { return false }
+            let verdict = watch.check(at: Self.now(), readings: Self.loadProgress(of: item))
+            guard verdict != .wait else { return true }
             self.state = .failed
-            IOSPlaybackLog.log("\(self.name) item ready timeout")
+            let reason = Self.describe(verdict, watch)
+            IOSPlaybackLog.log("\(self.name) item ready timeout \(reason)")
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not become ready."]
+                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not become ready (\(reason))."]
             )))
+            return false
         }
-        timeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(prepareTimeoutMs()), execute: timeout)
     }
 
     private func waitForPlaying(
@@ -391,17 +426,61 @@ final class IOSCrossfadeEngine {
             }
         }
 
-        let timeout = DispatchWorkItem { [weak self] in
-            guard let self = self, self.generation == generation else { return }
+        // Waiting to play while media keeps loading (or time advancing) is progress.
+        var watch = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: timeoutMs, startedAt: Self.now())
+        scheduleWaitCheck(generation: generation) { [weak self] in
+            guard let self = self, !didComplete else { return false }
+            let verdict = watch.check(
+                at: Self.now(),
+                readings: (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]
+            )
+            guard verdict != .wait else { return true }
             self.state = .failed
-            IOSPlaybackLog.log("\(self.name) playing timeout status=\(self.player.timeControlStatus.rawValue) waitingReason=\(self.player.reasonForWaitingToPlay?.rawValue ?? "none") itemError=\(self.player.currentItem?.error?.localizedDescription ?? "none")")
+            IOSPlaybackLog.log("\(self.name) playing timeout \(Self.describe(verdict, watch)) status=\(self.player.timeControlStatus.rawValue) waitingReason=\(self.player.reasonForWaitingToPlay?.rawValue ?? "none") itemError=\(self.player.currentItem?.error?.localizedDescription ?? "none")")
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 6,
-                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not start playing."]
+                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not start playing (\(Self.describe(verdict, watch)))."]
             )))
+            return false
         }
-        timeoutWorkItem = timeout
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(timeoutMs), execute: timeout)
+    }
+
+    /// Runs `check` every `stallCheckIntervalMs` on main while it returns true, for the current
+    /// load or play only (a reset or a new operation cancels it).
+    private func scheduleWaitCheck(generation: Int, _ check: @escaping () -> Bool) {
+        let tick = DispatchWorkItem { [weak self] in
+            guard let self = self, self.generation == generation else { return }
+            if check() {
+                self.scheduleWaitCheck(generation: generation, check)
+            }
+        }
+        timeoutWorkItem?.cancel()
+        timeoutWorkItem = tick
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(stallCheckIntervalMs), execute: tick)
+    }
+
+    /// The progress of a load or of a start that waits: the seconds of media the item has loaded,
+    /// and the bytes its access log reports downloaded (which grow while a first segment arrives,
+    /// before any loaded time range exists).
+    private static func loadProgress(of item: AVPlayerItem) -> [Double] {
+        let loadedSeconds = item.loadedTimeRanges.reduce(0.0) { total, value in
+            let seconds = value.timeRangeValue.duration.seconds
+            return seconds.isFinite ? total + seconds : total
+        }
+        let bytes = item.accessLog()?.events.reduce(0.0) { total, event in
+            total + Double(max(0, event.numberOfBytesTransferred))
+        } ?? 0
+        return [loadedSeconds, bytes]
+    }
+
+    private static func now() -> TimeInterval {
+        return ProcessInfo.processInfo.systemUptime
+    }
+
+    private static func describe(_ verdict: StallVerdict, _ watch: StallWatch) -> String {
+        return verdict == .stalled
+            ? "no progress for \(watch.stallTimeoutMs) ms"
+            : "over the \(watch.totalTimeoutMs) ms limit"
     }
 }

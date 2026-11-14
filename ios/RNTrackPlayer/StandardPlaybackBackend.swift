@@ -5,17 +5,22 @@ struct StandardPlaybackReadinessObservation {
     let state: AudioPlayerState
     let index: Int
     let position: Double
+    /// The player's buffered position (seconds): its growth is the wait's progress.
+    let buffered: Double
 }
 
 enum StandardPlaybackReadinessGate {
+    /// Fails when the track makes no progress for `stallTimeoutMs`, or after `timeoutMs` in all.
     static func wait(
         expectedIndex: Int,
         expectedPosition: Double,
-        timeout: TimeInterval,
+        timeoutMs: Int,
+        stallTimeoutMs: Int,
         observe: () -> StandardPlaybackReadinessObservation,
+        now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         waitForNextPoll: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
     ) throws {
-        let deadline = Date().addingTimeInterval(timeout)
+        var watch = StallWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: timeoutMs, startedAt: now())
         while true {
             let observation = observe()
             if observation.state == .failed {
@@ -33,10 +38,13 @@ enum StandardPlaybackReadinessGate {
                abs(observation.position - restoredPosition) <= 0.75 {
                 return
             }
-            if Date() >= deadline {
+            let verdict = watch.check(at: now(), readings: [observation.buffered])
+            if verdict != .wait {
                 throw playbackBackendError(
                     code: "playback_backend_activation_not_ready",
-                    message: "The standard playback candidate timed out while restoring playback."
+                    message: verdict == .stalled
+                        ? "The standard playback candidate made no progress for \(stallTimeoutMs) ms while restoring playback."
+                        : "The standard playback candidate timed out (\(timeoutMs) ms) while restoring playback."
                 )
             }
             waitForNextPoll()
@@ -47,7 +55,8 @@ enum StandardPlaybackReadinessGate {
 private func waitForStandardPlaybackActivation(
     player: QueuedAudioPlayer,
     snapshot: PlaybackBackendSnapshot,
-    timeoutMs: Int
+    timeoutMs: Int,
+    stallTimeoutMs: Int
 ) throws {
     guard let expectedIndex = snapshot.activeIndex else { return }
     guard !Thread.isMainThread else {
@@ -59,12 +68,14 @@ private func waitForStandardPlaybackActivation(
     try StandardPlaybackReadinessGate.wait(
         expectedIndex: expectedIndex,
         expectedPosition: snapshot.position,
-        timeout: TimeInterval(timeoutMs) / 1000,
+        timeoutMs: timeoutMs,
+        stallTimeoutMs: stallTimeoutMs,
         observe: {
             StandardPlaybackReadinessObservation(
                 state: player.playerState,
                 index: player.currentIndex,
-                position: player.currentTime
+                position: player.currentTime,
+                buffered: player.bufferedPosition
             )
         }
     )
@@ -224,8 +235,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let onIdleTrackActivationWillBegin: (QueuedAudioPlayer) -> Void
     private let onIdleTrackActivated: (QueuedAudioPlayer, Int?) -> Void
     private let waitForActivationReadiness: (QueuedAudioPlayer, PlaybackBackendSnapshot) throws -> Void
-    /// How long a seek may take (`standardSeekTimeoutMs`, 25000 ms by default), read at every seek.
+    /// How long a seek may take in all (`standardSeekTimeoutMs`, 60000 ms by default), read at
+    /// every seek.
     private let seekTimeoutMs: () -> Int
+    /// How long a seek or a readiness wait may go on with no progress (`stallTimeoutMs`).
+    private let stallTimeoutMs: () -> Int
     private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
     private var idleWithoutActiveTrack = false
@@ -266,9 +280,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     init(
         player: QueuedAudioPlayer,
         transitionGenerationSidecar: PlaybackTransitionGenerationSidecar,
-        // The app's standardReadyTimeoutMs and standardSeekTimeoutMs, read at every wait.
+        // The app's standardReadyTimeoutMs, standardSeekTimeoutMs and stallTimeoutMs, read at
+        // every wait.
         readinessTimeoutMs: @escaping () -> Int,
         seekTimeoutMs: @escaping () -> Int,
+        stallTimeoutMs: @escaping () -> Int,
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
@@ -292,9 +308,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.onIdleTrackActivationWillBegin = onIdleTrackActivationWillBegin
         self.onIdleTrackActivated = onIdleTrackActivated
         self.seekTimeoutMs = seekTimeoutMs
+        self.stallTimeoutMs = stallTimeoutMs
         // The app's readiness timeout (standardReadyTimeoutMs), read at every activation.
         self.waitForActivationReadiness = waitForActivationReadiness ?? { player, snapshot in
-            try waitForStandardPlaybackActivation(player: player, snapshot: snapshot, timeoutMs: readinessTimeoutMs())
+            try waitForStandardPlaybackActivation(
+                player: player,
+                snapshot: snapshot,
+                timeoutMs: readinessTimeoutMs(),
+                stallTimeoutMs: stallTimeoutMs()
+            )
         }
         self.isAuthoritative = initiallyAuthoritative
         if let incomingQueueProvider = incomingQueueProvider {
@@ -336,18 +358,43 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             return
         }
         let request = PendingSeek(track: track, position: max(0, position), completion: completion)
-        let timeout = DispatchWorkItem { [weak self, weak request] in
+        // Fails when the player loads nothing for stallTimeoutMs, or after standardSeekTimeoutMs.
+        let watch = StallWatch(
+            stallTimeoutMs: stallTimeoutMs(),
+            totalTimeoutMs: seekTimeoutMs(),
+            startedAt: ProcessInfo.processInfo.systemUptime
+        )
+        pendingSeeks.append(request)
+        scheduleSeekCheck(request, watch: watch)
+        pumpSeeks()
+    }
+
+    /// Reads the seek's progress every `stallCheckIntervalMs` until it completes or gives up.
+    private func scheduleSeekCheck(_ request: PendingSeek, watch: StallWatch) {
+        let check = DispatchWorkItem { [weak self, weak request] in
             guard let self = self, let request = request, request.completion != nil else { return }
+            var watch = watch
+            let verdict = watch.check(
+                at: ProcessInfo.processInfo.systemUptime,
+                readings: [self.player.bufferedPosition]
+            )
+            guard verdict != .wait else {
+                self.scheduleSeekCheck(request, watch: watch)
+                return
+            }
             self.pendingSeeks.removeAll { $0 === request }
             // If already emitted, keep the ticket until its real callback. A
             // timeout does not make a late, identical SDK event distinguishable.
-            request.finish(.failure(self.seekError("standard_seek_timeout", "The native seek did not complete in time.")))
+            request.finish(.failure(self.seekError(
+                "standard_seek_timeout",
+                verdict == .stalled
+                    ? "The native seek made no progress for \(watch.stallTimeoutMs) ms."
+                    : "The native seek did not complete within \(watch.totalTimeoutMs) ms."
+            )))
             self.pumpSeeks()
         }
-        request.timeout = timeout
-        pendingSeeks.append(request)
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seekTimeoutMs()), execute: timeout)
-        pumpSeeks()
+        request.timeout = check
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(stallCheckIntervalMs), execute: check)
     }
 
     private func pumpSeeks() {

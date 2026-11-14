@@ -90,23 +90,27 @@ internal class AndroidPlaybackOrchestrator private constructor(
     private val engineB: AndroidCrossfadeEnginePort
 ) {
     /**
-     * How long an engine may take to load a track or finish a seek (ms). Read at every load and
-     * seek, so a new value from the app applies to the next one at once; the service points it at
-     * its own setting.
+     * How long, in all, an engine may take to load a track or finish a seek (ms). Read at every
+     * load and seek, so a new value from the app applies to the next one at once; the service
+     * points it at its own setting.
      */
     var prepareTimeoutMs: () -> Long = { DEFAULT_PREPARE_TIMEOUT_MS }
+
+    /** How long a load or seek may go on with no progress (ms), read like [prepareTimeoutMs]. */
+    var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }
 
     constructor(
         context: Context,
         scope: CoroutineScope,
         audioContentType: Int,
         handleAudioFocus: Boolean,
+        initialBitrateEstimateBps: Long,
         delegate: AndroidPlaybackOrchestratorDelegate
     ) : this(
         scope,
         delegate,
-        AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus),
-        AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus)
+        AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps),
+        AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)
     )
 
     private var activeEngine = engineA
@@ -376,7 +380,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.reset()
             standbyEngine.reset()
             setState(AndroidPlaybackOrchestratorState.LOADING)
-            activeEngine.prepare(item, 0L, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+            activeEngine.prepare(item, 0L, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
             ticket.ensureActive()
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
@@ -500,7 +504,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         setState(AndroidPlaybackOrchestratorState.SEEKING)
         ensureActivePrepared(currentIndex, this.positionMs, ticket)
         ticket.ensureActive()
-        activeEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+        activeEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         ticket.ensureActive()
         if (playWhenReady) {
             activeEngine.setVolume(volume)
@@ -891,7 +895,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
         delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
-        activeEngine.prepare(queue[index], positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+        activeEngine.prepare(queue[index], positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
@@ -913,7 +917,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (activeEngine.isPreparedFor(item)) return
         setState(AndroidPlaybackOrchestratorState.LOADING)
-        activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+        activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         ticket?.ensureActive()
     }
 
@@ -926,13 +930,13 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (standbyEngine.isPreparedFor(item) && standbyEngine.isReady) {
             if (positionMs > 0L && abs(standbyEngine.positionMs - positionMs) > PREPARED_POSITION_TOLERANCE_MS) {
-                standbyEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+                standbyEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
                 ticket?.ensureActive()
             }
             return
         }
         androidXfadeLog("standby prepare targetIndex=$index engine=${standbyEngine.name}")
-        standbyEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), ticket = ticket)
+        standbyEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         ticket?.ensureActive()
     }
 

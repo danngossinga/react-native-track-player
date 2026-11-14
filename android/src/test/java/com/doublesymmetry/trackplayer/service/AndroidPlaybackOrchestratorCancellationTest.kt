@@ -18,8 +18,11 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.supervisorScope
+import kotlinx.coroutines.test.advanceTimeBy
+import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
@@ -27,6 +30,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Test
 
 @OptIn(ExperimentalCoroutinesApi::class)
@@ -377,11 +381,15 @@ class AndroidPlaybackOrchestratorCancellationTest {
             // a skip, the next one preloaded on the standby engine and a seek use it, and a new
             // value applies to the next one.
             var setting = 9_000L
+            var stall = 3_000L
             orchestrator.prepareTimeoutMs = { setting }
+            orchestrator.stallTimeoutMs = { stall }
             orchestrator.setQueue(testItems(3))
             orchestrator.play()
             runCurrent()
             assertEquals(9_000L, engineA.lastPrepareTimeoutMs)
+            assertEquals(3_000L, engineA.lastPrepareStallTimeoutMs)
+            stall = 4_000L
 
             setting = 12_000L
             val standbyLoads = engineB.prepareCalls
@@ -390,6 +398,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertEquals(12_000L, engineA.lastPrepareTimeoutMs)
             assertTrue(engineB.prepareCalls > standbyLoads)
             assertEquals(12_000L, engineB.lastPrepareTimeoutMs)
+            assertEquals(4_000L, engineA.lastPrepareStallTimeoutMs)
+            assertEquals(4_000L, engineB.lastPrepareStallTimeoutMs)
+            stall = 5_000L
             setting = 30_000L
             orchestrator.skip(0)
             runCurrent()
@@ -398,6 +409,40 @@ class AndroidPlaybackOrchestratorCancellationTest {
             orchestrator.seekTo(20_000L)
             runCurrent()
             assertEquals(40_000L, engineA.lastSeekTimeoutMs)
+            assertEquals(5_000L, engineA.lastSeekStallTimeoutMs)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aSlowButProgressingLoadPlaysAfterTheStallTimeoutAndAStalledLoadFailsAtIt() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.prepareTimeoutMs = { 60_000L }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            // 30 s to load on a slow network, data arriving all along: it plays.
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 512L, readyAfterMs = 30_000L, nowMs = { currentTime })
+            orchestrator.setQueue(testItems(3))
+            val started = currentTime
+            orchestrator.play()
+            assertEquals(30_000L, currentTime - started)
+            assertTrue(delegate.playbackErrors.isEmpty())
+            assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+
+            // The next load gets no data at all: it fails at the 10 s stall timeout.
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 30_000L, nowMs = { currentTime })
+            val skipped = currentTime
+            try {
+                orchestrator.skip(2)
+                fail("Expected the stalled load to fail")
+            } catch (error: RejectionException) {
+                assertEquals("crossfade_prepare_timeout", error.code)
+            }
+            assertEquals(10_000L, currentTime - skipped)
         } finally {
             orchestrator.release()
         }
@@ -614,6 +659,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
         val release = CompletableDeferred<Unit>()
     }
 
+    private class SimulatedLoad(val bytesPerPoll: Long, val readyAfterMs: Long, val nowMs: () -> Long)
+
     private class FakeCrossfadeEngine(
         override val name: String
     ) : AndroidCrossfadeEnginePort {
@@ -631,6 +678,16 @@ class AndroidPlaybackOrchestratorCancellationTest {
             private set
         var lastSeekTimeoutMs: Long? = null
             private set
+        var lastPrepareStallTimeoutMs: Long? = null
+            private set
+        var lastSeekStallTimeoutMs: Long? = null
+            private set
+        /**
+         * When set, the next load downloads like a network does: [SimulatedLoad.bytesPerPoll]
+         * every 25 ms (0: stalled) until [SimulatedLoad.readyAfterMs], judged by the same wait as
+         * the real engine with the limits the orchestrator passed.
+         */
+        var simulatedLoad: SimulatedLoad? = null
 
         override val positionMs: Long
             get() = position
@@ -652,11 +709,29 @@ class AndroidPlaybackOrchestratorCancellationTest {
             item: TrackAudioItem,
             positionMs: Long,
             timeoutMs: Long,
+            stallTimeoutMs: Long,
             ticket: PlaybackOperationTicket?
         ) {
             prepareCalls += 1
             lastPrepareTicket = ticket
             lastPrepareTimeoutMs = timeoutMs
+            lastPrepareStallTimeoutMs = stallTimeoutMs
+            simulatedLoad?.let { load ->
+                simulatedLoad = null
+                var bytes = 0L
+                var elapsed = 0L
+                val verdict = awaitWhileProgressing(
+                    stallTimeoutMs = stallTimeoutMs,
+                    totalTimeoutMs = timeoutMs,
+                    pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                    nowMs = load.nowMs,
+                    pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it); elapsed += it },
+                    readings = { bytes += load.bytesPerPoll; longArrayOf(bytes) }
+                ) { elapsed >= load.readyAfterMs }
+                if (verdict != null) {
+                    throw RejectionException("$name did not become ready.", "crossfade_prepare_timeout")
+                }
+            }
             val block = blockNextPrepare.also { blockNextPrepare = null }
             if (block != null) {
                 block.entered.complete(Unit)
@@ -700,10 +775,12 @@ class AndroidPlaybackOrchestratorCancellationTest {
         override suspend fun seekTo(
             positionMs: Long,
             timeoutMs: Long,
+            stallTimeoutMs: Long,
             ticket: PlaybackOperationTicket?
         ) {
             ticket?.ensureActive()
             lastSeekTimeoutMs = timeoutMs
+            lastSeekStallTimeoutMs = stallTimeoutMs
             position = positionMs
         }
 

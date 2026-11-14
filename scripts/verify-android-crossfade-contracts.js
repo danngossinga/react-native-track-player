@@ -259,11 +259,54 @@ assert(
   'Android legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
-// Every engine load and seek passes the app's setting, never a number.
+// Every engine load and seek passes the app's settings (the total limit and the stall timeout),
+// never a number.
 assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6,
-  'Android engine loads and seeks must all pass prepareTimeoutMs(), never a fixed timeout.'
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 6 &&
+    orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
+  'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
+);
+
+// Every engine wait gives up on a stall (no bytes downloaded, nothing buffered) or at its cap.
+const engineSource = read('android/src/main/java/com/doublesymmetry/trackplayer/service/AndroidCrossfadeEngine.kt');
+const stallWatchSource = read('android/src/main/java/com/doublesymmetry/trackplayer/service/StallWatch.kt');
+const enginePrepare = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+const engineSeek = section(engineSource, 'override suspend fun seekTo(', 'override fun setVolume(');
+for (const [label, wait] of [['load', enginePrepare], ['seek', engineSeek]]) {
+  assert(
+    wait.includes('awaitWhileProgressing(') &&
+      wait.includes('stallTimeoutMs = stallTimeoutMs,') &&
+      wait.includes('totalTimeoutMs = timeoutMs,') &&
+      wait.includes('pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,') &&
+      wait.includes('readings = ::loadProgress') &&
+      wait.includes('if (verdict != null) {') &&
+      !wait.includes('elapsedRealtime() - startedAt'),
+    `Android engine ${label} must wait with the stall watch (stallTimeoutMs, prepareTimeoutMs as cap), not a fixed total.`
+  );
+}
+assert(
+  engineSource.includes('longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
+    engineSource.includes('bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
+    engineSource.includes('.setTransferListener(object : TransferListener {') &&
+    stallWatchSource.includes('val watch = StallWatch(stallTimeoutMs, totalTimeoutMs, nowMs())') &&
+    stallWatchSource.includes('val verdict = watch.check(nowMs(), readings())'),
+  'Android engine waits must read downloaded bytes and buffered media as progress.'
+);
+
+// Crossfade players start from the app's low bandwidth estimate (initialBitrateEstimateBps).
+assert(
+  engineSource.includes('.setBandwidthMeter(\n            DefaultBandwidthMeter.Builder(context)\n                .setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
+    engineSource.includes('androidXfadeLog("$name built initialBitrateEstimateBps=$initialBitrateEstimateBps")') &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
+    musicService.includes('private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)') &&
+    musicService.includes('initialBitrateEstimateBps = initialBitrateEstimate.milliseconds,') &&
+    section(musicService, 'fun setupPlayer(playerOptions: Bundle?)', 'if (isPrimaryPlayerInitialized())')
+      .includes('applyTimeout(playerOptions, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)') &&
+    !section(musicService, 'fun updateOptions(options: Bundle)', 'val androidOptions').includes('INITIAL_BITRATE_ESTIMATE_KEY'),
+  'Android crossfade players must start from the setupPlayer initialBitrateEstimateBps.'
 );
 
 // The app's load timeout (prepareTimeoutMs) reaches every orchestrator, from setup (even when the
@@ -279,19 +322,44 @@ assert(
     updateOptionsSection.includes('applyTimeouts(options)') &&
     applyTimeoutSection.includes('applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)') &&
     applyTimeoutSection.includes('applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)') &&
+    applyTimeoutSection.includes('applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)') &&
+    musicService.includes('private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)') &&
+    musicService.includes('created.stallTimeoutMs = { stallTimeout.milliseconds }') &&
     section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('setting.apply(value)') &&
     section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('if (options?.containsKey(key) == true) options.get(key) else return'),
   'Android prepareTimeoutMs must be taken at setup (before the early return) and on updateOptions, and read by every orchestrator.'
 );
 
-// The standard backend's readiness wait reads the app's setting (standardReadyTimeoutMs).
+// The standard backend's readiness wait reads the app's settings (standardReadyTimeoutMs as the
+// cap, stallTimeoutMs) and the player's buffered position as progress.
+const runtimeSource = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt');
+const gateAwait = section(runtimeSource, 'suspend fun await(', 'private fun notReadyError()');
 assert(
   musicService.includes('private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)') &&
-    musicService.includes('readinessGate = StandardPlaybackReadinessGate(timeoutMs = { standardReadyTimeout.milliseconds })') &&
-    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('private val timeoutMs: () -> Long,') &&
+    musicService.includes('readinessGate = StandardPlaybackReadinessGate(\n                        timeoutMs = { standardReadyTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }\n                    ),') &&
+    runtimeSource.includes('private val timeoutMs: () -> Long,') &&
+    runtimeSource.includes('private val stallTimeoutMs: () -> Long,') &&
+    gateAwait.includes('stallTimeoutMs = stallTimeoutMs(),') &&
+    gateAwait.includes('totalTimeoutMs = timeoutMs(),') &&
+    gateAwait.includes('readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }') &&
+    !gateAwait.includes('withTimeoutOrNull') &&
+    standardBackend.includes('bufferedPositionMs = player.bufferedPosition') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt').includes('private val readinessGate: StandardPlaybackReadinessGate,') &&
     standardBackend.includes('        readinessGate.await(index, snapshot.positionMs) {'),
-  'Android standard readiness wait must read standardReadyTimeoutMs, not a fixed 5 s.'
+  'Android standard readiness wait must read standardReadyTimeoutMs and stallTimeoutMs, not a fixed total.'
+);
+
+for (const option of ['stallTimeoutMs', 'initialBitrateEstimateBps']) {
+  assert(
+    read('src/interfaces/PlayerOptions.ts').includes(`${option}?: number;`) &&
+      read('docs/docs/api/objects/player-options.md').includes(`| \`${option}\` |`),
+    `${option} must be typed and documented.`
+  );
+}
+assert(
+  read('src/interfaces/UpdateOptions.ts').includes('stallTimeoutMs?: number;') &&
+    read('docs/docs/api/objects/update-options.md').includes('| `stallTimeoutMs` |'),
+  'stallTimeoutMs must be accepted by updateOptions.'
 );
 
 console.log('Android crossfade contracts OK');

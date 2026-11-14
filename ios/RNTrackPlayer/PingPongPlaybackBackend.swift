@@ -376,11 +376,11 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         )
     }
 
-    /// Waits for a synchronous step (see `backendStepTimeout`): the load or play-start timeout
-    /// plus a margin, at least 10 s. A backend switch only loads or only starts playback; the play
-    /// used to resume after an interruption may do both, and the asset's own playable stage has no
-    /// bound, so the margin may not cover them (that result is not used). Other commands wait
-    /// behind such a step.
+    /// Waits for a synchronous step (see `backendStepTimeout`): the load limit plus the play-start
+    /// limit plus 5 s, at least 10 s, so it covers a step that loads a track (playable stage
+    /// included) and then starts it, such as the play used to resume after an interruption. The
+    /// waits inside fail sooner when they stall. The seek and preroll inside a load have no limit
+    /// of their own. Other commands wait behind such a step.
     private func awaitResult(
         _ start: (@escaping (Result<Void, Error>) -> Void) -> Void
     ) throws {

@@ -18,29 +18,35 @@ export interface UpdateOptions {
   capabilities?: Capability[];
 
   /**
-   * Crossfade backend: how long, in milliseconds, a track may take to become ready before the load
-   * fails. Android bounds the whole load and every seek (`crossfade_prepare_timeout`,
-   * `crossfade_seek_timeout`); iOS bounds the wait from a playable asset to a ready item, and a
-   * backend switch and the play used to resume after an interruption wait at least this long plus 5 s (at
-   * least 10 s). Defaults to 5000. A value that is not
-   * a number from 1 to 2147483646 is ignored.
+   * How long, in milliseconds, any of the player's waits for a track (a crossfade load, seek or
+   * play start, a standard backend's readiness or seek) may go on with no progress (no new media
+   * downloaded or buffered) before it fails. Defaults to 10000. A slow load that keeps progressing
+   * is not stopped by it, only by the wait's own total limit below. A value that is not a number
+   * from 1 to 2147483646 is ignored.
+   */
+  stallTimeoutMs?: number;
+  /**
+   * Crossfade backend: the total limit, in milliseconds, for a track to become ready, even while
+   * it progresses (`stallTimeoutMs` fails a stalled load sooner). Android bounds the whole load and
+   * every seek (`crossfade_prepare_timeout`, `crossfade_seek_timeout`); iOS bounds the whole load,
+   * the asset's playable stage included. Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   prepareTimeoutMs?: number;
   /**
-   * iOS crossfade backend: how long, in milliseconds, playback may take to start (after `play`, a
-   * load that plays at once, or the incoming song of a crossfade) before it fails. Defaults to
-   * 8000. A backend switch and the play used to resume after an interruption wait at least this
-   * long plus 2 s. Same bounds and rules as `prepareTimeoutMs`.
+   * iOS crossfade backend: the total limit, in milliseconds, for playback to start (after `play`,
+   * a load that plays at once, or the incoming song of a crossfade). Defaults to 60000. A backend
+   * switch and the play used to resume after an interruption wait at most this plus
+   * `prepareTimeoutMs` plus 5 s (at least 10 s). Same bounds as `stallTimeoutMs`.
    */
   playStartTimeoutMs?: number;
   /**
-   * Standard backend (iOS and Android): how long, in milliseconds, a track restored by a backend
-   * switch may take to be ready. Defaults to 5000. Same bounds and rules as `prepareTimeoutMs`.
+   * Standard backend (iOS and Android): the total limit, in milliseconds, for a track restored by
+   * a backend switch to be ready. Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   standardReadyTimeoutMs?: number;
   /**
-   * iOS standard backend: how long, in milliseconds, a seek may take before it fails
-   * (`standard_seek_timeout`). Defaults to 25000. Same bounds and rules as `prepareTimeoutMs`.
+   * iOS standard backend: the total limit, in milliseconds, for a seek (`standard_seek_timeout`).
+   * Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   standardSeekTimeoutMs?: number;
 

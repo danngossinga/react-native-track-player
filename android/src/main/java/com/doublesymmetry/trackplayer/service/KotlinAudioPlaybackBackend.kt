@@ -251,7 +251,8 @@ internal class KotlinAudioPlaybackBackend(
             StandardPlaybackReadinessObservation(
                 state = player.playerState,
                 currentIndex = player.currentIndex,
-                positionMs = player.position
+                positionMs = player.position,
+                bufferedPositionMs = player.bufferedPosition
             )
         }
     }

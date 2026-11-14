@@ -25,9 +25,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
         let setting = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)
-        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertEqual(setting.milliseconds, 60_000)
         XCTAssertNil(setting.apply(["capabilities": ["play"]]))
-        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertEqual(setting.milliseconds, 60_000)
         XCTAssertEqual(setting.apply(["prepareTimeoutMs": NSNumber(value: 15_000)]), true)
         XCTAssertEqual(setting.milliseconds, 15_000)
         // An invalid or missing value keeps the current one; a new valid value replaces it.
@@ -39,11 +39,13 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     }
 
     func testThePlayerTimeoutsKeepTheirOldValuesUntilTheAppSetsThem() {
-        // The waits that were fixed numbers keep them by default, each read from its own option.
+        // Each wait reads its own option; the total limits are safety caps, the stall timeout
+        // decides first.
         let cases: [(String, Int, Int)] = [
-            ("playStartTimeoutMs", playStartTimeoutDefaultMs, 8_000),
-            ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 5_000),
-            ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 25_000),
+            ("playStartTimeoutMs", playStartTimeoutDefaultMs, 60_000),
+            ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 60_000),
+            ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 60_000),
+            ("stallTimeoutMs", stallTimeoutDefaultMs, 10_000),
         ]
         for (key, defaultMs, expectedDefault) in cases {
             XCTAssertEqual(defaultMs, expectedDefault, key)
@@ -55,14 +57,61 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
-    func testBackendStepTimeoutCoversTheLoadOrPlayStartTimeoutAndNeverBelowTen() {
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 8_000), 10)
+    func testBackendStepTimeoutCoversALoadThenAPlayStartAndNeverBelowTen() {
+        // The defaults: 60 s load + 60 s play start + 5 s.
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: prepareTimeoutDefaultMs, playStartTimeoutMs: playStartTimeoutDefaultMs), 125)
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000, playStartTimeoutMs: 1_000), 10)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 35)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500, playStartTimeoutMs: 8_000), 17.5)
-        // A longer play-start wait makes the step wait longer too (a backend switch only starts
-        // playback; the resume after an interruption may load and start, beyond this margin).
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 22)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 43)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 2_500, playStartTimeoutMs: 5_000), 12.5)
+        // A longer play-start limit makes the step wait longer too.
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 30)
+    }
+
+    // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
+
+    func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {
+        // A load that adds a little media every second, with a 3 s stall timeout: it survives
+        // far beyond 3 s, until its 60 s cap.
+        var watch = StallWatch(stallTimeoutMs: 3_000, totalTimeoutMs: 60_000, startedAt: 100)
+        XCTAssertEqual(watch.check(at: 100, readings: [0]), .wait)
+        for second in 1..<60 {
+            XCTAssertEqual(watch.check(at: 100 + Double(second), readings: [Double(second) * 0.2]), .wait, "\(second)")
+        }
+        XCTAssertEqual(watch.check(at: 160, readings: [12]), .capExceeded)
+    }
+
+    func testStallWatchFailsAStalledLoadAtTheStallTimeout() {
+        var watch = StallWatch(stallTimeoutMs: 3_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [4]), .wait)
+        XCTAssertEqual(watch.check(at: 1, readings: [5]), .wait)
+        // Nothing more loads from t = 1 s: it fails 3 s later, not at the cap.
+        XCTAssertEqual(watch.check(at: 2, readings: [5]), .wait)
+        XCTAssertEqual(watch.check(at: 3.999, readings: [5]), .wait)
+        XCTAssertEqual(watch.check(at: 4, readings: [5]), .stalled)
+    }
+
+    func testStallWatchCountsAnyGrowingReadingAndGrowthAfterADrop() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [10, 0]), .wait)
+        // The second reading (time played) grows while the first does not.
+        XCTAssertEqual(watch.check(at: 0.9, readings: [10, 1]), .wait)
+        XCTAssertEqual(watch.check(at: 1.8, readings: [10, 2]), .wait)
+        // A seek back drops the buffer: not progress, but growth from the lower value is.
+        XCTAssertEqual(watch.check(at: 2.7, readings: [3, 2]), .wait)
+        XCTAssertEqual(watch.check(at: 3.5, readings: [4, 2]), .wait)
+        XCTAssertEqual(watch.check(at: 4.5, readings: [4, 2]), .stalled)
+    }
+
+    func testStallWatchCapWinsAndAStageReachedCountsAsProgress() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 5_000, startedAt: 0)
+        // The playable stage has no signal: only the cap bounds it.
+        XCTAssertEqual(watch.capVerdict(at: 4.9), .wait)
+        XCTAssertEqual(watch.capVerdict(at: 5), .capExceeded)
+        // A playable asset at 4 s restarts the stall clock; the cap still counts from the start.
+        watch.noteProgress(at: 4)
+        XCTAssertEqual(watch.check(at: 4, readings: [0]), .wait)
+        XCTAssertEqual(watch.check(at: 4.9, readings: [0]), .wait)
+        XCTAssertEqual(watch.check(at: 5, readings: [1]), .capExceeded)
     }
 
     private let snapshot = PlaybackBackendSnapshot(

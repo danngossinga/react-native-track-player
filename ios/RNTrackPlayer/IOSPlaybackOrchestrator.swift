@@ -123,6 +123,13 @@ final class IOSPlaybackOrchestrator {
             engineB.playStartTimeoutMs = playStartTimeoutMs
         }
     }
+    /// How long a load or play start may go on with no progress (ms); both engines read it.
+    var stallTimeoutMs: () -> Int = { stallTimeoutDefaultMs } {
+        didSet {
+            engineA.stallTimeoutMs = stallTimeoutMs
+            engineB.stallTimeoutMs = stallTimeoutMs
+        }
+    }
     private var activeEngine: IOSCrossfadeEngine
     private var standbyEngine: IOSCrossfadeEngine
     private var queue: [Track] = []
