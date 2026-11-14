@@ -17,6 +17,10 @@ import java.util.IdentityHashMap
  * media sources report their transfers to [getTransferListener]); the measuring meter behind it
  * changes. A transfer that started before a reset keeps reporting to the meter it started on, so
  * that meter's start and end calls stay paired.
+ *
+ * The setting is a start-of-track estimate by nature: a new value is used at the next
+ * [startTrack]; the playing track is not reset mid-track, its adaptive choice follows the
+ * bandwidth the meter measures (ExoPlayer's design).
  */
 internal class PerTrackBandwidthMeter(
     /** The app's current value, read at every [startTrack]. */

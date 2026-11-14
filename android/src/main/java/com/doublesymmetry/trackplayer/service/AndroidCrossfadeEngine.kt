@@ -177,6 +177,8 @@ internal class AndroidCrossfadeEngine(
         player.stop()
         player.clearMediaItems()
         // Every track starts from the app's current estimate, not from the last track's measure.
+        // A start-of-track estimate: a new value waits for the next track; the playing one keeps
+        // following the measured bandwidth.
         val initialEstimate = bandwidthMeter.startTrack()
         androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
         player.setMediaItem(buildMediaItem(item))

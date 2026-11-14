@@ -80,7 +80,9 @@ Added fork surface:
   `updateOptions`, default 96000): the bandwidth each track starts from before the
   player has measured the network. An adaptive stream starts at the highest
   rendition fitting about 70 % of it, or the lowest when none fits, and climbs as
-  the player measures. A new value applies to the next track.
+  the player measures. It is a start-of-track estimate: a new value is used at
+  the next track start; the playing track is not reset mid-track (its rendition
+  follows the measured bandwidth).
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.
