@@ -13,4 +13,15 @@ class CrossfadeBandwidthMeterInstrumentationTest {
             assertEquals(estimate, crossfadeBandwidthMeter(context, estimate).bitrateEstimate)
         }
     }
+
+    @Test
+    fun eachCrossfadeTrackStartsFromTheCurrentEstimateOnARealMeter() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        var setting = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS
+        val meter = PerTrackBandwidthMeter({ setting }) { crossfadeBandwidthMeter(context, it) }
+        assertEquals(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS, meter.bitrateEstimate)
+        setting = 48_000L
+        assertEquals(48_000L, meter.startTrack())
+        assertEquals(48_000L, meter.bitrateEstimate)
+    }
 }

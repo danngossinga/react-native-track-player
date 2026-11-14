@@ -80,7 +80,7 @@ class MusicService : HeadlessJsTaskService() {
     private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
     /** How long any of those waits may go on with no progress (`stallTimeoutMs`), read at every wait. */
     private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
-    /** The crossfade players' starting bandwidth estimate (`initialBitrateEstimateBps`), read when they are built. */
+    /** The bandwidth each crossfade track starts from (`initialBitrateEstimateBps`), read at every track. */
     private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
@@ -285,7 +285,8 @@ class MusicService : HeadlessJsTaskService() {
             scope = scope,
             audioContentType = orchestratorAudioContentType,
             handleAudioFocus = orchestratorHandlesAudioFocus,
-            initialBitrateEstimateBps = initialBitrateEstimate.milliseconds,
+            // Read at every track: a later updateOptions applies to the next track.
+            initialBitrateEstimateBps = { initialBitrateEstimate.milliseconds },
             delegate = object : AndroidPlaybackOrchestratorDelegate {
                 override fun onPlaybackStateChanged(state: AudioPlayerState) {
                     if (!isAuthoritative()) return
@@ -542,8 +543,6 @@ class MusicService : HeadlessJsTaskService() {
     fun setupPlayer(playerOptions: Bundle?) {
         // Taken even when the player is already set up (a reloaded app meeting a running service).
         applyTimeouts(playerOptions)
-        // Setup only: the crossfade players built from now on start from this estimate.
-        applyTimeout(playerOptions, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
         if (isPrimaryPlayerInitialized()) {
             print("Player was initialized. Prevent re-initializing again")
             return
@@ -602,12 +601,13 @@ class MusicService : HeadlessJsTaskService() {
 
     /**
      * Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`, `stallTimeoutMs`)
-     * from setup or update options; any other value is ignored.
+     * and `initialBitrateEstimateBps` from setup or update options; any other value is ignored.
      */
     private fun applyTimeouts(options: Bundle?) {
         applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)
         applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
         applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)
+        applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
     }
 
     private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting) {

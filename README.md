@@ -76,10 +76,11 @@ Added fork surface:
   `standardSeekTimeoutMs` (iOS standard seek), each 60000 by default. A backend
   switch and the play used to resume after an interruption wait at most the load
   limit plus the play-start limit plus 5 s (at least 10 s).
-- `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` only, default
-  96000): the bandwidth a crossfade player assumes before it has measured any. An
-  adaptive stream starts at the highest rendition fitting about 70 % of it, or the
-  lowest when none fits, and climbs as the player measures the network.
+- `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` and
+  `updateOptions`, default 96000): the bandwidth each track starts from before the
+  player has measured the network. An adaptive stream starts at the highest
+  rendition fitting about 70 % of it, or the lowest when none fits, and climbs as
+  the player measures. A new value applies to the next track.
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

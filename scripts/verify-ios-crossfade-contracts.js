@@ -261,6 +261,10 @@ assert(
     enginePrepare.includes('guard let self = self, self.generation == currentGeneration, !playableSettled else { return }') &&
     enginePrepare.includes('readyWatch.noteProgress(at: Self.now())') &&
     enginePrepare.includes('watch: readyWatch') &&
+    enginePrepare.includes('var settleWatch = loadWatch') &&
+    enginePrepare.includes('let verdict = settleWatch.check(at: Self.now(), readings: Self.loadProgress(of: item))') &&
+    enginePrepare.includes('guard let self = self, self.generation == currentGeneration, !settled else { return }') &&
+    enginePrepare.includes('self.player.cancelPendingPrerolls()') &&
     waitForReadyItem.includes('let verdict = watch.check(at: Self.now(), readings: Self.loadProgress(of: item))') &&
     !/\.milliseconds\(\d+\)/.test(waitForReadyItem) &&
     !waitForReadyItem.includes('asyncAfter'),

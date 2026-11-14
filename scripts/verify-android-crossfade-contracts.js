@@ -295,20 +295,30 @@ assert(
   'Android engine waits must read downloaded bytes and buffered media as progress.'
 );
 
-// Crossfade players start from the app's low bandwidth estimate (initialBitrateEstimateBps).
+// Every crossfade track starts from the app's current low bandwidth estimate
+// (initialBitrateEstimateBps), from setup or updateOptions, without rebuilding the players.
+const perTrackMeter = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PerTrackBandwidthMeter.kt');
+const startTrack = section(perTrackMeter, 'fun startTrack(): Long {', 'override fun getBitrateEstimate()');
 assert(
-  engineSource.includes('.setBandwidthMeter(crossfadeBandwidthMeter(context, initialBitrateEstimateBps))') &&
+  engineSource.includes('.setBandwidthMeter(bandwidthMeter)') &&
+    engineSource.includes('private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->\n        crossfadeBandwidthMeter(context, estimate)') &&
+    enginePrepare.includes('val initialEstimate = bandwidthMeter.startTrack()') &&
+    enginePrepare.includes('androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")') &&
+    enginePrepare.indexOf('bandwidthMeter.startTrack()') < enginePrepare.indexOf('player.setMediaItem(buildMediaItem(item))') &&
     section(engineSource, 'internal fun crossfadeBandwidthMeter(', '/**').includes('.setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
+    startTrack.includes('val estimate = initialBitrateEstimateBps()') &&
+    startTrack.includes('val fresh = newMeter(estimate)') &&
+    startTrack.includes('current = fresh') &&
+    perTrackMeter.includes('override fun getBitrateEstimate(): Long = current.bitrateEstimate') &&
+    perTrackMeter.includes('override fun getTransferListener(): TransferListener = this') &&
     read('android/src/androidTest/java/com/doublesymmetry/trackplayer/service/CrossfadeBandwidthMeterInstrumentationTest.kt').includes('crossfadeBandwidthMeter(context, estimate).bitrateEstimate') &&
-    engineSource.includes('androidXfadeLog("$name built initialBitrateEstimateBps=$initialBitrateEstimateBps")') &&
+    orchestrator.includes('initialBitrateEstimateBps: () -> Long,') &&
     orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
     orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
     musicService.includes('private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)') &&
-    musicService.includes('initialBitrateEstimateBps = initialBitrateEstimate.milliseconds,') &&
-    section(musicService, 'fun setupPlayer(playerOptions: Bundle?)', 'if (isPrimaryPlayerInitialized())')
-      .includes('applyTimeout(playerOptions, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)') &&
-    !section(musicService, 'fun updateOptions(options: Bundle)', 'val androidOptions').includes('INITIAL_BITRATE_ESTIMATE_KEY'),
-  'Android crossfade players must start from the setupPlayer initialBitrateEstimateBps.'
+    musicService.includes('initialBitrateEstimateBps = { initialBitrateEstimate.milliseconds },') &&
+    section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)'),
+  'Android crossfade tracks must each start from the current initialBitrateEstimateBps (setupPlayer and updateOptions).'
 );
 
 // The app's load timeout (prepareTimeoutMs) reaches every orchestrator, from setup (even when the
@@ -359,9 +369,10 @@ for (const option of ['stallTimeoutMs', 'initialBitrateEstimateBps']) {
   );
 }
 assert(
-  read('src/interfaces/UpdateOptions.ts').includes('stallTimeoutMs?: number;') &&
-    read('docs/docs/api/objects/update-options.md').includes('| `stallTimeoutMs` |'),
-  'stallTimeoutMs must be accepted by updateOptions.'
+  ['stallTimeoutMs', 'initialBitrateEstimateBps'].every((option) =>
+    read('src/interfaces/UpdateOptions.ts').includes(`${option}?: number;`) &&
+      read('docs/docs/api/objects/update-options.md').includes(`| \`${option}\` |`)),
+  'stallTimeoutMs and initialBitrateEstimateBps must be accepted by updateOptions.'
 );
 
 console.log('Android crossfade contracts OK');

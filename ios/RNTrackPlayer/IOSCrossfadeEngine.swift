@@ -229,20 +229,49 @@ final class IOSCrossfadeEngine {
                     case .failure(let error):
                         completion(.failure(error))
                     case .success:
+                        // The seek to the start position and the preroll stay under the same
+                        // watch: no progress for stallTimeoutMs, or the load limit, ends the load.
+                        var settleWatch = loadWatch
+                        settleWatch.noteProgress(at: Self.now())
+                        var settled = false
+                        func settle(_ result: Result<Void, Error>) {
+                            guard !settled else { return }
+                            settled = true
+                            self.timeoutWorkItem?.cancel()
+                            self.timeoutWorkItem = nil
+                            completion(result)
+                        }
+                        self.scheduleWaitCheck(generation: currentGeneration) { [weak self] in
+                            guard let self = self, !settled else { return false }
+                            let verdict = settleWatch.check(at: Self.now(), readings: Self.loadProgress(of: item))
+                            guard verdict != .wait else { return true }
+                            self.state = .failed
+                            let reason = Self.describe(verdict, settleWatch)
+                            IOSPlaybackLog.log("\(self.name) prepare seek/preroll timeout \(reason)")
+                            item.cancelPendingSeeks()
+                            self.player.cancelPendingPrerolls()
+                            settle(.failure(NSError(
+                                domain: "RNTP-Crossfade",
+                                code: 5,
+                                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not become ready (\(reason))."]
+                            )))
+                            return false
+                        }
                         self.seek(to: position) { [weak self] seekResult in
-                            guard let self = self, self.generation == currentGeneration else { return }
+                            guard let self = self, self.generation == currentGeneration, !settled else { return }
                             switch seekResult {
                             case .failure(let error):
                                 self.state = .failed
                                 IOSPlaybackLog.log("\(self.name) seek failed during prepare error=\(error.localizedDescription)")
-                                completion(.failure(error))
+                                settle(.failure(error))
                             case .success:
                                 self.preroll(generation: currentGeneration) { result in
+                                    guard !settled else { return }
                                     if case .success = result {
                                         self.state = .ready
                                         IOSPlaybackLog.log("\(self.name) prepare end duration=\(self.duration) buffered=\(self.bufferedPosition)")
                                     }
-                                    completion(result)
+                                    settle(result)
                                 }
                             }
                         }

@@ -104,7 +104,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         scope: CoroutineScope,
         audioContentType: Int,
         handleAudioFocus: Boolean,
-        initialBitrateEstimateBps: Long,
+        initialBitrateEstimateBps: () -> Long,
         delegate: AndroidPlaybackOrchestratorDelegate
     ) : this(
         scope,

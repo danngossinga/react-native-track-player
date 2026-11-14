@@ -82,12 +82,15 @@ internal class AndroidCrossfadeEngine(
     audioContentType: Int,
     handleAudioFocus: Boolean,
     /**
-     * The bandwidth the player assumes before it has measured any (`initialBitrateEstimateBps`):
-     * adaptive streams start low (see [crossfadeBandwidthMeter]), then follow the measured
-     * bandwidth.
+     * The bandwidth each track starts from before the player has measured any
+     * (`initialBitrateEstimateBps`), read at every load: adaptive streams start low (see
+     * [crossfadeBandwidthMeter]), then follow the measured bandwidth.
      */
-    initialBitrateEstimateBps: Long
+    initialBitrateEstimateBps: () -> Long
 ) : AndroidCrossfadeEnginePort {
+    private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->
+        crossfadeBandwidthMeter(context, estimate)
+    }
     /** Bytes this player has downloaded: a load's progress, counted while a segment arrives. */
     private val bytesLoaded = AtomicLong(0L)
     private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -107,7 +110,7 @@ internal class AndroidCrossfadeEngine(
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
-        .setBandwidthMeter(crossfadeBandwidthMeter(context, initialBitrateEstimateBps))
+        .setBandwidthMeter(bandwidthMeter)
         .build()
         .apply {
             volume = 0f
@@ -150,9 +153,6 @@ internal class AndroidCrossfadeEngine(
     override val playerErrorMessage: String?
         get() = player.playerError?.message
 
-    init {
-        androidXfadeLog("$name built initialBitrateEstimateBps=$initialBitrateEstimateBps")
-    }
 
     /** What a wait reads as progress: bytes downloaded and media buffered. */
     private fun loadProgress(): LongArray =
@@ -176,6 +176,9 @@ internal class AndroidCrossfadeEngine(
         player.pause()
         player.stop()
         player.clearMediaItems()
+        // Every track starts from the app's current estimate, not from the last track's measure.
+        val initialEstimate = bandwidthMeter.startTrack()
+        androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
         player.setMediaItem(buildMediaItem(item))
         player.prepare()
         player.seekTo(max(0L, positionMs))
