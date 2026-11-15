@@ -120,4 +120,19 @@ class PerTrackBandwidthMeterTest {
         assertEquals(50L, built[1].bytes)
         assertEquals(0, built[1].openTransfers)
     }
+
+    @Test
+    fun aFailedOpenThatNeverStartsIsNotKept() {
+        val built = mutableListOf<FakeMeter>()
+        val meter = PerTrackBandwidthMeter({ 96_000L }) { FakeMeter(it).also(built::add) }
+        // Opens that fail after initializing (a 404, a cancelled load) never start or end.
+        repeat(3) { meter.onTransferInitializing(FakeSource(), spec, true) }
+        assertEquals(0, meter.openTransfers)
+        val segment = FakeSource()
+        meter.onTransferInitializing(segment, spec, true)
+        meter.onTransferStart(segment, spec, true)
+        assertEquals(1, meter.openTransfers)
+        meter.onTransferEnd(segment, spec, true)
+        assertEquals(0, meter.openTransfers)
+    }
 }

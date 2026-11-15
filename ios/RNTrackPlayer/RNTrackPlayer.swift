@@ -62,6 +62,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)
     /// How long any of those waits may go on with no progress before it fails (`stallTimeoutMs`).
     private let stallTimeout = TimeoutSetting(optionKey: "stallTimeoutMs", defaultMs: stallTimeoutDefaultMs)
+    /// How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`).
+    private let incomingStallGrace = TimeoutSetting(optionKey: "incomingStallGraceMs", defaultMs: incomingStallGraceDefaultMs)
     private let playbackBackendAuthority = PlaybackBackendAuthority()
     private let playerEventTokensLock = NSLock()
     private var playerEventTokens: [ObjectIdentifier: PlaybackBackendEventToken] = [:]
@@ -491,6 +493,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
             orchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }
             orchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }
+            orchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }
             return PingPongPlaybackBackend(
                 player: queuePlayer,
                 orchestrator: orchestrator,
@@ -795,6 +798,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         playbackOrchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }
         playbackOrchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }
         playbackOrchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }
+        playbackOrchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }
         let initialBackend: PlaybackBackendKind = crossfadeEnabled ? .pingPong : .standard
         installPlaybackBackendFacade(initialKind: initialBackend)
 
@@ -980,10 +984,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     /// Takes the valid timeouts (`prepareTimeoutMs`, `playStartTimeoutMs`, `standardReadyTimeoutMs`,
-    /// `standardSeekTimeoutMs`, `stallTimeoutMs`) from setup or update options; any other value is
-    /// ignored.
+    /// `standardSeekTimeoutMs`, `stallTimeoutMs`) and `incomingStallGraceMs` from setup or update
+    /// options; any other value is ignored.
     private func applyTimeouts(_ options: [String: Any]) {
-        for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout] {
+        for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace] {
             switch setting.apply(options) {
             case true?: IOSPlaybackLog.log("\(setting.optionKey) set to \(setting.milliseconds)ms")
             case false?: IOSPlaybackLog.log("\(setting.optionKey) ignored, kept \(setting.milliseconds)ms")

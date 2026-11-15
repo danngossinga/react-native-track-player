@@ -4,7 +4,8 @@ import Foundation
 // exceeds its own total limit (the options below), a safety cap for slow but progressing loads.
 
 /// How long a crossfade engine's load may take in all (`prepareTimeoutMs`, setupPlayer or
-/// updateOptions): the asset's playable stage and the wait for a ready item.
+/// updateOptions): the asset's playable stage, the wait for a ready item, and the seek to the
+/// start position and preroll; also the limit of a crossfade engine's seek (as on Android).
 let prepareTimeoutDefaultMs = 60000
 /// How long a crossfade engine may take in all to start playback after `play` (`playStartTimeoutMs`).
 let playStartTimeoutDefaultMs = 60000
@@ -18,6 +19,21 @@ let stallTimeoutDefaultMs = 10000
 /// How often a callback-driven wait (crossfade engine, standard seek) reads its progress, in
 /// milliseconds. A poll interval, not a limit: a wait fails at most this much after its limit.
 let stallCheckIntervalMs = 250
+/// How long a crossfade waits for the incoming track's time to move before it falls back to
+/// playing that track alone (`incomingStallGraceMs`).
+let incomingStallGraceDefaultMs = 2000
+
+/// Whether a running crossfade should give up on its incoming track: `graceMs` (the app's
+/// `incomingStallGraceMs`) have passed and the incoming track has not moved past `toleranceSeconds`.
+func crossfadeIncomingStalled(
+    elapsedMs: Int,
+    graceMs: Int,
+    incomingTime: Double,
+    incomingStartTime: Double,
+    toleranceSeconds: Double = 0.2
+) -> Bool {
+    return elapsedMs >= graceMs && incomingTime <= incomingStartTime + toleranceSeconds
+}
 
 /// What a wait does after reading its progress.
 enum StallVerdict: Equatable {
@@ -115,6 +131,75 @@ final class TimeoutSetting {
         value = timeout
         lock.unlock()
         return true
+    }
+}
+
+/// Drives one wait on a callback queue: every `intervalMs` it reads the progress and asks its
+/// `StallWatch`; it reschedules itself while the verdict is `.wait` and calls `onGiveUp` once
+/// otherwise. `readings` returning nil means the wait has no progress signal yet (an asset not
+/// yet playable, a seek not yet issued): only the total limit applies then. Each wait owns its
+/// driver, so cancelling one never stops another. Not thread-safe: use it from one queue (main).
+final class StallWaitDriver {
+    typealias Schedule = (_ delayMs: Int, _ work: @escaping () -> Void) -> Void
+
+    private var watch: StallWatch
+    private let intervalMs: Int
+    private let now: () -> TimeInterval
+    private let schedule: Schedule
+    private let readings: () -> [Double]?
+    private let onGiveUp: (StallVerdict, StallWatch) -> Void
+    private(set) var isActive = false
+
+    init(
+        stallTimeoutMs: Int,
+        totalTimeoutMs: Int,
+        intervalMs: Int = stallCheckIntervalMs,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        schedule: @escaping Schedule = { delayMs, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: work)
+        },
+        readings: @escaping () -> [Double]?,
+        onGiveUp: @escaping (StallVerdict, StallWatch) -> Void
+    ) {
+        self.watch = StallWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: totalTimeoutMs, startedAt: now())
+        self.intervalMs = intervalMs
+        self.now = now
+        self.schedule = schedule
+        self.readings = readings
+        self.onGiveUp = onGiveUp
+    }
+
+    func start() {
+        guard !isActive else { return }
+        isActive = true
+        scheduleNext()
+    }
+
+    /// Stops the wait: no more checks, `onGiveUp` is never called.
+    func cancel() {
+        isActive = false
+    }
+
+    /// A stage reached (playable asset, ready item, seek issued): restarts the stall clock; the
+    /// total limit still counts from the start.
+    func noteProgress() {
+        watch.noteProgress(at: now())
+    }
+
+    private func scheduleNext() {
+        schedule(intervalMs) { self.tick() }
+    }
+
+    private func tick() {
+        guard isActive else { return }
+        let at = now()
+        let verdict = readings().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)
+        guard verdict != .wait else {
+            scheduleNext()
+            return
+        }
+        isActive = false
+        onGiveUp(verdict, watch)
     }
 }
 

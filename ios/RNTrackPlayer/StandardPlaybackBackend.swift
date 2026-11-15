@@ -253,7 +253,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         let track: Track
         let position: Double
         var completion: ((Result<Void, Error>) -> Void)?
-        var timeout: DispatchWorkItem?
+        /// The seek's wait (stallTimeoutMs once issued, standardSeekTimeoutMs in all).
+        var wait: StallWaitDriver?
+        /// Issued to the player: from then on, a stall of the buffered position fails it.
+        var issued = false
 
         init(track: Track, position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
             self.track = track
@@ -264,8 +267,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         func finish(_ result: Result<Void, Error>) {
             let callback = completion
             completion = nil
-            timeout?.cancel()
-            timeout = nil
+            wait?.cancel()
+            wait = nil
             callback?(result)
         }
     }
@@ -358,30 +361,20 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             return
         }
         let request = PendingSeek(track: track, position: max(0, position), completion: completion)
-        // Fails when the player loads nothing for stallTimeoutMs, or after standardSeekTimeoutMs.
-        let watch = StallWatch(
+        // Until the seek is issued (queued behind another seek, or waiting for the item to load,
+        // for example after a stop) only standardSeekTimeoutMs bounds it; once issued, it also
+        // fails when the player's buffered position does not grow for stallTimeoutMs. That
+        // position (the end of the last loaded range) is the only signal SwiftAudioEx exposes:
+        // a seek far from the loaded range shows no growth until its first data arrives.
+        let wait = StallWaitDriver(
             stallTimeoutMs: stallTimeoutMs(),
             totalTimeoutMs: seekTimeoutMs(),
-            startedAt: ProcessInfo.processInfo.systemUptime
-        )
-        pendingSeeks.append(request)
-        scheduleSeekCheck(request, watch: watch)
-        pumpSeeks()
-    }
-
-    /// Reads the seek's progress every `stallCheckIntervalMs` until it completes or gives up.
-    private func scheduleSeekCheck(_ request: PendingSeek, watch: StallWatch) {
-        let check = DispatchWorkItem { [weak self, weak request] in
-            guard let self = self, let request = request, request.completion != nil else { return }
-            var watch = watch
-            let verdict = watch.check(
-                at: ProcessInfo.processInfo.systemUptime,
-                readings: [self.player.bufferedPosition]
-            )
-            guard verdict != .wait else {
-                self.scheduleSeekCheck(request, watch: watch)
-                return
+            readings: { [weak self, weak request] in
+                guard let self = self, let request = request, request.issued else { return nil }
+                return [self.player.bufferedPosition]
             }
+        ) { [weak self, weak request] verdict, watch in
+            guard let self = self, let request = request, request.completion != nil else { return }
             self.pendingSeeks.removeAll { $0 === request }
             // If already emitted, keep the ticket until its real callback. A
             // timeout does not make a late, identical SDK event distinguishable.
@@ -393,8 +386,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             )))
             self.pumpSeeks()
         }
-        request.timeout = check
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(stallCheckIntervalMs), execute: check)
+        request.wait = wait
+        pendingSeeks.append(request)
+        wait.start()
+        pumpSeeks()
     }
 
     private func pumpSeeks() {
@@ -430,6 +425,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             pendingSeeks.removeFirst()
             issuedSeek = request
+            request.issued = true
+            request.wait?.noteProgress()
             player.seek(to: request.position)
             return
         }

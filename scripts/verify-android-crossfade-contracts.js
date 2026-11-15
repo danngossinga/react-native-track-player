@@ -375,4 +375,24 @@ assert(
   'stallTimeoutMs and initialBitrateEstimateBps must be accepted by updateOptions.'
 );
 
+// The crossfade fallback grace is the app's incomingStallGraceMs, read at every fade step.
+assert(
+  orchestrator.includes('var incomingStallGraceMs: () -> Long = { DEFAULT_INCOMING_STALL_GRACE_MS }') &&
+    orchestrator.includes('if (elapsedMs >= incomingStallGraceMs() &&') &&
+    !orchestrator.includes('INCOMING_STALL_GRACE_MS =') &&
+    musicService.includes('private val incomingStallGrace = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)') &&
+    musicService.includes('created.incomingStallGraceMs = { incomingStallGrace.milliseconds }') &&
+    section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, INCOMING_STALL_GRACE_KEY, incomingStallGrace)') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aCrossfadeFallsBackAfterTheIncomingStallGraceTheAppSet()'),
+  'Android crossfade fallback must read incomingStallGraceMs.'
+);
+
+// A transfer is tracked from its start to its end only: a failed open is not kept.
+assert(
+  section(perTrackMeter, 'override fun onTransferInitializing(', 'override fun onTransferStart(').indexOf('transfers[') < 0 &&
+    section(perTrackMeter, 'override fun onTransferStart(', 'override fun onBytesTransferred(').includes('transfers[source] = meter') &&
+    section(perTrackMeter, 'override fun onTransferEnd(', '\n}').includes('transfers.remove(source)'),
+  'PerTrackBandwidthMeter must track a transfer from its start to its end only.'
+);
+
 console.log('Android crossfade contracts OK');

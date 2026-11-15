@@ -90,4 +90,14 @@ class PrepareTimeoutOptionTest {
         assertTrue(setting.apply(64_000))
         assertEquals(64_000L, setting.milliseconds)
     }
+
+    @Test
+    fun theIncomingStallGraceIsItsOwnOptionAndDefaultsToTwoSeconds() {
+        assertEquals("incomingStallGraceMs", INCOMING_STALL_GRACE_KEY)
+        assertEquals(2_000L, DEFAULT_INCOMING_STALL_GRACE_MS)
+        val setting = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)
+        assertFalse(setting.apply(0.0))
+        assertTrue(setting.apply(4_000.0))
+        assertEquals(4_000L, setting.milliseconds)
+    }
 }

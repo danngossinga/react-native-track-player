@@ -80,6 +80,8 @@ class MusicService : HeadlessJsTaskService() {
     private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
     /** How long any of those waits may go on with no progress (`stallTimeoutMs`), read at every wait. */
     private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
+    /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
+    private val incomingStallGrace = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)
     /** The bandwidth each crossfade track starts from (`initialBitrateEstimateBps`), read at every track. */
     private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
     private var latestNotificationConfig: NotificationConfig? = null
@@ -349,6 +351,7 @@ class MusicService : HeadlessJsTaskService() {
         // Reads the service's setting at every load: a later updateOptions reaches every engine.
         created.prepareTimeoutMs = { prepareTimeout.milliseconds }
         created.stallTimeoutMs = { stallTimeout.milliseconds }
+        created.incomingStallGraceMs = { incomingStallGrace.milliseconds }
         Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
         return created
     }
@@ -601,12 +604,14 @@ class MusicService : HeadlessJsTaskService() {
 
     /**
      * Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`, `stallTimeoutMs`)
-     * and `initialBitrateEstimateBps` from setup or update options; any other value is ignored.
+     * `incomingStallGraceMs` and `initialBitrateEstimateBps` from setup or update options; any
+     * other value is ignored.
      */
     private fun applyTimeouts(options: Bundle?) {
         applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)
         applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
         applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)
+        applyTimeout(options, INCOMING_STALL_GRACE_KEY, incomingStallGrace)
         applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
     }
 

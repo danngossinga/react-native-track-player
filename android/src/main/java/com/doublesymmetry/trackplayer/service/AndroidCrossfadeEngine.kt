@@ -361,6 +361,13 @@ internal const val STALL_TIMEOUT_KEY = "stallTimeoutMs"
 internal const val DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS = 96_000L
 
 /**
+ * How long a crossfade waits for the incoming track's position to move before it falls back to
+ * playing that track alone (`incomingStallGraceMs`, `incoming_stalled`).
+ */
+internal const val DEFAULT_INCOMING_STALL_GRACE_MS = 2_000L
+internal const val INCOMING_STALL_GRACE_KEY = "incomingStallGraceMs"
+
+/**
  * The bandwidth meter of a crossfade player: it reports [initialBitrateEstimateBps] until it has
  * measured the network. ExoPlayer's adaptive selection then picks the highest rendition whose
  * bitrate fits about 70 % of the estimate (its default bandwidth fraction), or the lowest when

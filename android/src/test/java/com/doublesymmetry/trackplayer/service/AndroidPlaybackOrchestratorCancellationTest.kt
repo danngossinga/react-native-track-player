@@ -449,6 +449,31 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aCrossfadeFallsBackAfterTheIncomingStallGraceTheAppSet() = runTest {
+        // The fake engines never move, so the incoming track always stalls: the fallback comes
+        // after the grace read at that moment.
+        for (grace in listOf(300L, 1_200L)) {
+            val engineA = FakeCrossfadeEngine("engineA")
+            val engineB = FakeCrossfadeEngine("engineB")
+            val delegate = RecordingOrchestratorDelegate()
+            val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+            try {
+                orchestrator.incomingStallGraceMs = { grace }
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                val started = currentTime
+                orchestrator.crossFade(fadeDuration = 5_000.0)
+                val elapsed = currentTime - started
+                assertEquals("incoming_stalled", delegate.crossfadeEvents.last { it.state == "error" }.errorCode)
+                assertTrue("grace=$grace elapsed=$elapsed", elapsed >= grace && elapsed < grace + 100L)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")

@@ -70,12 +70,18 @@ Added fork surface:
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
 - The total limits, safety caps behind the stall timeout, with the same rules:
-  `prepareTimeoutMs` (crossfade load; Android: also every seek; iOS: the asset's
-  playable stage included), `playStartTimeoutMs` (iOS crossfade play start),
+  `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
+  before the asset is playable has no progress signal, so only this limit ends
+  it), `playStartTimeoutMs` (iOS crossfade play start),
   `standardReadyTimeoutMs` (standard backend readiness) and
-  `standardSeekTimeoutMs` (iOS standard seek), each 60000 by default. A backend
-  switch and the play used to resume after an interruption wait at most the load
-  limit plus the play-start limit plus 5 s (at least 10 s).
+  `standardSeekTimeoutMs` (iOS standard seek; before the seek is issued only this
+  limit applies, then the buffered position is its only progress signal), each
+  60000 by default. A backend switch and the play used to resume after an
+  interruption wait at most the load limit plus the play-start limit plus 5 s (at
+  least 10 s).
+- `incomingStallGraceMs` (crossfade, `setupPlayer` and `updateOptions`, default
+  2000): how long a crossfade waits for the incoming track to start moving before
+  it falls back to playing that track alone (`incoming_stalled`).
 - `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` and
   `updateOptions`, default 96000): the bandwidth each track starts from before the
   player has measured the network. An adaptive stream starts at the highest

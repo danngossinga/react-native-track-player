@@ -99,6 +99,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
     /** How long a load or seek may go on with no progress (ms), read like [prepareTimeoutMs]. */
     var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }
 
+    /**
+     * How long a crossfade waits for the incoming track to move before it falls back to that
+     * track alone (ms), read at every fade step.
+     */
+    var incomingStallGraceMs: () -> Long = { DEFAULT_INCOMING_STALL_GRACE_MS }
+
     constructor(
         context: Context,
         scope: CoroutineScope,
@@ -689,7 +695,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
                 if (!playWhenReady) {
                     ensurePlaybackStillActiveForCrossfade(fromIndex, toIndex, "Crossfade was cancelled because playback is paused.")
                 }
-                if (elapsedMs >= INCOMING_STALL_GRACE_MS &&
+                if (elapsedMs >= incomingStallGraceMs() &&
                     incomingEngine.positionMs <= incomingStartMs + INCOMING_STALL_TOLERANCE_MS
                 ) {
                     fallbackToTargetAfterStalledCrossfade(
@@ -1252,7 +1258,6 @@ internal class AndroidPlaybackOrchestrator private constructor(
         const val PREVIOUS_RESTART_THRESHOLD_MS = 3000L
         const val CROSSFADE_RUNNING_EVENT_INTERVAL_MS = 250L
         const val PREPARED_POSITION_TOLERANCE_MS = 250L
-        const val INCOMING_STALL_GRACE_MS = 2000L
         const val INCOMING_STALL_TOLERANCE_MS = 200L
         const val OUTGOING_END_TOLERANCE_MS = 150L
         const val POST_CROSSFADE_SETTLE_MS = 1500L

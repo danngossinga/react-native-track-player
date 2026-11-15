@@ -28,8 +28,11 @@ export interface UpdateOptions {
   /**
    * Crossfade backend: the total limit, in milliseconds, for a track to become ready, even while
    * it progresses (`stallTimeoutMs` fails a stalled load sooner). Android bounds the whole load and
-   * every seek (`crossfade_prepare_timeout`, `crossfade_seek_timeout`); iOS bounds the whole load,
-   * the asset's playable stage included. Defaults to 60000. Same bounds as `stallTimeoutMs`.
+   * every seek (`crossfade_prepare_timeout`, `crossfade_seek_timeout`); iOS bounds the whole load
+   * (playable stage, ready item, seek to the start position, preroll) and every seek. On iOS the
+   * stage before the asset is playable has no progress signal, so only this limit ends it there;
+   * `stallTimeoutMs` applies from the moment the asset is playable. Defaults to 60000. Same
+   * bounds as `stallTimeoutMs`.
    */
   prepareTimeoutMs?: number;
   /**
@@ -49,6 +52,12 @@ export interface UpdateOptions {
    * Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   standardSeekTimeoutMs?: number;
+  /**
+   * Crossfade backend: how long, in milliseconds, a crossfade waits for the incoming track to
+   * start moving before it falls back to playing that track alone (`incoming_stalled`). Read at
+   * every fade step. Defaults to 2000. Same bounds as `stallTimeoutMs`.
+   */
+  incomingStallGraceMs?: number;
   /**
    * Android crossfade backend: the bandwidth, in bits per second, each track starts from before
    * the player has measured the network. An adaptive (HLS/DASH) track starts at the highest

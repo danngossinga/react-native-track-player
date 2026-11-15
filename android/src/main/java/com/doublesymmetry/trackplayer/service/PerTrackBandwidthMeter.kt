@@ -69,14 +69,17 @@ internal class PerTrackBandwidthMeter(
         }
     }
 
+    /** Transfers started and not yet ended (a failed open never starts, so it is not kept). */
+    internal val openTransfers: Int
+        get() = transfers.size
+
     override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-        val meter = current
-        transfers[source] = meter
-        meter.transferListener?.onTransferInitializing(source, dataSpec, isNetwork)
+        current.transferListener?.onTransferInitializing(source, dataSpec, isNetwork)
     }
 
     override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-        val meter = transfers.getOrPut(source) { current }
+        val meter = current
+        transfers[source] = meter
         meter.transferListener?.onTransferStart(source, dataSpec, isNetwork)
     }
 

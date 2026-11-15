@@ -38,7 +38,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(setting.milliseconds, 30_000)
     }
 
-    func testThePlayerTimeoutsKeepTheirOldValuesUntilTheAppSetsThem() {
+    func testEachPlayerTimeoutHasItsDefaultUntilTheAppSetsIt() {
         // Each wait reads its own option; the total limits are safety caps, the stall timeout
         // decides first.
         let cases: [(String, Int, Int)] = [
@@ -46,6 +46,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 60_000),
             ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 60_000),
             ("stallTimeoutMs", stallTimeoutDefaultMs, 10_000),
+            ("incomingStallGraceMs", incomingStallGraceDefaultMs, 2_000),
         ]
         for (key, defaultMs, expectedDefault) in cases {
             XCTAssertEqual(defaultMs, expectedDefault, key)
@@ -112,6 +113,117 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(watch.check(at: 4, readings: [0]), .wait)
         XCTAssertEqual(watch.check(at: 4.9, readings: [0]), .wait)
         XCTAssertEqual(watch.check(at: 5, readings: [1]), .capExceeded)
+    }
+
+    // The wait driver: the engines' and the standard seek's waits run on it.
+
+    /// A manual clock and scheduler: `run()` fires the pending checks one at a time.
+    private final class ManualWaitClock {
+        var now: TimeInterval = 0
+        var pending: [(Int, () -> Void)] = []
+        func schedule(_ delayMs: Int, _ work: @escaping () -> Void) { pending.append((delayMs, work)) }
+        /// Fires the next check after its delay; false when none is pending.
+        @discardableResult
+        func step() -> Bool {
+            guard !pending.isEmpty else { return false }
+            let (delayMs, work) = pending.removeFirst()
+            now += Double(delayMs) / 1000
+            work()
+            return true
+        }
+    }
+
+    private func makeDriver(
+        _ clock: ManualWaitClock,
+        stallMs: Int = 1_000,
+        totalMs: Int = 10_000,
+        readings: @escaping () -> [Double]?,
+        gaveUp: @escaping (StallVerdict) -> Void
+    ) -> StallWaitDriver {
+        StallWaitDriver(
+            stallTimeoutMs: stallMs,
+            totalTimeoutMs: totalMs,
+            intervalMs: 250,
+            now: { clock.now },
+            schedule: { clock.schedule($0, $1) },
+            readings: readings,
+            onGiveUp: { verdict, _ in gaveUp(verdict) }
+        )
+    }
+
+    func testWaitDriverKeepsASlowButProgressingWaitUntilItsCap() {
+        let clock = ManualWaitClock()
+        var loaded = 0.0
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, readings: { loaded += 0.01; return [loaded] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        // A little more every 250 ms: far past the 1 s stall timeout, it fails only at 10 s.
+        var checks = 0
+        while clock.step() { checks += 1 }
+        XCTAssertEqual(verdicts, [.capExceeded])
+        XCTAssertEqual(checks, 40)
+        XCTAssertEqual(clock.now, 10, accuracy: 0.0001)
+        XCTAssertFalse(driver.isActive)
+    }
+
+    func testWaitDriverFailsAStalledWaitAtTheStallTimeout() {
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, readings: { [3] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        while clock.step() {}
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 1, accuracy: 0.0001)
+    }
+
+    func testWaitDriverWithoutASignalIsBoundOnlyByItsCapAndAStageRestartsTheStallClock() {
+        let clock = ManualWaitClock()
+        var signal: [Double]? = nil
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, totalMs: 4_000, readings: { signal }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        // No signal (an asset not yet playable, a seek not yet issued): 2 s pass, no stall.
+        for _ in 0..<8 { clock.step() }
+        XCTAssertTrue(verdicts.isEmpty)
+        XCTAssertEqual(clock.now, 2, accuracy: 0.0001)
+        // The stage is reached: the stall clock restarts, the cap still counts from the start.
+        signal = [0]
+        driver.noteProgress()
+        while clock.step() {}
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 3, accuracy: 0.0001)
+
+        let capped = ManualWaitClock()
+        var capVerdicts: [StallVerdict] = []
+        makeDriver(capped, totalMs: 3_000, readings: { nil }, gaveUp: { capVerdicts.append($0) }).start()
+        while capped.step() {}
+        XCTAssertEqual(capVerdicts, [.capExceeded])
+        XCTAssertEqual(capped.now, 3, accuracy: 0.0001)
+    }
+
+    func testWaitDriverReschedulesUntilCancelledAndThenNeverGivesUp() {
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        var reads = 0
+        let driver = makeDriver(clock, readings: { reads += 1; return [Double(reads)] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        for _ in 0..<5 { XCTAssertTrue(clock.step()) }
+        XCTAssertEqual(reads, 5)
+        XCTAssertEqual(clock.pending.count, 1)
+        driver.cancel()
+        while clock.step() {}
+        XCTAssertEqual(reads, 5)
+        XCTAssertTrue(verdicts.isEmpty)
+        XCTAssertTrue(clock.pending.isEmpty)
+    }
+
+    func testCrossfadeIncomingStallReadsTheGraceItIsGiven() {
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 1_999, graceMs: 2_000, incomingTime: 10, incomingStartTime: 10))
+        XCTAssertTrue(crossfadeIncomingStalled(elapsedMs: 2_000, graceMs: 2_000, incomingTime: 10.2, incomingStartTime: 10))
+        XCTAssertTrue(crossfadeIncomingStalled(elapsedMs: 500, graceMs: 500, incomingTime: 10, incomingStartTime: 10))
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 5_000, graceMs: 6_000, incomingTime: 10, incomingStartTime: 10))
+        // The incoming track moved: no fallback, whatever the grace.
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 5_000, graceMs: 500, incomingTime: 10.3, incomingStartTime: 10))
     }
 
     private let snapshot = PlaybackBackendSnapshot(
