@@ -395,10 +395,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     // MARK: - Bridged Methods
 
-    /// The native error's code when it has one (as Android rejects with its RejectionException's
-    /// code), else the command's generic code.
+    /// Codes iOS rejects with as Android does (its RejectionException's code): a play start that
+    /// gives up and a crossfade whose incoming song does not start. Other failures keep the
+    /// command's generic code.
+    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_start_failed"]
+
     private func rejectionCode(_ error: Error, _ fallback: String) -> String {
-        return (error as NSError).userInfo["code"] as? String ?? fallback
+        guard let code = (error as NSError).userInfo["code"] as? String,
+              Self.sharedRejectionCodes.contains(code) else { return fallback }
+        return code
     }
 
     private func rejectWhenNotInitialized(reject: RCTPromiseRejectBlock) -> Bool {
@@ -1397,9 +1402,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public func reset(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        withActivePlaybackBackendSerialized({ backend in
+        // Captures the policy, not self: deinit resets too.
+        withActivePlaybackBackendSerialized({ [interruptionPolicy] backend in
             // In the admitted operation: ordered with the interruption events.
-            self.interruptionPolicy.userCommand()
+            interruptionPolicy.userCommand()
             backend.stop()
             backend.clearQueue()
         }) { result in
@@ -1504,7 +1510,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
+                reject("seek_failed", "Unable to seek.", error)
             }
         }
     }
@@ -1520,7 +1526,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
+                reject("seek_failed", "Unable to seek.", error)
             }
         }
     }

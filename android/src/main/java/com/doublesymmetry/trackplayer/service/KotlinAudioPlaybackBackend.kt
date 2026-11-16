@@ -339,7 +339,11 @@ internal class KotlinAudioPlaybackBackend(
             player.play()
         }
     }
-    override fun pause() { player.pause() }
+    override fun pause() {
+        // As iOS (cancelPendingSeeks): a pause, stop, load or relative seek ends a seek in progress.
+        seekGate.cancel("pause")
+        player.pause()
+    }
     override suspend fun seekTo(positionMs: Long) {
         val item = player.currentItem
         if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)
@@ -424,6 +428,7 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override suspend fun load(item: TrackAudioItem) {
+        seekGate.cancel("load")
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             player.load(item)
@@ -459,14 +464,20 @@ internal class KotlinAudioPlaybackBackend(
         seekGate.cancel("skip")
         player.previous()
     }
-    override suspend fun seekBy(offsetMs: Long) { player.seekBy(offsetMs, TimeUnit.MILLISECONDS) }
+    override suspend fun seekBy(offsetMs: Long) {
+        seekGate.cancel("seek_by")
+        player.seekBy(offsetMs, TimeUnit.MILLISECONDS)
+    }
     override suspend fun retry() {
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             player.prepare()
         }
     }
-    override fun stop() { player.stop() }
+    override fun stop() {
+        seekGate.cancel("stop")
+        player.stop()
+    }
     override fun setVolume(value: Float) { player.volume = value }
     override fun setRate(value: Float) { player.playbackSpeed = value }
     override fun setRepeatMode(value: RepeatMode) {

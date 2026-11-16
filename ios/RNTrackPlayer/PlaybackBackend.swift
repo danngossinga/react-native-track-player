@@ -213,6 +213,24 @@ final class InterruptionPolicy {
     }
 }
 
+/// What the module last asked a standard player (play, pause, stop, playWhenReady, a restore),
+/// for interruptions: SwiftAudioEx sets its own playWhenReady to false when the system pauses the
+/// player (its timeControlStatus observer), which can run before the module reads it when an
+/// interruption begins, and would lose the resume. The module's own request does not change then.
+struct RequestedPlayback {
+    private(set) var playWhenReady = false
+
+    mutating func request(_ value: Bool) {
+        playWhenReady = value
+    }
+
+    /// Whether it plays as far as an interruption is concerned: requested, with an active track
+    /// that has not ended, failed or stopped.
+    func isPlayingForInterruption(idle: Bool, finished: Bool) -> Bool {
+        return !idle && playWhenReady && !finished
+    }
+}
+
 /// One value shared across threads (a setting read by notification handlers, a reference
 /// published once setup is done).
 final class LockedValue<Value> {

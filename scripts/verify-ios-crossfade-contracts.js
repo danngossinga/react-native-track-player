@@ -472,11 +472,13 @@ assert(
     applyInterruption.includes('completion(.success(duck))') &&
     applyInterruption.includes('"permanent": duck.permanent') &&
     // Was it playing: the module's last request, not SwiftAudioEx's own pause at the interruption.
-    standardBackend.includes('return !idleWithoutActiveTrack && requestedPlayWhenReady && !Self.isFinished(player.playerState)') &&
-    section(standardBackend, '    func play() throws {', '    func seek(to position: Double) throws {').includes('requestedPlayWhenReady = true\n            player.play()') &&
-    section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('requestedPlayWhenReady = false\n            player.pause()') &&
-    section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requestedPlayWhenReady = false\n            player.stop()') &&
-    section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('player.playWhenReady = value\n            requestedPlayWhenReady = value') &&
+    standardBackend.includes('return requested.isPlayingForInterruption(idle: idleWithoutActiveTrack, finished: Self.isFinished(player.playerState))') &&
+    facade.includes('return !idle && playWhenReady && !finished') &&
+    section(standardBackend, '    func play() throws {', '    func seek(to position: Double) throws {').includes('requested.request(true)\n            player.play()') &&
+    section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('requested.request(false)\n            player.pause()') &&
+    section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requested.request(false)\n            player.stop()') &&
+    section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('player.playWhenReady = value\n            requested.request(value)') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAnInterruptionResumesWhenTheSDKPausedThePlayerBeforeItWasRead()') &&
     pingPongBackend.includes('var interruptionIsPlaying: Bool { return orchestrator.playWhenReady }') &&
     // Every user command, inside its admitted operation (ordered with the interruption events).
     [['public func play(resolve:', 'public func pause(resolve:'],
@@ -485,8 +487,8 @@ assert(
       ['public func stop(resolve:', 'public func seekTo(time:'],
       ['public func reset(resolve:', 'public func play(resolve:']].every(([start, end]) => {
       const body = commandBody(start, end);
-      return body.includes('self.interruptionPolicy.userCommand()') &&
-        body.indexOf('withActivePlaybackBackend') < body.indexOf('self.interruptionPolicy.userCommand()');
+      const call = body.search(/(self\.)?interruptionPolicy\.userCommand\(\)/);
+      return call >= 0 && body.indexOf('withActivePlaybackBackend') < call;
     }) &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('scripts/fixtures/interruption-scenarios.json'),
   'iOS interruptions and unplugging must go through InterruptionPolicy on both backends.'
@@ -496,7 +498,12 @@ assert(
 // crossfade whose incoming song does not start rejects with crossfade_start_failed, as on Android.
 assert(
   engine.includes('"code": "crossfade_play_start_timeout"') &&
-    (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 2 &&
+    // Where play, a load that plays, skip and a recovery start playback (not the backend switch's
+    // activation, which Android does not wait for either).
+    section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
+    (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
+    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_start_failed"]') &&
+    (player.match(/reject\("seek_failed", "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
     player.includes('reject(self.rejectionCode(error, "playback_failed"), "Unable to start playback.", error)') &&

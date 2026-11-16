@@ -339,6 +339,26 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testAnInterruptionResumesWhenTheSDKPausedThePlayerBeforeItWasRead() {
+        // The module asked to play; the system pauses the player for a call and SwiftAudioEx
+        // turns its own playWhenReady off before the module reads it.
+        var requested = RequestedPlayback()
+        requested.request(true)
+        let sdkPlayWhenReady = false
+        let policy = InterruptionPolicy(autoResume: { true })
+        XCTAssertEqual(policy.began(isPlaying: requested.isPlayingForInterruption(idle: false, finished: false)).0, .pause)
+        XCTAssertEqual(policy.ended(shouldResume: true).0, .resume)
+        // The SDK's value would have lost the resume.
+        let fromSDK = InterruptionPolicy(autoResume: { true })
+        _ = fromSDK.began(isPlaying: sdkPlayWhenReady)
+        XCTAssertEqual(fromSDK.ended(shouldResume: true).0, .none)
+        // Not playing: paused by the module, no active track, or the track ended, failed or stopped.
+        XCTAssertFalse(requested.isPlayingForInterruption(idle: true, finished: false))
+        XCTAssertFalse(requested.isPlayingForInterruption(idle: false, finished: true))
+        requested.request(false)
+        XCTAssertFalse(requested.isPlayingForInterruption(idle: false, finished: false))
+    }
+
     func testInterruptionPolicyReadsTheOptionAtTheEnd() {
         var autoResume = false
         let policy = InterruptionPolicy(autoResume: { autoResume })

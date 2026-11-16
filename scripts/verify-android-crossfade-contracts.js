@@ -443,6 +443,9 @@ assert(
     section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('item = player.currentItem') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
+    // So do a pause, a stop, a load and a relative seek (iOS: cancelPendingSeeks).
+    ['seekGate.cancel("pause")\n        player.pause()', 'seekGate.cancel("stop")\n        player.stop()',
+      'seekGate.cancel("seek_by")\n        player.seekBy(', 'seekGate.cancel("load")\n        runActivatingOperation('].every((s) => standardBackend.includes(s)) &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aNewerSeekASkipOrAnotherItemEndsTheOlderSeekAtOnce()') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aStandardSeekThatReachesTheEndOfTheTrackCompletes()') &&
     // The real engine pauses when its play start gives up.

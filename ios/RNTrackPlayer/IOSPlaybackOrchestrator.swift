@@ -466,7 +466,6 @@ final class IOSPlaybackOrchestrator {
                 self.activeEngine.pause()
                 self.state = .paused
                 self.emitStateIfNeeded()
-                self.reportPlaybackStartFailure(error)
                 completion(.failure(error))
             }
         }

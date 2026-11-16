@@ -473,14 +473,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
     var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
-    /// SwiftAudioEx sets playWhenReady to false when the system pauses the player (its
-    /// timeControlStatus observer), which can run before the module reads it at an interruption.
-    /// The module's own last request does not change then.
+    /// The module's last request, not SwiftAudioEx's own pause at the interruption (see
+    /// RequestedPlayback).
     var interruptionIsPlaying: Bool {
-        return !idleWithoutActiveTrack && requestedPlayWhenReady && !Self.isFinished(player.playerState)
+        return requested.isPlayingForInterruption(idle: idleWithoutActiveTrack, finished: Self.isFinished(player.playerState))
     }
-    /// What the module last asked of this player (play, pause, stop, playWhenReady, a restore).
-    private var requestedPlayWhenReady = false
+    private var requested = RequestedPlayback()
 
     private static func isFinished(_ state: AudioPlayerState) -> Bool {
         switch state {
@@ -538,7 +536,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             player.rate = snapshot.rate
             player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
             player.playWhenReady = false
-            requestedPlayWhenReady = false
+            requested.request(false)
             player.pause()
             if let index = snapshot.activeIndex,
                queue.indices.contains(index) {
@@ -592,7 +590,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {
         try performPlaybackBackendOnMainSync {
             player.playWhenReady = snapshot.playWhenReady
-            requestedPlayWhenReady = snapshot.playWhenReady
+            requested.request(snapshot.playWhenReady)
             if snapshot.playWhenReady {
                 player.play()
             } else {
@@ -648,7 +646,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
         player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady
-        requestedPlayWhenReady = player.playWhenReady
+        requested.request(player.playWhenReady)
         if player.playWhenReady {
             player.play()
         } else {
@@ -672,7 +670,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
-            requestedPlayWhenReady = true
+            requested.request(true)
             player.play()
             publishIdleTrackActivationIfNeeded(wasIdle)
         }
@@ -680,7 +678,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func pause() {
         onMain {
             cancelPendingSeeks()
-            requestedPlayWhenReady = false
+            requested.request(false)
             player.pause()
         }
     }
@@ -863,7 +861,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func stop() {
         onMain {
             cancelPendingSeeks()
-            requestedPlayWhenReady = false
+            requested.request(false)
             player.stop()
         }
     }
@@ -875,7 +873,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
             player.playWhenReady = value
-            requestedPlayWhenReady = value
+            requested.request(value)
             publishIdleTrackActivationIfNeeded(wasIdle)
             completion(.success(()))
         }
