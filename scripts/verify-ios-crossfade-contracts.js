@@ -444,4 +444,16 @@ assert(
   'iOS play-start, standard readiness and standard seek waits must read the app\'s settings, not fixed numbers.'
 );
 
+// The seek watch can be skipped only by the load's own seek, anywhere in the module.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const dir = path.join(__dirname, '..', 'ios', 'RNTrackPlayer');
+  const unwatched = fs.readdirSync(dir).filter((f) => f.endsWith('.swift')).reduce((count, f) => {
+    const code = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter((line) => !line.trim().startsWith('///') && !line.trim().startsWith('//')).join('\n');
+    return count + (code.match(/watched:\s*false/g) || []).length;
+  }, 0);
+  assert(unwatched === 1, 'Only the load\'s own seek may pass watched: false in ios/RNTrackPlayer (found ' + unwatched + ').');
+}
+
 console.log('iOS crossfade contracts OK');

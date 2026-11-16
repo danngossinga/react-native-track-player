@@ -432,4 +432,23 @@ assert(
   'A stalled Android crossfade seek must pause, fail and leave the player in error, as on iOS.'
 );
 
+// Every track's headers and user agent reach the per-request HTTP source (set before the item).
+{
+  const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+  const requestOptions = section(engineSource, 'private fun configureRequestOptions(', '\n    }\n');
+  assert(
+    prepareBody.includes('configureRequestOptions(item)') &&
+      prepareBody.indexOf('configureRequestOptions(item)') < prepareBody.indexOf('player.setMediaItem(') &&
+      requestOptions.includes('options?.userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }') &&
+      requestOptions.includes('setDefaultRequestProperties'),
+    'Android crossfade must give each track its headers and user agent before setting the item.'
+  );
+}
+
+// The settings are read by the players' loading threads (HTTP timeouts): the value stays volatile.
+assert(
+  /internal open class WholeNumberSetting\(defaultValue: Long\) \{\s*@Volatile\s*var value: Long/.test(engineSource),
+  'WholeNumberSetting.value must stay @Volatile: loading threads read it at every HTTP request.'
+);
+
 console.log('Android crossfade contracts OK');
