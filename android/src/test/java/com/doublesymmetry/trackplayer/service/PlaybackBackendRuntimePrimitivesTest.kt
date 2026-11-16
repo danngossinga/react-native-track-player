@@ -4,6 +4,7 @@ import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -470,5 +471,110 @@ class PlaybackBackendRuntimePrimitivesTest {
             current = Any(); count = 11L
             observation
         }
+    }
+
+    /**
+     * The real ordering in ExoPlayer 2.19 under KotlinAudio: seekTo moves the position to the target
+     * and masks ExoPlayer's state to buffering at once; KotlinAudio's state still says what it was
+     * (it follows on a later message, in onEvents).
+     */
+    private class MaskingPlayer(private val nowMs: () -> Long) : StandardSeekPlayer {
+        override var currentItem: Any? = Any()
+        override var kotlinAudioState = AudioPlayerState.READY
+        var exoState = com.google.android.exoplayer2.Player.STATE_READY
+        override var hasError = false
+        override var positionMs = 0L
+        override val durationMs = 60_000L
+        override val rate = 1f
+        override val autoTransitions = 0L
+        val calls = mutableListOf<String>()
+        /** ExoPlayer becomes ready this long after the seek, data arriving meanwhile (null: no data, never). */
+        var readyAfterMs: Long? = 300L
+        private var seekAt = 0L
+
+        private val buffering: Boolean
+            get() = exoState == com.google.android.exoplayer2.Player.STATE_BUFFERING
+
+        override val exoPlaybackState: Int
+            get() {
+                val ready = readyAfterMs
+                return if (buffering && ready != null && nowMs() - seekAt >= ready) {
+                    com.google.android.exoplayer2.Player.STATE_READY
+                } else exoState
+            }
+
+        override val bufferedPositionMs: Long
+            get() = if (buffering && readyAfterMs != null) nowMs() - seekAt else 0L
+
+        override fun prepare() {
+            calls += "prepare"
+            exoState = com.google.android.exoplayer2.Player.STATE_BUFFERING
+        }
+
+        override fun seekTo(positionMs: Long) {
+            calls += "seek"
+            seekAt = nowMs()
+            this.positionMs = positionMs
+            if (exoState != com.google.android.exoplayer2.Player.STATE_IDLE) {
+                exoState = com.google.android.exoplayer2.Player.STATE_BUFFERING
+            }
+        }
+    }
+
+    private fun gate(scope: kotlinx.coroutines.test.TestScope) = StandardSeekGate(
+        timeoutMs = { 5_000L }, stallTimeoutMs = { 1_000L }, pollIntervalMs = 100L, nowMs = { scope.currentTime }
+    )
+
+    @Test
+    fun aSeekWaitsForExoPlayersMaskedStateNotKotlinAudiosStaleOne() = runTest {
+        val player = MaskingPlayer { currentTime }
+        val started = currentTime
+        gate(this).seek(player, 30_000L)
+        // KotlinAudio still said READY at the target from the first check: the wait must not end
+        // there, only once ExoPlayer is ready.
+        assertEquals(300L, currentTime - started)
+        assertEquals(listOf("seek"), player.calls)
+    }
+
+    @Test
+    fun aSeekThatNeverGetsDataTimesOutInTheRealOrdering() = runTest {
+        val player = MaskingPlayer { currentTime }.apply { readyAfterMs = null }
+        val started = currentTime
+        val failed = runCatching { gate(this).seek(player, 30_000L) }
+        assertEquals("standard_seek_timeout", (failed.exceptionOrNull() as RejectionException).code)
+        assertEquals(1_000L, currentTime - started)
+    }
+
+    @Test
+    fun aSeekWhileStoppedLoadsTheItemFirstAndWaitsForIt() = runTest {
+        val player = MaskingPlayer { currentTime }.apply {
+            kotlinAudioState = AudioPlayerState.STOPPED
+            exoState = com.google.android.exoplayer2.Player.STATE_IDLE
+        }
+        val started = currentTime
+        gate(this).seek(player, 30_000L)
+        assertEquals(listOf("prepare", "seek"), player.calls)
+        assertEquals(300L, currentTime - started)
+    }
+
+    @Test
+    fun aSeekOnAnUnloadedPlayerIsNotDoneAtTheMaskedPosition() = runTest {
+        // Never prepared (IDLE) but the position reads the target: not done; it times out.
+        val player = MaskingPlayer { currentTime }.apply {
+            exoState = com.google.android.exoplayer2.Player.STATE_IDLE
+        }
+        val failed = runCatching { gate(this).seek(player, 30_000L) }
+        assertEquals("standard_seek_timeout", (failed.exceptionOrNull() as RejectionException).code)
+    }
+
+    @Test
+    fun aSeekWithNoItemOrAPlayerErrorFailsAtOnceInTheRealOrdering() = runTest {
+        val none = MaskingPlayer { currentTime }.apply { currentItem = null }
+        val unavailable = runCatching { gate(this).seek(none, 30_000L) }
+        assertEquals("standard_seek_unavailable", (unavailable.exceptionOrNull() as RejectionException).code)
+        assertTrue(none.calls.isEmpty())
+        val failing = MaskingPlayer { currentTime }.apply { hasError = true }
+        val failed = runCatching { gate(this).seek(failing, 30_000L) }
+        assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
     }
 }

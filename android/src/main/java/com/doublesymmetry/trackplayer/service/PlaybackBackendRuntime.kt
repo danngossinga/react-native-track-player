@@ -131,8 +131,10 @@ internal class AutoTransitionCounter : com.google.android.exoplayer2.analytics.A
  * loading or buffering and is at the target; fails when the buffered position does not grow for
  * `stallTimeoutMs`, or after `standardSeekTimeoutMs` in all (`standard_seek_timeout`). With no
  * item it fails at once (`standard_seek_unavailable`, also when the item fails to load); a newer
- * seek, a skip ([cancel]) or another item (an auto-advance) ends it at once
- * (`standard_seek_cancelled`), as on iOS. Main thread.
+ * seek, a skip, a pause, a stop or a load ([cancel]), or another item without an automatic
+ * transition, ends it at once (`standard_seek_cancelled`), as on iOS. An automatic transition
+ * after the seek (the track played to its end: repeat-one, or the next track began) completes
+ * it, as iOS's native seek completes. Main thread.
  */
 internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
@@ -199,6 +201,8 @@ internal class StandardSeekGate(
                 observed.state == AudioPlayerState.ENDED ||
                     (observed.state != AudioPlayerState.LOADING &&
                         observed.state != AudioPlayerState.BUFFERING &&
+                        // Not loaded (stopped, never prepared): not at the target yet.
+                        observed.state != AudioPlayerState.IDLE &&
                         isAtSeekTarget(observed.positionMs, target, playedMs.toLong()))
             }
         } catch (cancelled: PlaybackOperationCancelledException) {
@@ -213,6 +217,78 @@ internal class StandardSeekGate(
                 "standard_seek_timeout"
             )
         }
+    }
+}
+
+/**
+ * The standard player as a seek sees it. Its state is ExoPlayer's own: prepare and seekTo mask it
+ * at once (to buffering), with the position already at the target, while KotlinAudio's state only
+ * follows on a later message; read KotlinAudio's, the first check would find the old state at the
+ * target and end the seek before it ran.
+ */
+internal interface StandardSeekPlayer {
+    val currentItem: Any?
+    /** KotlinAudio's state: set at once by stop() (its item unloaded), late after a seek. */
+    val kotlinAudioState: AudioPlayerState
+    /** ExoPlayer's playback state (`Player.STATE_*`), masked at once by prepare and seekTo. */
+    val exoPlaybackState: Int
+    val hasError: Boolean
+    val positionMs: Long
+    val bufferedPositionMs: Long
+    val durationMs: Long
+    val rate: Float
+    val autoTransitions: Long
+    fun prepare()
+    fun seekTo(positionMs: Long)
+}
+
+/** What a seek wait reads of [StandardSeekPlayer]. */
+internal fun StandardSeekPlayer.seekObservation() = StandardSeekObservation(
+    state = when {
+        hasError -> AudioPlayerState.ERROR
+        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_BUFFERING -> AudioPlayerState.BUFFERING
+        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_ENDED -> AudioPlayerState.ENDED
+        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_READY -> AudioPlayerState.READY
+        else -> AudioPlayerState.IDLE
+    },
+    positionMs = positionMs,
+    bufferedPositionMs = bufferedPositionMs,
+    durationMs = durationMs.coerceAtLeast(0L),
+    item = currentItem,
+    rate = rate,
+    autoTransitions = autoTransitions
+)
+
+/**
+ * A standard seek, as on iOS: a stopped player loads its item again (paused) first; the seek is
+ * issued, then waited for with [StandardSeekGate].
+ */
+internal suspend fun StandardSeekGate.seek(player: StandardSeekPlayer, positionMs: Long) {
+    val item = player.currentItem
+    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()
+    if (item != null) player.seekTo(positionMs)
+    await(positionMs, item) { player.seekObservation() }
+}
+
+/**
+ * Captures the standard player's ExoPlayer (ExoPlayer hands it to its analytics collector when
+ * built), so a seek can read ExoPlayer's own state; KotlinAudio keeps its ExoPlayer private.
+ */
+internal class StandardPlayerAnalytics(
+    clock: com.google.android.exoplayer2.util.Clock = com.google.android.exoplayer2.util.Clock.DEFAULT
+) : com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector(clock) {
+    @Volatile
+    var player: com.google.android.exoplayer2.Player? = null
+        private set
+    val transitions = AutoTransitionCounter()
+
+    init {
+        addListener(transitions)
+    }
+
+    override fun setPlayer(player: com.google.android.exoplayer2.Player, looper: android.os.Looper) {
+        super.setPlayer(player, looper)
+        this.player = player
     }
 }
 

@@ -439,8 +439,8 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)\n        seekGate.await(positionMs, item) {') &&
-    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('item = player.currentItem') &&
+    standardBackend.includes('override suspend fun seekTo(positionMs: Long) = seekGate.seek(seekPlayer, positionMs)') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
     // So do a pause, a stop, a load and a relative seek (iOS: cancelPendingSeeks).
@@ -451,7 +451,7 @@ assert(
     // At the target: no fixed tolerance (what playback played since the seek, plus one poll).
     !section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('positionToleranceMs') &&
     section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('isAtSeekTarget(observed.positionMs, target, playedMs.toLong())') &&
-    standardBackend.includes('rate = player.playbackSpeed') &&
+    standardBackend.includes('override val rate: Float get() = player.playbackSpeed') &&
     // A play after the queue ended starts the current track from 0, as on iOS.
     section(orchestrator, 'suspend fun play() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(').includes('if (state == AndroidPlaybackOrchestratorState.ENDED) {') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aPlayAfterTheQueueEndedStartsTheLastTrackAgainFromTheStartAsOnIos()') &&
@@ -470,7 +470,7 @@ assert(
 // HTTP timeouts as the crossfade players.
 const buildGradle = read('android/build.gradle');
 const vendoredBase = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
-const standardHooks = section(musicService, 'private fun standardPlayerHooks(transitions: AutoTransitionCounter) = PlayerHooks(', '/**');
+const standardHooks = section(musicService, 'private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(', '/**');
 assert(
   !buildGradle.includes("com.github.doublesymmetry:kotlinaudio") &&
     buildGradle.includes("java.srcDirs += 'src/vendor/kotlinaudio/java'") &&
@@ -479,28 +479,39 @@ assert(
     read('android/src/vendor/kotlinaudio/VENDORED.md').includes('bf71120704bfe4be2311cf86fc1e2ee1c3c702b7') &&
     vendoredBase.includes('hooks.configureExoPlayer(this)\n            }\n            .build()') &&
     vendoredBase.includes('val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)') &&
-    musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(transitions))') &&
+    musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(analytics))') &&
     // Start-low per track: each media period's own media loads (not its manifest, not another's).
-    standardHooks.includes('StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads)') &&
-    standardHooks.includes('addListener(StartLowLoadListener(loads))\n                    addListener(transitions)') &&
-    standardHooks.includes('builder.setAnalyticsCollector(') &&
+    standardHooks.includes('StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads, unmeasuredBps)') &&
+    standardHooks.includes('DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(unmeasuredBps).build()') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('return if (hasMeasured && estimate != unmeasuredEstimateBps) estimate else initialEstimateBps') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('loads.retainPeriodsOf(eventTime.timeline)') &&
+    standardHooks.includes('analytics.addListener(StartLowLoadListener(loads))\n            builder.setAnalyticsCollector(analytics)') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('        super.setPlayer(player, looper)\n        this.player = player') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('hasOwnMeasurement = { loads.hasMeasured(mediaPeriodId) }') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return\n        eventTime.mediaPeriodId?.let(loads::mediaLoaded)') &&
     ['fun theNextTrackPreparedAheadStartsLowUntilItsOwnMediaIsLoaded()', 'fun twoEqualItemsInTheQueueAreMeasuredApart()', 'fun aReplayedTrackStartsLowAgain()']
       .every((t) => read('android/src/test/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelectionTest.kt').includes(t)) &&
     // A seek at the end with repeat-one, and a seek while stopped, as on iOS.
     section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('if (observed.autoTransitions > startTransitions) return@awaitWhileProgressing true') &&
-    standardBackend.includes('if (item != null && player.playerState == AudioPlayerState.STOPPED) player.prepare()\n        if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)') &&
-    standardBackend.includes('autoTransitions = autoTransitions()') &&
-    musicService.includes('autoTransitions = { standardAutoTransitions[binding.player]?.count ?: 0L },') &&
-    musicService.includes('.also { standardAutoTransitions[it] = transitions }') &&
+    // ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later).
+    standardBackend.includes('get() = analytics()?.player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('exoPlaybackState == com.google.android.exoplayer2.Player.STATE_BUFFERING -> AudioPlayerState.BUFFERING') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('observed.state != AudioPlayerState.IDLE &&') &&
+    standardBackend.includes('override val autoTransitions: Long get() = analytics()?.transitions?.count ?: 0L') &&
+    musicService.includes('analytics = { standardAnalytics[binding.player] },') &&
+    musicService.includes('.also { standardAnalytics[it] = analytics }') &&
+    // backendSwitchPositionToleranceMs on both Android backends' restores, as on iOS.
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PingPongPlaybackBackend.kt').includes('if (indexChanged || kotlin.math.abs(orchestrator.positionMs - snapshot.positionMs) > positionToleranceMs()) {') &&
+    standardBackend.includes('kotlin.math.abs(player.position - snapshot.positionMs) > positionToleranceMs())') &&
+    (musicService.match(/positionToleranceMs = \{ backendSwitchPositionTolerance\.milliseconds \},/g) || []).length === 2 &&
     // Unplugging pauses through the service's receiver only (KotlinAudio's own handling off).
     musicService.includes('            handleAudioBecomingNoisy = false,') &&
     // The restored-position tolerance at a backend switch is the app's setting.
     musicService.includes('positionToleranceMs = { backendSwitchPositionTolerance.milliseconds }') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, BACKEND_SWITCH_POSITION_TOLERANCE_KEY, backendSwitchPositionTolerance)') &&
     !/positionToleranceMs: Long = \d/.test(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt')) &&
-    standardHooks.includes('configureExoPlayer = { builder ->\n            val loads = OwnMediaLoadRegistry()\n            builder.setTrackSelector(\n                DefaultTrackSelector(') &&
+    standardHooks.includes('configureExoPlayer = { builder ->\n            val loads = OwnMediaLoadRegistry()') &&
+    standardHooks.includes('builder.setTrackSelector(\n                DefaultTrackSelector(') &&
     standardHooks.includes('httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('StartLowBandwidthMeter(\n            bandwidthMeter,\n            initialBitrateEstimateBps(),') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelectionTest.kt').includes('fun everyTrackSelectionReadsTheCurrentSetting()') &&

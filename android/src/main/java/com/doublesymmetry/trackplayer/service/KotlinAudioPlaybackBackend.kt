@@ -149,8 +149,10 @@ internal class KotlinAudioPlaybackBackend(
     private val readinessGate: StandardPlaybackReadinessGate,
     /** Waits for every seek, as on iOS (`standardSeekTimeoutMs`, `stallTimeoutMs`). */
     private val seekGate: StandardSeekGate,
-    /** The player's automatic transitions (AutoTransitionCounter), for the seek wait. */
-    private val autoTransitions: () -> Long = { 0L },
+    /** The player's ExoPlayer and automatic transitions (StandardPlayerAnalytics), for seeks. */
+    private val analytics: () -> StandardPlayerAnalytics? = { null },
+    /** The app's `backendSwitchPositionToleranceMs`, read at every restore. */
+    private val positionToleranceMs: () -> Long = { DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS },
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -233,9 +235,11 @@ internal class KotlinAudioPlaybackBackend(
         (player.playerOptions as? QueuedPlayerOptions)?.repeatMode = RepeatMode.fromOrdinal(snapshot.repeatMode)
         val index = snapshot.activeIndex
         if (index != null && index in queue.indices &&
-            (!isAuthoritative || queueChanged || player.currentIndex != index)
+            (!isAuthoritative || queueChanged || player.currentIndex != index ||
+                // As iOS: a position further off than backendSwitchPositionToleranceMs is sought.
+                kotlin.math.abs(player.position - snapshot.positionMs) > positionToleranceMs())
         ) {
-            player.jumpToItem(index)
+            if (player.currentIndex != index || !isAuthoritative || queueChanged) player.jumpToItem(index)
             player.seek(snapshot.positionMs, TimeUnit.MILLISECONDS)
         }
         player.playWhenReady = false
@@ -346,22 +350,23 @@ internal class KotlinAudioPlaybackBackend(
         seekGate.cancel("pause")
         player.pause()
     }
-    override suspend fun seekTo(positionMs: Long) {
-        val item = player.currentItem
-        // As iOS: a stopped player unloaded its item; load it again (paused) before the seek.
-        if (item != null && player.playerState == AudioPlayerState.STOPPED) player.prepare()
-        if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)
-        seekGate.await(positionMs, item) {
-            StandardSeekObservation(
-                state = player.playerState,
-                positionMs = player.position,
-                bufferedPositionMs = player.bufferedPosition,
-                durationMs = player.duration.coerceAtLeast(0L),
-                item = player.currentItem,
-                rate = player.playbackSpeed,
-                autoTransitions = autoTransitions()
-            )
-        }
+    override suspend fun seekTo(positionMs: Long) = seekGate.seek(seekPlayer, positionMs)
+
+    /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
+    private val seekPlayer = object : StandardSeekPlayer {
+        override val currentItem: Any? get() = player.currentItem
+        override val kotlinAudioState: AudioPlayerState get() = player.playerState
+        override val exoPlaybackState: Int
+            get() = analytics()?.player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE
+        override val hasError: Boolean
+            get() = analytics()?.player?.playerError != null || player.playerState == AudioPlayerState.ERROR
+        override val positionMs: Long get() = player.position
+        override val bufferedPositionMs: Long get() = player.bufferedPosition
+        override val durationMs: Long get() = player.duration
+        override val rate: Float get() = player.playbackSpeed
+        override val autoTransitions: Long get() = analytics()?.transitions?.count ?: 0L
+        override fun prepare() = player.prepare()
+        override fun seekTo(positionMs: Long) = player.seek(positionMs, TimeUnit.MILLISECONDS)
     }
 
     override suspend fun startTransition(request: PlaybackTransitionRequest) {

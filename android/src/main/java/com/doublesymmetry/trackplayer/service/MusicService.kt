@@ -6,8 +6,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
-import com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector
-import com.google.android.exoplayer2.util.Clock
+import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import androidx.media.AudioAttributesCompat
 import android.os.Build
 import android.os.Bundle
@@ -100,8 +99,8 @@ class MusicService : HeadlessJsTaskService() {
     private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
     /** How far a restored position may be off at a backend switch (`backendSwitchPositionToleranceMs`). */
     private val backendSwitchPositionTolerance = TimeoutSetting(DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS)
-    /** Each standard player's automatic transitions (the seek wait reads them). */
-    private val standardAutoTransitions = java.util.WeakHashMap<QueuedAudioPlayer, AutoTransitionCounter>()
+    /** Each standard player's ExoPlayer and automatic transitions (the seek wait reads them). */
+    private val standardAnalytics = java.util.WeakHashMap<QueuedAudioPlayer, StandardPlayerAnalytics>()
     /** How long any of those waits may go on with no progress (`stallTimeoutMs`), read at every wait. */
     private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
     /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
@@ -480,7 +479,8 @@ class MusicService : HeadlessJsTaskService() {
                         timeoutMs = { standardSeekTimeout.milliseconds },
                         stallTimeoutMs = { stallTimeout.milliseconds }
                     ),
-                    autoTransitions = { standardAutoTransitions[binding.player]?.count ?: 0L },
+                    analytics = { standardAnalytics[binding.player] },
+                    positionToleranceMs = { backendSwitchPositionTolerance.milliseconds },
                     onCommitted = { committed ->
                         if (committed === binding.player) commitStandardPlayerBinding(binding)
                     },
@@ -555,6 +555,7 @@ class MusicService : HeadlessJsTaskService() {
                     activateControlSurfaceAfterDrain = {
                         admitAndPublishSurface("backend-commit")
                     },
+                    positionToleranceMs = { backendSwitchPositionTolerance.milliseconds },
                     onCommitted = { committed ->
                         if (committed === orchestrator) {
                             playbackOrchestrator = orchestrator
@@ -618,9 +619,9 @@ class MusicService : HeadlessJsTaskService() {
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
         standardPlayerFactory = {
-            val transitions = AutoTransitionCounter()
-            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(transitions))
-                .also { standardAutoTransitions[it] = transitions }
+            val analytics = StandardPlayerAnalytics()
+            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(analytics))
+                .also { standardAnalytics[it] = analytics }
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
         focusContentType = focusContentTypeOf(playerConfig.audioContentType)
@@ -651,22 +652,25 @@ class MusicService : HeadlessJsTaskService() {
      * crossfade players do: every track starts from the current `initialBitrateEstimateBps`, and
      * every HTTP request's connect and read timeouts follow the current `stallTimeoutMs`.
      */
-    private fun standardPlayerHooks(transitions: AutoTransitionCounter) = PlayerHooks(
+    private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(
         configureExoPlayer = { builder ->
             val loads = OwnMediaLoadRegistry()
+            // A meter that reports the app's setting until it has really measured (its own
+            // thresholds), not a country default: a track's start-low ends on a measurement.
+            val unmeasuredBps = initialBitrateEstimate.bitsPerSecond
+            builder.setBandwidthMeter(
+                DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(unmeasuredBps).build()
+            )
             builder.setTrackSelector(
                 DefaultTrackSelector(
                     this@MusicService,
-                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads)
+                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads, unmeasuredBps)
                 )
             )
-            // Each track's own media loads (not its playlist, not another track's).
-            builder.setAnalyticsCollector(
-                DefaultAnalyticsCollector(Clock.DEFAULT).apply {
-                    addListener(StartLowLoadListener(loads))
-                    addListener(transitions)
-                }
-            )
+            // Each track's own media loads (not its playlist, not another track's), ExoPlayer's
+            // own state for seeks, and its automatic transitions.
+            analytics.addListener(StartLowLoadListener(loads))
+            builder.setAnalyticsCollector(analytics)
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
         hostOwnsAudioFocus = true

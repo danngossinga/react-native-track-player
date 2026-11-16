@@ -86,6 +86,52 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPingPongRestoreSeeksOnlyWhenFurtherOffThanTheAppsTolerance() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, RecordingOrchestratorDelegate(), engineA, engineB)
+        var tolerance = 750L
+        val items = testItems(2)
+        val backend = PingPongPlaybackBackend(
+            orchestrator,
+            Any(),
+            AndroidTrackQueue().apply { replaceWith(items) },
+            PlaybackTransitionGenerationSidecar(),
+            suspendControlSurface = {},
+            resumeControlSurface = {},
+            activateControlSurface = {},
+            onCommitted = {},
+            onDisposed = {},
+            positionToleranceMs = { tolerance }
+        )
+        val snapshot = PlaybackBackendSnapshot(
+            queueIds = items.map { it.track.queueId.toString() },
+            activeIndex = 0,
+            activeTrackId = items[0].track.queueId.toString(),
+            positionMs = 10_000L,
+            playWhenReady = false,
+            volume = 1f,
+            rate = 1f,
+            repeatMode = 0,
+            transitionGeneration = 1L
+        )
+        try {
+            backend.prepareSilently(snapshot)
+            backend.restore(snapshot)
+            val seeks = engineA.seekCalls
+            // 500 ms off, within the setting: no seek (iOS: the same option, same rule).
+            backend.restore(snapshot.copy(positionMs = 10_500L))
+            assertEquals(seeks, engineA.seekCalls)
+            // The app lowers it: the same distance is sought.
+            tolerance = 200L
+            backend.restore(snapshot.copy(positionMs = 10_500L))
+            assertEquals(seeks + 1, engineA.seekCalls)
+        } finally {
+            backend.dispose()
+        }
+    }
+
+    @Test
     fun removedActiveTrackPayloadResolvesExplicitPreviousTrackFromOldQueue() {
         val previousTrack = allocateTrack()
 
@@ -993,12 +1039,16 @@ class AndroidPlaybackOrchestratorCancellationTest {
             reset()
         }
 
+        var seekCalls = 0
+            private set
+
         override suspend fun seekTo(
             positionMs: Long,
             timeoutMs: Long,
             stallTimeoutMs: Long,
             ticket: PlaybackOperationTicket?
         ) {
+            seekCalls += 1
             ticket?.ensureActive()
             failNextSeek?.let { failNextSeek = null; throw it }
             lastSeekTimeoutMs = timeoutMs

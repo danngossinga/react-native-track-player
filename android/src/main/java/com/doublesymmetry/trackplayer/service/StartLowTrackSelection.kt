@@ -28,6 +28,15 @@ internal class OwnMediaLoadRegistry {
 
     /** True once [period] loaded media. */
     fun hasMeasured(period: MediaSource.MediaPeriodId): Boolean = period in measured
+
+    /** Forgets the periods no longer in the player's [timeline] (removed items, past replays). */
+    fun retainPeriodsOf(timeline: Timeline) {
+        val uids = (0 until timeline.periodCount).mapTo(HashSet()) { timeline.getUidOfPeriod(it) }
+        synchronized(measured) { measured.removeAll { it.periodUid !in uids } }
+    }
+
+    internal val size: Int
+        get() = measured.size
 }
 
 /** Feeds [OwnMediaLoadRegistry] from the standard player's completed loads (media data only). */
@@ -39,6 +48,10 @@ internal class StartLowLoadListener(private val loads: OwnMediaLoadRegistry) : A
     ) {
         if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return
         eventTime.mediaPeriodId?.let(loads::mediaLoaded)
+    }
+
+    override fun onTimelineChanged(eventTime: AnalyticsListener.EventTime, reason: Int) {
+        loads.retainPeriodsOf(eventTime.timeline)
     }
 }
 
@@ -54,6 +67,8 @@ internal class StartLowLoadListener(private val loads: OwnMediaLoadRegistry) : A
 internal class StartLowTrackSelectionFactory(
     private val initialBitrateEstimateBps: () -> Long,
     private val loads: OwnMediaLoadRegistry = OwnMediaLoadRegistry(),
+    /** The shared meter's estimate before it has measured (its initial estimate), if known. */
+    private val unmeasuredEstimateBps: Long? = null,
     private val adaptive: ExoTrackSelection.Factory = AdaptiveTrackSelection.Factory()
 ) : ExoTrackSelection.Factory {
     override fun createTrackSelections(
@@ -66,7 +81,8 @@ internal class StartLowTrackSelectionFactory(
         StartLowBandwidthMeter(
             bandwidthMeter,
             initialBitrateEstimateBps(),
-            hasOwnMeasurement = { loads.hasMeasured(mediaPeriodId) }
+            hasOwnMeasurement = { loads.hasMeasured(mediaPeriodId) },
+            unmeasuredEstimateBps = unmeasuredEstimateBps
         ),
         mediaPeriodId,
         timeline
@@ -80,7 +96,12 @@ internal class StartLowTrackSelectionFactory(
 internal class StartLowBandwidthMeter(
     private val measured: BandwidthMeter,
     private val initialEstimateBps: Long,
-    private val hasOwnMeasurement: (() -> Boolean)? = null
+    private val hasOwnMeasurement: (() -> Boolean)? = null,
+    /**
+     * [measured]'s estimate before it has measured anything (its initial estimate): while it
+     * still reports it, the track keeps [initialEstimateBps] (the current setting).
+     */
+    private val unmeasuredEstimateBps: Long? = null
 ) : BandwidthMeter {
     private val estimateAtStart = measured.bitrateEstimate
     @Volatile
@@ -90,7 +111,8 @@ internal class StartLowBandwidthMeter(
         if (!hasMeasured) {
             hasMeasured = hasOwnMeasurement?.invoke() ?: (measured.bitrateEstimate != estimateAtStart)
         }
-        return if (hasMeasured) measured.bitrateEstimate else initialEstimateBps
+        val estimate = measured.bitrateEstimate
+        return if (hasMeasured && estimate != unmeasuredEstimateBps) estimate else initialEstimateBps
     }
     override fun getTimeToFirstByteEstimateUs(): Long = measured.timeToFirstByteEstimateUs
 

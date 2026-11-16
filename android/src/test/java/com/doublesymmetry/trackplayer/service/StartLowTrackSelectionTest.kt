@@ -14,6 +14,8 @@ import com.google.android.exoplayer2.trackselection.ExoTrackSelection
 import com.google.android.exoplayer2.upstream.BandwidthMeter
 import com.google.android.exoplayer2.upstream.TransferListener
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class StartLowTrackSelectionTest {
@@ -126,6 +128,58 @@ class StartLowTrackSelectionTest {
         // The same item played again (a new period): it starts low again.
         val replayMeter = selections(loads, shared, replay).single()
         assertEquals(96_000L, replayMeter.bitrateEstimate)
+    }
+
+    @Test
+    fun aTrackKeepsTheSettingUntilTheMeterHasReallyMeasured() {
+        // The standard player's meter is built with an initial estimate (here an older setting);
+        // until it has really measured (its own thresholds) it keeps reporting it.
+        val unmeasured = 500_000L
+        val meter = FakeMeter(unmeasured)
+        val loads = OwnMediaLoadRegistry()
+        val track = period(item(0))
+        val seen = mutableListOf<BandwidthMeter>()
+        val factory = StartLowTrackSelectionFactory({ DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, loads, unmeasured) { _, m, _, _ ->
+            seen += m
+            emptyArray()
+        }
+        @Suppress("UNCHECKED_CAST")
+        val timeline = bare(Class.forName("com.google.android.exoplayer2.source.SinglePeriodTimeline") as Class<Timeline>)
+        factory.createTrackSelections(emptyArray<ExoTrackSelection.Definition>(), meter, track, timeline)
+        val trackMeter = seen.single()
+        // Its own first small segment loaded, but the meter still reports its default: the track
+        // keeps the current setting, not the meter's default.
+        loadCompleted(StartLowLoadListener(loads), track, C.DATA_TYPE_MEDIA)
+        assertEquals(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS, trackMeter.bitrateEstimate)
+        // The meter measured: the track follows it.
+        meter.estimate = 2_000_000L
+        assertEquals(2_000_000L, trackMeter.bitrateEstimate)
+    }
+
+    @Test
+    fun periodsThatLeftTheTimelineAreForgotten() {
+        val loads = OwnMediaLoadRegistry()
+        val kept = period(item(0))
+        val removed = period(item(1))
+        val listener = StartLowLoadListener(loads)
+        loadCompleted(listener, kept, C.DATA_TYPE_MEDIA)
+        loadCompleted(listener, removed, C.DATA_TYPE_MEDIA)
+        assertEquals(2, loads.size)
+        val timeline = object : Timeline() {
+            override fun getWindowCount() = 1
+            override fun getWindow(windowIndex: Int, window: Window, defaultPositionProjectionUs: Long) = window
+            override fun getPeriodCount() = 1
+            override fun getPeriod(periodIndex: Int, period: Period, setIds: Boolean) = period
+            override fun getIndexOfPeriod(uid: Any) = if (uid == kept.periodUid) 0 else C.INDEX_UNSET
+            override fun getUidOfPeriod(periodIndex: Int): Any = kept.periodUid
+        }
+        listener.onTimelineChanged(
+            AnalyticsListener.EventTime(0L, timeline, 0, null, 0L, timeline, 0, null, 0L, 0L),
+            0
+        )
+        assertEquals(1, loads.size)
+        assertTrue(loads.hasMeasured(kept))
+        assertFalse(loads.hasMeasured(removed))
     }
 
     @Test

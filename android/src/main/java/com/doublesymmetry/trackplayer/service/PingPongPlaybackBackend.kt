@@ -15,7 +15,9 @@ internal class PingPongPlaybackBackend(
     private val activateControlSurfaceAfterDrain: suspend () -> Unit = { activateControlSurface() },
     private val onCommitted: (AndroidPlaybackOrchestrator) -> Unit,
     private val onDisposed: (AndroidPlaybackOrchestrator) -> Unit,
-    initiallyAuthoritative: Boolean = false
+    initiallyAuthoritative: Boolean = false,
+    /** The app's `backendSwitchPositionToleranceMs`, read at every restore. */
+    private val positionToleranceMs: () -> Long = { DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS }
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.PING_PONG
     private val queueState = PlaybackBackendQueueState<TrackAudioItem>()
@@ -82,7 +84,8 @@ internal class PingPongPlaybackBackend(
         if (index != null && index in queue.indices) {
             val indexChanged = orchestrator.currentIndex != index
             if (indexChanged) orchestrator.skip(index)
-            if (indexChanged || orchestrator.positionMs != snapshot.positionMs) {
+            // As iOS: a position further off than backendSwitchPositionToleranceMs is sought.
+            if (indexChanged || kotlin.math.abs(orchestrator.positionMs - snapshot.positionMs) > positionToleranceMs()) {
                 orchestrator.seekTo(snapshot.positionMs)
             }
         }
