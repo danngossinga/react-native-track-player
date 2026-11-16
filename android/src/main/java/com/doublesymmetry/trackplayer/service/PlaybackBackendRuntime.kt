@@ -230,9 +230,8 @@ internal interface StandardSeekPlayer {
     val currentItem: Any?
     /** KotlinAudio's state: set at once by stop() (its item unloaded), late after a seek. */
     val kotlinAudioState: AudioPlayerState
-    /** ExoPlayer's playback state (`Player.STATE_*`), masked at once by prepare and seekTo. */
-    val exoPlaybackState: Int
-    val hasError: Boolean
+    /** ExoPlayer's own state, error and playing flag (masked at once by prepare and seekTo). */
+    val exo: ExoSeekState
     val positionMs: Long
     val bufferedPositionMs: Long
     val durationMs: Long
@@ -242,13 +241,37 @@ internal interface StandardSeekPlayer {
     fun seekTo(positionMs: Long)
 }
 
+/** What a seek reads of ExoPlayer itself. */
+internal interface ExoSeekState {
+    /** `Player.STATE_*`. */
+    val playbackState: Int
+    val hasError: Boolean
+    /** Playing now (ready and asked to play): the position moves past the target. */
+    val isPlaying: Boolean
+}
+
+/** [ExoSeekState] of the captured ExoPlayer ([StandardPlayerAnalytics]; idle until there is one). */
+internal class CapturedExoSeekState(private val captured: () -> com.google.android.exoplayer2.Player?) : ExoSeekState {
+    private val player: com.google.android.exoplayer2.Player?
+        get() = captured()
+
+    override val playbackState: Int
+        get() = player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE
+    override val hasError: Boolean
+        get() = player?.playerError != null
+    override val isPlaying: Boolean
+        get() = player?.isPlaying == true
+}
+
 /** What a seek wait reads of [StandardSeekPlayer]. */
 internal fun StandardSeekPlayer.seekObservation() = StandardSeekObservation(
     state = when {
-        hasError -> AudioPlayerState.ERROR
-        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_BUFFERING -> AudioPlayerState.BUFFERING
-        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_ENDED -> AudioPlayerState.ENDED
-        exoPlaybackState == com.google.android.exoplayer2.Player.STATE_READY -> AudioPlayerState.READY
+        exo.hasError || kotlinAudioState == AudioPlayerState.ERROR -> AudioPlayerState.ERROR
+        exo.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING -> AudioPlayerState.BUFFERING
+        exo.playbackState == com.google.android.exoplayer2.Player.STATE_ENDED -> AudioPlayerState.ENDED
+        // Playing: the position moves on from the target while the wait polls (rate, late polls).
+        exo.playbackState == com.google.android.exoplayer2.Player.STATE_READY && exo.isPlaying -> AudioPlayerState.PLAYING
+        exo.playbackState == com.google.android.exoplayer2.Player.STATE_READY -> AudioPlayerState.READY
         else -> AudioPlayerState.IDLE
     },
     positionMs = positionMs,
@@ -270,16 +293,40 @@ internal suspend fun StandardSeekGate.seek(player: StandardSeekPlayer, positionM
     await(positionMs, item) { player.seekObservation() }
 }
 
+/** What a standard restore does (iOS: the same rule). */
+internal data class StandardRestoreSteps(val jump: Boolean, val seek: Boolean)
+
+/**
+ * A standard restore: a candidate (not authoritative), a changed queue or another index loads the
+ * track again (jump) and seeks; on the same track, a position further off than
+ * `backendSwitchPositionToleranceMs` is sought.
+ */
+internal fun standardRestoreSteps(
+    isAuthoritative: Boolean,
+    queueChanged: Boolean,
+    currentIndex: Int,
+    targetIndex: Int,
+    positionMs: Long,
+    targetPositionMs: Long,
+    positionToleranceMs: Long
+): StandardRestoreSteps {
+    val jump = !isAuthoritative || queueChanged || currentIndex != targetIndex
+    val seek = jump || kotlin.math.abs(positionMs - targetPositionMs) > positionToleranceMs
+    return StandardRestoreSteps(jump = jump, seek = seek)
+}
+
 /**
  * Captures the standard player's ExoPlayer (ExoPlayer hands it to its analytics collector when
- * built), so a seek can read ExoPlayer's own state; KotlinAudio keeps its ExoPlayer private.
+ * built), so a seek can read ExoPlayer's own state; KotlinAudio keeps its ExoPlayer private. The
+ * player is held weakly: the service's map of these must not keep a released player alive.
  */
 internal class StandardPlayerAnalytics(
     clock: com.google.android.exoplayer2.util.Clock = com.google.android.exoplayer2.util.Clock.DEFAULT
 ) : com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector(clock) {
     @Volatile
-    var player: com.google.android.exoplayer2.Player? = null
-        private set
+    private var captured: java.lang.ref.WeakReference<com.google.android.exoplayer2.Player>? = null
+    val player: com.google.android.exoplayer2.Player?
+        get() = captured?.get()
     val transitions = AutoTransitionCounter()
 
     init {
@@ -288,7 +335,12 @@ internal class StandardPlayerAnalytics(
 
     override fun setPlayer(player: com.google.android.exoplayer2.Player, looper: android.os.Looper) {
         super.setPlayer(player, looper)
-        this.player = player
+        captured = java.lang.ref.WeakReference(player)
+    }
+
+    override fun release() {
+        captured = null
+        super.release()
     }
 }
 

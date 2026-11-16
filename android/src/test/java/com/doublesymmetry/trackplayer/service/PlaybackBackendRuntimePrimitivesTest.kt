@@ -482,29 +482,49 @@ class PlaybackBackendRuntimePrimitivesTest {
         override var currentItem: Any? = Any()
         override var kotlinAudioState = AudioPlayerState.READY
         var exoState = com.google.android.exoplayer2.Player.STATE_READY
-        override var hasError = false
-        override var positionMs = 0L
+        var exoError = false
+        /** Asked to play: once ready, it plays and the position moves on at [rate]. */
+        var playWhenReady = false
+        override var rate = 1f
         override val durationMs = 60_000L
-        override val rate = 1f
         override val autoTransitions = 0L
         val calls = mutableListOf<String>()
         /** ExoPlayer becomes ready this long after the seek, data arriving meanwhile (null: no data, never). */
         var readyAfterMs: Long? = 300L
+        /** When set, the track ends (STATE_ENDED) this long after the seek instead of becoming ready. */
+        var endsAfterMs: Long? = null
         private var seekAt = 0L
+        private var target = 0L
 
         private val buffering: Boolean
             get() = exoState == com.google.android.exoplayer2.Player.STATE_BUFFERING
 
-        override val exoPlaybackState: Int
+        private fun since() = nowMs() - seekAt
+
+        private val effectiveState: Int
             get() {
+                val ends = endsAfterMs
+                if (buffering && ends != null && since() >= ends) return com.google.android.exoplayer2.Player.STATE_ENDED
                 val ready = readyAfterMs
-                return if (buffering && ready != null && nowMs() - seekAt >= ready) {
-                    com.google.android.exoplayer2.Player.STATE_READY
-                } else exoState
+                return if (buffering && ready != null && since() >= ready) com.google.android.exoplayer2.Player.STATE_READY else exoState
+            }
+
+        override val exo = object : ExoSeekState {
+            override val playbackState: Int get() = effectiveState
+            override val hasError: Boolean get() = exoError
+            override val isPlaying: Boolean
+                get() = playWhenReady && effectiveState == com.google.android.exoplayer2.Player.STATE_READY
+        }
+
+        override val positionMs: Long
+            get() {
+                val ready = readyAfterMs ?: return target
+                if (effectiveState == com.google.android.exoplayer2.Player.STATE_ENDED) return durationMs
+                return if (exo.isPlaying) target + ((since() - ready) * rate).toLong() else target
             }
 
         override val bufferedPositionMs: Long
-            get() = if (buffering && readyAfterMs != null) nowMs() - seekAt else 0L
+            get() = if (buffering && readyAfterMs != null) since() else 0L
 
         override fun prepare() {
             calls += "prepare"
@@ -514,7 +534,7 @@ class PlaybackBackendRuntimePrimitivesTest {
         override fun seekTo(positionMs: Long) {
             calls += "seek"
             seekAt = nowMs()
-            this.positionMs = positionMs
+            target = positionMs
             if (exoState != com.google.android.exoplayer2.Player.STATE_IDLE) {
                 exoState = com.google.android.exoplayer2.Player.STATE_BUFFERING
             }
@@ -573,8 +593,94 @@ class PlaybackBackendRuntimePrimitivesTest {
         val unavailable = runCatching { gate(this).seek(none, 30_000L) }
         assertEquals("standard_seek_unavailable", (unavailable.exceptionOrNull() as RejectionException).code)
         assertTrue(none.calls.isEmpty())
-        val failing = MaskingPlayer { currentTime }.apply { hasError = true }
+        // ExoPlayer failed; KotlinAudio's state has not caught up (still READY).
+        val failing = MaskingPlayer { currentTime }.apply { exoError = true }
         val failed = runCatching { gate(this).seek(failing, 30_000L) }
         assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
     }
+
+    @Test
+    fun aSeekWhilePlayingFastWithALatePollCompletes() = runTest {
+        // Ready 200 ms after the seek, then playing at 2x; the first poll after that lands
+        // 100 ms late: the position is 200 ms past the target, which playback explains.
+        val player = MaskingPlayer { currentTime }.apply {
+            readyAfterMs = 120L
+            playWhenReady = true
+            rate = 2f
+        }
+        val started = currentTime
+        // First poll after ready at 200 ms: 160 ms past the target (80 ms at 2x), more than one poll.
+        gate(this).seek(player, 30_000L)
+        assertEquals(200L, currentTime - started)
+    }
+
+    @Test
+    fun aSeekToTheEndOfTheTrackCompletesWhenItEnds() = runTest {
+        val player = MaskingPlayer { currentTime }.apply {
+            readyAfterMs = 10_000L
+            endsAfterMs = 200L
+        }
+        val started = currentTime
+        gate(this).seek(player, 90_000L)
+        assertEquals(200L, currentTime - started)
+    }
+
+    @Test
+    fun theCapturedExoPlayerIsWhatTheSeekReads() {
+        var state = com.google.android.exoplayer2.Player.STATE_BUFFERING
+        var playing = false
+        var error: Any? = null
+        val exoPlayer = java.lang.reflect.Proxy.newProxyInstance(
+            javaClass.classLoader, arrayOf(com.google.android.exoplayer2.Player::class.java)
+        ) { _, method, _ ->
+            when (method.name) {
+                "getPlaybackState" -> state
+                "isPlaying" -> playing
+                "getPlayerError" -> error
+                else -> defaultValue(method.returnType)
+            }
+        } as com.google.android.exoplayer2.Player
+        var captured: com.google.android.exoplayer2.Player? = null
+        val exo = CapturedExoSeekState { captured }
+        // Not built yet: idle, nothing to read.
+        assertEquals(com.google.android.exoplayer2.Player.STATE_IDLE, exo.playbackState)
+        captured = exoPlayer
+        assertEquals(com.google.android.exoplayer2.Player.STATE_BUFFERING, exo.playbackState)
+        state = com.google.android.exoplayer2.Player.STATE_READY
+        playing = true
+        assertEquals(com.google.android.exoplayer2.Player.STATE_READY, exo.playbackState)
+        assertTrue(exo.isPlaying)
+        assertFalse(exo.hasError)
+        error = bare(com.google.android.exoplayer2.PlaybackException::class.java)
+        assertTrue(exo.hasError)
+    }
+
+    @Test
+    fun aStandardRestoreLoadsAndSeeksAsOnIos() {
+        fun steps(authoritative: Boolean = true, queueChanged: Boolean = false, current: Int = 1, position: Long = 10_000L, tolerance: Long = 750L) =
+            standardRestoreSteps(authoritative, queueChanged, current, targetIndex = 1, positionMs = position, targetPositionMs = 10_000L, positionToleranceMs = tolerance)
+        // Same track, close enough: nothing.
+        assertEquals(StandardRestoreSteps(jump = false, seek = false), steps(position = 10_500L))
+        // Same track, further off than the setting: seek only.
+        assertEquals(StandardRestoreSteps(jump = false, seek = true), steps(position = 10_500L, tolerance = 200L))
+        // Another index, a changed queue or a candidate: load the track again and seek.
+        assertEquals(StandardRestoreSteps(jump = true, seek = true), steps(current = 0))
+        assertEquals(StandardRestoreSteps(jump = true, seek = true), steps(queueChanged = true))
+        assertEquals(StandardRestoreSteps(jump = true, seek = true), steps(authoritative = false))
+    }
+
+    private fun <T> bare(type: Class<T>): T {
+        val unsafe = Class.forName("sun.misc.Unsafe").getDeclaredField("theUnsafe").apply { isAccessible = true }.get(null)
+        @Suppress("UNCHECKED_CAST")
+        return unsafe.javaClass.getMethod("allocateInstance", Class::class.java).invoke(unsafe, type) as T
+    }
+}
+
+private fun defaultValue(type: Class<*>): Any? = when (type) {
+    java.lang.Boolean.TYPE -> false
+    java.lang.Integer.TYPE -> 0
+    java.lang.Long.TYPE -> 0L
+    java.lang.Float.TYPE -> 0f
+    java.lang.Double.TYPE -> 0.0
+    else -> null
 }

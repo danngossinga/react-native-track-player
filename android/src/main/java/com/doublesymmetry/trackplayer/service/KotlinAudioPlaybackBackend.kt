@@ -234,13 +234,20 @@ internal class KotlinAudioPlaybackBackend(
         player.playbackSpeed = snapshot.rate
         (player.playerOptions as? QueuedPlayerOptions)?.repeatMode = RepeatMode.fromOrdinal(snapshot.repeatMode)
         val index = snapshot.activeIndex
-        if (index != null && index in queue.indices &&
-            (!isAuthoritative || queueChanged || player.currentIndex != index ||
-                // As iOS: a position further off than backendSwitchPositionToleranceMs is sought.
-                kotlin.math.abs(player.position - snapshot.positionMs) > positionToleranceMs())
-        ) {
-            if (player.currentIndex != index || !isAuthoritative || queueChanged) player.jumpToItem(index)
-            player.seek(snapshot.positionMs, TimeUnit.MILLISECONDS)
+        if (index != null && index in queue.indices) {
+            // As iOS: load the track again when needed, and seek when further off than
+            // backendSwitchPositionToleranceMs.
+            val steps = standardRestoreSteps(
+                isAuthoritative = isAuthoritative,
+                queueChanged = queueChanged,
+                currentIndex = player.currentIndex,
+                targetIndex = index,
+                positionMs = player.position,
+                targetPositionMs = snapshot.positionMs,
+                positionToleranceMs = positionToleranceMs()
+            )
+            if (steps.jump) player.jumpToItem(index)
+            if (steps.seek) player.seek(snapshot.positionMs, TimeUnit.MILLISECONDS)
         }
         player.playWhenReady = false
         player.pause()
@@ -356,10 +363,7 @@ internal class KotlinAudioPlaybackBackend(
     private val seekPlayer = object : StandardSeekPlayer {
         override val currentItem: Any? get() = player.currentItem
         override val kotlinAudioState: AudioPlayerState get() = player.playerState
-        override val exoPlaybackState: Int
-            get() = analytics()?.player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE
-        override val hasError: Boolean
-            get() = analytics()?.player?.playerError != null || player.playerState == AudioPlayerState.ERROR
+        override val exo: ExoSeekState = CapturedExoSeekState { analytics()?.player }
         override val positionMs: Long get() = player.position
         override val bufferedPositionMs: Long get() = player.bufferedPosition
         override val durationMs: Long get() = player.duration

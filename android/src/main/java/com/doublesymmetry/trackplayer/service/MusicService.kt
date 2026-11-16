@@ -488,6 +488,7 @@ class MusicService : HeadlessJsTaskService() {
                         if (activated === binding.player) activateStandardPlayerBinding(binding)
                     },
                     onDisposed = { disposed ->
+                        standardAnalytics.remove(disposed)
                         binding.ownerJob.cancel()
                         playbackControlOwnerRegistry.deactivate(binding.identity) { disposed.destroy() }
                         if (standardPlayerBinding === binding) standardPlayerBinding = null
@@ -654,22 +655,16 @@ class MusicService : HeadlessJsTaskService() {
      */
     private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(
         configureExoPlayer = { builder ->
-            val loads = OwnMediaLoadRegistry()
             // A meter that reports the app's setting until it has really measured (its own
-            // thresholds), not a country default: a track's start-low ends on a measurement.
-            val unmeasuredBps = initialBitrateEstimate.bitsPerSecond
-            builder.setBandwidthMeter(
-                DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(unmeasuredBps).build()
+            // thresholds), not a country default; each track's own media loads (not its
+            // playlist, not another track's); ExoPlayer's own state for seeks.
+            val startLow = StandardStartLow(
+                { initialBitrateEstimate.bitsPerSecond },
+                newMeter = { bps -> DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(bps).build() }
             )
-            builder.setTrackSelector(
-                DefaultTrackSelector(
-                    this@MusicService,
-                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads, unmeasuredBps)
-                )
-            )
-            // Each track's own media loads (not its playlist, not another track's), ExoPlayer's
-            // own state for seeks, and its automatic transitions.
-            analytics.addListener(StartLowLoadListener(loads))
+            builder.setBandwidthMeter(startLow.meter)
+            builder.setTrackSelector(DefaultTrackSelector(this@MusicService, startLow.selectionFactory))
+            analytics.addListener(startLow.loadListener)
             builder.setAnalyticsCollector(analytics)
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),

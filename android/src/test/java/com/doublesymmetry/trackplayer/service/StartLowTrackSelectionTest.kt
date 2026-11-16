@@ -183,6 +183,52 @@ class StartLowTrackSelectionTest {
     }
 
     @Test
+    fun theStandardMeterAndItsSelectionsShareOneUnmeasuredValue() {
+        var setting = 96_000L
+        val seen = mutableListOf<BandwidthMeter>()
+        val startLow = StandardStartLow({ setting }, { bps -> FakeMeter(bps) }) { _, m, _, _ ->
+            seen += m
+            emptyArray()
+        }
+        // The meter is built with the setting as its unmeasured estimate.
+        assertEquals(96_000L, startLow.meter.bitrateEstimate)
+        // updateOptions: the next track starts from the new value; the meter (not measured yet)
+        // still reports the one it was built with.
+        setting = 48_000L
+        val track = period(item(0))
+        @Suppress("UNCHECKED_CAST")
+        val timeline = bare(Class.forName("com.google.android.exoplayer2.source.SinglePeriodTimeline") as Class<Timeline>)
+        startLow.selectionFactory.createTrackSelections(emptyArray<ExoTrackSelection.Definition>(), startLow.meter, track, timeline)
+        loadCompleted(startLow.loadListener, track, C.DATA_TYPE_MEDIA)
+        // Its own load, but the meter has not measured: the current setting, not the meter's value.
+        assertEquals(48_000L, seen.single().bitrateEstimate)
+        (startLow.meter as FakeMeter).estimate = 3_000_000L
+        assertEquals(3_000_000L, seen.single().bitrateEstimate)
+    }
+
+    @Test
+    fun earlierPlaysOfTheItemNowPlayingAreForgotten() {
+        val loads = OwnMediaLoadRegistry()
+        val listener = StartLowLoadListener(loads)
+        val track = item(0)
+        val holder = Any()
+        val first = period(track, windowSequenceNumber = 1L, holder = holder)
+        val second = period(track, windowSequenceNumber = 2L, holder = holder)
+        loadCompleted(listener, first, C.DATA_TYPE_MEDIA)
+        loadCompleted(listener, second, C.DATA_TYPE_MEDIA)
+        // Repeat-one: the second play began; the first one ended.
+        listener.onPositionDiscontinuity(
+            AnalyticsListener.EventTime(0L, Timeline.EMPTY, 0, second, 0L, Timeline.EMPTY, 0, second, 0L, 0L),
+            bare(com.google.android.exoplayer2.Player.PositionInfo::class.java),
+            bare(com.google.android.exoplayer2.Player.PositionInfo::class.java),
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_AUTO_TRANSITION
+        )
+        assertFalse(loads.hasMeasured(first))
+        assertTrue(loads.hasMeasured(second))
+        assertEquals(1, loads.size)
+    }
+
+    @Test
     fun everyTrackSelectionReadsTheCurrentSetting() {
         var setting = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS
         val seen = mutableListOf<Long>()

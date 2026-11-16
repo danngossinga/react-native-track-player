@@ -17,7 +17,9 @@ import com.google.android.exoplayer2.upstream.TransferListener
  * The media periods (one per track load or play: a replay or a duplicate in the queue is another
  * period) whose own media has been loaded, so a track's selection can tell its own measurement
  * from another track's (the one playing while the next one is prepared ahead). A manifest or
- * playlist load does not count: only media data (segments, a progressive file).
+ * playlist load does not count: only media data (segments, a progressive file). Bounded: a period
+ * whose item left the timeline is forgotten ([retainPeriodsOf]), and so is an earlier play of the
+ * item now playing ([retireBefore]; a repeat-one replay is a new period of the same item).
  */
 internal class OwnMediaLoadRegistry {
     private val measured = Collections.synchronizedSet(HashSet<MediaSource.MediaPeriodId>())
@@ -33,6 +35,13 @@ internal class OwnMediaLoadRegistry {
     fun retainPeriodsOf(timeline: Timeline) {
         val uids = (0 until timeline.periodCount).mapTo(HashSet()) { timeline.getUidOfPeriod(it) }
         synchronized(measured) { measured.removeAll { it.periodUid !in uids } }
+    }
+
+    /** [playing] began: the earlier plays (window sequences) of its item have ended. */
+    fun retireBefore(playing: MediaSource.MediaPeriodId) {
+        synchronized(measured) {
+            measured.removeAll { it.periodUid == playing.periodUid && it.windowSequenceNumber < playing.windowSequenceNumber }
+        }
     }
 
     internal val size: Int
@@ -52,6 +61,15 @@ internal class StartLowLoadListener(private val loads: OwnMediaLoadRegistry) : A
 
     override fun onTimelineChanged(eventTime: AnalyticsListener.EventTime, reason: Int) {
         loads.retainPeriodsOf(eventTime.timeline)
+    }
+
+    override fun onPositionDiscontinuity(
+        eventTime: AnalyticsListener.EventTime,
+        oldPosition: com.google.android.exoplayer2.Player.PositionInfo,
+        newPosition: com.google.android.exoplayer2.Player.PositionInfo,
+        reason: Int
+    ) {
+        eventTime.currentMediaPeriodId?.let(loads::retireBefore)
     }
 }
 
@@ -87,6 +105,23 @@ internal class StartLowTrackSelectionFactory(
         mediaPeriodId,
         timeline
     )
+}
+
+/**
+ * The standard player's start-low pieces, built from one value: the meter's initial estimate and
+ * the value its track selections take as "not measured yet" are the same by construction.
+ */
+internal class StandardStartLow(
+    initialBitrateEstimateBps: () -> Long,
+    /** Builds the player's meter reporting the given estimate until it has measured. */
+    newMeter: (Long) -> BandwidthMeter,
+    adaptive: ExoTrackSelection.Factory = AdaptiveTrackSelection.Factory()
+) {
+    private val loads = OwnMediaLoadRegistry()
+    private val unmeasuredBps = initialBitrateEstimateBps()
+    val meter: BandwidthMeter = newMeter(unmeasuredBps)
+    val selectionFactory = StartLowTrackSelectionFactory(initialBitrateEstimateBps, loads, unmeasuredBps, adaptive)
+    val loadListener = StartLowLoadListener(loads)
 }
 
 /**
