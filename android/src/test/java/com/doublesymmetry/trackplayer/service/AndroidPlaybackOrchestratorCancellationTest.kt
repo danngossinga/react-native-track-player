@@ -507,6 +507,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
             }
             assertEquals(10_000L, currentTime - stalledAt)
             assertEquals(30_000L, engineA.lastPlayStartTimeoutMs)
+            // The failed start leaves playback paused, not waiting to play by itself.
+            assertFalse(orchestrator.playWhenReady)
             assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
             assertEquals("crossfade_play_start_timeout", delegate.playbackErrors.last().first)
         } finally {
