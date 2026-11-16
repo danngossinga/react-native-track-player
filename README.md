@@ -72,7 +72,8 @@ Added fork surface:
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends
-  it), `playStartTimeoutMs` (iOS crossfade play start),
+  it; an iOS crossfade seek, which had no limit before, now fails on a stall or
+  at this limit and the player then reports an error state), `playStartTimeoutMs` (iOS crossfade play start),
   `standardReadyTimeoutMs` (standard backend readiness) and
   `standardSeekTimeoutMs` (iOS standard seek; before the seek is issued only this
   limit applies, then the buffered position is its only progress signal), each

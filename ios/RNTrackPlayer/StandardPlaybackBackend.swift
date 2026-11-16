@@ -264,6 +264,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             self.completion = completion
         }
 
+        // A request dropped without a result stops its wait instead of leaving it to the cap.
+        deinit {
+            wait?.cancel()
+        }
+
         func finish(_ result: Result<Void, Error>) {
             let callback = completion
             completion = nil

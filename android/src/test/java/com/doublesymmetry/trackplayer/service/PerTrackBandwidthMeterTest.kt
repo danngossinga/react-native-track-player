@@ -43,7 +43,8 @@ class PerTrackBandwidthMeterTest {
             openTransfers += 1
         }
         override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-            // DefaultBandwidthMeter asserts a transfer is open on it.
+            // Stricter than DefaultBandwidthMeter (which asserts an open transfer only in
+            // onTransferEnd): bytes must also reach the meter the transfer started on.
             check(openTransfers > 0) { "bytes reported to a meter with no open transfer" }
             bytes += bytesTransferred
         }
@@ -93,6 +94,9 @@ class PerTrackBandwidthMeterTest {
         assertTrue(built.first().eventListeners.isEmpty())
         assertEquals(listOf(listener), built.last().eventListeners)
         meter.removeEventListener(listener)
+        assertTrue(built.last().eventListeners.isEmpty())
+        // A removed listener does not come back on the next track's meter.
+        meter.startTrack()
         assertTrue(built.last().eventListeners.isEmpty())
         assertSame(meter, meter.transferListener)
     }

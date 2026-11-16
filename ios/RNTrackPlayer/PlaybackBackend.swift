@@ -146,8 +146,10 @@ final class StallWaitDriver {
     private let intervalMs: Int
     private let now: () -> TimeInterval
     private let schedule: Schedule
-    private let readings: () -> [Double]?
-    private let onGiveUp: (StallVerdict, StallWatch) -> Void
+    // Released when the wait ends (cancel or give-up): they usually hold the caller's completion
+    // and the engine, which would otherwise stay alive through the driver.
+    private var readings: (() -> [Double]?)?
+    private var onGiveUp: ((StallVerdict, StallWatch) -> Void)?
     private(set) var isActive = false
 
     init(
@@ -178,6 +180,8 @@ final class StallWaitDriver {
     /// Stops the wait: no more checks, `onGiveUp` is never called.
     func cancel() {
         isActive = false
+        readings = nil
+        onGiveUp = nil
     }
 
     /// A stage reached (playable asset, ready item, seek issued): restarts the stall clock; the
@@ -193,13 +197,16 @@ final class StallWaitDriver {
     private func tick() {
         guard isActive else { return }
         let at = now()
-        let verdict = readings().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)
+        let verdict = readings?().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)
         guard verdict != .wait else {
             scheduleNext()
             return
         }
         isActive = false
-        onGiveUp(verdict, watch)
+        let giveUp = onGiveUp
+        readings = nil
+        onGiveUp = nil
+        giveUp?(verdict, watch)
     }
 }
 

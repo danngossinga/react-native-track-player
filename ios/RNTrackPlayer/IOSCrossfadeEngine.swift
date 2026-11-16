@@ -181,6 +181,7 @@ final class IOSCrossfadeEngine {
             guard !settled else { return }
             settled = true
             if let loadWait = loadWait { self.endWait(loadWait) }
+            loadWait = nil
             completion(result)
         }
         let wait = startWait(
@@ -280,6 +281,7 @@ final class IOSCrossfadeEngine {
             guard !done else { return }
             done = true
             if let seekWait = seekWait { endWait(seekWait) }
+            seekWait = nil
             completion?(result)
         }
         if watched, completion != nil {
@@ -431,6 +433,7 @@ final class IOSCrossfadeEngine {
             self.timeControlObservation?.invalidate()
             self.timeControlObservation = nil
             if let playWait = playWait { self.endWait(playWait) }
+            playWait = nil
             completion(result)
         }
 

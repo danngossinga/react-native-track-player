@@ -295,7 +295,14 @@ assert(
 const driverSource = section(facade, 'final class StallWaitDriver {', 'func backendStepTimeout(');
 const transactionTests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
 assert(
-  driverSource.includes('let verdict = readings().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)') &&
+  driverSource.includes('let verdict = readings?().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)') &&
+    // A wait releases its closures (the caller's completion, the engine) when it ends.
+    section(driverSource, 'func cancel() {', 'func noteProgress()').includes('readings = nil') &&
+    section(driverSource, 'func cancel() {', 'func noteProgress()').includes('onGiveUp = nil') &&
+    section(driverSource, 'private func tick() {', '\n    }\n}').includes('onGiveUp = nil\n        giveUp?(verdict, watch)') &&
+    facade.includes('let stallCheckIntervalMs = 250') &&
+    standardBackend.includes('deinit {\n            wait?.cancel()\n        }') &&
+    transactionTests.includes('func testWaitDriverReleasesItsClosuresWhenCancelledAndWhenItGivesUp()') &&
     driverSource.includes('guard isActive else { return }') &&
     ['testWaitDriverKeepsASlowButProgressingWaitUntilItsCap', 'testWaitDriverFailsAStalledWaitAtTheStallTimeout',
       'testWaitDriverWithoutASignalIsBoundOnlyByItsCapAndAStageRestartsTheStallClock',

@@ -224,6 +224,72 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(clock.pending.isEmpty)
     }
 
+    func testWaitDriverReleasesItsClosuresWhenCancelledAndWhenItGivesUp() {
+        // The closures hold the caller's completion and the engine: they must not outlive the wait.
+        final class Captured {}
+        for giveUp in [false, true] {
+            let clock = ManualWaitClock()
+            weak var weakReadingsCapture: Captured?
+            weak var weakGiveUpCapture: Captured?
+            weak var weakDriver: StallWaitDriver?
+            var gaveUp = 0
+            autoreleasepool {
+                let readingsCapture = Captured()
+                let giveUpCapture = Captured()
+                weakReadingsCapture = readingsCapture
+                weakGiveUpCapture = giveUpCapture
+                let driver = makeDriver(
+                    clock,
+                    readings: { _ = readingsCapture; return [1] },
+                    gaveUp: { _ in _ = giveUpCapture; gaveUp += 1 }
+                )
+                weakDriver = driver
+                driver.start()
+                clock.step()
+                if !giveUp { driver.cancel() }
+            }
+            clock.runUntilIdle()
+            XCTAssertEqual(gaveUp, giveUp ? 1 : 0)
+            XCTAssertNil(weakReadingsCapture, "readings kept, giveUp=\(giveUp)")
+            XCTAssertNil(weakGiveUpCapture, "onGiveUp kept, giveUp=\(giveUp)")
+            XCTAssertNil(weakDriver, "driver kept, giveUp=\(giveUp)")
+        }
+    }
+
+    func testWaitDriverChecksEveryPollIntervalAndStartsOnce() {
+        // The documented poll interval: a wait fails at most this much after its limit.
+        XCTAssertEqual(stallCheckIntervalMs, 250)
+        var delays: [Int] = []
+        let driver = StallWaitDriver(
+            stallTimeoutMs: 1_000,
+            totalTimeoutMs: 10_000,
+            now: { 0 },
+            schedule: { delay, _ in delays.append(delay) },
+            readings: { [0] },
+            onGiveUp: { _, _ in }
+        )
+        driver.start()
+        driver.start()
+        XCTAssertEqual(delays, [stallCheckIntervalMs])
+    }
+
+    func testStallWatchDoesNotCountADropAsProgress() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [8]), .wait)
+        // A seek back drops the reading; nothing loads after it: stalled 1 s after the start.
+        XCTAssertEqual(watch.check(at: 0.5, readings: [2]), .wait)
+        XCTAssertEqual(watch.check(at: 1, readings: [2]), .stalled)
+    }
+
+    func testStallWatchStartsANewBaselineAfterAStage() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [5]), .wait)
+        watch.noteProgress(at: 1)
+        // The first reading after the stage is a baseline, not growth from the old reading.
+        XCTAssertEqual(watch.check(at: 1.5, readings: [6]), .wait)
+        XCTAssertEqual(watch.check(at: 2, readings: [6]), .stalled)
+    }
+
     func testCrossfadeIncomingStallReadsTheGraceItIsGiven() {
         XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 1_999, graceMs: 2_000, incomingTime: 10, incomingStartTime: 10))
         XCTAssertTrue(crossfadeIncomingStalled(elapsedMs: 2_000, graceMs: 2_000, incomingTime: 10.2, incomingStartTime: 10))

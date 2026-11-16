@@ -35,12 +35,6 @@ internal class StallWatch(
         if (nowMs - lastProgressAtMs >= stallTimeoutMs) return StallVerdict.STALLED
         return StallVerdict.WAIT
     }
-
-    fun describe(verdict: StallVerdict): String = when (verdict) {
-        StallVerdict.STALLED -> "no progress for ${stallTimeoutMs}ms"
-        StallVerdict.CAP_EXCEEDED -> "over the ${totalTimeoutMs}ms limit"
-        StallVerdict.WAIT -> "waiting"
-    }
 }
 
 /**

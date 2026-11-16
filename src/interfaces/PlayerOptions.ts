@@ -123,8 +123,9 @@ export interface PlayerOptions {
    * every seek (`crossfade_prepare_timeout`, `crossfade_seek_timeout`); iOS bounds the whole load
    * (playable stage, ready item, seek to the start position, preroll) and every seek. On iOS the
    * stage before the asset is playable has no progress signal, so only this limit ends it there;
-   * `stallTimeoutMs` applies from the moment the asset is playable. Defaults to 60000. Same
-   * bounds as `stallTimeoutMs`.
+   * `stallTimeoutMs` applies from the moment the asset is playable. An iOS crossfade seek (which
+   * had no limit before) now fails after `stallTimeoutMs` with no progress or at this limit, and
+   * the player then reports an error state. Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   prepareTimeoutMs?: number;
   /**

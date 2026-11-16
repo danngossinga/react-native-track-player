@@ -47,6 +47,15 @@ class StallWatchTest {
     }
 
     @Test
+    fun aDropIsNotProgress() {
+        val watch = StallWatch(stallTimeoutMs = 1_000L, totalTimeoutMs = 60_000L, startedAtMs = 0L)
+        assertEquals(StallVerdict.WAIT, watch.check(0L, longArrayOf(8_000L)))
+        // A seek back drops the buffered position; nothing loads after it.
+        assertEquals(StallVerdict.WAIT, watch.check(500L, longArrayOf(2_000L)))
+        assertEquals(StallVerdict.STALLED, watch.check(1_000L, longArrayOf(2_000L)))
+    }
+
+    @Test
     fun theWaitEndsWhenDoneAndOtherwiseOnItsVerdict() = runTest {
         // Done after 30 s of slow progress, with a 10 s stall timeout: no verdict.
         var loaded = 0L
