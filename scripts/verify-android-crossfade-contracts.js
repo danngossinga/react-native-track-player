@@ -425,6 +425,8 @@ assert(
     orchestrator.includes('var playStartTimeoutMs: () -> Long = { DEFAULT_PLAY_START_TIMEOUT_MS }') &&
     section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('readings = { loadProgress() + longArrayOf(positionMs) }') &&
     section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('player.pause()') &&
+    section(orchestrator, '            incomingEngine.play(rate)\n', 'currentIndex = toIndex').includes('incomingEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)') &&
+    section(orchestrator, '            incomingEngine.play(rate)\n', 'currentIndex = toIndex').includes('emitCrossfade("error", fromIndex, toIndex, errorCode = "crossfade_start_failed")') &&
     musicService.includes('private val playStartTimeout = TimeoutSetting(DEFAULT_PLAY_START_TIMEOUT_MS)') &&
     musicService.includes('created.playStartTimeoutMs = { playStartTimeout.milliseconds }') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&

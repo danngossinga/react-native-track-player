@@ -131,10 +131,12 @@ export interface PlayerOptions {
    */
   prepareTimeoutMs?: number;
   /**
-   * Crossfade backend: the total limit, in milliseconds, for playback to start (iOS: after `play`,
-   * a load that plays at once, or the incoming song of a crossfade; Android: after `play` and a
-   * load that plays at once). A start that loads nothing for `stallTimeoutMs` fails sooner; a
-   * failed start pauses and reports `crossfade_play_start_timeout` on Android. Defaults to 60000. A backend
+   * Crossfade backend (iOS and Android): the total limit, in milliseconds, for playback to start
+   * (after `play`, a load that plays at once, or the incoming song of a crossfade; the resume of a
+   * fade paused mid-way does not wait). A start that loads nothing for `stallTimeoutMs` fails
+   * sooner; a failed start pauses and reports `crossfade_play_start_timeout` on Android, and a
+   * crossfade whose incoming song does not start reports `crossfade_start_failed` while the
+   * outgoing song plays on. Defaults to 60000. A backend
    * switch and the play used to resume after an interruption wait at most this plus
    * `prepareTimeoutMs` plus 5 s (at least 10 s). Same bounds as `stallTimeoutMs`.
    */

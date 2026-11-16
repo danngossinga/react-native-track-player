@@ -702,6 +702,15 @@ internal class AndroidPlaybackOrchestrator private constructor(
             incomingEngine.setVolume(0f)
             outgoingEngine.play(rate)
             incomingEngine.play(rate)
+            // As on iOS, the fade starts once the incoming track plays (playStartTimeoutMs, with the
+            // stall rule); if it does not, the outgoing track keeps playing alone.
+            try {
+                incomingEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+            } catch (error: RejectionException) {
+                incomingEngine.setVolume(0f)
+                emitCrossfade("error", fromIndex, toIndex, errorCode = "crossfade_start_failed")
+                throw RejectionException(error.message, "crossfade_start_failed")
+            }
 
             currentIndex = toIndex
             delegate.onActiveTrackChanged(toIndex, fromIndex, oldPositionMs)
@@ -790,7 +799,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         } catch (error: RejectionException) {
             if (error.code == "cancelled") {
                 emitCrossfade("cancelled", fromIndex, toIndex, errorCode = error.code)
-            } else if (error.code != "crossfade_not_playing") {
+            } else if (error.code != "crossfade_not_playing" && error.code != "crossfade_start_failed") {
                 emitCrossfade("error", fromIndex, toIndex, errorCode = error.code)
                 setState(AndroidPlaybackOrchestratorState.ERROR)
             }

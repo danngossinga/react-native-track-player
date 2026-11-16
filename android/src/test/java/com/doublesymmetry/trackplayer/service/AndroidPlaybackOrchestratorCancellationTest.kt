@@ -517,6 +517,39 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aCrossfadeStartsOnceTheIncomingTrackPlaysAndKeepsTheOutgoingOneWhenItStalls() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.playStartTimeoutMs = { 40_000L }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.incomingStallGraceMs = { 60_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            // The incoming track gets no data: the fade does not start; the outgoing track plays on.
+            engineB.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val started = currentTime
+            try {
+                orchestrator.crossFade(fadeDuration = 1_000.0)
+                fail("Expected the crossfade start to fail")
+            } catch (error: RejectionException) {
+                assertEquals("crossfade_start_failed", error.code)
+            }
+            assertEquals(10_000L, currentTime - started)
+            assertEquals(40_000L, engineB.lastPlayStartTimeoutMs)
+            assertEquals("crossfade_start_failed", delegate.crossfadeEvents.last().errorCode)
+            assertTrue(delegate.crossfadeEvents.none { it.state == "started" })
+            assertEquals(0, orchestrator.currentIndex)
+            assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
