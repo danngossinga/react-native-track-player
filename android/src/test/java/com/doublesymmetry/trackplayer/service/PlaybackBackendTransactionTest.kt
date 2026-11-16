@@ -100,36 +100,92 @@ class PlaybackBackendTransactionTest {
         assertEquals(1, controlOwners.maximumActiveCount())
     }
 
-    @Test
-    fun aBackendSwitchDoesNotWaitForAnInterruptionResumeToStart() = runTest {
-        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot, readPlaybackState = AudioPlayerState.PAUSED)
-        val starting = CompletableDeferred<Unit>()
-        old.playGate = starting
-        val facade = PlaybackBackendFacade(old, FakeFactory())
-        val focus = object : AudioFocusRequester {
+    private fun interruptionCoordinator() = InterruptionCoordinator(
+        { true },
+        object : AudioFocusRequester {
             override fun request(onChange: (Int) -> Unit) = true
             override fun abandon() = Unit
-        }
-        val receiver = object : NoisyReceiverRegistrar {
+        },
+        object : NoisyReceiverRegistrar {
             override fun register(onNoisy: () -> Unit) = Unit
             override fun unregister() = Unit
         }
-        val coordinator = InterruptionCoordinator({ true }, focus, receiver) { }
+    ) { }
+
+    /** The policy's own use of the flag: resume only what was not playing, pause what plays. */
+    private val pauseOrResume: (Boolean) -> InterruptionDecision? = { isPlaying ->
+        if (isPlaying) InterruptionDecision(InterruptionAction.PAUSE, RemoteDuckPayload(paused = true, permanent = false))
+        else InterruptionDecision(InterruptionAction.RESUME, RemoteDuckPayload(paused = false, permanent = false))
+    }
+
+    @Test
+    fun aBackendSwitchDoesNotWaitForAnInterruptionResumeToStart() = runTest {
+        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot.copy(playWhenReady = false), readPlaybackState = AudioPlayerState.PAUSED)
+        val starting = CompletableDeferred<Unit>()
+        old.playGate = starting
+        val facade = PlaybackBackendFacade(old, FakeFactory())
         val ducks = mutableListOf<RemoteDuckPayload>()
-        // The gain after an interruption: resume; the crossfade backend's play start takes time.
-        coordinator.applyOn(
+        val decided = mutableListOf<Pair<InterruptionAction?, PlaybackBackendType>>()
+        // The gain after an interruption: the paused backend resumes; its play start takes time.
+        interruptionCoordinator().applyOn(
             facade = facade,
             scope = backgroundScope,
-            decide = { InterruptionDecision(InterruptionAction.RESUME, RemoteDuckPayload(paused = false, permanent = false)) },
+            decide = pauseOrResume,
             emit = { ducks += it },
-            onResumeFailed = { }
+            onResumeFailed = { },
+            onDecided = { decision, type -> decided += decision?.action to type }
         )
+        // The play was entered on that backend before applyOn returned (inside its lease).
+        assertTrue(old.playEntered)
+        assertEquals(listOf(InterruptionAction.RESUME to PlaybackBackendType.PING_PONG), decided)
         assertEquals(listOf(RemoteDuckPayload(paused = false, permanent = false)), ducks)
         // A backend switch now proceeds at once, as on iOS (it does not wait for the play start).
         val switched = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
         runCurrent()
         assertTrue(switched.isCompleted)
+        // The switch settled the old backend, which drops its pending play start (as the real
+        // crossfade backend does): it never plays.
+        runCurrent()
+        assertEquals(0, old.playCalls)
+    }
+
+    @Test
+    fun anInterruptionResumeThatStartsPlaysOnce() = runTest {
+        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot.copy(playWhenReady = false), readPlaybackState = AudioPlayerState.PAUSED)
+        val starting = CompletableDeferred<Unit>()
+        old.playGate = starting
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+        interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { }, { })
         starting.complete(Unit)
+        runCurrent()
+        assertEquals(1, old.playCalls)
+    }
+
+    @Test
+    fun anInterruptionResumeThatFailsIsReportedButNotWhenCancelled() = runTest {
+        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot.copy(playWhenReady = false), readPlaybackState = AudioPlayerState.PAUSED)
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+        val failures = mutableListOf<Throwable>()
+        old.playFailure = RejectionException("did not start", "crossfade_play_start_timeout")
+        interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { }, { failures += it })
+        runCurrent()
+        assertEquals(listOf("crossfade_play_start_timeout"), failures.map { (it as RejectionException).code })
+        old.playFailure = PlaybackOperationCancelledException("pause")
+        interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { }, { failures += it })
+        runCurrent()
+        assertEquals(1, failures.size)
+    }
+
+    @Test
+    fun anInterruptionPausesAPlayingBackend() = runTest {
+        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot.copy(playWhenReady = true), readPlaybackState = AudioPlayerState.PLAYING)
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+        val ducks = mutableListOf<RemoteDuckPayload>()
+        interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { ducks += it }, { })
+        assertEquals(1, old.pauseCalls)
+        assertFalse(old.playWhenReady)
+        assertEquals(0, old.playCalls)
+        assertEquals(listOf(RemoteDuckPayload(paused = true, permanent = false)), ducks)
     }
 
     @Test
@@ -1825,6 +1881,8 @@ class PlaybackBackendTransactionTest {
         }
 
         override suspend fun settleActiveTransition() {
+            // As the real crossfade backend: a play start in progress is dropped.
+            playGate?.takeIf { !it.isCompleted }?.completeExceptionally(PlaybackOperationCancelledException("backend_swap"))
             calls += "settle"
             protocolTrace += "$type:settle"
             if (transitionBarrier?.releaseOnSettle == true) {
@@ -1955,8 +2013,14 @@ class PlaybackBackendTransactionTest {
 
         /** When set, play() waits for it (a play start in progress). */
         var playGate: CompletableDeferred<Unit>? = null
+        /** When set, play() fails with it. */
+        var playFailure: Exception? = null
+        /** play() was entered (before any wait). */
+        var playEntered = false
 
         override suspend fun play() {
+            playEntered = true
+            playFailure?.let { throw it }
             playGate?.await()
             playCalls += 1
             snapshotValue = snapshotValue.copy(playWhenReady = true)

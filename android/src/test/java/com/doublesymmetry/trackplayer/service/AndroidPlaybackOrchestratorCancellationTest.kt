@@ -622,6 +622,46 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPlayFromPausedIsLoadingUntilItStartsAsOnIos() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(2))
+            orchestrator.play()
+            orchestrator.pause()
+            delegate.playbackStates.clear()
+            // Still prepared; this start takes 5 s, data arriving.
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val started = async { orchestrator.play() }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(listOf(AudioPlayerState.LOADING), delegate.playbackStates)
+            assertEquals(AudioPlayerState.LOADING, orchestrator.snapshot().playbackState)
+            assertTrue(orchestrator.snapshot().playWhenReady)
+            started.await()
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PLAYING), delegate.playbackStates)
+            assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
+
+            // A pause during the start: loading, then paused (the start is cancelled).
+            orchestrator.pause()
+            delegate.playbackStates.clear()
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val cancelled = async { runCatching { orchestrator.play() } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            orchestrator.pause()
+            cancelled.await()
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED), delegate.playbackStates)
+            assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aFailedFirstPlayStartLeavesThePlayerPaused() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")

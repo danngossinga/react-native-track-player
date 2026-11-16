@@ -436,6 +436,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
         ensureActivePrepared(currentIndex, positionMs, ticket)
         ticket.ensureActive()
+        // As iOS (play from paused reloads the item): loading while the start is awaited, then
+        // playing, or paused when it fails or a pause cancels it.
+        setState(AndroidPlaybackOrchestratorState.LOADING)
         activeEngine.setVolume(volume)
         activeEngine.play(rate)
         awaitPlaybackStart(ticket)
