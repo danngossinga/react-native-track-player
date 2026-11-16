@@ -68,6 +68,12 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
             interruptionCountsAsPlaying(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)
         }) ?? false
     }
+    /// Read on main, as `interruptionIsPlaying`.
+    var startingCommandPlays: Bool {
+        return (try? performPlaybackBackendOnMainSync {
+            commandStartsPlayback(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)
+        }) ?? false
+    }
     var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 

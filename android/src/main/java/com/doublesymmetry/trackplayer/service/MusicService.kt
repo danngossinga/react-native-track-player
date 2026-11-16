@@ -395,7 +395,7 @@ class MusicService : HeadlessJsTaskService() {
                 playbackControlOwnerRegistry.deactivate(identity, physicalDeactivation)
             },
             delegate = object : AndroidOrchestratedMediaSurfaceDelegate {
-                // The same play, pause and stop as the app's (userCommand and focus included).
+                // The same play, pause and stop as the app's (policy and focus included).
                 override fun onRemotePlay() =
                     runOrchestratedRemoteCommand(identity, "play", MusicEvents.BUTTON_PLAY) { playOn(it) }
                 override fun onRemotePause() =
@@ -410,30 +410,30 @@ class MusicService : HeadlessJsTaskService() {
                     created.hide()
                 }
                 override fun onRemoteNext() =
-                    runOrchestratedRemoteCommand(identity, "next", MusicEvents.BUTTON_SKIP_NEXT) { it.skipToNext() }
+                    runOrchestratedRemoteCommand(identity, "next", MusicEvents.BUTTON_SKIP_NEXT) { runStartingCommand(it, null) { it.skipToNext() } }
                 override fun onRemotePrevious() =
-                    runOrchestratedRemoteCommand(identity, "previous", MusicEvents.BUTTON_SKIP_PREVIOUS) { it.skipToPrevious() }
+                    runOrchestratedRemoteCommand(identity, "previous", MusicEvents.BUTTON_SKIP_PREVIOUS) { runStartingCommand(it, null) { it.skipToPrevious() } }
                 override fun onRemoteSeekTo(positionMs: Long) =
                     runOrchestratedRemoteCommand(
                         identity,
                         "seek",
                         MusicEvents.BUTTON_SEEK_TO,
                         Bundle().apply { putDouble("position", positionMs.toSeconds()) }
-                    ) { it.seekTo(positionMs) }
+                    ) { runStartingCommand(it, null) { it.seekTo(positionMs) } }
                 override fun onRemoteJumpForward(interval: Int) =
                     runOrchestratedRemoteCommand(
                         identity,
                         "jump-forward",
                         MusicEvents.BUTTON_JUMP_FORWARD,
                         Bundle().apply { putInt("interval", interval) }
-                    ) { it.seekBy(interval * 1000L) }
+                    ) { runStartingCommand(it, null) { it.seekBy(interval * 1000L) } }
                 override fun onRemoteJumpBackward(interval: Int) =
                     runOrchestratedRemoteCommand(
                         identity,
                         "jump-backward",
                         MusicEvents.BUTTON_JUMP_BACKWARD,
                         Bundle().apply { putInt("interval", interval) }
-                    ) { it.seekBy(-interval * 1000L) }
+                    ) { runStartingCommand(it, null) { it.seekBy(-interval * 1000L) } }
                 override fun onRemoteSetRating(rating: RatingCompat) =
                     runOrchestratedRemoteCommand(
                         identity,
@@ -934,14 +934,23 @@ class MusicService : HeadlessJsTaskService() {
                 val facade = playbackBackendFacade ?: return@launch
                 val ticket = facade.capturePhysicalRemoteTicket(identity) ?: return@launch
                 var routedBackendType: PlaybackBackendType? = null
+                var refused: RejectionException? = null
                 val executed = facade.routePhysicalRemote(ticket) { backend ->
-                    command(backend as AndroidPlaybackBackendRouting)
+                    try {
+                        command(backend as AndroidPlaybackBackendRouting)
+                    } catch (error: RejectionException) {
+                        // Refused (decision B): the command ran paused or not at all; the media
+                        // surface still shows the new state.
+                        if (error.code != AUDIO_FOCUS_REFUSED) throw error
+                        refused = error
+                    }
                     routedBackendType = backend.type
                 }
                 if (!executed) return@launch
                 if (refreshAfter && routedBackendType == PlaybackBackendType.PING_PONG) {
                     refreshOrchestratedMediaSurface(reason = "remote-$reason")
                 }
+                refused?.let { throw it }
                 emitHandledByNativeRemoteEvent(event, eventData)
             } catch (error: Exception) {
                 reportIfAudioFocusRefused(error)
@@ -972,11 +981,31 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     suspend fun load(track: Track) {
         withActivePlaybackBackend { backend ->
-            backend.load(track.toAudioItem())
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "load")
-            }
+            runStartingCommand(backend, "load") { backend.load(track.toAudioItem()) }
         }
+    }
+
+    /**
+     * A command that loads or moves the active track, from the app or a remote control: a user
+     * play when it starts the audio (InterruptionCoordinator.runStartingCommand, decision B, as
+     * iOS). Refused, it ran paused: the media surface shows that, then it rejects with
+     * `audio_focus_refused`.
+     */
+    private suspend fun runStartingCommand(
+        backend: AndroidPlaybackBackendRouting,
+        reason: String?,
+        command: suspend () -> Unit
+    ) {
+        val allowed = interruptions.runStartingCommand(
+            playWhenReady = backend.playWhenReady,
+            state = backend.playbackState,
+            pause = { backend.pause() },
+            command = command
+        )
+        if (reason != null && backend.type == PlaybackBackendType.PING_PONG) {
+            refreshOrchestratedMediaSurface(reason = reason)
+        }
+        if (!allowed) throw audioFocusRefused()
     }
 
     @MainThread
@@ -1101,32 +1130,35 @@ class MusicService : HeadlessJsTaskService() {
         withActivePlaybackBackend { it.removePreviousTracks() }
     }
 
+    /** [initialTime] (seconds, when not negative) is applied in the same command, as on iOS. */
     @MainThread
-    suspend fun skip(index: Int) {
+    suspend fun skip(index: Int, initialTime: Float = -1f) {
         withActivePlaybackBackend { backend ->
-            backend.skip(index)
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "skip")
+            runStartingCommand(backend, "skip") {
+                backend.skip(index)
+                if (initialTime >= 0) backend.seekTo((initialTime * 1000).toLong())
             }
         }
     }
 
+    /** [initialTime] (seconds, when not negative) is applied in the same command, as on iOS. */
     @MainThread
-    suspend fun skipToNext() {
+    suspend fun skipToNext(initialTime: Float = -1f) {
         withActivePlaybackBackend { backend ->
-            backend.skipToNext()
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "skip-next")
+            runStartingCommand(backend, "skip-next") {
+                backend.skipToNext()
+                if (initialTime >= 0) backend.seekTo((initialTime * 1000).toLong())
             }
         }
     }
 
+    /** [initialTime] (seconds, when not negative) is applied in the same command, as on iOS. */
     @MainThread
-    suspend fun skipToPrevious() {
+    suspend fun skipToPrevious(initialTime: Float = -1f) {
         withActivePlaybackBackend { backend ->
-            backend.skipToPrevious()
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "skip-previous")
+            runStartingCommand(backend, "skip-previous") {
+                backend.skipToPrevious()
+                if (initialTime >= 0) backend.seekTo((initialTime * 1000).toLong())
             }
         }
     }
@@ -1134,30 +1166,21 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     suspend fun seekTo(seconds: Float) {
         withActivePlaybackBackend { backend ->
-            backend.seekTo((seconds * 1000).toLong())
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "seek-to")
-            }
+            runStartingCommand(backend, "seek-to") { backend.seekTo((seconds * 1000).toLong()) }
         }
     }
 
     @MainThread
     suspend fun seekBy(offset: Float) {
         withActivePlaybackBackend { backend ->
-            backend.seekBy((offset * 1000).toLong())
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "seek-by")
-            }
+            runStartingCommand(backend, "seek-by") { backend.seekBy((offset * 1000).toLong()) }
         }
     }
 
     @MainThread
     suspend fun retry() {
         withActivePlaybackBackend { backend ->
-            backend.retry()
-            if (backend.type == PlaybackBackendType.PING_PONG) {
-                refreshOrchestratedMediaSurface(reason = "retry")
-            }
+            runStartingCommand(backend, "retry") { backend.retry() }
         }
     }
 

@@ -149,6 +149,15 @@ enum UserPlayDecision: Equatable {
     case refused
 }
 
+/// What the module does for an interruption decision: a resume the session refuses is
+/// `resumeRefused` (Android: a resume without the audio focus, `onResumeFailed`).
+enum InterruptionStep: Equatable {
+    case none
+    case pause
+    case resume
+    case resumeRefused
+}
+
 /// The code a refused play rejects with and reports (`playback-error`), the same on Android.
 let audioFocusRefusedCode = "audio_focus_refused"
 
@@ -178,7 +187,9 @@ final class InterruptionPolicy {
     private let autoResume: () -> Bool
     private let lock = NSLock()
     private var resumeOnEnd = false
-    /// An interruption began and has not ended (nor been overtaken by the user or a permanent loss).
+    /// A call is in progress: an interruption began and has not ended, nor been overtaken by a
+    /// permanent loss, headphones unplugged or a play the system allowed. A user pause does not
+    /// end it: a play refused after that pause still resumes when the call ends.
     private var interrupted = false
 
     init(autoResume: @escaping () -> Bool) {
@@ -213,25 +224,45 @@ final class InterruptionPolicy {
         return (isPlaying ? .pause : .none, nil)
     }
 
-    /// A play, pause, stop or reset from the user (app or remote control): an interruption's end
-    /// no longer resumes.
-    func userCommand() {
+    /// A pause from the user (app or remote control): an interruption's end no longer resumes.
+    /// The call is still in progress: a play refused after it resumes at its end.
+    func userPause() {
+        lock.lock()
+        resumeOnEnd = false
+        lock.unlock()
+    }
+
+    /// A stop or a reset from the user: nothing resumes, and the player leaves the call (as on
+    /// Android, which gives the focus up): a play refused after it does not resume.
+    func userStop() {
         forget()
     }
 
-    /// An interruption began and has not ended (a call): a play then is refused (decision B).
-    var isInterrupted: Bool {
-        lock.lock()
-        defer { lock.unlock() }
-        return interrupted
+    /// A play from the user, decided from the system's answer alone (`activate`: iOS activates
+    /// the session, Android requests the focus), also after an interruption that began and never
+    /// ended: an answer that gives the audio overrules it. See `userPlay(granted:)`.
+    func userPlay(activate: () -> Bool) -> UserPlayDecision {
+        return userPlay(granted: activate())
+    }
+
+    /// What the module does on an interruption decision (decision B): a resume needs the session;
+    /// when `activate` fails, the resume is refused (reported as `audio_focus_refused`, not
+    /// retried). `activate` runs only for a resume.
+    func step(for action: InterruptionAction, activate: () -> Bool) -> InterruptionStep {
+        switch action {
+        case .none: return .none
+        case .pause: return .pause
+        case .resume: return activate() ? .resume : .resumeRefused
+        }
     }
 
     /// A play from the user (owner decision B): it starts only if the system gives the audio
-    /// (`granted`: iOS activates the session, outside an interruption; Android grants the focus).
-    /// Granted, it is a user command (an interruption's end no longer resumes). Refused, nothing
-    /// starts now, but the user's last intent is to play: an interruption in progress (a call)
-    /// resumes when it ends, if the system allows it ("pause, then auto-resume"); a later user
-    /// pause still cancels that. Nothing else retries.
+    /// (`granted`: iOS activates the session; Android grants the focus).
+    /// Granted, the audio is back: no call is in progress any more and nothing resumes at an
+    /// interruption's end. Refused, nothing starts now, but the user's last intent is to play: a
+    /// call in progress resumes when it ends, also after a user pause during it, if the system
+    /// allows it ("pause, then auto-resume"); a later user pause cancels that. Nothing else
+    /// retries.
     func userPlay(granted: Bool) -> UserPlayDecision {
         guard granted else {
             lock.lock()
@@ -277,6 +308,22 @@ let interruptionFinishedStates: Set<String> = ["none", "ended", "error", "stoppe
 /// pauses nor resumes.
 func interruptionCountsAsPlaying(playWhenReady: Bool, stateRawValue: String) -> Bool {
     return playWhenReady && !interruptionFinishedStates.contains(stateRawValue)
+}
+
+/// Whether a command that loads or moves the active track (load, skip, seek, retry) starts the
+/// audio: playWhenReady is still on but nothing plays (the queue ended, an error...), so the
+/// command plays at once. It is then a user play (decision B, Android: `commandStartsPlayback`):
+/// an interruption while nothing played paused nothing, so the audio may be another app's or a
+/// call's.
+func commandStartsPlayback(playWhenReady: Bool, stateRawValue: String) -> Bool {
+    return playWhenReady && interruptionFinishedStates.contains(stateRawValue)
+}
+
+/// A starting command's result when its play was refused (decision B): it ran paused and fails
+/// with `audio_focus_refused`, unless it failed by itself (that failure is kept).
+func applyingPlayRefusal<Value>(refused: Bool, to result: Result<Value, Error>) -> Result<Value, Error> {
+    guard refused, case .success = result else { return result }
+    return .failure(audioFocusRefusedError())
 }
 
 /// The native seeks a standard backend issued, to match each SwiftAudioEx seek callback (which

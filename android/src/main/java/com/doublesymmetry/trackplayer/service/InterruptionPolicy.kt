@@ -16,6 +16,15 @@ internal val INTERRUPTION_FINISHED_STATES = setOf(
     AudioPlayerState.IDLE, AudioPlayerState.ENDED, AudioPlayerState.ERROR, AudioPlayerState.STOPPED
 )
 
+/**
+ * Whether a command that loads or moves the active track (load, skip, seek, retry) starts the
+ * audio: playWhenReady is still on but nothing plays (the queue ended, an error...), so the
+ * command plays at once. It is then a user play (decision B, iOS: `commandStartsPlayback`): an
+ * interruption while nothing played paused nothing, so the audio may be another app's or a call's.
+ */
+internal fun commandStartsPlayback(playWhenReady: Boolean, state: AudioPlayerState): Boolean =
+    playWhenReady && state in INTERRUPTION_FINISHED_STATES
+
 /** A user play: start it, or refuse it because the system keeps the audio (iOS: the same). */
 internal enum class UserPlayDecision { PLAY, REFUSED }
 
@@ -53,7 +62,11 @@ internal class InterruptionPolicy(
     private val autoResume: () -> Boolean
 ) {
     private var resumeOnEnd = false
-    /** An interruption began and has not ended (nor been overtaken by the user or a permanent loss). */
+    /**
+     * A call is in progress: an interruption began and has not ended, nor been overtaken by a
+     * permanent loss, headphones unplugged or a play the system allowed. A user pause does not
+     * end it: a play refused after that pause still resumes when the call ends.
+     */
     private var interrupted = false
 
     fun began(isPlaying: Boolean): InterruptionDecision {
@@ -79,18 +92,37 @@ internal class InterruptionPolicy(
         return InterruptionDecision(if (isPlaying) InterruptionAction.PAUSE else InterruptionAction.NONE, null)
     }
 
-    /** A play or pause from the user (app or remote control): an interruption's end no longer resumes. */
-    fun userCommand() {
+    /**
+     * A pause from the user (app or remote control): an interruption's end no longer resumes.
+     * The call is still in progress: a play refused after it resumes at its end.
+     */
+    fun userPause() {
+        resumeOnEnd = false
+    }
+
+    /**
+     * A stop or a reset from the user: nothing resumes, and the player leaves the call (Android
+     * gives the focus up, so no end would reach it): a play refused after it does not resume.
+     */
+    fun userStop() {
         forget()
     }
 
     /**
+     * A play from the user, decided from the system's answer alone ([activate]: Android requests
+     * the focus, iOS activates the session), also after an interruption that began and never
+     * ended: an answer that gives the audio overrules it. See [userPlay].
+     */
+    fun userPlay(activate: () -> Boolean): UserPlayDecision = userPlay(granted = activate())
+
+    /**
      * A play from the user (owner decision B): it starts only if the system gives the audio
-     * ([granted]: Android grants the focus; iOS activates the session, outside an interruption).
-     * Granted, it is a user command (an interruption's end no longer resumes). Refused, nothing
-     * starts now, but the user's last intent is to play: an interruption in progress (a call)
-     * resumes when it ends, if the system allows it ("pause, then auto-resume"); a later user
-     * pause still cancels that. Nothing else retries.
+     * ([granted]: Android grants the focus; iOS activates the session).
+     * Granted, the audio is back: no call is in progress any more and nothing resumes at an
+     * interruption's end. Refused, nothing starts now, but the user's last intent is to play: a
+     * call in progress resumes when it ends, also after a user pause during it, if the system
+     * allows it ("pause, then auto-resume"); a later user pause cancels that. Nothing else
+     * retries.
      */
     fun userPlay(granted: Boolean): UserPlayDecision {
         if (granted) {

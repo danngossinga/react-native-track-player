@@ -543,9 +543,10 @@ assert(
     !/requestAudioFocus\(/.test(musicService + orchestrator + engineSource) &&
     focusKt.includes('.setWillPauseWhenDucked(true)') &&
     focusKt.includes('AudioManager.AUDIOFOCUS_LOSS -> abandon()') &&
-    coordinatorKt.includes('fun userPlay(): Boolean = policy.userPlay(granted = focus.requestIfNeeded()) == UserPlayDecision.PLAY') &&
+    coordinatorKt.includes('fun userPlay(): Boolean = policy.userPlay(activate = focus::requestIfNeeded) == UserPlayDecision.PLAY') &&
     coordinatorKt.includes('        if (userPlay()) {\n            play()\n        } else {\n            refuse()\n            throw audioFocusRefused()') &&
-    coordinatorKt.includes('fun userStop() {\n        policy.userCommand()\n        focus.abandon()') &&
+    coordinatorKt.includes('fun userStop() {\n        policy.userStop()\n        focus.abandon()') &&
+    coordinatorKt.includes('fun userPause() {\n        policy.userPause()\n    }') &&
     coordinatorKt.includes('fun destroy() {\n        noisyReceiver.unregister()\n        focus.abandon()') &&
     coordinatorKt.includes('InterruptionAction.RESUME -> {\n                val granted = focus.requestIfNeeded()') &&
     coordinatorKt.includes('                if (!granted) {\n                    // Decision B: no play without the focus; reported, not retried.\n                    onResumeFailed(audioFocusRefused())\n                    return decision') &&
@@ -634,6 +635,38 @@ assert(
     musicService.includes('emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state, includeStandardError = false))') &&
     musicService.includes('bundle.putBundle(ERROR_KEY, if (includeStandardError) getPlaybackErrorBundle() else Bundle())'),
   'Android twelfth-review fixes must stay in place.'
+);
+
+// Thirteenth review: setPlayWhenReady settles its promise like play (a refusal rejects), and
+// every command that loads or moves the active track is a user play when it starts the audio
+// (commandStartsPlayback), from the app or a remote control, as on iOS.
+const androidModule = read('android/src/main/java/com/doublesymmetry/trackplayer/module/MusicModule.kt');
+assert(
+  section(androidModule, 'fun setPlayWhenReady(playWhenReady: Boolean, callback: Promise) {', '@ReactMethod').includes('completeCommand(callback) { musicService.setPlayWhenReady(playWhenReady) }') &&
+    !section(androidModule, 'fun setPlayWhenReady(playWhenReady: Boolean, callback: Promise) {', '@ReactMethod').includes('callback.resolve') &&
+    [['fun load(data: ReadableMap?', 'musicService.load('], ['fun skip(index: Double', 'musicService.skip('],
+      ['fun skipToNext(initialTime: Double', 'musicService.skipToNext('], ['fun skipToPrevious(initialTime: Double', 'musicService.skipToPrevious('],
+      ['fun seekTo(seconds: Double', 'musicService.seekTo('], ['fun seekBy(offset: Double', 'musicService.seekBy('],
+      ['fun retry(callback: Promise', 'musicService.retry(']].every(([start, call]) => {
+      const body = section(androidModule, start, '@ReactMethod');
+      return body.indexOf('completeCommand(callback) {') >= 0 && body.indexOf('completeCommand(callback) {') < body.indexOf(call);
+    }) &&
+    section(coordinatorKt, 'suspend fun runStartingCommand(', '/** A pause from the user').includes('        if (!commandStartsPlayback(playWhenReady, state) || userPlay()) {\n            command()\n            return true\n        }\n        pause()\n        command()\n        return false') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/InterruptionPolicy.kt').includes('    playWhenReady && state in INTERRUPTION_FINISHED_STATES') &&
+    section(musicService, 'private suspend fun runStartingCommand(', '@MainThread').includes('        if (!allowed) throw audioFocusRefused()') &&
+    [['suspend fun load(track: Track)', 'runStartingCommand(backend, "load") { backend.load(track.toAudioItem()) }'],
+      ['suspend fun skip(index: Int', 'runStartingCommand(backend, "skip") {\n                backend.skip(index)'],
+      ['suspend fun skipToNext(', 'runStartingCommand(backend, "skip-next") {\n                backend.skipToNext()'],
+      ['suspend fun skipToPrevious(', 'runStartingCommand(backend, "skip-previous") {\n                backend.skipToPrevious()'],
+      ['suspend fun seekTo(seconds: Float)', 'runStartingCommand(backend, "seek-to") { backend.seekTo('],
+      ['suspend fun seekBy(offset: Float)', 'runStartingCommand(backend, "seek-by") { backend.seekBy('],
+      ['suspend fun retry()', 'runStartingCommand(backend, "retry") { backend.retry() }']].every(([start, call]) =>
+      section(musicService, start, '@MainThread').includes(call)) &&
+    (musicService.match(/runStartingCommand\(it, null\) \{ it\.(skipToNext|skipToPrevious|seekTo|seekBy)\(/g) || []).length === 5 &&
+    section(musicService, 'private fun runOrchestratedRemoteCommand(', '@MainThread').includes('                if (refreshAfter && routedBackendType == PlaybackBackendType.PING_PONG) {\n                    refreshOrchestratedMediaSurface(reason = "remote-$reason")\n                }\n                refused?.let { throw it }') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionCoordinatorTest.kt').includes('fun aSkipAfterTheFocusWasLostWhileTheQueueEndedIsRefusedAndSilent()') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aSkipAfterTheQueueEndedPausedFirstStaysSilent()'),
+  'Android thirteenth-review fixes must stay in place.'
 );
 
 console.log('Android crossfade contracts OK');

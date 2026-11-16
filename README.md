@@ -85,11 +85,14 @@ Added fork surface:
   thread and is bounded by the load and play-start waits themselves. The play
   that resumes after an interruption is not awaited on either platform.
 - A play the system refuses (Android audio focus denied; iOS audio session not
-  activated, or a call in progress) does not start, on iOS and Android and both
-  backends: the player stays paused, `play()` / `setPlayWhenReady(true)` reject
-  with `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a play
-  no one awaits (a remote control, an interruption's resume) emits it as a
-  `PlaybackError`. Nothing retries by itself; the app shows its own message.
+  activated) does not start, on iOS and Android and both backends: the player
+  stays paused, `play()` / `setPlayWhenReady(true)` reject with
+  `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a play no
+  one awaits (a remote control, an interruption's resume) emits it as a
+  `PlaybackError`. A load, skip, seek or retry that would start the audio
+  (`playWhenReady` on, nothing playing) is a play too: refused, it runs paused
+  and rejects with that code. Nothing retries by itself; the app shows its own
+  message.
 - `incomingStallGraceMs` (crossfade, `setupPlayer` and `updateOptions`, default
   2000): how long a crossfade waits for the incoming track to start moving before
   it falls back to playing that track alone (`incoming_stalled`).

@@ -201,15 +201,21 @@ resume.
 
 A play the system refuses does not start, on both platforms and both backends:
 an Android audio focus request that is denied, or on iOS an audio session that
-cannot be activated or a play during an interruption (a call). The player stays
-paused (`playWhenReady` false, silent); `play()` and `setPlayWhenReady(true)`
-reject with `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a
-play no one awaits (an Android crossfade remote control, an interruption's
-resume) emits a `PlaybackError` with that code. A play refused during an
-interruption (a call) is not a pause: the user's last intent is to play, so
+cannot be activated (the answer alone decides: an interruption that began and
+never ended does not refuse a play the system allows). The player stays paused
+(`playWhenReady` false, silent); `play()` and `setPlayWhenReady(true)` reject
+with `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a play
+no one awaits (an Android crossfade remote control, an interruption's resume)
+emits a `PlaybackError` with that code. `load`, `skip`, `skipToNext`,
+`skipToPrevious`, `seekTo`, `seekBy` and `retry` issued while `playWhenReady`
+is on but nothing plays (the queue ended, an error) start the audio, so they are
+a play too: refused, the command still runs, paused, then rejects with
+`audio_focus_refused`. A play refused during an interruption (a call), even
+after a pause during it, is not a pause: the user's last intent is to play, so
 playback resumes when the interruption ends, if the system allows it (as for
-any interruption); a user pause after it cancels that. Nothing else retries: a
-later play tries again. Showing a message is up to the app.
+any interruption); a user pause after it cancels that, and a stop or reset
+ends the call for the player (nothing resumes). Nothing else retries: a later
+play tries again. Showing a message is up to the app.
 
 When it resumes, the event with `paused: false` is emitted as soon as the
 resume is issued, before playback has started, and a pause from the user

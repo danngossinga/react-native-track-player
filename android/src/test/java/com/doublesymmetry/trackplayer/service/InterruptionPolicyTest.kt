@@ -42,7 +42,7 @@ class InterruptionPolicyTest {
     @Test
     fun followsTheSharedScenarios() {
         val all = scenarios()
-        assertEquals(17, all.size)
+        assertEquals(22, all.size)
         for (scenario in all) {
             val id = scenario["id"] as String
             val autoResume = scenario["autoResume"] as Boolean
@@ -59,9 +59,12 @@ class InterruptionPolicyTest {
                     "ended" -> policy.ended(step["shouldResume"] as Boolean)
                     "lostPermanently" -> policy.lostPermanently(isPlaying())
                     "noisy" -> policy.noisy(isPlaying())
-                    "userPause" -> { policy.userCommand(); playing = false; InterruptionDecision(InterruptionAction.NONE, null) }
+                    "userPause" -> { policy.userPause(); playing = false; InterruptionDecision(InterruptionAction.NONE, null) }
+                    "userStop" -> { policy.userStop(); playing = false; InterruptionDecision(InterruptionAction.NONE, null) }
                     "userPlay" -> {
-                        val decision = policy.userPlay(granted = step["granted"] as Boolean? ?: true)
+                        // The system's answer (Android: the focus request; iOS: the activation).
+                        val granted = step["granted"] as Boolean? ?: true
+                        val decision = policy.userPlay(activate = { granted })
                         assertEquals("$id userPlay", step["action"] == "refused", decision == UserPlayDecision.REFUSED)
                         if (decision == UserPlayDecision.PLAY) playing = true
                         InterruptionDecision(InterruptionAction.NONE, null)

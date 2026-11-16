@@ -516,12 +516,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        completeCommand(callback) {
-            musicService.skip(index.toInt())
-            if (initialTime >= 0) {
-                musicService.seekTo(initialTime.toFloat())
-            }
-        }
+        completeCommand(callback) { musicService.skip(index.toInt(), initialTime.toFloat()) }
     }
     }
 
@@ -530,12 +525,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        completeCommand(callback) {
-            musicService.skipToNext()
-            if (initialTime >= 0) {
-                musicService.seekTo(initialTime.toFloat())
-            }
-        }
+        completeCommand(callback) { musicService.skipToNext(initialTime.toFloat()) }
     }
     }
 
@@ -544,12 +534,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        completeCommand(callback) {
-            musicService.skipToPrevious()
-            if (initialTime >= 0) {
-                musicService.seekTo(initialTime.toFloat())
-            }
-        }
+        completeCommand(callback) { musicService.skipToPrevious(initialTime.toFloat()) }
     }
     }
 
@@ -706,8 +691,7 @@ class MusicModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaM
         scope.launch {
         if (verifyServiceBoundOrReject(callback)) return@launch
 
-        musicService.setPlayWhenReady(playWhenReady)
-        callback.resolve(null)
+        completeCommand(callback) { musicService.setPlayWhenReady(playWhenReady) }
     }
     }
 

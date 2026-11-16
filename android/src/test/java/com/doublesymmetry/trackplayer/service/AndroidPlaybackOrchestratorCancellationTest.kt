@@ -1087,6 +1087,62 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aLoadOfANewTrackThatFailsLeavesThePlayerInErrorAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(1))
+            orchestrator.play()
+            runCurrent()
+            // A track not in the queue replaces it; its load gets no data and gives up.
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            engines.second.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val loaded = runCatching { orchestrator.load(testItems(1).single()) }
+            assertEquals("crossfade_prepare_timeout", (loaded.exceptionOrNull() as RejectionException).code)
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
+            assertFalse(engines.first.audible || engines.second.audible)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aSkipAfterTheQueueEndedPausedFirstStaysSilent() = runTest {
+        // The service's refusal (decision B) when the audio focus was lost while the queue
+        // ended: it pauses, then runs the skip. Without that pause the skip plays at once.
+        for (pausedFirst in listOf(false, true)) {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(2))
+                orchestrator.play()
+                orchestrator.skip(1)
+                engines.first.ended = true
+                engines.second.ended = true
+                advanceTimeBy(1_000L)
+                runCurrent()
+                assertEquals(AudioPlayerState.ENDED, delegate.playbackStates.last())
+                assertTrue(orchestrator.snapshot().playWhenReady)
+                engines.first.ended = false
+                engines.second.ended = false
+
+                if (pausedFirst) orchestrator.pause()
+                orchestrator.skip(0)
+                runCurrent()
+                assertEquals("$pausedFirst", !pausedFirst, engines.first.audible || engines.second.audible)
+                assertEquals("$pausedFirst", !pausedFirst, orchestrator.snapshot().playWhenReady)
+                assertEquals(
+                    "$pausedFirst",
+                    if (pausedFirst) AudioPlayerState.PAUSED else AudioPlayerState.PLAYING,
+                    orchestrator.snapshot().playbackState
+                )
+                assertEquals(0, orchestrator.snapshot().currentIndex)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
     fun aPlayOrASeekAfterStopWhoseLoadFailsEndsInErrorAsOnIos() = runTest {
         for (command in listOf("play", "seek")) {
             val (orchestrator, engines, delegate) = ninth()

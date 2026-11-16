@@ -28,7 +28,7 @@ internal class InterruptionCoordinator(
      * A play from the user (app, notification, lock screen, headset): an interruption's end no
      * longer resumes, and the focus is requested. True when the focus is held.
      */
-    fun userPlay(): Boolean = policy.userPlay(granted = focus.requestIfNeeded()) == UserPlayDecision.PLAY
+    fun userPlay(): Boolean = policy.userPlay(activate = focus::requestIfNeeded) == UserPlayDecision.PLAY
 
     /**
      * A user play on a backend: plays when the focus is granted; refused, the backend is paused
@@ -43,14 +43,37 @@ internal class InterruptionCoordinator(
         }
     }
 
+    /**
+     * A command that loads or moves the active track (load, skip, seek, retry), from the app or a
+     * remote control. When it starts the audio ([commandStartsPlayback]) it is a user play: the
+     * focus is requested; refused, the backend is paused first (playWhenReady off, silent), the
+     * command still runs, paused, and this returns false (the caller rejects with
+     * `audio_focus_refused` once its media surface is up to date). A command that starts nothing
+     * requests nothing. A failure of the command itself is thrown as it is.
+     */
+    suspend fun runStartingCommand(
+        playWhenReady: Boolean,
+        state: com.doublesymmetry.kotlinaudio.models.AudioPlayerState,
+        pause: suspend () -> Unit,
+        command: suspend () -> Unit
+    ): Boolean {
+        if (!commandStartsPlayback(playWhenReady, state) || userPlay()) {
+            command()
+            return true
+        }
+        pause()
+        command()
+        return false
+    }
+
     /** A pause from the user: an interruption's end no longer resumes. */
     fun userPause() {
-        policy.userCommand()
+        policy.userPause()
     }
 
     /** A stop or a reset from the user: no resume, and the focus is given up. */
     fun userStop() {
-        policy.userCommand()
+        policy.userStop()
         focus.abandon()
     }
 

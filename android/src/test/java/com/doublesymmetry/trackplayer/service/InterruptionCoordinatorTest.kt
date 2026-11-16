@@ -323,4 +323,67 @@ class InterruptionCoordinatorTest {
         assertEquals(listOf(AUDIO_FOCUS_REFUSED), failures.map { (it as com.doublesymmetry.trackplayer.utils.RejectionException).code })
         assertEquals(listOf(RemoteDuckPayload(paused = false, permanent = false)), ducks)
     }
+    @Test
+    fun aSkipAfterTheFocusWasLostWhileTheQueueEndedIsRefusedAndSilent() {
+        val harness = Harness()
+        harness.userPlay()
+        // The queue ended (playWhenReady stays on), then a call takes the focus: nothing paused.
+        harness.state = AudioPlayerState.ENDED
+        harness.focus.change(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertTrue(harness.playing)
+        harness.focus.grant = false
+        val calls = mutableListOf<String>()
+        var allowed = true
+        runTest {
+            allowed = harness.coordinator.runStartingCommand(
+                playWhenReady = harness.playing,
+                state = harness.state,
+                pause = { calls += "pause"; harness.playing = false },
+                command = { calls += "skip" }
+            )
+        }
+        // Refused: paused before the skip runs, so the skipped track does not start.
+        assertFalse(allowed)
+        assertEquals(listOf("pause", "skip"), calls)
+        assertFalse(harness.playing)
+        assertEquals(2, harness.focus.requests)
+        // The user's last intent is to play: the call's end resumes the skipped track.
+        harness.state = AudioPlayerState.PAUSED
+        harness.focus.grant = true
+        harness.focus.change(AudioManager.AUDIOFOCUS_GAIN)
+        assertTrue(harness.playing)
+    }
+
+    @Test
+    fun aStartingCommandThatStartsNothingRequestsNothing() = runTest {
+        val focus = FakeFocus(grant = false)
+        val coordinator = InterruptionCoordinator({ true }, focus, FakeReceiver()) { }
+        var ran = 0
+        // Playing (the focus is ours) or not asked to play: no request, the command runs.
+        assertTrue(coordinator.runStartingCommand(true, AudioPlayerState.PLAYING, { error("paused") }) { ran += 1 })
+        assertTrue(coordinator.runStartingCommand(false, AudioPlayerState.ENDED, { error("paused") }) { ran += 1 })
+        assertEquals(2, ran)
+        assertEquals(0, focus.requests)
+        // Asked to play after the queue ended, with the focus still held: no new request.
+        focus.grant = true
+        coordinator.userPlay()
+        assertTrue(coordinator.runStartingCommand(true, AudioPlayerState.ENDED, { error("paused") }) { ran += 1 })
+        assertEquals(1, focus.requests)
+        assertEquals(3, ran)
+        for (state in AudioPlayerState.values()) {
+            assertEquals("$state", state in INTERRUPTION_FINISHED_STATES, commandStartsPlayback(true, state))
+            assertFalse("$state", commandStartsPlayback(false, state))
+        }
+    }
+
+    @Test
+    fun aRefusedStartingCommandThatFailsByItselfKeepsItsOwnFailure() = runTest {
+        val coordinator = InterruptionCoordinator({ true }, FakeFocus(grant = false), FakeReceiver()) { }
+        var paused = false
+        val failure = runCatching {
+            coordinator.runStartingCommand(true, AudioPlayerState.ENDED, { paused = true }) { error("load failed") }
+        }.exceptionOrNull()
+        assertEquals("load failed", failure?.message)
+        assertTrue(paused)
+    }
 }

@@ -293,20 +293,18 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             // playWhenReady off itself when the system pauses it for the interruption.
             let (action, duck) = decide(self.interruptionPolicy, backend.interruptionIsPlaying)
             IOSPlaybackLog.log("interruption action=\(action) backend=\(backend.kind)")
-            switch action {
+            // Decision B: no resume without the session; reported, not retried.
+            switch self.interruptionPolicy.step(for: action, activate: { self.activateAudioSessionForPlayback() }) {
             case .pause: backend.pause()
-            case .resume:
-                // Decision B: no resume without the session; reported, not retried.
-                guard self.activateAudioSessionForPlayback() else {
-                    let error = audioFocusRefusedError()
-                    DispatchQueue.main.async {
-                        self.emit(event: EventType.PlaybackError, body: [
-                            "code": audioFocusRefusedCode,
-                            "message": error.localizedDescription
-                        ])
-                    }
-                    break
+            case .resumeRefused:
+                let error = audioFocusRefusedError()
+                DispatchQueue.main.async {
+                    self.emit(event: EventType.PlaybackError, body: [
+                        "code": audioFocusRefusedCode,
+                        "message": error.localizedDescription
+                    ])
                 }
+            case .resume:
                 // Not awaited (the crossfade backend's play waits for playback to start): the
                 // remote-duck goes out now, and a user pause is admitted at once instead of
                 // queueing behind the resume, as on Android. A failed resume is logged; the gain
@@ -865,17 +863,29 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     /// Decision B, the same rule as Android on both backends: a user play starts only when the
-    /// session activates and no interruption (a call) is in progress. Refused: the backend is
-    /// paused (playWhenReady off, silent) and the play fails with `audio_focus_refused`. Runs in
-    /// the admitted operation, ordered with the interruption events.
+    /// session activates (decided from the activation alone, as Android from the focus).
+    /// Refused: the backend is paused (playWhenReady off, silent) and the play fails with
+    /// `audio_focus_refused`. Runs in the admitted operation, ordered with the interruption events.
     private func userPlayIsAllowed(_ backend: IOSPlaybackBackendRouting) -> Bool {
-        let interrupted = interruptionPolicy.isInterrupted
-        let granted = !interrupted && activateAudioSessionForPlayback()
-        guard interruptionPolicy.userPlay(granted: granted) == .play else {
+        guard interruptionPolicy.userPlay(activate: { activateAudioSessionForPlayback() }) == .play else {
             backend.pause()
             return false
         }
         return true
+    }
+
+    /// A command that loads or moves the active track (load, skip, seek, retry): a user play when
+    /// it starts the audio (`commandStartsPlayback`, decision B, the same rule as Android). The
+    /// session is then activated; refused, the backend is paused first (silent), the command still
+    /// runs, paused, and fails with `audio_focus_refused` (its own failure first). A command that
+    /// starts nothing activates nothing. Runs in the admitted operation.
+    private func runStartingCommand<Value>(
+        _ backend: IOSPlaybackBackendRouting,
+        completion: @escaping (Result<Value, Error>) -> Void,
+        _ command: (@escaping (Result<Value, Error>) -> Void) -> Void
+    ) {
+        let allowed = !backend.startingCommandPlays || userPlayIsAllowed(backend)
+        command { result in completion(applyingPlayRefusal(refused: !allowed, to: result)) }
     }
 
     @objc(setupPlayer:resolver:rejecter:)
@@ -1306,8 +1316,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
 
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.load(track, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) { backend.load(track, completion: $0) }
+        }) { (result: Result<Int, Error>) in
             switch result {
             case .success(let index):
                 resolve(index)
@@ -1394,8 +1404,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         print("Skipping to track:", index)
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.skip(to: index, initialTime: initialTime, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) {
+                backend.skip(to: index, initialTime: initialTime, completion: $0)
+            }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
@@ -1414,8 +1426,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.skipToNext(initialTime: initialTime, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) {
+                backend.skipToNext(initialTime: initialTime, completion: $0)
+            }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
@@ -1434,8 +1448,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.skipToPrevious(initialTime: initialTime, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) {
+                backend.skipToPrevious(initialTime: initialTime, completion: $0)
+            }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
@@ -1452,7 +1468,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         // Captures the policy, not self: deinit resets too.
         withActivePlaybackBackendSerialized({ [interruptionPolicy] backend in
             // In the admitted operation: ordered with the interruption events.
-            interruptionPolicy.userCommand()
+            interruptionPolicy.userStop()
             backend.stop()
             backend.clearQueue()
         }) { result in
@@ -1490,7 +1506,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         withActivePlaybackBackendSerialized({ backend in
             // In the admitted operation: ordered with the interruption events.
-            self.interruptionPolicy.userCommand()
+            self.interruptionPolicy.userPause()
             backend.pause()
         }) { result in
             switch result {
@@ -1511,7 +1527,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                     return
                 }
             } else {
-                self.interruptionPolicy.userCommand()
+                self.interruptionPolicy.userPause()
             }
             backend.setPlayWhenReady(playWhenReady, completion: completion)
         }) { (result: Result<Void, Error>) in
@@ -1540,7 +1556,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         withActivePlaybackBackendSerialized({ backend in
             // In the admitted operation: ordered with the interruption events.
-            self.interruptionPolicy.userCommand()
+            self.interruptionPolicy.userStop()
             backend.stop()
         }) { result in
             switch result {
@@ -1555,13 +1571,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.seek(to: time, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) { backend.seek(to: time, completion: $0) }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("seek_failed", "Unable to seek.", error)
+                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
             }
         }
     }
@@ -1571,13 +1587,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         withActivePlaybackBackendAsync({ backend, completion in
-            backend.seek(by: offset, completion: completion)
-        }) { result in
+            self.runStartingCommand(backend, completion: completion) { backend.seek(by: offset, completion: $0) }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("seek_failed", "Unable to seek.", error)
+                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
             }
         }
     }
@@ -1585,10 +1601,15 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(retry:rejecter:)
     public func retry(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        withActivePlaybackBackendSerialized({ $0.retry() }) { result in
+        withActivePlaybackBackendAsync({ backend, completion in
+            self.runStartingCommand(backend, completion: completion) { done in
+                backend.retry()
+                done(.success(()))
+            }
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success: resolve(NSNull())
-            case .failure(let error): reject("retry_failed", "Unable to retry playback.", error)
+            case .failure(let error): reject(self.rejectionCode(error, "retry_failed"), "Unable to retry playback.", error)
             }
         }
     }

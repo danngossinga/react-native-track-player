@@ -496,7 +496,7 @@ assert(
       ['public func stop(resolve:', 'public func seekTo(time:'],
       ['public func reset(resolve:', 'public func play(resolve:']].every(([start, end]) => {
       const body = commandBody(start, end);
-      const call = body.search(/(self\.)?interruptionPolicy\.userCommand\(\)|self\.userPlayIsAllowed\(backend\)/);
+      const call = body.search(/(self\.)?interruptionPolicy\.user(Pause|Stop)\(\)|self\.userPlayIsAllowed\(backend\)/);
       return call >= 0 && body.indexOf('withActivePlaybackBackend') < call;
     }) &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('scripts/fixtures/interruption-scenarios.json'),
@@ -513,7 +513,7 @@ assert(
     section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
     (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
     player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", audioFocusRefusedCode]') &&
-    (player.match(/reject\("seek_failed", "Unable to seek\.", error\)/g) || []).length === 2 &&
+    (player.match(/reject\(self\.rejectionCode\(error, "seek_failed"\), "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
     player.includes('reject(self.rejectionCode(error, "playback_failed"), "Unable to start playback.", error)') &&
@@ -561,16 +561,32 @@ assert(
 // Decision B: a play the system refuses does not start, on both iOS backends.
 const userPlayAllowed = section(player, 'private func userPlayIsAllowed(', '@objc(setupPlayer:');
 assert(
-  userPlayAllowed.includes('let interrupted = interruptionPolicy.isInterrupted\n        let granted = !interrupted && activateAudioSessionForPlayback()\n        guard interruptionPolicy.userPlay(granted: granted) == .play else {\n            backend.pause()\n            return false') &&
+  userPlayAllowed.includes('guard interruptionPolicy.userPlay(activate: { activateAudioSessionForPlayback() }) == .play else {\n            backend.pause()\n            return false') &&
+    !player.includes('isInterrupted') &&
     section(player, 'private func activateAudioSessionForPlayback()', 'private func userPlayIsAllowed(').includes('        do {\n            try audioSessionController.activateSession()\n        } catch {\n            activated = false\n        }') &&
     section(player, 'private func activateAudioSessionForPlayback()', 'private func userPlayIsAllowed(').includes('        return activated\n') &&
     section(player, 'public func play(resolve:', 'public func pause(resolve:').includes('            guard self.userPlayIsAllowed(backend) else {\n                completion(.failure(audioFocusRefusedError()))\n                return\n            }\n            backend.play(completion: completion)') &&
     section(player, 'public func setPlayWhenReady(playWhenReady:', 'public func getPlayWhenReady(').includes('            if playWhenReady {\n                guard self.userPlayIsAllowed(backend) else {\n                    completion(.failure(audioFocusRefusedError()))') &&
-    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('                guard self.activateAudioSessionForPlayback() else {\n                    let error = audioFocusRefusedError()') &&
-    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('"code": audioFocusRefusedCode,') &&
+    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('            switch self.interruptionPolicy.step(for: action, activate: { self.activateAudioSessionForPlayback() }) {\n            case .pause: backend.pause()\n            case .resumeRefused:\n                let error = audioFocusRefusedError()\n                DispatchQueue.main.async {\n                    self.emit(event: EventType.PlaybackError, body: [\n                        "code": audioFocusRefusedCode,') &&
+    // Thirteenth review: every command that loads or moves the active track is a user play
+    // when it starts the audio (commandStartsPlayback, read on main on both backends).
+    section(player, 'private func runStartingCommand<Value>(', '@objc(setupPlayer:').includes('let allowed = !backend.startingCommandPlays || userPlayIsAllowed(backend)\n        command { result in completion(applyingPlayRefusal(refused: !allowed, to: result)) }') &&
+    [['public func load(', 'public func remove(tracks'],
+      ['public func skip(', 'public func skipToNext('],
+      ['public func skipToNext(', 'public func skipToPrevious('],
+      ['public func skipToPrevious(', 'public func reset(resolve:'],
+      ['public func seekTo(time:', 'public func seekBy(offset:'],
+      ['public func seekBy(offset:', 'public func retry(resolve:'],
+      ['public func retry(resolve:', 'public func setRepeatMode(']].every(([start, end]) =>
+      section(player, start, end).includes('self.runStartingCommand(backend, completion: completion)')) &&
+    (player.match(/backend\.(load\(track|skip\(to: index|skipToNext\(initialTime|skipToPrevious\(initialTime|seek\(to: time|seek\(by: offset|retry\(\))/g) || []).length === 7 &&
+    section(player, 'public func retry(resolve:', 'public func setRepeatMode(').includes('reject(self.rejectionCode(error, "retry_failed")') &&
+    standardBackend.includes('    var startingCommandPlays: Bool {\n        return onMain {\n            commandStartsPlayback(playWhenReady: publicPlayWhenReady, stateRawValue: playbackState.rawValue)') &&
+    pingPongBackend.includes('    var startingCommandPlays: Bool {\n        return (try? performPlaybackBackendOnMainSync {\n            commandStartsPlayback(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)') &&
     player.includes('"crossfade_start_failed", audioFocusRefusedCode]') &&
     facade.includes('let audioFocusRefusedCode = "audio_focus_refused"') &&
-    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayDuringAnInterruptionIsRefusedAndNothingRetries()'),
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayIsDecidedFromTheActivationAlone()') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAResumeNeedsTheSessionAndNothingElseActivatesIt()'),
   'iOS must refuse a play the system does not give the audio to (audio_focus_refused) on both backends.'
 );
 

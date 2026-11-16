@@ -1,5 +1,5 @@
 {
-  "comment": "Shared by the Android JVM tests and the iOS XCTests (InterruptionPolicy). userPlay carries granted (default true): whether the system gives the audio (Android focus, iOS session activation outside an interruption); refused, the play is refused (audio_focus_refused) and playing stays false. playing is the backend's playWhenReady and state its playback state (default playing; 'ended' after the queue ended); both platforms count it as playing with the same rule (interruptionCountsAsPlaying). Events: began (call or transient focus loss, can-duck included), ended (with shouldResume), lostPermanently, noisy (headphones unplugged / route oldDeviceUnavailable), userPause, userPlay. Each step gives the expected action (pause, resume or none) and the remote-duck payload (null when none is emitted).",
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (InterruptionPolicy). userPlay carries granted (default true): whether the system gives the audio (Android focus, iOS session activation; decided from that answer alone); refused, the play is refused (audio_focus_refused) and playing stays false. playing is the backend's playWhenReady and state its playback state (default playing; 'ended' after the queue ended); both platforms count it as playing with the same rule (interruptionCountsAsPlaying). Events: began (call or transient focus loss, can-duck included), ended (with shouldResume), lostPermanently, noisy (headphones unplugged / route oldDeviceUnavailable), userPause, userStop (stop or reset), userPlay. Each step gives the expected action (pause, resume or none) and the remote-duck payload (null when none is emitted).",
   "scenarios": [
     {
       "id": "FOCUS-01a call or focus loss then end with resume: pause then resume",
@@ -147,6 +147,53 @@
       "autoResume": true, "playing": true, "state": "ended",
       "steps": [
         { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-REFUSED-e the user paused during a call, then a play the system refuses: resumed when it ends (the user's last intent decides)",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPause", "action": "none", "duck": null },
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-REFUSED-f a play the system refuses outside a call: nothing resumes at a later end",
+      "autoResume": true, "playing": false,
+      "steps": [
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-REFUSED-g a stop during a call leaves it: a play refused after it does not resume",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userStop", "action": "none", "duck": null },
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-05a an interruption that began and never ended: a play the system allows plays, and ends that interruption",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPlay", "action": "none", "duck": null },
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-05b a play the system allows during an interruption: nothing resumes when it ends",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPlay", "action": "none", "duck": null },
         { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
       ]
     }

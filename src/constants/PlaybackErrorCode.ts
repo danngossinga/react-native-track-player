@@ -5,9 +5,11 @@
 export enum PlaybackErrorCode {
   /**
    * The system did not give the audio to this player (decision B): an Android audio focus
-   * request was denied, or iOS could not activate the audio session or a call (an interruption)
-   * is in progress. Nothing plays (paused, `playWhenReady` false) and nothing retries by
-   * itself; a later play tries again. `play()` / `setPlayWhenReady(true)` reject with it; a
+   * request was denied, or iOS could not activate the audio session. Nothing plays (paused,
+   * `playWhenReady` false) and nothing retries by itself; a later play tries again.
+   * `play()` / `setPlayWhenReady(true)` reject with it, and so do `load`, `skip*`, `seek*` and
+   * `retry` when they would start the audio (`playWhenReady` on, nothing playing: they run
+   * paused); a
    * play no one awaits (a remote control on Android's crossfade backend, an interruption's
    * resume) emits it as `PlaybackError`. Showing a message (for example "can't play during a
    * call") is up to the app.

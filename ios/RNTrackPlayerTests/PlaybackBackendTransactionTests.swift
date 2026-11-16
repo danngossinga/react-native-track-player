@@ -306,7 +306,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/interruption-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 17)
+        XCTAssertEqual(scenarios.count, 22)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             let autoResume = scenario["autoResume"] as? Bool ?? false
@@ -323,9 +323,12 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 case "ended": result = policy.ended(shouldResume: step["shouldResume"] as? Bool ?? false)
                 case "lostPermanently": result = policy.lostPermanently(isPlaying: isPlaying())
                 case "noisy": result = policy.noisy(isPlaying: isPlaying())
-                case "userPause": policy.userCommand(); playing = false; result = (.none, nil)
+                case "userPause": policy.userPause(); playing = false; result = (.none, nil)
+                case "userStop": policy.userStop(); playing = false; result = (.none, nil)
                 case "userPlay":
-                    let decision = policy.userPlay(granted: step["granted"] as? Bool ?? true)
+                    // The system's answer (iOS: the activation; Android: the focus request).
+                    let granted = step["granted"] as? Bool ?? true
+                    let decision = policy.userPlay(activate: { granted })
                     XCTAssertEqual(decision == .refused, step["action"] as? String == "refused", "\(id) userPlay")
                     if decision == .play { playing = true }
                     continue
@@ -396,20 +399,49 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(ledger.completed(at: 5) === latest)
     }
 
-    func testAPlayDuringAnInterruptionIsRefusedAndNothingRetries() {
-        // The module's rule (decision B): granted = the session activates and no interruption is
-        // in progress.
+    func testAPlayIsDecidedFromTheActivationAlone() {
+        // The module's rule (decision B): the play starts when the session activates, also after
+        // an interruption that began and never ended.
         let policy = InterruptionPolicy(autoResume: { true })
-        XCTAssertFalse(policy.isInterrupted)
         _ = policy.began(isPlaying: true)
-        XCTAssertTrue(policy.isInterrupted)
-        XCTAssertEqual(policy.userPlay(granted: !policy.isInterrupted && true), .refused)
-        // The user's last intent was to play: the call's end resumes (nothing else retries).
-        XCTAssertTrue(policy.isInterrupted)
-        XCTAssertEqual(policy.ended(shouldResume: true).0, .resume)
-        XCTAssertEqual(policy.userPlay(granted: !policy.isInterrupted && true), .play)
+        var activations = 0
+        XCTAssertEqual(policy.userPlay(activate: { activations += 1; return false }), .refused)
+        XCTAssertEqual(activations, 1)
+        XCTAssertEqual(policy.userPlay(activate: { activations += 1; return true }), .play)
+        XCTAssertEqual(activations, 2)
+        // The allowed play ended that interruption: a later refused play arms no resume.
+        XCTAssertEqual(policy.userPlay(activate: { false }), .refused)
+        XCTAssertEqual(policy.ended(shouldResume: true).0, .none)
         XCTAssertEqual(audioFocusRefusedCode, "audio_focus_refused")
         XCTAssertEqual((audioFocusRefusedError() as NSError).userInfo["code"] as? String, "audio_focus_refused")
+    }
+
+    func testAResumeNeedsTheSessionAndNothingElseActivatesIt() {
+        let policy = InterruptionPolicy(autoResume: { true })
+        var activations = 0
+        XCTAssertEqual(policy.step(for: .none, activate: { activations += 1; return true }), .none)
+        XCTAssertEqual(policy.step(for: .pause, activate: { activations += 1; return true }), .pause)
+        XCTAssertEqual(activations, 0)
+        XCTAssertEqual(policy.step(for: .resume, activate: { activations += 1; return true }), .resume)
+        XCTAssertEqual(policy.step(for: .resume, activate: { activations += 1; return false }), .resumeRefused)
+        XCTAssertEqual(activations, 2)
+    }
+
+    func testOnlyACommandIssuedWhileAskedToPlayWithNothingPlayingStartsTheAudio() {
+        for state in ["none", "ready", "playing", "paused", "stopped", "buffering", "loading", "error", "ended"] {
+            XCTAssertEqual(commandStartsPlayback(playWhenReady: true, stateRawValue: state),
+                           ["none", "ended", "error", "stopped"].contains(state), state)
+            XCTAssertFalse(commandStartsPlayback(playWhenReady: false, stateRawValue: state), state)
+        }
+        // Refused, the command ran paused: it fails with audio_focus_refused, unless it failed
+        // by itself.
+        let ok: Result<Int, Error> = .success(3)
+        XCTAssertEqual(try applyingPlayRefusal(refused: false, to: ok).get(), 3)
+        guard case .failure(let refusal) = applyingPlayRefusal(refused: true, to: ok) else { return XCTFail("not refused") }
+        XCTAssertEqual((refusal as NSError).userInfo["code"] as? String, audioFocusRefusedCode)
+        let own = NSError(domain: "test", code: 1)
+        guard case .failure(let kept) = applyingPlayRefusal(refused: true, to: Result<Int, Error>.failure(own)) else { return XCTFail("succeeded") }
+        XCTAssertTrue((kept as NSError) === own)
     }
 
     func testInterruptionPolicyReadsTheOptionAtTheEnd() {

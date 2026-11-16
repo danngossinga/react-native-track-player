@@ -98,6 +98,8 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
     /// Whether it plays as far as an interruption is concerned: what the module last asked
     /// (play, pause, stop...), not a pause the system made for the interruption itself.
     var interruptionIsPlaying: Bool { get }
+    /// Whether a load, skip, seek or retry would start the audio now (`commandStartsPlayback`).
+    var startingCommandPlays: Bool { get }
     var publicRepeatMode: Int { get }
     var queue: [Track] { get }
 
@@ -502,6 +504,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     var interruptionIsPlaying: Bool {
         return onMain {
             interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady, stateRawValue: playbackState.rawValue)
+        }
+    }
+    /// SwiftAudioEx's own playWhenReady: the one a load or skip starts the audio with. Read on main.
+    var startingCommandPlays: Bool {
+        return onMain {
+            commandStartsPlayback(playWhenReady: publicPlayWhenReady, stateRawValue: playbackState.rawValue)
         }
     }
     private var requested = RequestedPlayback()
