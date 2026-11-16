@@ -327,4 +327,41 @@ class PlaybackBackendRuntimePrimitivesTest {
         runCatching { gate.await(expectedIndex = 0, expectedPositionMs = 0L) { notReady } }
         assertEquals(400L, currentTime - again)
     }
+
+    @Test
+    fun aStandardSeekWaitsWhileBufferingGrowsAndFailsWhenItStalls() = runTest {
+        var stall = 300L
+        var limit = 2_000L
+        val gate = StandardSeekGate(timeoutMs = { limit }, stallTimeoutMs = { stall }, pollIntervalMs = 100L, nowMs = { currentTime })
+        // Buffering at the target, data arriving: it waits up to its limit.
+        var buffered = 0L
+        val started = currentTime
+        val progressing = runCatching {
+            gate.await(20_000L) {
+                buffered += 500L
+                StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, buffered)
+            }
+        }
+        assertEquals("standard_seek_timeout", (progressing.exceptionOrNull() as RejectionException).code)
+        assertEquals(2_000L, currentTime - started)
+        // No data: it fails at the stall timeout read now.
+        stall = 400L
+        val stalledAt = currentTime
+        val stalled = runCatching {
+            gate.await(20_000L) { StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, 9_000L) }
+        }
+        assertEquals("standard_seek_timeout", (stalled.exceptionOrNull() as RejectionException).code)
+        assertEquals(400L, currentTime - stalledAt)
+        // Ready at the target: done at once; a seek past the end completes at the end.
+        limit = 60_000L
+        gate.await(20_000L) { StandardSeekObservation(AudioPlayerState.READY, 20_100L, 25_000L) }
+        gate.await(90_000L) { StandardSeekObservation(AudioPlayerState.PAUSED, 60_000L, 60_000L, durationMs = 60_000L) }
+    }
+
+    @Test
+    fun aStandardSeekFailsAtOnceOnAPlayerError() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
+        val failed = runCatching { gate.await(1_000L) { StandardSeekObservation(AudioPlayerState.ERROR, 0L, 0L) } }
+        assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
+    }
 }

@@ -212,6 +212,10 @@ class KotlinAudioMediaSessionControlInstrumentationTest {
                     readinessGate = StandardPlaybackReadinessGate(
                         timeoutMs = { DEFAULT_STANDARD_READY_TIMEOUT_MS },
                         stallTimeoutMs = { DEFAULT_STALL_TIMEOUT_MS }
+                    ),
+                    seekGate = StandardSeekGate(
+                        timeoutMs = { DEFAULT_STANDARD_SEEK_TIMEOUT_MS },
+                        stallTimeoutMs = { DEFAULT_STALL_TIMEOUT_MS }
                     )
                 )
                 val snapshot = PlaybackBackendSnapshot.empty().copy(

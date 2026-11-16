@@ -474,6 +474,47 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPlayWaitsForPlaybackToStartWithTheCurrentLimitsAndPausesWhenItStalls() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            var limit = 45_000L
+            orchestrator.playStartTimeoutMs = { limit }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            // A slow start that keeps loading: playing after 20 s, past the stall timeout.
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 20_000L, nowMs = { currentTime })
+            val started = currentTime
+            orchestrator.play()
+            assertEquals(20_000L, currentTime - started)
+            assertEquals(45_000L, engineA.lastPlayStartTimeoutMs)
+            assertEquals(10_000L, engineA.lastPlayStartStallTimeoutMs)
+            assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+
+            // A new limit applies to the next play; a start with no data fails at the stall
+            // timeout, pauses, and reports the error.
+            limit = 30_000L
+            orchestrator.pause()
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val stalledAt = currentTime
+            try {
+                orchestrator.play()
+                fail("Expected the play start to fail")
+            } catch (error: RejectionException) {
+                assertEquals("crossfade_play_start_timeout", error.code)
+            }
+            assertEquals(10_000L, currentTime - stalledAt)
+            assertEquals(30_000L, engineA.lastPlayStartTimeoutMs)
+            assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
+            assertEquals("crossfade_play_start_timeout", delegate.playbackErrors.last().first)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -713,6 +754,12 @@ class AndroidPlaybackOrchestratorCancellationTest {
          * the real engine with the limits the orchestrator passed.
          */
         var simulatedLoad: SimulatedLoad? = null
+        /** When set, the next play start behaves like [simulatedLoad] (time to start, data rate). */
+        var simulatedStart: SimulatedLoad? = null
+        var lastPlayStartTimeoutMs: Long? = null
+            private set
+        var lastPlayStartStallTimeoutMs: Long? = null
+            private set
 
         override val positionMs: Long
             get() = position
@@ -784,6 +831,24 @@ class AndroidPlaybackOrchestratorCancellationTest {
         }
 
         override fun play(rate: Float) = Unit
+
+        override suspend fun awaitPlaying(timeoutMs: Long, stallTimeoutMs: Long, ticket: PlaybackOperationTicket?) {
+            lastPlayStartTimeoutMs = timeoutMs
+            lastPlayStartStallTimeoutMs = stallTimeoutMs
+            val start = simulatedStart?.also { simulatedStart = null } ?: return
+            var bytes = 0L
+            var elapsed = 0L
+            val verdict = awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs,
+                totalTimeoutMs = timeoutMs,
+                pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                nowMs = start.nowMs,
+                pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it); elapsed += it },
+                readings = { bytes += start.bytesPerPoll; longArrayOf(bytes) }
+            ) { elapsed >= start.readyAfterMs }
+            if (verdict != null) throw RejectionException("$name did not start playing.", "crossfade_play_start_timeout")
+        }
+
         override fun pause() = Unit
 
         override fun reset() {

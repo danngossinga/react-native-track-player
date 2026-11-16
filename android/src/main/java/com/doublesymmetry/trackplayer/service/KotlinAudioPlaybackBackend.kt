@@ -147,6 +147,8 @@ internal class KotlinAudioPlaybackBackend(
     private val suspendControlSurface: () -> Unit = {},
     private val resumeControlSurface: suspend (AudioPlayerState) -> Unit = {},
     private val readinessGate: StandardPlaybackReadinessGate,
+    /** Waits for every seek, as on iOS (`standardSeekTimeoutMs`, `stallTimeoutMs`). */
+    private val seekGate: StandardSeekGate,
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -338,7 +340,17 @@ internal class KotlinAudioPlaybackBackend(
         }
     }
     override fun pause() { player.pause() }
-    override suspend fun seekTo(positionMs: Long) { player.seek(positionMs, TimeUnit.MILLISECONDS) }
+    override suspend fun seekTo(positionMs: Long) {
+        player.seek(positionMs, TimeUnit.MILLISECONDS)
+        seekGate.await(positionMs) {
+            StandardSeekObservation(
+                state = player.playerState,
+                positionMs = player.position,
+                bufferedPositionMs = player.bufferedPosition,
+                durationMs = player.duration.coerceAtLeast(0L)
+            )
+        }
+    }
 
     override suspend fun startTransition(request: PlaybackTransitionRequest) {
         throw RejectionException(

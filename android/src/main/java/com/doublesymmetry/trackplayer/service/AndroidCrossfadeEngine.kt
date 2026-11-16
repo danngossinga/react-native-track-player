@@ -62,6 +62,11 @@ internal interface AndroidCrossfadeEnginePort {
         ticket: PlaybackOperationTicket? = null
     )
     fun play(rate: Float = 1f)
+    /**
+     * Waits for playback to start after [play]: fails (and pauses) when nothing loads and the time
+     * does not move for [stallTimeoutMs], or after [timeoutMs] (`playStartTimeoutMs`), as on iOS.
+     */
+    suspend fun awaitPlaying(timeoutMs: Long, stallTimeoutMs: Long, ticket: PlaybackOperationTicket? = null)
     fun pause()
     fun reset()
     fun release()
@@ -232,6 +237,36 @@ internal class AndroidCrossfadeEngine(
         state = AndroidCrossfadeEngineState.PLAYING
     }
 
+    override suspend fun awaitPlaying(timeoutMs: Long, stallTimeoutMs: Long, ticket: PlaybackOperationTicket?) {
+        val generation = operationGeneration
+        val verdict = awaitWhileProgressing(
+            stallTimeoutMs = stallTimeoutMs,
+            totalTimeoutMs = timeoutMs,
+            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+            nowMs = SystemClock::elapsedRealtime,
+            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+            // Waiting to play while media keeps loading (or time advancing) is progress.
+            readings = { loadProgress() + longArrayOf(positionMs) }
+        ) {
+            if (player.playerError != null) {
+                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+                throw RejectionException(player.playerError?.message ?: "$name failed to play.", "crossfade_engine_error")
+            }
+            player.isPlaying
+        }
+        ticket?.ensureActive()
+        if (operationGeneration != generation) throw PlaybackOperationCancelledException("engine_reset")
+        if (verdict != null) {
+            // Audio must not start by itself later, as on iOS.
+            player.playWhenReady = false
+            player.pause()
+            state = AndroidCrossfadeEngineState.FAILED
+            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
+            androidXfadeLog("$name play start timeout $reason")
+            throw RejectionException("$name did not start playing ($reason).", "crossfade_play_start_timeout")
+        }
+    }
+
     override fun pause() {
         androidXfadeLog("$name pause positionMs=$positionMs")
         player.playWhenReady = false
@@ -351,6 +386,14 @@ internal const val DEFAULT_PREPARE_TIMEOUT_MS = 60_000L
 
 /** How long, in all, the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`). */
 internal const val DEFAULT_STANDARD_READY_TIMEOUT_MS = 60_000L
+
+/** How long, in all, a crossfade player may take to start playing (`playStartTimeoutMs`, as on iOS). */
+internal const val DEFAULT_PLAY_START_TIMEOUT_MS = 60_000L
+internal const val PLAY_START_TIMEOUT_KEY = "playStartTimeoutMs"
+
+/** How long, in all, the standard backend may take to complete a seek (`standardSeekTimeoutMs`, as on iOS). */
+internal const val DEFAULT_STANDARD_SEEK_TIMEOUT_MS = 60_000L
+internal const val STANDARD_SEEK_TIMEOUT_KEY = "standardSeekTimeoutMs"
 internal const val STANDARD_READY_TIMEOUT_KEY = "standardReadyTimeoutMs"
 
 /** How long any of those waits goes on with no progress before it fails (`stallTimeoutMs`). */

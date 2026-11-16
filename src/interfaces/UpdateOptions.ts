@@ -39,8 +39,10 @@ export interface UpdateOptions {
    */
   prepareTimeoutMs?: number;
   /**
-   * iOS crossfade backend: the total limit, in milliseconds, for playback to start (after `play`,
-   * a load that plays at once, or the incoming song of a crossfade). Defaults to 60000. A backend
+   * Crossfade backend: the total limit, in milliseconds, for playback to start (iOS: after `play`,
+   * a load that plays at once, or the incoming song of a crossfade; Android: after `play` and a
+   * load that plays at once). A start that loads nothing for `stallTimeoutMs` fails sooner; a
+   * failed start pauses and reports `crossfade_play_start_timeout` on Android. Defaults to 60000. A backend
    * switch and the play used to resume after an interruption wait at most this plus
    * `prepareTimeoutMs` plus 5 s (at least 10 s). Same bounds as `stallTimeoutMs`.
    */
@@ -51,8 +53,9 @@ export interface UpdateOptions {
    */
   standardReadyTimeoutMs?: number;
   /**
-   * iOS standard backend: the total limit, in milliseconds, for a seek (`standard_seek_timeout`).
-   * Defaults to 60000. Same bounds as `stallTimeoutMs`.
+   * Standard backend (iOS and Android): the total limit, in milliseconds, for a seek
+   * (`standard_seek_timeout`); a seek whose buffered position does not grow for `stallTimeoutMs`
+   * fails sooner. Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   standardSeekTimeoutMs?: number;
   /**

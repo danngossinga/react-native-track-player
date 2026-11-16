@@ -82,6 +82,10 @@ class MusicService : HeadlessJsTaskService() {
     private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
     /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
     private val incomingStallGrace = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)
+    /** How long a crossfade play may take to start (`playStartTimeoutMs`), read at every play. */
+    private val playStartTimeout = TimeoutSetting(DEFAULT_PLAY_START_TIMEOUT_MS)
+    /** How long a standard seek may take in all (`standardSeekTimeoutMs`), read at every seek. */
+    private val standardSeekTimeout = TimeoutSetting(DEFAULT_STANDARD_SEEK_TIMEOUT_MS)
     /** The bandwidth each crossfade track starts from (`initialBitrateEstimateBps`), read at every track. */
     private val initialBitrateEstimate = BitrateSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
     private var latestNotificationConfig: NotificationConfig? = null
@@ -353,6 +357,7 @@ class MusicService : HeadlessJsTaskService() {
         created.prepareTimeoutMs = { prepareTimeout.milliseconds }
         created.stallTimeoutMs = { stallTimeout.milliseconds }
         created.incomingStallGraceMs = { incomingStallGrace.milliseconds }
+        created.playStartTimeoutMs = { playStartTimeout.milliseconds }
         Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
         return created
     }
@@ -446,6 +451,10 @@ class MusicService : HeadlessJsTaskService() {
                     transitionGenerationSidecar,
                     readinessGate = StandardPlaybackReadinessGate(
                         timeoutMs = { standardReadyTimeout.milliseconds },
+                        stallTimeoutMs = { stallTimeout.milliseconds }
+                    ),
+                    seekGate = StandardSeekGate(
+                        timeoutMs = { standardSeekTimeout.milliseconds },
                         stallTimeoutMs = { stallTimeout.milliseconds }
                     ),
                     onCommitted = { committed ->
@@ -613,6 +622,8 @@ class MusicService : HeadlessJsTaskService() {
         applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
         applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)
         applyTimeout(options, INCOMING_STALL_GRACE_KEY, incomingStallGrace)
+        applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)
+        applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)
         applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
     }
 

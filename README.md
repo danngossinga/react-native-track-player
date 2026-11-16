@@ -75,10 +75,11 @@ Added fork surface:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends
   it; an iOS crossfade seek, which had no limit before, now fails on a stall or
-  at this limit and the player then reports an error state), `playStartTimeoutMs` (iOS crossfade play start),
+  at this limit and the player then reports an error state), `playStartTimeoutMs` (crossfade play start, iOS and Android),
   `standardReadyTimeoutMs` (standard backend readiness) and
-  `standardSeekTimeoutMs` (iOS standard seek; before the seek is issued only this
-  limit applies, then the buffered position is its only progress signal), each
+  `standardSeekTimeoutMs` (standard seek, iOS and Android; on iOS, before the seek
+  is issued only this limit applies, then the buffered position is its only
+  progress signal), each
   60000 by default. A backend switch and the play used to resume after an
   interruption wait at most the load limit plus the play-start limit plus 5 s (at
   least 10 s).

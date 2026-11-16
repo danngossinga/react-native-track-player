@@ -92,6 +92,56 @@ internal class StandardPlaybackReadinessGate(
     }
 }
 
+internal data class StandardSeekObservation(
+    val state: AudioPlayerState,
+    val positionMs: Long,
+    val bufferedPositionMs: Long,
+    /** The track's duration (0 when unknown): a seek past the end lands at the end. */
+    val durationMs: Long = 0L
+)
+
+/**
+ * Waits for a standard backend seek to complete, as iOS does: done once the player is no longer
+ * loading or buffering and is at the target; fails when the buffered position does not grow for
+ * `stallTimeoutMs`, or after `standardSeekTimeoutMs` in all (`standard_seek_timeout`).
+ */
+internal class StandardSeekGate(
+    private val timeoutMs: () -> Long,
+    private val stallTimeoutMs: () -> Long,
+    private val pollIntervalMs: Long = 25L,
+    private val positionToleranceMs: Long = 750L,
+    private val nowMs: () -> Long = ::monotonicNowMs
+) {
+    suspend fun await(targetMs: Long, observe: () -> StandardSeekObservation) {
+        var current: StandardSeekObservation? = null
+        val verdict = awaitWhileProgressing(
+            stallTimeoutMs = stallTimeoutMs(),
+            totalTimeoutMs = timeoutMs(),
+            pollIntervalMs = pollIntervalMs,
+            nowMs = nowMs,
+            pause = { delay(it) },
+            readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }
+        ) {
+            val observed = observe().also { current = it }
+            if (observed.state == AudioPlayerState.ERROR) {
+                throw RejectionException("The active track failed to load.", "standard_seek_unavailable")
+            }
+            val target = targetMs.coerceAtLeast(0L).let { if (observed.durationMs > 0L) minOf(it, observed.durationMs) else it }
+            observed.state == AudioPlayerState.ENDED ||
+                (observed.state != AudioPlayerState.LOADING &&
+                    observed.state != AudioPlayerState.BUFFERING &&
+                    kotlin.math.abs(observed.positionMs - target) <= positionToleranceMs)
+        }
+        if (verdict != null) {
+            throw RejectionException(
+                if (verdict == StallVerdict.STALLED) "The native seek made no progress for ${stallTimeoutMs()} ms."
+                else "The native seek did not complete within ${timeoutMs()} ms.",
+                "standard_seek_timeout"
+            )
+        }
+    }
+}
+
 internal class PlaybackOperationCancelledException(
     val reason: String
 ) : CancellationException("Playback operation was cancelled by $reason.")

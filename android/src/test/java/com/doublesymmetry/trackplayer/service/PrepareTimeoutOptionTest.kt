@@ -100,4 +100,12 @@ class PrepareTimeoutOptionTest {
         assertTrue(setting.apply(4_000.0))
         assertEquals(4_000L, setting.milliseconds)
     }
+
+    @Test
+    fun thePlayStartAndStandardSeekLimitsAreTheIosOptionsWithTheSameDefaults() {
+        assertEquals("playStartTimeoutMs", PLAY_START_TIMEOUT_KEY)
+        assertEquals("standardSeekTimeoutMs", STANDARD_SEEK_TIMEOUT_KEY)
+        assertEquals(60_000L, DEFAULT_PLAY_START_TIMEOUT_MS)
+        assertEquals(60_000L, DEFAULT_STANDARD_SEEK_TIMEOUT_MS)
+    }
 }

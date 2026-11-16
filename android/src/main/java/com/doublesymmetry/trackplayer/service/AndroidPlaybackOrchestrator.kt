@@ -105,6 +105,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
      */
     var incomingStallGraceMs: () -> Long = { DEFAULT_INCOMING_STALL_GRACE_MS }
 
+    /** How long playback may take in all to start after a play (ms, `playStartTimeoutMs`), read at every play. */
+    var playStartTimeoutMs: () -> Long = { DEFAULT_PLAY_START_TIMEOUT_MS }
+
     constructor(
         context: Context,
         scope: CoroutineScope,
@@ -429,8 +432,25 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket.ensureActive()
         activeEngine.setVolume(volume)
         activeEngine.play(rate)
+        awaitPlaybackStart(ticket)
         setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
         preloadNextIfPossible()
+    }
+
+    /**
+     * Waits for the active engine to start playing, as iOS does after a play or a load that plays
+     * at once. When it does not start, playback is paused (playWhenReady false) and the error is
+     * thrown to the caller.
+     */
+    private suspend fun awaitPlaybackStart(ticket: PlaybackOperationTicket?) {
+        try {
+            activeEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            playWhenReady = false
+            setState(AndroidPlaybackOrchestratorState.PAUSED)
+            delegate.onPlaybackError(error.code, error.message)
+            throw error
+        }
     }
 
     /**
@@ -908,6 +928,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
             activeEngine.play(rate)
+            awaitPlaybackStart(ticket)
             setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
         } else {
             setState(AndroidPlaybackOrchestratorState.PAUSED)

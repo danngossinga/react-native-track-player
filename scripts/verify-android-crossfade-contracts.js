@@ -415,4 +415,24 @@ assert(
   'Android crossfade HTTP timeouts must follow the current stallTimeoutMs at every request.'
 );
 
+// Android waits for a play to start (playStartTimeoutMs) and for a standard seek
+// (standardSeekTimeoutMs), with the stall rule, as iOS does.
+const playSection = section(orchestrator, 'suspend fun play() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(');
+assert(
+  playSection.includes('activeEngine.play(rate)\n        awaitPlaybackStart(ticket)\n        setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)') &&
+    orchestrator.includes('            activeEngine.play(rate)\n            awaitPlaybackStart(ticket)\n            setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)') &&
+    section(orchestrator, 'private suspend fun awaitPlaybackStart(', '\n    }\n').includes('activeEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)') &&
+    orchestrator.includes('var playStartTimeoutMs: () -> Long = { DEFAULT_PLAY_START_TIMEOUT_MS }') &&
+    section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('readings = { loadProgress() + longArrayOf(positionMs) }') &&
+    section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('player.pause()') &&
+    musicService.includes('private val playStartTimeout = TimeoutSetting(DEFAULT_PLAY_START_TIMEOUT_MS)') &&
+    musicService.includes('created.playStartTimeoutMs = { playStartTimeout.milliseconds }') &&
+    section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
+    section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
+    musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
+    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('player.seek(positionMs, TimeUnit.MILLISECONDS)\n        seekGate.await(positionMs) {') &&
+    section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }'),
+  'Android must wait for a play start and a standard seek like iOS.'
+);
+
 console.log('Android crossfade contracts OK');
