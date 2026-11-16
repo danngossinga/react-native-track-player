@@ -512,7 +512,13 @@ internal class AndroidPlaybackOrchestrator private constructor(
         setState(AndroidPlaybackOrchestratorState.SEEKING)
         ensureActivePrepared(currentIndex, this.positionMs, ticket)
         ticket.ensureActive()
-        activeEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        try {
+            activeEngine.seekTo(positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            // As on iOS: a seek that fails leaves the player in an error state (not seeking).
+            setState(AndroidPlaybackOrchestratorState.ERROR)
+            throw error
+        }
         ticket.ensureActive()
         if (playWhenReady) {
             activeEngine.setVolume(volume)

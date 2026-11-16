@@ -16,14 +16,18 @@ class CrossfadeHttpTimeoutsTest {
         unsafe.javaClass.getMethod("allocateInstance", Class::class.java).invoke(unsafe, DataSpec::class.java) as DataSpec
     }
 
-    /** Records each request's timeout and the listeners it was given. */
+    /** Records each request's timeout, its listeners, and what was asked of it. */
     private class RecordingRequest(val timeoutMs: Int) : DataSource {
         val listeners = mutableListOf<TransferListener>()
+        var closes = 0
+        var uriReads = 0
+        val headers = mapOf("x-request" to listOf("$timeoutMs"))
         override fun addTransferListener(transferListener: TransferListener) { listeners += transferListener }
         override fun open(dataSpec: DataSpec): Long = 0L
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int = -1
-        override fun getUri(): Uri? = null
-        override fun close() = Unit
+        override fun getUri(): Uri? { uriReads += 1; return null }
+        override fun getResponseHeaders(): Map<String, List<String>> = headers
+        override fun close() { closes += 1 }
     }
 
     @Test
@@ -43,13 +47,29 @@ class CrossfadeHttpTimeoutsTest {
         }
         source.addTransferListener(listener)
         source.open(spec)
+        // While open, the source is the request: its uri and headers come from it.
+        source.uri
+        assertEquals(mapOf("x-request" to listOf("10000")), source.responseHeaders)
         source.close()
         stall = 25_000L
         source.open(spec)
+        // A listener added while a request is open reaches it too.
+        val late = object : TransferListener {
+            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) = Unit
+            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        }
+        source.addTransferListener(late)
+        source.close()
         source.close()
         assertEquals(listOf(10_000, 25_000), requests.map { it.timeoutMs })
-        // Every request gets the listeners (bytes loaded, bandwidth meter).
-        requests.forEach { assertSame(listener, it.listeners.single()) }
+        // Every request gets the listeners (bytes loaded, bandwidth meter), is asked for its uri,
+        // and is closed exactly once (its connection ends and the meter sees the transfer end).
+        assertEquals(listOf(listener), requests[0].listeners)
+        assertEquals(listOf(listener, late), requests[1].listeners)
+        assertEquals(1, requests[0].uriReads)
+        assertEquals(listOf(1, 1), requests.map { it.closes })
     }
 
     @Test
@@ -62,5 +82,26 @@ class CrossfadeHttpTimeoutsTest {
         // The option's bounds fit an Int.
         assertEquals(2_147_483_646, httpTimeoutMs(2_147_483_646L))
         assertEquals(10_000, httpTimeoutMs(DEFAULT_STALL_TIMEOUT_MS))
+    }
+
+    @Test
+    fun eachRequestCarriesTheTracksHeadersAndUserAgent() {
+        var handed: DefaultHttpDataSource.Factory? = null
+        val factory = CurrentTimeoutHttpDataSourceFactory({ DEFAULT_STALL_TIMEOUT_MS }) { http, timeoutMs ->
+            handed = http
+            RecordingRequest(timeoutMs)
+        }
+        // The engine configures each track's request options this way.
+        factory.configure {
+            setDefaultRequestProperties(mapOf("Authorization" to "Bearer test-token"))
+            setUserAgent("djeeloo-test")
+        }
+        factory.createDataSource().open(spec)
+        val http = checkNotNull(handed)
+        fun field(name: String) = DefaultHttpDataSource.Factory::class.java.getDeclaredField(name)
+            .apply { isAccessible = true }.get(http)
+        assertEquals("djeeloo-test", field("userAgent"))
+        val properties = field("defaultRequestProperties") as com.google.android.exoplayer2.upstream.HttpDataSource.RequestProperties
+        assertEquals(mapOf("Authorization" to "Bearer test-token"), properties.snapshot)
     }
 }

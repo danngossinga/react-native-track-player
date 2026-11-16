@@ -406,6 +406,13 @@ assert(
     perRequestOpen.indexOf('listeners.forEach(source::addTransferListener)') < perRequestOpen.indexOf('return source.open(dataSpec)') &&
     section(perRequestHttp, 'private fun openRequestSource(): DataSource {', 'private inner class').includes('val timeoutMs = httpTimeoutMs(stallTimeoutMs())') &&
     perRequestHttp.includes('factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs).createDataSource()') &&
+    // The track's headers and user agent (configure) reach every request.
+    section(perRequestHttp, 'private fun openRequestSource(): DataSource {', 'private inner class').includes('return synchronized(http) { newRequestSource(http, timeoutMs) }') &&
+    section(perRequestHttp, 'fun configure(', 'override fun createDataSource()').includes('synchronized(http) { http.change() }') &&
+    section(engineSource, 'private fun configureRequestOptions(', '\n    }\n').includes('httpDataSourceFactory.configure {\n            setDefaultRequestProperties(options?.headers ?: emptyMap())') &&
+    section(perRequestHttp, 'override fun close() {', '\n        }\n').includes('source?.close()') &&
+    section(perRequestHttp, 'override fun addTransferListener(', 'override fun open(').includes('current?.addTransferListener(transferListener)') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun eachRequestCarriesTheTracksHeadersAndUserAgent()') &&
     perRequestHttp.includes('override fun createDataSource(): DataSource = PerRequestSource()') &&
     !/set(Connect|Read)TimeoutMs\(\d/.test(engineSource + perRequestHttp) &&
     orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)') &&
@@ -413,6 +420,16 @@ assert(
     musicService.includes('requestStallTimeoutMs = { stallTimeout.milliseconds },') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun aSourceCreatedBeforeAnOptionsChangeOpensWithTheNewTimeout()'),
   'Android crossfade HTTP timeouts must follow the current stallTimeoutMs at every request.'
+);
+
+// A stalled crossfade seek, as on iOS: the engine pauses and fails, the orchestrator reports an
+// error instead of staying in seeking.
+assert(
+  section(engineSeek, 'if (verdict != null) {', 'throw RejectionException(').includes('player.playWhenReady = false\n            player.pause()') &&
+    section(engineSeek, 'if (verdict != null) {', 'throw RejectionException(').includes('state = AndroidCrossfadeEngineState.FAILED') &&
+    section(orchestrator, 'suspend fun seekTo(positionMs: Long)', 'suspend fun seekBy(').includes('} catch (error: RejectionException) {\n            // As on iOS: a seek that fails leaves the player in an error state (not seeking).\n            setState(AndroidPlaybackOrchestratorState.ERROR)\n            throw error') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aStalledSeekLeavesThePlayerInErrorAsOnIos()'),
+  'A stalled Android crossfade seek must pause, fail and leave the player in error, as on iOS.'
 );
 
 console.log('Android crossfade contracts OK');

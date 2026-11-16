@@ -474,6 +474,30 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aStalledSeekLeavesThePlayerInErrorAsOnIos() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            engineA.failNextSeek = RejectionException("engineA did not finish seeking.", "crossfade_seek_timeout")
+            try {
+                orchestrator.seekTo(30_000L)
+                fail("Expected the seek to fail")
+            } catch (error: RejectionException) {
+                assertEquals("crossfade_seek_timeout", error.code)
+            }
+            // Not stuck in seeking (JS would see loading): the player reports an error.
+            assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun secondCrossfadeRejectsWithoutCancellingFirstAndPauseEmitsOneTerminalEvent() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -713,6 +737,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
          * the real engine with the limits the orchestrator passed.
          */
         var simulatedLoad: SimulatedLoad? = null
+        /** When set, the next seek fails with it (a stalled seek). */
+        var failNextSeek: RejectionException? = null
 
         override val positionMs: Long
             get() = position
@@ -804,6 +830,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             ticket: PlaybackOperationTicket?
         ) {
             ticket?.ensureActive()
+            failNextSeek?.let { failNextSeek = null; throw it }
             lastSeekTimeoutMs = timeoutMs
             lastSeekStallTimeoutMs = stallTimeoutMs
             position = positionMs

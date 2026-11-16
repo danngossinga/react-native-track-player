@@ -273,6 +273,15 @@ assert(
     (enginePrepare.match(/guard !settled else \{ return \}/g) || []).length === 2 &&
     engineSeek.includes('seekWait = startWait(\n                totalTimeoutMs: prepareTimeoutMs(),') &&
     engineSeek.includes('if watched, completion != nil {') &&
+    // Every seek is watched unless it runs inside the load's own wait.
+    engine.includes('func seek(to position: Double, watched: Bool = true, completion: ((Result<Void, Error>) -> Void)? = nil) {') &&
+    (engine.match(/watched: false\)/g) || []).length === 1 &&
+    enginePrepare.includes('self.seek(to: position, watched: false)') &&
+    orchestrator.includes('seekOperation: @escaping SeekOperation = { engine, position, completion in\n            engine.seek(to: position, completion: completion)\n        },') &&
+    !orchestrator.includes('watched:') &&
+    waitForPlaying.includes('weak var observation: NSKeyValueObservation?') &&
+    // A failed start pauses the engine wherever playback starts (play and a load that plays).
+    orchestrator.includes('self.playWhenReady = false\n                                            // As after a failed play(): audio must not start by itself later.\n                                            self.activeEngine.pause()') &&
     engineSeek.includes('readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
     // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
