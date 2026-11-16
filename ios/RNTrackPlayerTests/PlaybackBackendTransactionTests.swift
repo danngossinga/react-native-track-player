@@ -306,7 +306,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/interruption-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 15)
+        XCTAssertEqual(scenarios.count, 17)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             let autoResume = scenario["autoResume"] as? Bool ?? false
@@ -404,9 +404,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         _ = policy.began(isPlaying: true)
         XCTAssertTrue(policy.isInterrupted)
         XCTAssertEqual(policy.userPlay(granted: !policy.isInterrupted && true), .refused)
-        // The refused play was the user's: the call's end does not resume, and nothing retries.
-        XCTAssertFalse(policy.isInterrupted)
-        XCTAssertEqual(policy.ended(shouldResume: true).0, .none)
+        // The user's last intent was to play: the call's end resumes (nothing else retries).
+        XCTAssertTrue(policy.isInterrupted)
+        XCTAssertEqual(policy.ended(shouldResume: true).0, .resume)
         XCTAssertEqual(policy.userPlay(granted: !policy.isInterrupted && true), .play)
         XCTAssertEqual(audioFocusRefusedCode, "audio_focus_refused")
         XCTAssertEqual((audioFocusRefusedError() as NSError).userInfo["code"] as? String, "audio_focus_refused")

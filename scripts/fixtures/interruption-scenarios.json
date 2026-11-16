@@ -106,12 +106,31 @@
       ]
     },
     {
-      "id": "FOCUS-REFUSED-a a play the system refuses during a call: refused, nothing plays, no resume when the call ends",
+      "id": "FOCUS-REFUSED-a a play the system refuses during a call: refused now, resumed when the call ends (the user's last intent is to play)",
       "autoResume": true, "playing": true,
       "steps": [
         { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
         { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-REFUSED-c a user pause after a refused play during a call: no resume when it ends",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "userPause", "action": "none", "duck": null },
         { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-REFUSED-d paused when the call began, then a play refused during it: resumed when it ends",
+      "autoResume": true, "playing": false,
+      "steps": [
+        { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPlay", "granted": false, "action": "refused", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
       ]
     },
     {

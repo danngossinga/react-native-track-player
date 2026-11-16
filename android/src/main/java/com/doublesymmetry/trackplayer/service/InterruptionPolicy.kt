@@ -87,12 +87,18 @@ internal class InterruptionPolicy(
     /**
      * A play from the user (owner decision B): it starts only if the system gives the audio
      * ([granted]: Android grants the focus; iOS activates the session, outside an interruption).
-     * Refused, nothing starts and nothing retries by itself (a later play tries again); either
-     * way an interruption's end no longer resumes.
+     * Granted, it is a user command (an interruption's end no longer resumes). Refused, nothing
+     * starts now, but the user's last intent is to play: an interruption in progress (a call)
+     * resumes when it ends, if the system allows it ("pause, then auto-resume"); a later user
+     * pause still cancels that. Nothing else retries.
      */
     fun userPlay(granted: Boolean): UserPlayDecision {
-        forget()
-        return if (granted) UserPlayDecision.PLAY else UserPlayDecision.REFUSED
+        if (granted) {
+            forget()
+            return UserPlayDecision.PLAY
+        }
+        if (interrupted) resumeOnEnd = true
+        return UserPlayDecision.REFUSED
     }
 
     private fun forget() {

@@ -228,11 +228,19 @@ final class InterruptionPolicy {
 
     /// A play from the user (owner decision B): it starts only if the system gives the audio
     /// (`granted`: iOS activates the session, outside an interruption; Android grants the focus).
-    /// Refused, nothing starts and nothing retries by itself (a later play tries again); either
-    /// way an interruption's end no longer resumes.
+    /// Granted, it is a user command (an interruption's end no longer resumes). Refused, nothing
+    /// starts now, but the user's last intent is to play: an interruption in progress (a call)
+    /// resumes when it ends, if the system allows it ("pause, then auto-resume"); a later user
+    /// pause still cancels that. Nothing else retries.
     func userPlay(granted: Bool) -> UserPlayDecision {
+        guard granted else {
+            lock.lock()
+            if interrupted { resumeOnEnd = true }
+            lock.unlock()
+            return .refused
+        }
         forget()
-        return granted ? .play : .refused
+        return .play
     }
 
     private func forget() {

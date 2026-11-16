@@ -42,7 +42,7 @@ class InterruptionPolicyTest {
     @Test
     fun followsTheSharedScenarios() {
         val all = scenarios()
-        assertEquals(15, all.size)
+        assertEquals(17, all.size)
         for (scenario in all) {
             val id = scenario["id"] as String
             val autoResume = scenario["autoResume"] as Boolean

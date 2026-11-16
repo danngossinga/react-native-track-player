@@ -205,10 +205,11 @@ cannot be activated or a play during an interruption (a call). The player stays
 paused (`playWhenReady` false, silent); `play()` and `setPlayWhenReady(true)`
 reject with `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a
 play no one awaits (an Android crossfade remote control, an interruption's
-resume) emits a `PlaybackError` with that code. Nothing retries by itself: a
-later play tries again, and the refused play counts as the user's (an
-interruption in progress then does not resume when it ends). Showing a message
-is up to the app.
+resume) emits a `PlaybackError` with that code. A play refused during an
+interruption (a call) is not a pause: the user's last intent is to play, so
+playback resumes when the interruption ends, if the system allows it (as for
+any interruption); a user pause after it cancels that. Nothing else retries: a
+later play tries again. Showing a message is up to the app.
 
 When it resumes, the event with `paused: false` is emitted as soon as the
 resume is issued, before playback has started, and a pause from the user
