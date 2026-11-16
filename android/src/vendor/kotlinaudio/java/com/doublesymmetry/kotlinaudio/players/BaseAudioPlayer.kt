@@ -549,7 +549,8 @@ abstract class BaseAudioPlayer internal constructor(
                     .setContentType(CONTENT_TYPE_MUSIC)
                     .build()
             )
-            .setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption)
+            // With the host handling focus, a can-duck loss is reported (it pauses) instead of ducked.
+            .setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption || hooks.onAudioFocusChange != null)
             .build()
 
         val result: Int = if (manager != null && focus != null) {
@@ -579,6 +580,11 @@ abstract class BaseAudioPlayer internal constructor(
     override fun onAudioFocusChange(focusChange: Int) {
         Timber.d("Audio focus changed")
         val isPermanent = focusChange == AUDIOFOCUS_LOSS
+        hooks.onAudioFocusChange?.let { onChange ->
+            if (isPermanent) abandonAudioFocusIfHeld()
+            onChange(focusChange)
+            return
+        }
         val isPaused = when (focusChange) {
             AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> true
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> playerOptions.alwaysPauseOnInterruption

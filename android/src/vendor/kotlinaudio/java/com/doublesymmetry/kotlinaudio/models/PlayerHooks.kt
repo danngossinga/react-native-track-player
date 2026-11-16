@@ -15,5 +15,11 @@ class PlayerHooks(
      * Builds the HTTP data source factory of an item from KotlinAudio's own configuration of it
      * (user agent, redirects, headers); null keeps a plain DefaultHttpDataSource.Factory.
      */
-    val httpDataSourceFactory: ((DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory)? = null
+    val httpDataSourceFactory: ((DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory)? = null,
+    /**
+     * When set, receives every audio focus change of the focus KotlinAudio holds, and KotlinAudio
+     * neither ducks nor emits its own focus event: the host pauses and resumes (one rule for every
+     * backend). A permanent loss still gives the focus up.
+     */
+    val onAudioFocusChange: ((Int) -> Unit)? = null
 )

@@ -99,8 +99,13 @@ export interface PlayerOptions {
    */
   autoUpdateMetadata?: boolean;
   /**
-   * Indicates whether the player should automatically handle audio interruptions.
-   * Defaults to `false`.
+   * Calls, other apps' audio and headphones, the same on iOS and Android and on both backends
+   * (standard and crossfade): playback always pauses when the audio is taken away (a call, an
+   * audio focus loss, can-duck included) or the headphones are unplugged. With this option, it
+   * resumes by itself when the interruption ends, if the system allows it (iOS `shouldResume`,
+   * Android focus gain after a transient loss) and the user did not pause or play meanwhile; a
+   * permanent loss or an unplug never resumes. `remote-duck` reports `paused` and `permanent`
+   * with the same meaning on both platforms. Defaults to `false`.
    */
   autoHandleInterruptions?: boolean;
   /**

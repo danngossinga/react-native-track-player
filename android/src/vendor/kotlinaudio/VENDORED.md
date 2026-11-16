@@ -36,3 +36,9 @@ privately, so these need small changes in it.
     applied to a plain `DefaultHttpDataSource.Factory` as upstream.
 - `players/QueuedAudioPlayer.kt:17-19`: constructor parameter `hooks`, passed to
   `BaseAudioPlayer`.
+- Audio focus (DJE-204/205), same file and `models/PlayerHooks.kt`:
+  - `PlayerHooks.onAudioFocusChange`: when set, `onAudioFocusChange` gives the focus up on a
+    permanent loss and passes every change to the host, without ducking or emitting its own
+    event (the host pauses and resumes with one rule for every backend);
+  - `requestAudioFocus`: `setWillPauseWhenDucked(... || hooks.onAudioFocusChange != null)`, so a
+    can-duck loss is reported to the host (which pauses) instead of ducked by the system.

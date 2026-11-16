@@ -460,4 +460,31 @@ assert(
   'The Android standard player must start each track low and follow stallTimeoutMs per request, like the crossfade path.'
 );
 
+// Calls, other apps' audio and headphones (DJE-204/205/206): one policy for both backends, one
+// focus holder for the crossfade orchestrator (none per engine), the same remote-duck meaning.
+const applyInterruptionKt = section(musicService, 'private fun applyInterruption(', '/**');
+assert(
+  musicService.includes('private val interruptionPolicy = InterruptionPolicy { autoHandleInterruptions }') &&
+    musicService.includes('autoHandleInterruptions = handleAudioFocus') &&
+    musicService.includes('            handleAudioFocus = false,\n            audioContentType = audioContentType') &&
+    musicService.includes('orchestratorHandlesAudioFocus = false\n        registerBecomingNoisyReceiver()') &&
+    musicService.includes('onAudioFocusChange = { onAudioFocusChange(it) }') &&
+    musicService.includes('applyInterruption { isPlaying -> interruptionPolicy.onFocusChange(focusChange, isPlaying) }') &&
+    musicService.includes('applyInterruption { isPlaying -> interruptionPolicy.noisy(isPlaying) }') &&
+    musicService.includes('IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)') &&
+    applyInterruptionKt.includes('val decision = decide(backend.playWhenReady)') &&
+    applyInterruptionKt.includes('InterruptionAction.PAUSE -> backend.pause()') &&
+    applyInterruptionKt.includes('if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()\n                            backend.play()') &&
+    applyInterruptionKt.includes('putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)') &&
+    ['suspend fun play() {\n        interruptionPolicy.userCommand()', 'suspend fun pause() {\n        interruptionPolicy.userCommand()',
+      'suspend fun setPlayWhenReady(value: Boolean) {\n        interruptionPolicy.userCommand()',
+      'suspend fun stop() {\n        interruptionPolicy.userCommand()\n        orchestratorFocus.abandon()'].every((s) => musicService.includes(s)) &&
+    musicService.includes('if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()\n            backend.play()') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/OrchestratorAudioFocus.kt').includes('.setWillPauseWhenDucked(true)') &&
+    vendoredBase.includes('hooks.onAudioFocusChange?.let { onChange ->') &&
+    vendoredBase.includes('.setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption || hooks.onAudioFocusChange != null)') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionPolicyTest.kt').includes('scripts/fixtures/interruption-scenarios.json'),
+  'Android interruptions must go through InterruptionPolicy on both backends, with one focus holder for the orchestrator.'
+);
+
 console.log('Android crossfade contracts OK');

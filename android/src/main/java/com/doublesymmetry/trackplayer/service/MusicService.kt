@@ -1,7 +1,10 @@
 package com.doublesymmetry.trackplayer.service
 
 import android.app.*
+import android.content.BroadcastReceiver
 import android.content.Context
+import android.content.IntentFilter
+import android.media.AudioManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
@@ -68,6 +71,13 @@ class MusicService : HeadlessJsTaskService() {
     private var playbackOrchestratorIdentity: Any? = null
     private var orchestratorAudioContentType: Int = C.AUDIO_CONTENT_TYPE_MUSIC
     private var orchestratorHandlesAudioFocus: Boolean = false
+    /** `autoHandleInterruptions`: an interruption's end resumes playback (DJE-204/205). */
+    private var autoHandleInterruptions = false
+    /** Calls, other apps' audio and headphones: one rule for both backends, as on iOS. */
+    private val interruptionPolicy = InterruptionPolicy { autoHandleInterruptions }
+    /** The crossfade backend's single focus holder (the engines hold none). */
+    private val orchestratorFocus by lazy { OrchestratorAudioFocus(this) { onAudioFocusChange(it) } }
+    private var becomingNoisyReceiver: BroadcastReceiver? = null
     private var playbackBackendFacade: PlaybackBackendFacade? = null
     private var orchestratedMediaSurface: AndroidOrchestratedMediaSurface? = null
     private val playbackControlOwnerRegistry = PlaybackControlOwnerRegistry()
@@ -579,10 +589,13 @@ class MusicService : HeadlessJsTaskService() {
             "unknown" -> AudioContentType.UNKNOWN
             else -> AudioContentType.MUSIC
         }
+        // The service owns audio focus on both backends (InterruptionPolicy): KotlinAudio requests
+        // it and reports every change (PlayerHooks.onAudioFocusChange); ExoPlayer does not.
+        autoHandleInterruptions = handleAudioFocus
         val playerConfig = PlayerConfig(
             interceptPlayerActionsTriggeredExternally = true,
             handleAudioBecomingNoisy = true,
-            handleAudioFocus = handleAudioFocus,
+            handleAudioFocus = false,
             audioContentType = audioContentType
         )
 
@@ -593,7 +606,9 @@ class MusicService : HeadlessJsTaskService() {
             QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
-        orchestratorHandlesAudioFocus = handleAudioFocus
+        // One focus holder for the orchestrator (orchestratorFocus), none per engine.
+        orchestratorHandlesAudioFocus = false
+        registerBecomingNoisyReceiver()
 
         val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD
         val backendFactory = PlaybackBackendFactory { type, identity ->
@@ -627,8 +642,60 @@ class MusicService : HeadlessJsTaskService() {
                 )
             )
         },
-        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })
+        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
+        onAudioFocusChange = { onAudioFocusChange(it) }
     )
+
+    /** An audio focus change of either backend, through the interruption policy. */
+    private fun onAudioFocusChange(focusChange: Int) {
+        applyInterruption { isPlaying -> interruptionPolicy.onFocusChange(focusChange, isPlaying) }
+    }
+
+    /** Headphones unplugged: pause both backends, no resume (the engines do not do it themselves). */
+    private fun registerBecomingNoisyReceiver() {
+        if (becomingNoisyReceiver != null) return
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) {
+                if (intent?.action != AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
+                applyInterruption { isPlaying -> interruptionPolicy.noisy(isPlaying) }
+            }
+        }
+        // A system broadcast: delivered to a not-exported receiver too.
+        androidx.core.content.ContextCompat.registerReceiver(
+            this, receiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
+            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        becomingNoisyReceiver = receiver
+    }
+
+    /**
+     * Runs one interruption event on the active backend: reads whether it plays, then pauses or
+     * resumes it and emits the `remote-duck` payload (same meaning as on iOS).
+     */
+    private fun applyInterruption(decide: (Boolean) -> InterruptionDecision?) {
+        if (playbackBackendFacade == null) return
+        scope.launch {
+            val duck = runCatching {
+                withActivePlaybackBackend { backend ->
+                    val decision = decide(backend.playWhenReady) ?: return@withActivePlaybackBackend null
+                    androidXfadeLog("interruption action=${decision.action} backend=${backend.type}")
+                    when (decision.action) {
+                        InterruptionAction.PAUSE -> backend.pause()
+                        InterruptionAction.RESUME -> {
+                            if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
+                            backend.play()
+                        }
+                        InterruptionAction.NONE -> Unit
+                    }
+                    decision.duck
+                }
+            }.getOrNull() ?: return@launch
+            emit(MusicEvents.BUTTON_DUCK, Bundle().apply {
+                putBoolean(IS_PAUSED_KEY, duck.paused)
+                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
+            })
+        }
+    }
 
     /**
      * Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`, `stallTimeoutMs`)
@@ -935,6 +1002,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun reset() {
+        interruptionPolicy.userCommand()
+        orchestratorFocus.abandon()
         withActivePlaybackBackend { backend ->
             backend.stop()
             backend.clearQueue()
@@ -952,7 +1021,9 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun play() {
+        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
+            if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
             backend.play()
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 refreshOrchestratedMediaSurface(reason = "play")
@@ -962,7 +1033,9 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun setPlayWhenReady(value: Boolean) {
+        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
+            if (value && backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
             if (value) backend.play() else backend.pause()
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 refreshOrchestratedMediaSurface(reason = "play-when-ready")
@@ -972,6 +1045,7 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun pause() {
+        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
             backend.pause()
             if (backend.type == PlaybackBackendType.PING_PONG) {
@@ -982,6 +1056,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun stop() {
+        interruptionPolicy.userCommand()
+        orchestratorFocus.abandon()
         withActivePlaybackBackend { backend ->
             backend.stop()
             if (backend.type == PlaybackBackendType.PING_PONG) {
@@ -1611,6 +1687,9 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     override fun onDestroy() {
         super.onDestroy()
+        becomingNoisyReceiver?.let { runCatching { unregisterReceiver(it) } }
+        becomingNoisyReceiver = null
+        orchestratorFocus.abandon()
         allPlayers().forEach { it.destroy() }
         playbackOrchestrator?.release()
         playbackOrchestrator = null
