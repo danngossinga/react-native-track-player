@@ -42,7 +42,7 @@ class InterruptionPolicyTest {
     @Test
     fun followsTheSharedScenarios() {
         val all = scenarios()
-        assertEquals(13, all.size)
+        assertEquals(15, all.size)
         for (scenario in all) {
             val id = scenario["id"] as String
             val autoResume = scenario["autoResume"] as Boolean
@@ -60,8 +60,17 @@ class InterruptionPolicyTest {
                     "lostPermanently" -> policy.lostPermanently(isPlaying())
                     "noisy" -> policy.noisy(isPlaying())
                     "userPause" -> { policy.userCommand(); playing = false; InterruptionDecision(InterruptionAction.NONE, null) }
-                    "userPlay" -> { policy.userCommand(); playing = true; InterruptionDecision(InterruptionAction.NONE, null) }
+                    "userPlay" -> {
+                        val decision = policy.userPlay(granted = step["granted"] as Boolean? ?: true)
+                        assertEquals("$id userPlay", step["action"] == "refused", decision == UserPlayDecision.REFUSED)
+                        if (decision == UserPlayDecision.PLAY) playing = true
+                        InterruptionDecision(InterruptionAction.NONE, null)
+                    }
                     else -> error("unknown event $event in $id")
+                }
+                if (event == "userPlay") {
+                    assertNull("$id $event", decision.duck)
+                    continue
                 }
                 val expected = when (step["action"]) {
                     "pause" -> InterruptionAction.PAUSE

@@ -6,6 +6,7 @@ export * from './IOSCategory';
 export * from './IOSCategoryMode';
 export * from './IOSCategoryOptions';
 export * from './PitchAlgorithm';
+export * from './PlaybackErrorCode';
 export * from './RatingType';
 export * from './RepeatMode';
 export * from './State';

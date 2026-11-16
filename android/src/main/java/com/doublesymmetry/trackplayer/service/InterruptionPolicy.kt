@@ -16,6 +16,17 @@ internal val INTERRUPTION_FINISHED_STATES = setOf(
     AudioPlayerState.IDLE, AudioPlayerState.ENDED, AudioPlayerState.ERROR, AudioPlayerState.STOPPED
 )
 
+/** A user play: start it, or refuse it because the system keeps the audio (iOS: the same). */
+internal enum class UserPlayDecision { PLAY, REFUSED }
+
+/** The code a refused play rejects with and reports (`playback-error`), the same on iOS. */
+internal const val AUDIO_FOCUS_REFUSED = "audio_focus_refused"
+
+internal fun audioFocusRefused() = com.doublesymmetry.trackplayer.utils.RejectionException(
+    "The system did not give the audio to this player (a call or another app holds it).",
+    AUDIO_FOCUS_REFUSED
+)
+
 /** What the player does on an interruption event (DJE-204/205/206; iOS has the same policy). */
 internal enum class InterruptionAction { NONE, PAUSE, RESUME }
 
@@ -71,6 +82,17 @@ internal class InterruptionPolicy(
     /** A play or pause from the user (app or remote control): an interruption's end no longer resumes. */
     fun userCommand() {
         forget()
+    }
+
+    /**
+     * A play from the user (owner decision B): it starts only if the system gives the audio
+     * ([granted]: Android grants the focus; iOS activates the session, outside an interruption).
+     * Refused, nothing starts and nothing retries by itself (a later play tries again); either
+     * way an interruption's end no longer resumes.
+     */
+    fun userPlay(granted: Boolean): UserPlayDecision {
+        forget()
+        return if (granted) UserPlayDecision.PLAY else UserPlayDecision.REFUSED
     }
 
     private fun forget() {

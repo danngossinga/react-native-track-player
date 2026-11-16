@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
+import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import androidx.media.AudioAttributesCompat
 import android.os.Build
@@ -690,7 +691,10 @@ class MusicService : HeadlessJsTaskService() {
                             putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
                         })
                     },
-                    onResumeFailed = { androidXfadeLog("interruption resume failed error=${it.message}") },
+                    onResumeFailed = {
+                        reportIfAudioFocusRefused(it)
+                        androidXfadeLog("interruption resume failed error=${it.message}")
+                    },
                     onDecided = { decision, type -> androidXfadeLog("interruption action=${decision?.action} backend=$type") }
                 )
             }
@@ -940,6 +944,7 @@ class MusicService : HeadlessJsTaskService() {
                 }
                 emitHandledByNativeRemoteEvent(event, eventData)
             } catch (error: Exception) {
+                reportIfAudioFocusRefused(error)
                 androidXfadeLog("remote command failed reason=$reason error=${error.message}")
             }
         }
@@ -1062,8 +1067,18 @@ class MusicService : HeadlessJsTaskService() {
      * the admitted operation, so they are ordered with the interruption events.
      */
     private suspend fun playOn(backend: AndroidPlaybackBackendRouting) {
-        interruptions.userPlay()
-        backend.play()
+        // Decision B: refused focus, no play (paused, silent) and `audio_focus_refused`.
+        interruptions.playOrRefuse(play = { backend.play() }, refuse = { backend.pause() })
+    }
+
+    /** A refused play no one awaits (a remote control, an interruption's resume) is reported. */
+    private fun reportIfAudioFocusRefused(error: Throwable) {
+        val rejection = error as? RejectionException ?: return
+        if (rejection.code != AUDIO_FOCUS_REFUSED) return
+        emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {
+            putString("code", rejection.code)
+            putString("message", rejection.message)
+        })
     }
 
     private suspend fun pauseOn(backend: AndroidPlaybackBackendRouting) {

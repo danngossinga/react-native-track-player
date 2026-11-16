@@ -496,7 +496,7 @@ assert(
       ['public func stop(resolve:', 'public func seekTo(time:'],
       ['public func reset(resolve:', 'public func play(resolve:']].every(([start, end]) => {
       const body = commandBody(start, end);
-      const call = body.search(/(self\.)?interruptionPolicy\.userCommand\(\)/);
+      const call = body.search(/(self\.)?interruptionPolicy\.userCommand\(\)|self\.userPlayIsAllowed\(backend\)/);
       return call >= 0 && body.indexOf('withActivePlaybackBackend') < call;
     }) &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('scripts/fixtures/interruption-scenarios.json'),
@@ -512,7 +512,7 @@ assert(
     // activation, which Android does not wait for either).
     section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
     (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
-    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed"]') &&
+    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", audioFocusRefusedCode]') &&
     (player.match(/reject\("seek_failed", "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
@@ -556,6 +556,22 @@ assert(
     player.includes('stallTimeout, incomingStallGrace, backendSwitchPositionTolerance] {') &&
     (player.match(/self\?\.backendSwitchPositionTolerance\.milliseconds \?\? backendSwitchPositionToleranceDefaultMs/g) || []).length === 2,
   'iOS third-review fixes must stay in place.'
+);
+
+// Decision B: a play the system refuses does not start, on both iOS backends.
+const userPlayAllowed = section(player, 'private func userPlayIsAllowed(', '@objc(setupPlayer:');
+assert(
+  userPlayAllowed.includes('let interrupted = interruptionPolicy.isInterrupted\n        let granted = !interrupted && activateAudioSessionForPlayback()\n        guard interruptionPolicy.userPlay(granted: granted) == .play else {\n            backend.pause()\n            return false') &&
+    section(player, 'private func activateAudioSessionForPlayback()', 'private func userPlayIsAllowed(').includes('        do {\n            try audioSessionController.activateSession()\n        } catch {\n            activated = false\n        }') &&
+    section(player, 'private func activateAudioSessionForPlayback()', 'private func userPlayIsAllowed(').includes('        return activated\n') &&
+    section(player, 'public func play(resolve:', 'public func pause(resolve:').includes('            guard self.userPlayIsAllowed(backend) else {\n                completion(.failure(audioFocusRefusedError()))\n                return\n            }\n            backend.play(completion: completion)') &&
+    section(player, 'public func setPlayWhenReady(playWhenReady:', 'public func getPlayWhenReady(').includes('            if playWhenReady {\n                guard self.userPlayIsAllowed(backend) else {\n                    completion(.failure(audioFocusRefusedError()))') &&
+    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('                guard self.activateAudioSessionForPlayback() else {\n                    let error = audioFocusRefusedError()') &&
+    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('"code": audioFocusRefusedCode,') &&
+    player.includes('"crossfade_start_failed", audioFocusRefusedCode]') &&
+    facade.includes('let audioFocusRefusedCode = "audio_focus_refused"') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayDuringAnInterruptionIsRefusedAndNothingRetries()'),
+  'iOS must refuse a play the system does not give the audio to (audio_focus_refused) on both backends.'
 );
 
 console.log('iOS crossfade contracts OK');

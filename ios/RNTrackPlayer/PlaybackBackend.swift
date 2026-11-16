@@ -143,6 +143,22 @@ enum InterruptionAction: Equatable {
     case resume
 }
 
+/// A user play: start it, or refuse it because the system keeps the audio (Android: the same).
+enum UserPlayDecision: Equatable {
+    case play
+    case refused
+}
+
+/// The code a refused play rejects with and reports (`playback-error`), the same on Android.
+let audioFocusRefusedCode = "audio_focus_refused"
+
+func audioFocusRefusedError() -> Error {
+    NSError(domain: "RNTrackPlayer.PlaybackBackend", code: 1, userInfo: [
+        NSLocalizedDescriptionKey: "The system did not give the audio to this player (a call or another app holds it).",
+        "code": audioFocusRefusedCode
+    ])
+}
+
 /// The `remote-duck` event for an interruption event: `paused` while the audio is taken away,
 /// `permanent` when it will not be given back (same meaning on iOS and Android).
 struct RemoteDuckPayload: Equatable {
@@ -201,6 +217,22 @@ final class InterruptionPolicy {
     /// no longer resumes.
     func userCommand() {
         forget()
+    }
+
+    /// An interruption began and has not ended (a call): a play then is refused (decision B).
+    var isInterrupted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return interrupted
+    }
+
+    /// A play from the user (owner decision B): it starts only if the system gives the audio
+    /// (`granted`: iOS activates the session, outside an interruption; Android grants the focus).
+    /// Refused, nothing starts and nothing retries by itself (a later play tries again); either
+    /// way an interruption's end no longer resumes.
+    func userPlay(granted: Bool) -> UserPlayDecision {
+        forget()
+        return granted ? .play : .refused
     }
 
     private func forget() {

@@ -543,16 +543,19 @@ assert(
     !/requestAudioFocus\(/.test(musicService + orchestrator + engineSource) &&
     focusKt.includes('.setWillPauseWhenDucked(true)') &&
     focusKt.includes('AudioManager.AUDIOFOCUS_LOSS -> abandon()') &&
-    coordinatorKt.includes('fun userPlay(): Boolean {\n        policy.userCommand()\n        return focus.requestIfNeeded()') &&
+    coordinatorKt.includes('fun userPlay(): Boolean = policy.userPlay(granted = focus.requestIfNeeded()) == UserPlayDecision.PLAY') &&
+    coordinatorKt.includes('        if (userPlay()) {\n            play()\n        } else {\n            refuse()\n            throw audioFocusRefused()') &&
     coordinatorKt.includes('fun userStop() {\n        policy.userCommand()\n        focus.abandon()') &&
     coordinatorKt.includes('fun destroy() {\n        noisyReceiver.unregister()\n        focus.abandon()') &&
-    coordinatorKt.includes('InterruptionAction.RESUME -> {\n                focus.requestIfNeeded()') &&
+    coordinatorKt.includes('InterruptionAction.RESUME -> {\n                val granted = focus.requestIfNeeded()') &&
+    coordinatorKt.includes('                if (!granted) {\n                    // Decision B: no play without the focus; reported, not retried.\n                    onResumeFailed(audioFocusRefused())\n                    return decision') &&
     coordinatorKt.includes('            playWhenReady = backend.playWhenReady,\n            state = backend.playbackState,') &&
     applyInterruptionKt.includes('interruptions.applyOn(\n                    facade = facade,\n                    scope = scope,') &&
     coordinatorKt.includes('val decision = decide(interruptionCountsAsPlaying(playWhenReady, state)) ?: return null') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/InterruptionPolicy.kt').includes('playWhenReady && state !in INTERRUPTION_FINISHED_STATES') &&
     // remote-duck when the pause is done, or before the resumed play is awaited (as on iOS).
-    coordinatorKt.includes('focus.requestIfNeeded()\n                decision.duck?.let(emit)\n                try {\n                    play()') &&
+    coordinatorKt.includes('val granted = focus.requestIfNeeded()\n                decision.duck?.let(emit)\n                if (!granted) {') &&
+    coordinatorKt.includes('                    return decision\n                }\n                try {\n                    play()') &&
     focusKt.includes('.setContentType(contentType())') &&
     musicService.includes('SystemAudioFocusRequester(this) { focusContentType }') &&
     musicService.includes('focusContentType = focusContentTypeOf(playerConfig.audioContentType)') &&
@@ -564,7 +567,11 @@ assert(
     userCommandsKt.includes('if (value) playOn(backend) else pauseOn(backend)') &&
     userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            pauseOn(backend)') &&
     userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            stopOn(backend)') &&
-    userCommandsKt.includes('private suspend fun playOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userPlay()\n        backend.play()') &&
+    userCommandsKt.includes('private suspend fun playOn(backend: AndroidPlaybackBackendRouting) {\n        // Decision B: refused focus, no play (paused, silent) and `audio_focus_refused`.\n        interruptions.playOrRefuse(play = { backend.play() }, refuse = { backend.pause() })') &&
+    musicService.includes('            } catch (error: Exception) {\n                reportIfAudioFocusRefused(error)\n                androidXfadeLog("remote command failed') &&
+    musicService.includes('                    onResumeFailed = {\n                        reportIfAudioFocusRefused(it)') &&
+    section(musicService, 'private fun reportIfAudioFocusRefused(', '\n    }\n').includes('if (rejection.code != AUDIO_FOCUS_REFUSED) return\n        emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionCoordinatorTest.kt').includes('fun aPlayTheSystemRefusesDoesNotStartAndRejectsWithAudioFocusRefused()') &&
     userCommandsKt.includes('private suspend fun pauseOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userPause()\n        backend.pause()') &&
     userCommandsKt.includes('private suspend fun stopOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userStop()\n        backend.stop()') &&
     section(musicService, 'suspend fun reset() {', '@MainThread').includes('withActivePlaybackBackend { backend ->\n            interruptions.userStop()\n            backend.stop()') &&

@@ -73,7 +73,7 @@ Fired when an error occurs.
 
 | Param   | Type     | Description       |
 | ------- | -------- | ----------------- |
-| code    | `string` | The error code    |
+| code    | `string` | The error code (`PlaybackErrorCode`: for example `audio_focus_refused` when the system refused the audio to a play, see `RemoteDuck`) |
 | message | `string` | The error message |
 
 ### `PlaybackPlayWhenReadyChanged`
@@ -197,8 +197,18 @@ ends, if the system allows it, playback was playing when it began (asked to
 play, with an active track that has not ended, failed or stopped: after the
 queue ended an interruption neither pauses nor resumes) and the user did not
 play, pause or stop since. A permanent loss or unplugged headphones never
-resume. A refused audio focus request (Android) or audio session activation
-(iOS) does not stop playback from starting, on both platforms.
+resume.
+
+A play the system refuses does not start, on both platforms and both backends:
+an Android audio focus request that is denied, or on iOS an audio session that
+cannot be activated or a play during an interruption (a call). The player stays
+paused (`playWhenReady` false, silent); `play()` and `setPlayWhenReady(true)`
+reject with `audio_focus_refused` (`PlaybackErrorCode.AudioFocusRefused`), and a
+play no one awaits (an Android crossfade remote control, an interruption's
+resume) emits a `PlaybackError` with that code. Nothing retries by itself: a
+later play tries again, and the refused play counts as the user's (an
+interruption in progress then does not resume when it ends). Showing a message
+is up to the app.
 
 When it resumes, the event with `paused: false` is emitted as soon as the
 resume is issued, before playback has started, and a pause from the user

@@ -296,7 +296,17 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             switch action {
             case .pause: backend.pause()
             case .resume:
-                if backend.kind == .pingPong { self.activateAudioSessionForPlayback() }
+                // Decision B: no resume without the session; reported, not retried.
+                guard self.activateAudioSessionForPlayback() else {
+                    let error = audioFocusRefusedError()
+                    DispatchQueue.main.async {
+                        self.emit(event: EventType.PlaybackError, body: [
+                            "code": audioFocusRefusedCode,
+                            "message": error.localizedDescription
+                        ])
+                    }
+                    break
+                }
                 // Not awaited (the crossfade backend's play waits for playback to start): the
                 // remote-duck goes out now, and a user pause is admitted at once instead of
                 // queueing behind the resume, as on Android. A failed resume is logged; the gain
@@ -406,7 +416,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// Codes iOS rejects with as Android does (its RejectionException's code): a play start that
     /// gives up and a crossfade whose incoming song does not start. Other failures keep the
     /// command's generic code.
-    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed"]
+    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", audioFocusRefusedCode]
 
     private func rejectionCode(_ error: Error, _ fallback: String) -> String {
         guard let code = (error as NSError).userInfo["code"] as? String,
@@ -827,8 +837,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         )
     }
 
-    private func activateAudioSessionForPlayback() {
-        try? audioSessionController.activateSession()
+    /// Activates the session for playback; false when the system refuses it (a call, another
+    /// app with priority): decision B, the play is refused.
+    @discardableResult
+    private func activateAudioSessionForPlayback() -> Bool {
+        var activated = true
+        do {
+            try audioSessionController.activateSession()
+        } catch {
+            activated = false
+        }
         if #available(iOS 11.0, *) {
             try? AVAudioSession.sharedInstance().setCategory(
                 sessionCategory,
@@ -843,6 +861,21 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 options: sessionCategoryOptions
             )
         }
+        return activated
+    }
+
+    /// Decision B, the same rule as Android on both backends: a user play starts only when the
+    /// session activates and no interruption (a call) is in progress. Refused: the backend is
+    /// paused (playWhenReady off, silent) and the play fails with `audio_focus_refused`. Runs in
+    /// the admitted operation, ordered with the interruption events.
+    private func userPlayIsAllowed(_ backend: IOSPlaybackBackendRouting) -> Bool {
+        let interrupted = interruptionPolicy.isInterrupted
+        let granted = !interrupted && activateAudioSessionForPlayback()
+        guard interruptionPolicy.userPlay(granted: granted) == .play else {
+            backend.pause()
+            return false
+        }
+        return true
     }
 
     @objc(setupPlayer:resolver:rejecter:)
@@ -1435,13 +1468,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
         withActivePlaybackBackendAsync({ backend, completion in
             // In the admitted operation: ordered with the interruption events.
-            self.interruptionPolicy.userCommand()
             backend.syncQueue(self.playerTracks())
-            if backend.kind == .pingPong {
-                self.activateAudioSessionForPlayback()
+            guard self.userPlayIsAllowed(backend) else {
+                completion(.failure(audioFocusRefusedError()))
+                return
             }
             backend.play(completion: completion)
-        }) { result in
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())
@@ -1472,12 +1505,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
         withActivePlaybackBackendAsync({ backend, completion in
             // In the admitted operation: ordered with the interruption events.
-            self.interruptionPolicy.userCommand()
-            if playWhenReady, backend.kind == .pingPong {
-                self.activateAudioSessionForPlayback()
+            if playWhenReady {
+                guard self.userPlayIsAllowed(backend) else {
+                    completion(.failure(audioFocusRefusedError()))
+                    return
+                }
+            } else {
+                self.interruptionPolicy.userCommand()
             }
             backend.setPlayWhenReady(playWhenReady, completion: completion)
-        }) { result in
+        }) { (result: Result<Void, Error>) in
             switch result {
             case .success:
                 resolve(NSNull())

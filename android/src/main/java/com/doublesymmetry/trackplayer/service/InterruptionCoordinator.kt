@@ -28,9 +28,19 @@ internal class InterruptionCoordinator(
      * A play from the user (app, notification, lock screen, headset): an interruption's end no
      * longer resumes, and the focus is requested. True when the focus is held.
      */
-    fun userPlay(): Boolean {
-        policy.userCommand()
-        return focus.requestIfNeeded()
+    fun userPlay(): Boolean = policy.userPlay(granted = focus.requestIfNeeded()) == UserPlayDecision.PLAY
+
+    /**
+     * A user play on a backend: plays when the focus is granted; refused, the backend is paused
+     * (playWhenReady off, silent) and the play rejects with `audio_focus_refused` (decision B).
+     */
+    suspend fun playOrRefuse(play: suspend () -> Unit, refuse: suspend () -> Unit) {
+        if (userPlay()) {
+            play()
+        } else {
+            refuse()
+            throw audioFocusRefused()
+        }
     }
 
     /** A pause from the user: an interruption's end no longer resumes. */
@@ -71,8 +81,13 @@ internal class InterruptionCoordinator(
                 decision.duck?.let(emit)
             }
             InterruptionAction.RESUME -> {
-                focus.requestIfNeeded()
+                val granted = focus.requestIfNeeded()
                 decision.duck?.let(emit)
+                if (!granted) {
+                    // Decision B: no play without the focus; reported, not retried.
+                    onResumeFailed(audioFocusRefused())
+                    return decision
+                }
                 try {
                     play()
                 } catch (error: Exception) {

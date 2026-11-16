@@ -287,4 +287,40 @@ class InterruptionCoordinatorTest {
         assertEquals(listOf(0), harness.ducksAtPause)
         assertEquals(RemoteDuckPayload(paused = true, permanent = false), harness.ducks.last())
     }
+
+    @Test
+    fun aPlayTheSystemRefusesDoesNotStartAndRejectsWithAudioFocusRefused() = runTest {
+        val focus = FakeFocus(grant = false)
+        val coordinator = InterruptionCoordinator({ true }, focus, FakeReceiver()) { }
+        val calls = mutableListOf<String>()
+        val refused = runCatching {
+            coordinator.playOrRefuse(play = { calls += "play" }, refuse = { calls += "pause" })
+        }
+        assertEquals(AUDIO_FOCUS_REFUSED, (refused.exceptionOrNull() as com.doublesymmetry.trackplayer.utils.RejectionException).code)
+        // Nothing plays; the backend is paused (playWhenReady off, silent).
+        assertEquals(listOf("pause"), calls)
+        assertFalse(coordinator.focus.isHeld)
+        // Nothing retries by itself; a later play the system allows plays.
+        focus.grant = true
+        coordinator.playOrRefuse(play = { calls += "play" }, refuse = { calls += "pause" })
+        assertEquals(listOf("pause", "play"), calls)
+        assertEquals(2, focus.requests)
+    }
+
+    @Test
+    fun aResumeTheSystemRefusesDoesNotPlayAndIsReported() = runTest {
+        val focus = FakeFocus(grant = false)
+        val coordinator = InterruptionCoordinator({ true }, focus, FakeReceiver()) { }
+        val failures = mutableListOf<Throwable>()
+        val ducks = mutableListOf<RemoteDuckPayload>()
+        var played = false
+        coordinator.applyTo(
+            false, AudioPlayerState.PAUSED,
+            { InterruptionDecision(InterruptionAction.RESUME, RemoteDuckPayload(paused = false, permanent = false)) },
+            { }, { played = true }, { ducks += it }, { failures += it }
+        )
+        assertFalse(played)
+        assertEquals(listOf(AUDIO_FOCUS_REFUSED), failures.map { (it as com.doublesymmetry.trackplayer.utils.RejectionException).code })
+        assertEquals(listOf(RemoteDuckPayload(paused = false, permanent = false)), ducks)
+    }
 }
