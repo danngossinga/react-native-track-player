@@ -59,6 +59,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// The app's other waits: crossfade play start, standard readiness and standard seek.
     private let playStartTimeout = TimeoutSetting(optionKey: "playStartTimeoutMs", defaultMs: playStartTimeoutDefaultMs)
     private let standardReadyTimeout = TimeoutSetting(optionKey: "standardReadyTimeoutMs", defaultMs: standardReadyTimeoutDefaultMs)
+    /// How far a restored position may be off at a backend switch (same option as Android).
+    private let backendSwitchPositionTolerance = TimeoutSetting(
+        optionKey: "backendSwitchPositionToleranceMs",
+        defaultMs: backendSwitchPositionToleranceDefaultMs
+    )
     private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)
     /// How long any of those waits may go on with no progress before it fails (`stallTimeoutMs`).
     private let stallTimeout = TimeoutSetting(optionKey: "stallTimeoutMs", defaultMs: stallTimeoutDefaultMs)
@@ -292,11 +297,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .pause: backend.pause()
             case .resume:
                 if backend.kind == .pingPong { self.activateAudioSessionForPlayback() }
-                do {
-                    try backend.play()
-                } catch {
-                    // The gain is still reported (remote-duck), as on Android.
-                    IOSPlaybackLog.log("interruption resume failed error=\(error.localizedDescription)")
+                // Not awaited (the crossfade backend's play waits for playback to start): the
+                // remote-duck goes out now, and a user pause is admitted at once instead of
+                // queueing behind the resume, as on Android. A failed resume is logged; the gain
+                // is still reported.
+                backend.play { result in
+                    if case .failure(let error) = result {
+                        IOSPlaybackLog.log("interruption resume failed error=\(error.localizedDescription)")
+                    }
                 }
             case .none: break
             }
@@ -509,6 +517,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 player: source,
                 transitionGenerationSidecar: transitionGenerationSidecar,
                 readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs },
+                positionToleranceMs: { [weak self] in
+                    self?.backendSwitchPositionTolerance.milliseconds ?? backendSwitchPositionToleranceDefaultMs
+                },
                 seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs },
                 stallTimeoutMs: { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
@@ -558,6 +569,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                     }
                 },
                 initiallyAuthoritative: initiallyAuthoritative,
+                positionToleranceMs: { [weak self] in
+                    self?.backendSwitchPositionTolerance.milliseconds ?? backendSwitchPositionToleranceDefaultMs
+                },
                 queueProvider: { [weak queuePlayer] in
                     queuePlayer?.items.compactMap { $0 as? Track } ?? []
                 }
@@ -1035,7 +1049,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// `standardSeekTimeoutMs`, `stallTimeoutMs`) and `incomingStallGraceMs` from setup or update
     /// options; any other value is ignored.
     private func applyTimeouts(_ options: [String: Any]) {
-        for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace] {
+        for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace, backendSwitchPositionTolerance] {
             switch setting.apply(options) {
             case true?: IOSPlaybackLog.log("\(setting.optionKey) set to \(setting.milliseconds)ms")
             case false?: IOSPlaybackLog.log("\(setting.optionKey) ignored, kept \(setting.milliseconds)ms")

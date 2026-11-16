@@ -198,7 +198,12 @@ play, with an active track that has not ended, failed or stopped: after the
 queue ended an interruption neither pauses nor resumes) and the user did not
 play, pause or stop since. A permanent loss or unplugged headphones never
 resume. A refused audio focus request (Android) or audio session activation
-(iOS) does not stop playback from starting, on both platforms. With `autoHandleInterruptions: false` (default), the app may
+(iOS) does not stop playback from starting, on both platforms.
+
+When it resumes, the event with `paused: false` is emitted as soon as the
+resume is issued, before playback has started, and a pause from the user
+during that start runs at once (it does not wait for the start), on both
+platforms and both backends. With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

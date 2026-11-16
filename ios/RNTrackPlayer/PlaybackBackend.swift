@@ -11,6 +11,8 @@ let prepareTimeoutDefaultMs = 60000
 let playStartTimeoutDefaultMs = 60000
 /// How long the standard backend may take in all for a restored track to be ready (`standardReadyTimeoutMs`).
 let standardReadyTimeoutDefaultMs = 60000
+/// `backendSwitchPositionToleranceMs`: how far a restored position may be off at a backend switch.
+let backendSwitchPositionToleranceDefaultMs = 750
 /// How long the standard backend may take in all to complete a seek (`standardSeekTimeoutMs`).
 let standardSeekTimeoutDefaultMs = 60000
 /// How long any of those waits goes on with no progress (no new media loaded) before it fails
@@ -235,6 +237,33 @@ let interruptionFinishedStates: Set<String> = ["none", "ended", "error", "stoppe
 /// pauses nor resumes.
 func interruptionCountsAsPlaying(playWhenReady: Bool, stateRawValue: String) -> Bool {
     return playWhenReady && !interruptionFinishedStates.contains(stateRawValue)
+}
+
+/// The native seeks a standard backend issued, to match each SwiftAudioEx seek callback (which
+/// carries only the position) to its own seek: a callback belongs to the oldest outstanding native
+/// seek at that position. A seek that a newer one replaced keeps its slot (AVPlayer still calls it
+/// back, finished or not) but has no owner any more, so after A, B, then A again, only the last
+/// A's callback resolves the current seek. A callback for a seek the backend did not issue (the
+/// SDK's own) matches nothing. Not thread-safe: use it from one queue (main).
+struct NativeSeekLedger<Owner: AnyObject> {
+    private var outstanding: [(position: Double, owner: Owner?)] = []
+
+    mutating func issued(_ owner: Owner, at position: Double) {
+        outstanding.append((position: position, owner: owner))
+    }
+
+    /// The owner gave its seek up (a newer seek replaced it): its callback resolves nothing.
+    mutating func release(_ owner: Owner) {
+        for index in outstanding.indices where outstanding[index].owner === owner {
+            outstanding[index].owner = nil
+        }
+    }
+
+    /// The owner of the native seek this callback completes, nil when it was replaced or not ours.
+    mutating func completed(at position: Double) -> Owner? {
+        guard let index = outstanding.firstIndex(where: { $0.position == position }) else { return nil }
+        return outstanding.remove(at: index).owner
+    }
 }
 
 /// One value shared across threads (a setting read by notification handlers, a reference

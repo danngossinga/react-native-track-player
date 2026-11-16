@@ -58,6 +58,13 @@ export interface UpdateOptions {
    */
   standardReadyTimeoutMs?: number;
   /**
+   * Backend switch (iOS and Android, both backends): how far, in milliseconds, the restored
+   * position may be from the switched-from position for the new backend to count as restored
+   * (otherwise it seeks, or keeps waiting for readiness). Defaults to 750. Same bounds as
+   * `stallTimeoutMs`.
+   */
+  backendSwitchPositionToleranceMs?: number;
+  /**
    * Standard backend (iOS and Android): the total limit, in milliseconds, for a seek
    * (`standard_seek_timeout`); a seek whose buffered position does not grow for `stallTimeoutMs`
    * fails sooner. Defaults to 60000. Same bounds as `stallTimeoutMs`.

@@ -340,7 +340,7 @@ assert(
     !/elapsedMs >= \d/.test(orchestrator) &&
     facade.includes('let incomingStallGraceDefaultMs = 2000') &&
     player.includes('private let incomingStallGrace = TimeoutSetting(optionKey: "incomingStallGraceMs", defaultMs: incomingStallGraceDefaultMs)') &&
-    player.includes('stallTimeout, incomingStallGrace]') &&
+    player.includes('stallTimeout, incomingStallGrace, backendSwitchPositionTolerance]') &&
     section(player, 'case .pingPong:', 'return PingPongPlaybackBackend(').includes('orchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }') &&
     section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:').includes('playbackOrchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }') &&
     ['src/interfaces/PlayerOptions.ts', 'src/interfaces/UpdateOptions.ts'].every((f) => read(f).includes('incomingStallGraceMs?: number;')) &&
@@ -380,7 +380,7 @@ const pingPongFactory = section(player, 'case .pingPong:', 'return PingPongPlayb
 const setupPlayerTimeout = section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:');
 assert(
   player.includes('private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)') &&
-    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace]') &&
+    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace, backendSwitchPositionTolerance]') &&
     player.includes('private let stallTimeout = TimeoutSetting(optionKey: "stallTimeoutMs", defaultMs: stallTimeoutDefaultMs)') &&
     pingPongFactory.includes('orchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }') &&
     setupPlayerTimeout.includes('playbackOrchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }') &&
@@ -417,7 +417,7 @@ assert(
     standardBackend2.includes('let wait = StallWaitDriver(\n            stallTimeoutMs: stallTimeoutMs(),\n            totalTimeoutMs: seekTimeoutMs(),') &&
     standardBackend2.includes('guard let self = self, let request = request, request.issued else { return nil }') &&
     standardBackend2.includes('return [self.player.bufferedPosition]') &&
-    standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            player.seek(to: request.position)') &&
+    standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
     standardBackend2.includes('request.wait = wait\n        // A newer seek ends the older ones at once (standard_seek_cancelled), as on Android.') &&
     standardBackend2.includes('        pendingSeeks.append(request)\n        wait.start()\n        pumpSeeks()') &&
     section(standardBackend2, '// A newer seek ends the older ones at once', 'pendingSeeks.append(request)').includes('issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))') &&
@@ -427,8 +427,8 @@ assert(
     !standardBackend2.includes('DispatchWorkItem { [weak self, weak request]') &&
     !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
     !/timeout: TimeInterval = \d/.test(standardBackend2) &&
-    standardBackend2.includes('timeoutMs: readinessTimeoutMs(),\n                stallTimeoutMs: stallTimeoutMs()') &&
-    standardBackend2.includes('        timeoutMs: timeoutMs,\n        stallTimeoutMs: stallTimeoutMs,\n        observe: {') &&
+    standardBackend2.includes('timeoutMs: readinessTimeoutMs(),\n                positionToleranceMs: positionToleranceMs(),\n                stallTimeoutMs: stallTimeoutMs()') &&
+    standardBackend2.includes('        timeoutMs: timeoutMs,\n        stallTimeoutMs: stallTimeoutMs,\n        positionToleranceMs: positionToleranceMs,\n        observe: {') &&
     standardBackend2.includes('buffered: player.bufferedPosition') &&
     standardBackend2.includes('self.seekTimeoutMs = seekTimeoutMs') &&
     standardBackend2.includes('self.stallTimeoutMs = stallTimeoutMs') &&
@@ -472,7 +472,7 @@ assert(
     applyInterruption.includes('let (action, duck) = decide(self.interruptionPolicy, backend.interruptionIsPlaying)') &&
     !/guard[^\n]*kind|kind (==|!=) \.(standard|pingPong)[^\n]*(return|\{\s*\n\s*return)/.test(applyInterruption.slice(0, applyInterruption.indexOf('let (action, duck) = decide('))) &&
     applyInterruption.includes('case .pause: backend.pause()') &&
-    applyInterruption.includes('do {\n                    try backend.play()\n                } catch {') &&
+    applyInterruption.includes('backend.play { result in') &&
     applyInterruption.includes('completion(.success(duck))') &&
     applyInterruption.includes('"permanent": duck.permanent') &&
     // Was it playing: the module's last request, not SwiftAudioEx's own pause at the interruption.
@@ -519,6 +519,43 @@ assert(
     player.includes('reject(self.rejectionCode(error, "playback_failed"), "Unable to start playback.", error)') &&
     player.includes('reject(self.rejectionCode(error, "crossfade_failed"), "Unable to complete crossfade.", error)'),
   'iOS play-start failures must reject and report like Android.'
+);
+
+// Third review: exact pins for what the XCTest target cannot reach (StandardPlaybackBackend,
+// the engine, the ping-pong backend and the module are not compiled into it).
+assert(
+  // A newer seek ends every queued one and the issued one; each native callback resolves only
+  // the seek it completes (NativeSeekLedger, tested).
+  standardBackend.includes('        let superseded = pendingSeeks\n        pendingSeeks.removeAll()\n        superseded.forEach {\n            $0.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
+    standardBackend.includes('        if let issued = issuedSeek {\n            // Its native callback still comes (NativeSeekLedger) but resolves nothing.\n            issuedSeek = nil\n            nativeSeeks.release(issued)\n            issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
+    standardBackend.includes('            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
+    standardBackend.includes('        guard let request = nativeSeeks.completed(at: position) else { return }\n        if issuedSeek === request { issuedSeek = nil }') &&
+    !standardBackend.includes('request.position == position') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testANativeSeekCallbackResolvesOnlyTheSeekItCompletes()') &&
+    // The module's request follows every playWhenReady it sets (restore, a cancelled handoff,
+    // the activation after a switch).
+    section(standardBackend, '    func restore(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = false\n            requested.request(false)\n            player.pause()') &&
+    section(standardBackend, '    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = snapshot.playWhenReady\n            requested.request(snapshot.playWhenReady)') &&
+    section(standardBackend, '    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {', '    func ').includes('        player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady\n        requested.request(player.playWhenReady)') &&
+    // The crossfade engine gives up at once with crossfade_engine_error when the player fails.
+    engine.includes('                if let failure = self.player.currentItem?.error ?? self.player.error,\n                   self.player.currentItem?.status == .failed || self.player.status == .failed {\n                    DispatchQueue.main.async {\n                        guard self.generation == generation, !didComplete else { return }\n                        self.state = .failed\n                        finish(.failure(NSError(') &&
+    // The ping-pong backend reads the orchestrator on main.
+    pingPongBackend.includes('    var interruptionIsPlaying: Bool {\n        return (try? performPlaybackBackendOnMainSync {\n            interruptionCountsAsPlaying(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)\n        }) ?? false\n    }') &&
+    // Only the authoritative orchestrator reports a failed play start.
+    player.includes('    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailPlaybackStart code: String, message: String) {\n        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),\n              orchestrator === playbackOrchestrator else { return }\n        // The same playback-error as Android\'s for a play start that gives up.\n        emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
+    // The interruption resume is not awaited: remote-duck goes out at once, a user pause is not
+    // queued behind it (as on Android).
+    section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(').includes('                backend.play { result in\n                    if case .failure(let error) = result {') &&
+    !/try backend\.play\(\)/.test(section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(')) &&
+    // backendSwitchPositionToleranceMs, the same option as Android, on both backends.
+    standardBackend.includes('abs(observation.position - restoredPosition) <= Double(positionToleranceMs) / 1000 {') &&
+    standardBackend.includes('abs(player.currentTime - max(0, snapshot.position)) > Double(positionToleranceMs()) / 1000 {') &&
+    pingPongBackend.includes('abs(orchestrator.currentTime - snapshot.position) > Double(positionToleranceMs()) / 1000 {') &&
+    !/> 0\.75|<= 0\.75/.test(standardBackend + pingPongBackend) &&
+    player.includes('optionKey: "backendSwitchPositionToleranceMs",') &&
+    player.includes('stallTimeout, incomingStallGrace, backendSwitchPositionTolerance] {') &&
+    (player.match(/self\?\.backendSwitchPositionTolerance\.milliseconds \?\? backendSwitchPositionToleranceDefaultMs/g) || []).length === 2,
+  'iOS third-review fixes must stay in place.'
 );
 
 console.log('iOS crossfade contracts OK');

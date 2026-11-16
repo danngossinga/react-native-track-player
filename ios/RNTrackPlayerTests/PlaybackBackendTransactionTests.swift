@@ -368,6 +368,30 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testANativeSeekCallbackResolvesOnlyTheSeekItCompletes() {
+        final class Seek {}
+        var ledger = NativeSeekLedger<Seek>()
+        // A, then B replaces it, then A again replaces B: AVPlayer calls all three back in order.
+        let first = Seek(), second = Seek(), third = Seek()
+        ledger.issued(first, at: 10)
+        ledger.release(first)
+        ledger.issued(second, at: 20)
+        ledger.release(second)
+        ledger.issued(third, at: 10)
+        XCTAssertNil(ledger.completed(at: 10), "the first A's callback must not resolve the last A")
+        XCTAssertNil(ledger.completed(at: 20))
+        XCTAssertTrue(ledger.completed(at: 10) === third)
+        // A callback for a seek the backend did not issue (the SDK's own) matches nothing.
+        XCTAssertNil(ledger.completed(at: 30))
+        // The same target issued again after a replaced one: only the new one resolves.
+        let again = Seek(), latest = Seek()
+        ledger.issued(again, at: 5)
+        ledger.release(again)
+        ledger.issued(latest, at: 5)
+        XCTAssertNil(ledger.completed(at: 5))
+        XCTAssertTrue(ledger.completed(at: 5) === latest)
+    }
+
     func testInterruptionPolicyReadsTheOptionAtTheEnd() {
         var autoResume = false
         let policy = InterruptionPolicy(autoResume: { autoResume })

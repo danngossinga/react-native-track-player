@@ -27,6 +27,8 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     private var disposed = false
     private var pendingQueueChanged = false
     private(set) var queueResetCount = 0
+    /// How far a restored position may be off at a backend switch (`backendSwitchPositionToleranceMs`).
+    private let positionToleranceMs: () -> Int
 
     init(
         player: QueuedAudioPlayer,
@@ -36,8 +38,10 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
         onActivated: @escaping (IOSPlaybackOrchestrator) -> Void,
         onDisposed: @escaping (IOSPlaybackOrchestrator, QueuedAudioPlayer) -> Void,
         initiallyAuthoritative: Bool = false,
+        positionToleranceMs: @escaping () -> Int = { backendSwitchPositionToleranceDefaultMs },
         queueProvider: @escaping () -> [Track]
     ) {
+        self.positionToleranceMs = positionToleranceMs
         self.player = player
         self.orchestrator = orchestrator
         self.transitionGenerationSidecar = transitionGenerationSidecar
@@ -120,7 +124,7 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
                 try awaitResult { completion in
                     orchestrator.skip(to: index, initialTime: snapshot.position, completion: completion)
                 }
-            } else if abs(orchestrator.currentTime - snapshot.position) > 0.75 {
+            } else if abs(orchestrator.currentTime - snapshot.position) > Double(positionToleranceMs()) / 1000 {
                 try awaitResult { completion in
                     orchestrator.seek(to: snapshot.position, completion: completion)
                 }

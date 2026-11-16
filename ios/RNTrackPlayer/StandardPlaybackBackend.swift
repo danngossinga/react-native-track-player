@@ -16,6 +16,8 @@ enum StandardPlaybackReadinessGate {
         expectedPosition: Double,
         timeoutMs: Int,
         stallTimeoutMs: Int,
+        /// The app's `backendSwitchPositionToleranceMs`.
+        positionToleranceMs: Int,
         observe: () -> StandardPlaybackReadinessObservation,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
         waitForNextPoll: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
@@ -35,7 +37,7 @@ enum StandardPlaybackReadinessGate {
             let restoredPosition = max(0, expectedPosition)
             if isReadyState,
                observation.index == expectedIndex,
-               abs(observation.position - restoredPosition) <= 0.75 {
+               abs(observation.position - restoredPosition) <= Double(positionToleranceMs) / 1000 {
                 return
             }
             let verdict = watch.check(at: now(), readings: [observation.buffered])
@@ -56,6 +58,7 @@ private func waitForStandardPlaybackActivation(
     player: QueuedAudioPlayer,
     snapshot: PlaybackBackendSnapshot,
     timeoutMs: Int,
+    positionToleranceMs: Int,
     stallTimeoutMs: Int
 ) throws {
     guard let expectedIndex = snapshot.activeIndex else { return }
@@ -70,6 +73,7 @@ private func waitForStandardPlaybackActivation(
         expectedPosition: snapshot.position,
         timeoutMs: timeoutMs,
         stallTimeoutMs: stallTimeoutMs,
+        positionToleranceMs: positionToleranceMs,
         observe: {
             StandardPlaybackReadinessObservation(
                 state: player.playerState,
@@ -241,6 +245,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     /// How long a seek may take in all (`standardSeekTimeoutMs`, 60000 ms by default), read at
     /// every seek.
     private let seekTimeoutMs: () -> Int
+    /// How far a restored position may be off at a backend switch (`backendSwitchPositionToleranceMs`).
+    private let positionToleranceMs: () -> Int
     /// How long a seek or a readiness wait may go on with no progress (`stallTimeoutMs`).
     private let stallTimeoutMs: () -> Int
     private let queueState = PlaybackBackendQueueState<Track>()
@@ -249,9 +255,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
-    // SwiftAudioEx's seek event has no item or command identifier. Only one
-    // native seek may be outstanding, including a cancelled seek whose actual
-    // AVFoundation callback has not arrived yet.
+    // SwiftAudioEx's seek event has no item or command identifier: NativeSeekLedger matches
+    // each callback to the native seek it completes.
     private final class PendingSeek {
         let track: Track
         let position: Double
@@ -282,6 +287,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
     private var pendingSeeks: [PendingSeek] = []
     private var issuedSeek: PendingSeek?
+    private var nativeSeeks = NativeSeekLedger<PendingSeek>()
     private var seekReadinessPoll: DispatchWorkItem?
     // SwiftAudioEx retains the listener during asynchronous removal. Use a
     // separate identity so deinit never passes its dying self to that closure.
@@ -294,6 +300,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         // The app's standardReadyTimeoutMs, standardSeekTimeoutMs and stallTimeoutMs, read at
         // every wait.
         readinessTimeoutMs: @escaping () -> Int,
+        positionToleranceMs: @escaping () -> Int = { backendSwitchPositionToleranceDefaultMs },
         seekTimeoutMs: @escaping () -> Int,
         stallTimeoutMs: @escaping () -> Int,
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
@@ -319,6 +326,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.onIdleTrackActivationWillBegin = onIdleTrackActivationWillBegin
         self.onIdleTrackActivated = onIdleTrackActivated
         self.seekTimeoutMs = seekTimeoutMs
+        self.positionToleranceMs = positionToleranceMs
         self.stallTimeoutMs = stallTimeoutMs
         // The app's readiness timeout (standardReadyTimeoutMs), read at every activation.
         self.waitForActivationReadiness = waitForActivationReadiness ?? { player, snapshot in
@@ -326,6 +334,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 player: player,
                 snapshot: snapshot,
                 timeoutMs: readinessTimeoutMs(),
+                positionToleranceMs: positionToleranceMs(),
                 stallTimeoutMs: stallTimeoutMs()
             )
         }
@@ -402,17 +411,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             $0.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))
         }
         if let issued = issuedSeek {
+            // Its native callback still comes (NativeSeekLedger) but resolves nothing.
             issuedSeek = nil
+            nativeSeeks.release(issued)
             issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))
-            if issued.track === request.track && issued.position == request.position {
-                // The same target is already issued: this seek takes its native callback over
-                // (a second native seek to it would make the first callback look like ours).
-                issuedSeek = request
-                request.issued = true
-                wait.start()
-                wait.noteProgress()
-                return
-            }
         }
         pendingSeeks.append(request)
         wait.start()
@@ -454,14 +456,16 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             issuedSeek = request
             request.issued = true
             request.wait?.noteProgress()
+            nativeSeeks.issued(request, at: request.position)
             player.seek(to: request.position)
             return
         }
     }
 
     private func didCompleteNativeSeek(position: Double, didFinish: Bool) {
-        guard let request = issuedSeek, request.position == position else { return }
-        issuedSeek = nil
+        // Matched by the seek it completes, not by position alone (A, B, then A again).
+        guard let request = nativeSeeks.completed(at: position) else { return }
+        if issuedSeek === request { issuedSeek = nil }
         let sameTrack = (player.currentItem as? Track) === request.track
         request.finish(didFinish && sameTrack && !disposed
             ? .success(())
@@ -561,7 +565,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                     try player.jumpToItem(atIndex: index, playWhenReady: false)
                 }
                 if queueChanged || indexChanged ||
-                    abs(player.currentTime - max(0, snapshot.position)) > 0.75 {
+                    abs(player.currentTime - max(0, snapshot.position)) > Double(positionToleranceMs()) / 1000 {
                     enqueueSeek(to: snapshot.position) { _ in }
                 }
             }
