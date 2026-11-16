@@ -23,3 +23,16 @@ privately, so these need small changes in it.
 - `java/com/doublesymmetry/kotlinaudio/notification/NotificationManager.kt:23`:
   `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
   resources are now merged into this library's namespace).
+- `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
+  (defaults keep upstream behaviour).
+- `players/BaseAudioPlayer.kt`:
+  - `:35` import of `PlayerHooks`;
+  - `:87-88` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
+  - `:235` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
+    selector whose selections start each track from `initialBitrateEstimateBps`);
+  - `:477-487` the item's HTTP configuration (user agent, redirects, headers) becomes a
+    `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
+    builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
+    applied to a plain `DefaultHttpDataSource.Factory` as upstream.
+- `players/QueuedAudioPlayer.kt:17-19`: constructor parameter `hooks`, passed to
+  `BaseAudioPlayer`.

@@ -66,9 +66,9 @@ Added fork surface:
   for a track (crossfade load, seek and play start, standard backend readiness and
   seek) fails when it makes no progress (no new media downloaded or buffered) for
   this long. A slow load that keeps progressing goes on, up to the wait's own total
-  limit below. On Android the crossfade players' HTTP connect and read timeouts
+  limit below. On Android the players' HTTP connect and read timeouts
   follow it too, from the next request on every track, instead of ExoPlayer's
-  fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
+  fixed 8 s (both the crossfade and the standard player). A new value applies to the next wait at once. Left out, the current
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
 - The total limits, safety caps behind the stall timeout, with the same rules:
@@ -86,7 +86,7 @@ Added fork surface:
 - `incomingStallGraceMs` (crossfade, `setupPlayer` and `updateOptions`, default
   2000): how long a crossfade waits for the incoming track to start moving before
   it falls back to playing that track alone (`incoming_stalled`).
-- `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` and
+- `initialBitrateEstimateBps` (Android, both backends, `setupPlayer` and
   `updateOptions`, default 96000): the bandwidth each track starts from before the
   player has measured the network. An adaptive stream starts at the highest
   rendition fitting about 70 % of it, or the lowest when none fits, and climbs as

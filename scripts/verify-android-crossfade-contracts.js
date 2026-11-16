@@ -437,4 +437,27 @@ assert(
   'Android must wait for a play start and a standard seek like iOS.'
 );
 
+// The standard player is the vendored KotlinAudio, with the same start-low and per-request
+// HTTP timeouts as the crossfade players.
+const buildGradle = read('android/build.gradle');
+const vendoredBase = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
+const standardHooks = section(musicService, 'private fun standardPlayerHooks() = PlayerHooks(', '/**');
+assert(
+  !buildGradle.includes("com.github.doublesymmetry:kotlinaudio") &&
+    buildGradle.includes("java.srcDirs += 'src/vendor/kotlinaudio/java'") &&
+    buildGradle.includes("res.srcDirs += 'src/vendor/kotlinaudio/res'") &&
+    read('android/src/vendor/kotlinaudio/LICENSE').includes('Apache License') &&
+    read('android/src/vendor/kotlinaudio/VENDORED.md').includes('bf71120704bfe4be2311cf86fc1e2ee1c3c702b7') &&
+    vendoredBase.includes('hooks.configureExoPlayer(this)\n            }\n            .build()') &&
+    vendoredBase.includes('val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)') &&
+    musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())') &&
+    standardHooks.includes('StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond })') &&
+    standardHooks.includes('builder.setTrackSelector(') &&
+    standardHooks.includes('httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('StartLowBandwidthMeter(bandwidthMeter, initialBitrateEstimateBps())') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelectionTest.kt').includes('fun everyTrackSelectionReadsTheCurrentSetting()') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun theStandardPlayersRequestsKeepKotlinAudiosConfigurationAndFollowTheCurrentStallTimeout()'),
+  'The Android standard player must start each track low and follow stallTimeoutMs per request, like the crossfade path.'
+);
+
 console.log('Android crossfade contracts OK');

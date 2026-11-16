@@ -63,4 +63,22 @@ class CrossfadeHttpTimeoutsTest {
         assertEquals(2_147_483_646, httpTimeoutMs(2_147_483_646L))
         assertEquals(10_000, httpTimeoutMs(DEFAULT_STALL_TIMEOUT_MS))
     }
+
+    @Test
+    fun theStandardPlayersRequestsKeepKotlinAudiosConfigurationAndFollowTheCurrentStallTimeout() {
+        var stall = DEFAULT_STALL_TIMEOUT_MS
+        val opened = mutableListOf<Pair<String?, Int>>()
+        val forItem = standardHttpDataSourceFactory({ stall }) { factory, timeoutMs ->
+            val userAgent = DefaultHttpDataSource.Factory::class.java.getDeclaredField("userAgent")
+                .apply { isAccessible = true }.get(factory) as String?
+            opened += userAgent to timeoutMs
+            RecordingRequest(timeoutMs)
+        }
+        // KotlinAudio configures the item's factory (here its user agent), then ExoPlayer opens.
+        val source = forItem { setUserAgent("djeeloo-test") }.createDataSource()
+        source.open(spec)
+        stall = 30_000L
+        source.open(spec)
+        assertEquals(listOf("djeeloo-test" to 10_000, "djeeloo-test" to 30_000), opened)
+    }
 }

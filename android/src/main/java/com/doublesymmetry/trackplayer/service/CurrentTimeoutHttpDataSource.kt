@@ -75,3 +75,15 @@ internal fun httpTimeoutMs(stallTimeoutMs: Long): Int =
 /** A DefaultHttpDataSource for one request, with the given connect and read timeouts. */
 internal fun httpSourceWithTimeouts(factory: DefaultHttpDataSource.Factory, timeoutMs: Int): DataSource =
     factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs).createDataSource()
+
+/**
+ * The standard player's HTTP data source factory for one item (vendored KotlinAudio's
+ * `PlayerHooks.httpDataSourceFactory`): KotlinAudio's configuration of the item (user agent,
+ * redirects, headers) on a factory whose requests follow the current `stallTimeoutMs`.
+ */
+internal fun standardHttpDataSourceFactory(
+    stallTimeoutMs: () -> Long,
+    newRequestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
+): (DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory = { configure ->
+    CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, newRequestSource).apply { configure(configure) }
+}

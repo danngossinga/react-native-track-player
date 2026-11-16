@@ -17,6 +17,7 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.models.NotificationButton.*
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
+import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.doublesymmetry.trackplayer.R as TrackPlayerR
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
@@ -589,7 +590,7 @@ class MusicService : HeadlessJsTaskService() {
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
         standardPlayerFactory = {
-            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig)
+            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
         orchestratorHandlesAudioFocus = handleAudioFocus
@@ -611,6 +612,23 @@ class MusicService : HeadlessJsTaskService() {
             diagnosticScope = scope
         )
     }
+
+    /**
+     * What the standard player (vendored KotlinAudio) takes from the app's settings, as the
+     * crossfade players do: every track starts from the current `initialBitrateEstimateBps`, and
+     * every HTTP request's connect and read timeouts follow the current `stallTimeoutMs`.
+     */
+    private fun standardPlayerHooks() = PlayerHooks(
+        configureExoPlayer = { builder ->
+            builder.setTrackSelector(
+                DefaultTrackSelector(
+                    this@MusicService,
+                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond })
+                )
+            )
+        },
+        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })
+    )
 
     /**
      * Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`, `stallTimeoutMs`)

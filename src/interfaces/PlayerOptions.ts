@@ -113,9 +113,9 @@ export interface PlayerOptions {
    * How long, in milliseconds, any of the player's waits for a track (a crossfade load, seek or
    * play start, a standard backend's readiness or seek) may go on with no progress (no new media
    * downloaded or buffered) before it fails. Defaults to 10000. A slow load that keeps progressing
-   * is not stopped by it, only by the wait's own total limit below. On Android, the crossfade
+   * is not stopped by it, only by the wait's own total limit below. On Android, the
    * players' HTTP connect and read timeouts follow it too (instead of ExoPlayer's fixed 8 s), from
-   * the next request on every track; the standard player (KotlinAudio) keeps the fixed 8 s. A value that is
+   * the next request on every track; the crossfade and the standard player alike. A value that is
    * not a number from 1 to 2147483646 is ignored.
    */
   stallTimeoutMs?: number;
@@ -159,7 +159,7 @@ export interface PlayerOptions {
    */
   incomingStallGraceMs?: number;
   /**
-   * Android crossfade backend: the bandwidth, in bits per second, each track starts from before
+   * Android (crossfade and standard backends): the bandwidth, in bits per second, each track starts from before
    * the player has measured the network. An adaptive (HLS/DASH) track starts at the highest
    * rendition whose bitrate fits about 70 % of it (ExoPlayer's bandwidth fraction), or at the
    * lowest when none fits, and climbs as the player measures. Defaults to 96000. Also accepted by

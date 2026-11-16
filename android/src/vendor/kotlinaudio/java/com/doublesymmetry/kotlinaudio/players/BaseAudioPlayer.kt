@@ -32,6 +32,7 @@ import com.doublesymmetry.kotlinaudio.models.MediaType
 import com.doublesymmetry.kotlinaudio.models.PlayWhenReadyChangeData
 import com.doublesymmetry.kotlinaudio.models.PlaybackError
 import com.doublesymmetry.kotlinaudio.models.PlayerConfig
+import com.doublesymmetry.kotlinaudio.models.PlayerHooks
 import com.doublesymmetry.kotlinaudio.models.PlayerOptions
 import com.doublesymmetry.kotlinaudio.models.PositionChangedReason
 import com.doublesymmetry.kotlinaudio.models.WakeMode
@@ -83,7 +84,8 @@ abstract class BaseAudioPlayer internal constructor(
     internal val context: Context,
     playerConfig: PlayerConfig,
     private val bufferConfig: BufferConfig?,
-    private val cacheConfig: CacheConfig?
+    private val cacheConfig: CacheConfig?,
+    private val hooks: PlayerHooks = PlayerHooks()
 ) : AudioManager.OnAudioFocusChangeListener {
     protected val exoPlayer: ExoPlayer
 
@@ -230,6 +232,7 @@ abstract class BaseAudioPlayer internal constructor(
             )
             .apply {
                 if (bufferConfig != null) setLoadControl(setupBuffer(bufferConfig))
+                hooks.configureExoPlayer(this)
             }
             .build()
 
@@ -471,7 +474,7 @@ abstract class BaseAudioPlayer internal constructor(
                 DefaultDataSourceFactory(context, userAgent)
             }
             else -> {
-                val tempFactory = DefaultHttpDataSource.Factory().apply {
+                val configureHttp: DefaultHttpDataSource.Factory.() -> Unit = {
                     setUserAgent(userAgent)
                     setAllowCrossProtocolRedirects(true)
 
@@ -479,6 +482,8 @@ abstract class BaseAudioPlayer internal constructor(
                         setDefaultRequestProperties(it.toMap())
                     }
                 }
+                val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)
+                    ?: DefaultHttpDataSource.Factory().apply(configureHttp)
 
                 enableCaching(tempFactory)
             }
