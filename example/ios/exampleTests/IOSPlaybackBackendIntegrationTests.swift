@@ -2673,4 +2673,10 @@ private final class RecordingOrchestratorDelegate: IOSPlaybackOrchestratorDelega
     }
 
     func playbackOrchestratorDidUpdateNowPlaying(_ orchestrator: IOSPlaybackOrchestrator) {}
+
+    var playbackStartFailures: [String] = []
+
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailPlaybackStart code: String, message: String) {
+        playbackStartFailures.append(code)
+    }
 }

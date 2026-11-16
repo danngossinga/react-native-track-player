@@ -152,42 +152,88 @@ struct RemoteDuckPayload: Equatable {
 /// when it is given back, resume only if the system allows it, `autoHandleInterruptions` is on,
 /// playback was playing when it was taken and the user did not pause or play since. A permanent
 /// loss or headphones unplugged pause with no resume. A can-duck loss is treated as a transient
-/// loss: pause, then resume (the platforms differ on ducking, so both pause).
+/// loss: pause, then resume (the platforms differ on ducking, so both pause). A second loss during
+/// an interruption keeps what the first one recorded (the player is paused by then).
+/// Thread-safe: the module calls it from the notification threads and its command queue.
 final class InterruptionPolicy {
     /// `autoHandleInterruptions`, read at every interruption end.
-    var autoResume: () -> Bool
+    private let autoResume: () -> Bool
+    private let lock = NSLock()
     private var resumeOnEnd = false
+    /// An interruption began and has not ended (nor been overtaken by the user or a permanent loss).
+    private var interrupted = false
 
     init(autoResume: @escaping () -> Bool) {
         self.autoResume = autoResume
     }
 
     func began(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
-        resumeOnEnd = isPlaying
+        lock.lock()
+        defer { lock.unlock() }
+        if !interrupted { resumeOnEnd = isPlaying }
+        interrupted = true
         return (isPlaying ? .pause : .none, RemoteDuckPayload(paused: true, permanent: false))
     }
 
     func ended(shouldResume: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
-        let resume = shouldResume && resumeOnEnd && autoResume()
-        resumeOnEnd = false
+        lock.lock()
+        let wasToResume = resumeOnEnd
+        forgetLocked()
+        lock.unlock()
+        let resume = shouldResume && wasToResume && autoResume()
         return (resume ? .resume : .none, RemoteDuckPayload(paused: !shouldResume, permanent: !shouldResume))
     }
 
     func lostPermanently(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
-        resumeOnEnd = false
+        forget()
         return (isPlaying ? .pause : .none, RemoteDuckPayload(paused: true, permanent: true))
     }
 
     /// Headphones unplugged (`oldDeviceUnavailable` / becoming noisy).
     func noisy(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
-        resumeOnEnd = false
+        forget()
         return (isPlaying ? .pause : .none, nil)
     }
 
-    /// A play or pause from the user (app or remote control): an interruption's end no longer
-    /// resumes.
+    /// A play, pause, stop or reset from the user (app or remote control): an interruption's end
+    /// no longer resumes.
     func userCommand() {
+        forget()
+    }
+
+    private func forget() {
+        lock.lock()
+        forgetLocked()
+        lock.unlock()
+    }
+
+    private func forgetLocked() {
         resumeOnEnd = false
+        interrupted = false
+    }
+}
+
+/// One value shared across threads (a setting read by notification handlers, a reference
+/// published once setup is done).
+final class LockedValue<Value> {
+    private let lock = NSLock()
+    private var stored: Value
+
+    init(_ value: Value) {
+        stored = value
+    }
+
+    var value: Value {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return stored
+        }
+        set {
+            lock.lock()
+            stored = newValue
+            lock.unlock()
+        }
     }
 }
 

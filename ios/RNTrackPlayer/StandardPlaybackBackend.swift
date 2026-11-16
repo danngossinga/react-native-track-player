@@ -91,6 +91,9 @@ protocol IOSPlaybackBackendRouting: PlaybackBackend {
     var publicVolume: Float { get }
     var publicRate: Float { get }
     var publicPlayWhenReady: Bool { get }
+    /// Whether it plays as far as an interruption is concerned: what the module last asked
+    /// (play, pause, stop...), not a pause the system made for the interruption itself.
+    var interruptionIsPlaying: Bool { get }
     var publicRepeatMode: Int { get }
     var queue: [Track] { get }
 
@@ -470,6 +473,21 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
     var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
+    /// SwiftAudioEx sets playWhenReady to false when the system pauses the player (its
+    /// timeControlStatus observer), which can run before the module reads it at an interruption.
+    /// The module's own last request does not change then.
+    var interruptionIsPlaying: Bool {
+        return !idleWithoutActiveTrack && requestedPlayWhenReady && !Self.isFinished(player.playerState)
+    }
+    /// What the module last asked of this player (play, pause, stop, playWhenReady, a restore).
+    private var requestedPlayWhenReady = false
+
+    private static func isFinished(_ state: AudioPlayerState) -> Bool {
+        switch state {
+        case .ended, .failed, .stopped, .idle: return true
+        default: return false
+        }
+    }
     var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 
@@ -520,6 +538,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             player.rate = snapshot.rate
             player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
             player.playWhenReady = false
+            requestedPlayWhenReady = false
             player.pause()
             if let index = snapshot.activeIndex,
                queue.indices.contains(index) {
@@ -573,6 +592,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {
         try performPlaybackBackendOnMainSync {
             player.playWhenReady = snapshot.playWhenReady
+            requestedPlayWhenReady = snapshot.playWhenReady
             if snapshot.playWhenReady {
                 player.play()
             } else {
@@ -628,6 +648,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
         player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady
+        requestedPlayWhenReady = player.playWhenReady
         if player.playWhenReady {
             player.play()
         } else {
@@ -651,6 +672,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
+            requestedPlayWhenReady = true
             player.play()
             publishIdleTrackActivationIfNeeded(wasIdle)
         }
@@ -658,6 +680,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func pause() {
         onMain {
             cancelPendingSeeks()
+            requestedPlayWhenReady = false
             player.pause()
         }
     }
@@ -840,6 +863,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func stop() {
         onMain {
             cancelPendingSeeks()
+            requestedPlayWhenReady = false
             player.stop()
         }
     }
@@ -851,6 +875,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
             player.playWhenReady = value
+            requestedPlayWhenReady = value
             publishIdleTrackActivationIfNeeded(wasIdle)
             completion(.success(()))
         }

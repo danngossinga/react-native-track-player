@@ -57,6 +57,8 @@ final class PingPongPlaybackBackend: IOSPlaybackBackendRouting {
     var publicVolume: Float { return orchestrator.volume }
     var publicRate: Float { return orchestrator.rate }
     var publicPlayWhenReady: Bool { return orchestrator.playWhenReady }
+    /// The orchestrator's playWhenReady is only changed by the module (never by the system).
+    var interruptionIsPlaying: Bool { return orchestrator.playWhenReady }
     var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 

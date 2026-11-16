@@ -73,11 +73,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var shouldEmitProgressEvent: Bool = false
     private var progressUpdateInterval: Double = 0
     private var orchestratedProgressWorkItem: DispatchWorkItem? = nil
-    private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
+    /// `autoHandleInterruptions`, read by the interruption handlers on any thread.
+    private let shouldResumePlaybackAfterInterruptionEnds: LockedValue<Bool>
     /// Calls, other apps' audio and headphones, the same rule for both backends (DJE-204/205/206).
-    private lazy var interruptionPolicy = InterruptionPolicy(autoResume: { [weak self] in
-        self?.shouldResumePlaybackAfterInterruptionEnds ?? false
-    })
+    /// Created with the module (not lazily) so the notification threads never race its creation.
+    private let interruptionPolicy: InterruptionPolicy
+    /// The facade once setup is done, for the interruption handlers: they run off the main thread
+    /// and the module's queue, so they never read `hasInitialized` or `playbackBackendFacade`.
+    private let interruptionFacade = LockedValue<PlaybackBackendFacade?>(nil)
     private var crossfadeEnabled: Bool = false
     private var autoUpdateNowPlayingInfo: Bool = true
     private var forwardJumpInterval: NSNumber? = nil;
@@ -94,6 +97,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     // MARK: - Lifecycle Methods
 
     public override init() {
+        let autoResume = LockedValue(false)
+        shouldResumePlaybackAfterInterruptionEnds = autoResume
+        interruptionPolicy = InterruptionPolicy(autoResume: { autoResume.value })
         super.init()
         EventEmitter.shared.register(eventEmitter: self)
         audioSessionController.delegate = self
@@ -274,17 +280,28 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private func applyInterruption(
         _ decide: @escaping (InterruptionPolicy, Bool) -> (InterruptionAction, RemoteDuckPayload?)
     ) {
-        guard hasInitialized, playbackBackendFacade != nil else { return }
-        withActivePlaybackBackendSerialized({ backend -> RemoteDuckPayload? in
-            let (action, duck) = decide(self.interruptionPolicy, backend.publicPlayWhenReady)
+        // Any thread: only the facade published at setup is read here.
+        guard let facade = interruptionFacade.value else { return }
+        facade.withCurrentBackendAsync({ routed, completion in
+            let backend = routed as! IOSPlaybackBackendRouting
+            // Whether it was playing as the module last set it: SwiftAudioEx turns
+            // playWhenReady off itself when the system pauses it for the interruption.
+            let (action, duck) = decide(self.interruptionPolicy, backend.interruptionIsPlaying)
             IOSPlaybackLog.log("interruption action=\(action) backend=\(backend.kind)")
             switch action {
             case .pause: backend.pause()
-            case .resume: try backend.play()
+            case .resume:
+                if backend.kind == .pingPong { self.activateAudioSessionForPlayback() }
+                do {
+                    try backend.play()
+                } catch {
+                    // The gain is still reported (remote-duck), as on Android.
+                    IOSPlaybackLog.log("interruption resume failed error=\(error.localizedDescription)")
+                }
             case .none: break
             }
-            return duck
-        }) { [weak self] result in
+            completion(.success(duck))
+        }) { [weak self] (result: Result<RemoteDuckPayload?, Error>) in
             guard case .success(let duck?) = result else { return }
             self?.emit(event: EventType.RemoteDuck, body: [
                 "paused": duck.paused,
@@ -377,6 +394,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     // MARK: - Bridged Methods
+
+    /// The native error's code when it has one (as Android rejects with its RejectionException's
+    /// code), else the command's generic code.
+    private func rejectionCode(_ error: Error, _ fallback: String) -> String {
+        return (error as NSError).userInfo["code"] as? String ?? fallback
+    }
 
     private func rejectWhenNotInitialized(reject: RCTPromiseRejectBlock) -> Bool {
         let rejected = !hasInitialized;
@@ -827,7 +850,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
 
         if let autoHandleInterruptions = config["autoHandleInterruptions"] as? Bool {
-            self.shouldResumePlaybackAfterInterruptionEnds = autoHandleInterruptions
+            self.shouldResumePlaybackAfterInterruptionEnds.value = autoHandleInterruptions
         }
 
         // configure wether player waits to play (deprecated)
@@ -870,6 +893,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         configureAudioSession()
 
         hasInitialized = true
+        interruptionFacade.value = playbackBackendFacade
         resolve(NSNull())
     }
 
@@ -1236,7 +1260,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success(let index):
                 resolve(index)
             case .failure(let error):
-                reject("playback_backend_load_failed", "Unable to load the track.", error)
+                reject(self.rejectionCode(error, "playback_backend_load_failed"), "Unable to load the track.", error)
             }
         }
     }
@@ -1324,7 +1348,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("skip_failed", "Unable to skip to track.", error)
+                reject(self.rejectionCode(error, "skip_failed"), "Unable to skip to track.", error)
             }
         }
     }
@@ -1344,7 +1368,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("skip_failed", "Unable to skip to next track.", error)
+                reject(self.rejectionCode(error, "skip_failed"), "Unable to skip to next track.", error)
             }
         }
     }
@@ -1364,7 +1388,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("skip_failed", "Unable to skip to previous track.", error)
+                reject(self.rejectionCode(error, "skip_failed"), "Unable to skip to previous track.", error)
             }
         }
     }
@@ -1374,6 +1398,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
         withActivePlaybackBackendSerialized({ backend in
+            // In the admitted operation: ordered with the interruption events.
+            self.interruptionPolicy.userCommand()
             backend.stop()
             backend.clearQueue()
         }) { result in
@@ -1387,8 +1413,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(play:rejecter:)
     public func play(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        interruptionPolicy.userCommand()
         withActivePlaybackBackendAsync({ backend, completion in
+            // In the admitted operation: ordered with the interruption events.
+            self.interruptionPolicy.userCommand()
             backend.syncQueue(self.playerTracks())
             if backend.kind == .pingPong {
                 self.activateAudioSessionForPlayback()
@@ -1399,7 +1426,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("playback_failed", "Unable to start playback.", error)
+                reject(self.rejectionCode(error, "playback_failed"), "Unable to start playback.", error)
             }
         }
     }
@@ -1407,9 +1434,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(pause:rejecter:)
     public func pause(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        interruptionPolicy.userCommand()
 
-        withActivePlaybackBackendSerialized({ $0.pause() }) { result in
+        withActivePlaybackBackendSerialized({ backend in
+            // In the admitted operation: ordered with the interruption events.
+            self.interruptionPolicy.userCommand()
+            backend.pause()
+        }) { result in
             switch result {
             case .success: resolve(NSNull())
             case .failure(let error): reject("playback_failed", "Unable to pause playback.", error)
@@ -1420,15 +1450,19 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(setPlayWhenReady:resolver:rejecter:)
     public func setPlayWhenReady(playWhenReady: Bool, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
-        interruptionPolicy.userCommand()
         withActivePlaybackBackendAsync({ backend, completion in
+            // In the admitted operation: ordered with the interruption events.
+            self.interruptionPolicy.userCommand()
+            if playWhenReady, backend.kind == .pingPong {
+                self.activateAudioSessionForPlayback()
+            }
             backend.setPlayWhenReady(playWhenReady, completion: completion)
         }) { result in
             switch result {
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("playback_failed", "Unable to update playWhenReady.", error)
+                reject(self.rejectionCode(error, "playback_failed"), "Unable to update playWhenReady.", error)
             }
         }
     }
@@ -1447,7 +1481,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public func stop(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        withActivePlaybackBackendSerialized({ $0.stop() }) { result in
+        withActivePlaybackBackendSerialized({ backend in
+            // In the admitted operation: ordered with the interruption events.
+            self.interruptionPolicy.userCommand()
+            backend.stop()
+        }) { result in
             switch result {
             case .success: resolve(NSNull())
             case .failure(let error): reject("playback_failed", "Unable to stop playback.", error)
@@ -1466,7 +1504,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("seek_failed", "Unable to seek.", error)
+                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
             }
         }
     }
@@ -1482,7 +1520,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             case .success:
                 resolve(NSNull())
             case .failure(let error):
-                reject("seek_failed", "Unable to seek.", error)
+                reject(self.rejectionCode(error, "seek_failed"), "Unable to seek.", error)
             }
         }
     }
@@ -1584,7 +1622,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 case .success:
                     resolve(NSNull())
                 case .failure(let error):
-                    reject("crossfade_failed", "Unable to complete crossfade.", error)
+                    reject(self.rejectionCode(error, "crossfade_failed"), "Unable to complete crossfade.", error)
                 }
             }
             return
@@ -2043,6 +2081,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
               orchestrator === playbackOrchestrator else { return }
         updateNowPlayingForOrchestrator(orchestrator)
+    }
+
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailPlaybackStart code: String, message: String) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
+        // The same playback-error as Android's for a play start that gives up.
+        emit(event: EventType.PlaybackError, body: ["code": code, "message": message])
     }
 
     private func updateNowPlayingForOrchestrator(

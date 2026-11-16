@@ -447,21 +447,61 @@ assert(
 // Calls, other apps' audio and headphones: one policy for both backends (DJE-204/205/206).
 const interruptionSection = section(player, 'public func handleInterruption(type: InterruptionType) {', '// MARK: - Bridged Methods');
 const applyInterruption = section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(');
+const routeChange = section(player, '@objc private func handleAudioSessionRouteChange(', 'private func applyInterruption(');
+const commandBody = (start, end) => section(player, start, end);
 assert(
   facade.includes('final class InterruptionPolicy {') &&
+    // Thread-safe and created with the module, not lazily.
+    section(facade, 'final class InterruptionPolicy {', 'final class LockedValue<Value> {').includes('private let lock = NSLock()') &&
+    player.includes('private let interruptionPolicy: InterruptionPolicy') &&
+    player.includes('interruptionPolicy = InterruptionPolicy(autoResume: { autoResume.value })\n        super.init()') &&
+    player.includes('self.shouldResumePlaybackAfterInterruptionEnds.value = autoHandleInterruptions') &&
     interruptionSection.includes('applyInterruption { policy, isPlaying in policy.began(isPlaying: isPlaying) }') &&
     interruptionSection.includes('applyInterruption { policy, _ in policy.ended(shouldResume: shouldResume) }') &&
-    section(player, '@objc private func handleAudioSessionRouteChange(', 'private func applyInterruption(').includes('== .oldDeviceUnavailable else { return }') &&
-    section(player, '@objc private func handleAudioSessionRouteChange(', 'private func applyInterruption(').includes('applyInterruption { policy, isPlaying in policy.noisy(isPlaying: isPlaying) }') &&
-    applyInterruption.includes('decide(self.interruptionPolicy, backend.publicPlayWhenReady)') &&
+    routeChange.includes('== .oldDeviceUnavailable else { return }') &&
+    routeChange.includes('applyInterruption { policy, isPlaying in policy.noisy(isPlaying: isPlaying) }') &&
+    // Off the main thread and the module's queue: only the facade published at setup is read.
+    !/hasInitialized|playbackBackendFacade/.test(routeChange + applyInterruption) &&
+    applyInterruption.includes('guard let facade = interruptionFacade.value else { return }') &&
+    player.includes('hasInitialized = true\n        interruptionFacade.value = playbackBackendFacade') &&
+    // Both backends, no guard on the kind before the decision.
+    applyInterruption.includes('let (action, duck) = decide(self.interruptionPolicy, backend.interruptionIsPlaying)') &&
+    !/guard[^\n]*kind|kind (==|!=) \.(standard|pingPong)[^\n]*(return|\{\s*\n\s*return)/.test(applyInterruption.slice(0, applyInterruption.indexOf('let (action, duck) = decide('))) &&
     applyInterruption.includes('case .pause: backend.pause()') &&
-    applyInterruption.includes('case .resume: try backend.play()') &&
+    applyInterruption.includes('do {\n                    try backend.play()\n                } catch {') &&
+    applyInterruption.includes('completion(.success(duck))') &&
     applyInterruption.includes('"permanent": duck.permanent') &&
-    player.includes('self?.shouldResumePlaybackAfterInterruptionEnds ?? false') &&
-    ['public func play(resolve:', 'public func pause(resolve:', 'public func setPlayWhenReady(playWhenReady:'].every((start) =>
-      player.slice(player.indexOf(start), player.indexOf(start) + 400).includes('interruptionPolicy.userCommand()')) &&
+    // Was it playing: the module's last request, not SwiftAudioEx's own pause at the interruption.
+    standardBackend.includes('return !idleWithoutActiveTrack && requestedPlayWhenReady && !Self.isFinished(player.playerState)') &&
+    section(standardBackend, '    func play() throws {', '    func seek(to position: Double) throws {').includes('requestedPlayWhenReady = true\n            player.play()') &&
+    section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('requestedPlayWhenReady = false\n            player.pause()') &&
+    section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requestedPlayWhenReady = false\n            player.stop()') &&
+    section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('player.playWhenReady = value\n            requestedPlayWhenReady = value') &&
+    pingPongBackend.includes('var interruptionIsPlaying: Bool { return orchestrator.playWhenReady }') &&
+    // Every user command, inside its admitted operation (ordered with the interruption events).
+    [['public func play(resolve:', 'public func pause(resolve:'],
+      ['public func pause(resolve:', 'public func setPlayWhenReady(playWhenReady:'],
+      ['public func setPlayWhenReady(playWhenReady:', 'public func getPlayWhenReady('],
+      ['public func stop(resolve:', 'public func seekTo(time:'],
+      ['public func reset(resolve:', 'public func play(resolve:']].every(([start, end]) => {
+      const body = commandBody(start, end);
+      return body.includes('self.interruptionPolicy.userCommand()') &&
+        body.indexOf('withActivePlaybackBackend') < body.indexOf('self.interruptionPolicy.userCommand()');
+    }) &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('scripts/fixtures/interruption-scenarios.json'),
   'iOS interruptions and unplugging must go through InterruptionPolicy on both backends.'
+);
+
+// A play start that gives up: the same rejection code and playback-error event as Android; a
+// crossfade whose incoming song does not start rejects with crossfade_start_failed, as on Android.
+assert(
+  engine.includes('"code": "crossfade_play_start_timeout"') &&
+    (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 2 &&
+    orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
+    player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
+    player.includes('reject(self.rejectionCode(error, "playback_failed"), "Unable to start playback.", error)') &&
+    player.includes('reject(self.rejectionCode(error, "crossfade_failed"), "Unable to complete crossfade.", error)'),
+  'iOS play-start failures must reject and report like Android.'
 );
 
 console.log('iOS crossfade contracts OK');

@@ -480,7 +480,11 @@ final class IOSCrossfadeEngine {
             finish(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 6,
-                userInfo: [NSLocalizedDescriptionKey: "Crossfade engine did not start playing (\(Self.describe(verdict, watch)))."]
+                userInfo: [
+                    NSLocalizedDescriptionKey: "Crossfade engine did not start playing (\(Self.describe(verdict, watch))).",
+                    // The same code as Android's play-start give-up.
+                    "code": "crossfade_play_start_timeout"
+                ]
             )))
         }
     }

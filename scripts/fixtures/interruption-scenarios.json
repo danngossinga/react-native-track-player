@@ -66,6 +66,35 @@
         { "event": "noisy", "action": "none", "duck": null },
         { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
       ]
+    },
+    {
+      "id": "FOCUS-03a a second loss during an interruption keeps the resume of the first",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-03b the user plays during an interruption, then a new loss: resume after it",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPlay", "action": "none", "duck": null },
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-03c the user pauses during an interruption, then a new loss: stays paused",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPause", "action": "none", "duck": null },
+        { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
     }
   ]
 }

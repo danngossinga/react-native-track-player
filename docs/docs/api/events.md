@@ -183,25 +183,24 @@ Fired when the user presses the dislike button in the now playing center. Only f
 Fired when the user presses the bookmark button in the now playing center. Only fired if the `bookmarkOptions` is set in `updateOptions`.
 
 ### `RemoteDuck`
-Fired when the audio is interrupted. For example when a phone call arrives,
-a clock or calender sounds, or another app starts playing audio.
+Fired when the audio is interrupted and when the interruption ends. For example
+when a phone call arrives, a clock or calendar sounds, another app starts
+playing audio (Android audio focus, a can-duck loss included), or the
+headphones are unplugged.
 
-We recommend to set `autoHandleInterruptions: true` in
-`TrackPlayer.setupPlayer`. This way toggling playback is handled automatically.
-
-By default `autoHandleInterruptions` is set to `false` (default) in
-`TrackPlayer.setupPlayer`, which means your app is expected to respond to this
-event in the following situations:
-- When the event is triggered with `paused` set to `true`, on Android playback
-  should be paused. When `permanent` is also set to `true`, on Android the
-  player should stop playback.
-- When the event is triggered and `paused` is set to `false`, the player may
-  resume playback.
+The player handles interruptions itself, the same on iOS and Android and on
+both backends: it pauses when the audio is taken away (JS sees `paused`), and
+the app does not need to pause it. With `autoHandleInterruptions: true` in
+`TrackPlayer.setupPlayer`, it also resumes by itself when the interruption
+ends, if the system allows it, playback was playing when it began and the user
+did not play, pause or stop since. A permanent loss or unplugged headphones
+never resume. With `autoHandleInterruptions: false` (default), the app may
+resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |
 | --------- | --------- | -------------------------------------------- |
-| paused    | `boolean` | On Android when `true` the player should pause playback, when `false` the player may resume playback. On iOS when `true` the playback was paused and when `false` the player may resume playback. |
-| permanent | `boolean` | Whether the interruption is permanent. On Android the player should stop playback.  |
+| paused    | `boolean` | `true` while the audio is taken away (the player has paused); `false` when it is given back and playback may resume. Same meaning on iOS and Android. |
+| permanent | `boolean` | Whether the interruption is permanent: the audio will not be given back and the player does not resume. Same meaning on iOS and Android. |
 
 
 ## Metadata

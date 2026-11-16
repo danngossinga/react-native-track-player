@@ -75,10 +75,9 @@ export interface PlayerOptions {
    * (Android only) The audio content type indicates to the android system how
    * you intend to use audio in your app.
    *
-   * With `autoHandleInterruptions: true` and
-   * `androidAudioContentType: AndroidAudioContentType.Speech`, the audio will be
-   * paused during short interruptions, such as when a message arrives.
-   * Otherwise the playback volume is reduced while the notification is playing.
+   * It no longer changes interruptions: every interruption pauses, a short one
+   * (a can-duck loss such as a message sound) too, whatever the type, and
+   * `autoHandleInterruptions` decides the resume, as on iOS.
    *
    * @default AndroidAudioContentType.Music
    */
@@ -139,11 +138,13 @@ export interface PlayerOptions {
    * Crossfade backend (iOS and Android): the total limit, in milliseconds, for playback to start
    * (after `play`, a load that plays at once, or the incoming song of a crossfade; the resume of a
    * fade paused mid-way does not wait). A start that loads nothing for `stallTimeoutMs` fails
-   * sooner; a failed start pauses and reports `crossfade_play_start_timeout` on Android, and a
-   * crossfade whose incoming song does not start reports `crossfade_start_failed` while the
-   * outgoing song plays on. Defaults to 60000. A backend
-   * switch and the play used to resume after an interruption wait at most this plus
-   * `prepareTimeoutMs` plus 5 s (at least 10 s). Same bounds as `stallTimeoutMs`.
+   * sooner. On both platforms a failed start pauses, rejects with `crossfade_play_start_timeout`
+   * and emits a `playback-error` with that code, and a crossfade whose incoming song does not
+   * start rejects with `crossfade_start_failed` while the outgoing song plays on. Defaults to
+   * 60000. On iOS, a backend switch and the play used to resume after an interruption wait at
+   * most this plus `prepareTimeoutMs` plus 5 s (at least 10 s); on Android these steps do not
+   * block a thread and are bounded by the load and play-start waits themselves. Same bounds as
+   * `stallTimeoutMs`.
    */
   playStartTimeoutMs?: number;
   /**

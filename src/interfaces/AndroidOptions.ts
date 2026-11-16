@@ -9,7 +9,8 @@ export interface AndroidOptions {
   appKilledPlaybackBehavior?: AppKilledPlaybackBehavior;
 
   /**
-   * Whether the remote-duck event will be triggered on every interruption
+   * @deprecated No effect: every interruption pauses (a can-duck one too) and
+   * emits `remote-duck` on both backends, as on iOS.
    */
   alwaysPauseOnInterruption?: boolean;
 

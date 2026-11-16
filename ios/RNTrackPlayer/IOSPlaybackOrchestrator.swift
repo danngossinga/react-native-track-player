@@ -41,6 +41,9 @@ protocol IOSPlaybackOrchestratorDelegate: AnyObject {
         errorCode: String?
     )
     func playbackOrchestratorDidUpdateNowPlaying(_ orchestrator: IOSPlaybackOrchestrator)
+    /// Playback did not start (after play, or a load that plays at once): reported as a
+    /// `playback-error`, as on Android.
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailPlaybackStart code: String, message: String)
 }
 
 private final class IOSCrossfadeContext {
@@ -463,6 +466,7 @@ final class IOSPlaybackOrchestrator {
                 self.activeEngine.pause()
                 self.state = .paused
                 self.emitStateIfNeeded()
+                self.reportPlaybackStartFailure(error)
                 completion(.failure(error))
             }
         }
@@ -1128,6 +1132,7 @@ final class IOSPlaybackOrchestrator {
                                             // As after a failed play(): audio must not start by itself later.
                                             self.activeEngine.pause()
                                             self.state = .paused
+                                            self.reportPlaybackStartFailure(error)
                                         }
                                         self.operationRegistry.performAfterCurrentMutation {
                                             if case .success = playResult {
@@ -1272,7 +1277,8 @@ final class IOSPlaybackOrchestrator {
                     self.runCrossfadeRamp(context: context, completion: completion)
                 case .failure(let error):
                     self.emitCrossfadeState("error", fromIndex: fromIndex, toIndex: toIndex, errorCode: "crossfade_start_failed")
-                    completion(.failure(error))
+                    // The same rejection code as Android.
+                    completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))
                 }
             }
         }
@@ -2083,6 +2089,11 @@ final class IOSPlaybackOrchestrator {
     private func refreshNowPlaying() {
         IOSPlaybackLog.log("nowPlaying update index=\(currentIndex) position=\(currentTime) rate=\(nowPlayingPlaybackRate)")
         delegate?.playbackOrchestratorDidUpdateNowPlaying(self)
+    }
+
+    private func reportPlaybackStartFailure(_ error: Error) {
+        let code = (error as NSError).userInfo["code"] as? String ?? "crossfade_play_start_timeout"
+        delegate?.playbackOrchestrator(self, didFailPlaybackStart: code, message: error.localizedDescription)
     }
 
     private func makeError(_ code: String, _ message: String) -> NSError {
