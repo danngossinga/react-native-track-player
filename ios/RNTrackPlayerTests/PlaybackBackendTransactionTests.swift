@@ -218,31 +218,31 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(reads, 5)
         XCTAssertEqual(clock.pending.count, 1)
         driver.cancel()
-        clock.runUntilIdle()
+        // The pending check fires once and schedules nothing more.
+        XCTAssertEqual(clock.runUntilIdle(), 1)
         XCTAssertEqual(reads, 5)
         XCTAssertTrue(verdicts.isEmpty)
         XCTAssertTrue(clock.pending.isEmpty)
     }
 
     func testWaitDriverReleasesItsClosuresWhenCancelledAndWhenItGivesUp() {
-        // The closures hold the caller's completion and the engine: they must not outlive the wait.
-        final class Captured {}
+        // Like an engine wait: the closures reach back to the driver (through the caller's state),
+        // so the driver and the completion it holds are freed only if the closures are released.
+        final class Caller { var driver: StallWaitDriver? }
         for giveUp in [false, true] {
             let clock = ManualWaitClock()
-            weak var weakReadingsCapture: Captured?
-            weak var weakGiveUpCapture: Captured?
+            weak var weakCaller: Caller?
             weak var weakDriver: StallWaitDriver?
             var gaveUp = 0
             autoreleasepool {
-                let readingsCapture = Captured()
-                let giveUpCapture = Captured()
-                weakReadingsCapture = readingsCapture
-                weakGiveUpCapture = giveUpCapture
+                let caller = Caller()
+                weakCaller = caller
                 let driver = makeDriver(
                     clock,
-                    readings: { _ = readingsCapture; return [1] },
-                    gaveUp: { _ in _ = giveUpCapture; gaveUp += 1 }
+                    readings: { _ = caller.driver; return [1] },
+                    gaveUp: { _ in _ = caller.driver; gaveUp += 1 }
                 )
+                caller.driver = driver
                 weakDriver = driver
                 driver.start()
                 clock.step()
@@ -250,8 +250,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             }
             clock.runUntilIdle()
             XCTAssertEqual(gaveUp, giveUp ? 1 : 0)
-            XCTAssertNil(weakReadingsCapture, "readings kept, giveUp=\(giveUp)")
-            XCTAssertNil(weakGiveUpCapture, "onGiveUp kept, giveUp=\(giveUp)")
+            XCTAssertNil(weakCaller, "closures kept, giveUp=\(giveUp)")
             XCTAssertNil(weakDriver, "driver kept, giveUp=\(giveUp)")
         }
     }
