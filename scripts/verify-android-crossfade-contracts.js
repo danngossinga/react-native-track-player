@@ -547,7 +547,8 @@ assert(
     coordinatorKt.includes('fun userStop() {\n        policy.userCommand()\n        focus.abandon()') &&
     coordinatorKt.includes('fun destroy() {\n        noisyReceiver.unregister()\n        focus.abandon()') &&
     coordinatorKt.includes('InterruptionAction.RESUME -> {\n                focus.requestIfNeeded()') &&
-    applyInterruptionKt.includes('playWhenReady = backend.playWhenReady,\n                        state = backend.playbackState,') &&
+    coordinatorKt.includes('            playWhenReady = backend.playWhenReady,\n            state = backend.playbackState,') &&
+    applyInterruptionKt.includes('interruptions.applyOn(\n                    facade = facade,\n                    scope = scope,') &&
     coordinatorKt.includes('val decision = decide(interruptionCountsAsPlaying(playWhenReady, state)) ?: return null') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/InterruptionPolicy.kt').includes('playWhenReady && state !in INTERRUPTION_FINISHED_STATES') &&
     // remote-duck when the pause is done, or before the resumed play is awaited (as on iOS).
@@ -555,7 +556,8 @@ assert(
     focusKt.includes('.setContentType(contentType())') &&
     musicService.includes('SystemAudioFocusRequester(this) { focusContentType }') &&
     musicService.includes('focusContentType = focusContentTypeOf(playerConfig.audioContentType)') &&
-    applyInterruptionKt.includes('pause = { backend.pause() },\n                        play = { backend.play() },') &&
+    coordinatorKt.includes('            pause = { backend.pause() },\n            play = {\n                scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {\n                    try {\n                        backend.play()') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendTransactionTest.kt').includes('fun aBackendSwitchDoesNotWaitForAnInterruptionResumeToStart()') &&
     applyInterruptionKt.includes('putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)') &&
     // User commands: inside the admitted operation (ordered with the interruption events).
     userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            playOn(backend)') &&

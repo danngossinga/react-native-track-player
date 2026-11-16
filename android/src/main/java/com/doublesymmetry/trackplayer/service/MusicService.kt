@@ -676,26 +676,23 @@ class MusicService : HeadlessJsTaskService() {
      * resumes it and emits the `remote-duck` payload (same meaning as on iOS).
      */
     private fun applyInterruption(decide: (Boolean) -> InterruptionDecision?) {
-        if (playbackBackendFacade == null) return
+        val facade = playbackBackendFacade ?: return
         scope.launch {
             runCatching {
-                withActivePlaybackBackend { backend ->
-                    val decision = interruptions.applyTo(
-                        playWhenReady = backend.playWhenReady,
-                        state = backend.playbackState,
-                        decide = decide,
-                        pause = { backend.pause() },
-                        play = { backend.play() },
-                        emit = { duck ->
-                            emit(MusicEvents.BUTTON_DUCK, Bundle().apply {
-                                putBoolean(IS_PAUSED_KEY, duck.paused)
-                                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
-                            })
-                        },
-                        onResumeFailed = { androidXfadeLog("interruption resume failed error=${it.message}") }
-                    )
-                    androidXfadeLog("interruption action=${decision?.action} backend=${backend.type}")
-                }
+                // The resume's play is not awaited inside the command lease (as on iOS).
+                interruptions.applyOn(
+                    facade = facade,
+                    scope = scope,
+                    decide = decide,
+                    emit = { duck ->
+                        emit(MusicEvents.BUTTON_DUCK, Bundle().apply {
+                            putBoolean(IS_PAUSED_KEY, duck.paused)
+                            putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
+                        })
+                    },
+                    onResumeFailed = { androidXfadeLog("interruption resume failed error=${it.message}") },
+                    onDecided = { decision, type -> androidXfadeLog("interruption action=${decision?.action} backend=$type") }
+                )
             }
         }
     }

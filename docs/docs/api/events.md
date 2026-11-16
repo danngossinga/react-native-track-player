@@ -214,11 +214,10 @@ true` if it ends without allowing playback to resume (iOS never says up front
 that a loss is permanent). In both cases nothing is paused or resumed, since
 nothing was playing.
 
-Known difference (crossfade backend): on Android, the resume after an
-interruption is awaited inside the command that runs it, so a backend switch
-(`setPlaybackBackend`) issued during that start waits for it, at most
-`playStartTimeoutMs` (a user pause still runs at once). On iOS the resume is
-not awaited and a backend switch does not wait for it. With `autoHandleInterruptions: false` (default), the app may
+The play that resumes after an interruption is not awaited by the command
+that issues it, on both platforms and both backends: a backend switch
+(`setPlaybackBackend`) or a pause issued while it starts runs at once, and a
+start that fails is reported as any play start is (`playback-error`). With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

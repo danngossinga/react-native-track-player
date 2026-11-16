@@ -1,5 +1,7 @@
 package com.doublesymmetry.trackplayer.service
 
+import kotlinx.coroutines.launch
+
 /**
  * What the service does about calls, other apps' audio and headphones on both backends
  * (DJE-204/205/206): the InterruptionPolicy, the single audio focus and the headphones receiver,
@@ -83,3 +85,43 @@ internal class InterruptionCoordinator(
         return decision
     }
 }
+
+/**
+ * Runs one interruption event on the active backend of [facade], inside its command lease: reads
+ * whether it plays, pauses it or requests the focus and resumes it, and emits the `remote-duck`
+ * payload. The resume's play is started at once, still inside the lease, but not awaited there:
+ * like iOS, a backend switch issued while that play starts does not wait for it, and a user pause
+ * runs at once. A failed start is reported as the backend reports any play start (its
+ * playback-error) and passed to [onResumeFailed].
+ */
+internal suspend fun InterruptionCoordinator.applyOn(
+    facade: PlaybackBackendFacade,
+    scope: kotlinx.coroutines.CoroutineScope,
+    decide: (Boolean) -> InterruptionDecision?,
+    emit: (RemoteDuckPayload) -> Unit,
+    onResumeFailed: (Throwable) -> Unit,
+    onDecided: (InterruptionDecision?, PlaybackBackendType) -> Unit = { _, _ -> }
+) {
+    facade.withCurrentBackend { current ->
+        val backend = current as AndroidPlaybackBackendRouting
+        val decision = applyTo(
+            playWhenReady = backend.playWhenReady,
+            state = backend.playbackState,
+            decide = decide,
+            pause = { backend.pause() },
+            play = {
+                scope.launch(start = kotlinx.coroutines.CoroutineStart.UNDISPATCHED) {
+                    try {
+                        backend.play()
+                    } catch (error: Exception) {
+                        if (error !is kotlinx.coroutines.CancellationException) onResumeFailed(error)
+                    }
+                }
+            },
+            emit = emit,
+            onResumeFailed = onResumeFailed
+        )
+        onDecided(decision, backend.type)
+    }
+}
+

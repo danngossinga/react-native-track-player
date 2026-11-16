@@ -101,6 +101,38 @@ class PlaybackBackendTransactionTest {
     }
 
     @Test
+    fun aBackendSwitchDoesNotWaitForAnInterruptionResumeToStart() = runTest {
+        val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot, readPlaybackState = AudioPlayerState.PAUSED)
+        val starting = CompletableDeferred<Unit>()
+        old.playGate = starting
+        val facade = PlaybackBackendFacade(old, FakeFactory())
+        val focus = object : AudioFocusRequester {
+            override fun request(onChange: (Int) -> Unit) = true
+            override fun abandon() = Unit
+        }
+        val receiver = object : NoisyReceiverRegistrar {
+            override fun register(onNoisy: () -> Unit) = Unit
+            override fun unregister() = Unit
+        }
+        val coordinator = InterruptionCoordinator({ true }, focus, receiver) { }
+        val ducks = mutableListOf<RemoteDuckPayload>()
+        // The gain after an interruption: resume; the crossfade backend's play start takes time.
+        coordinator.applyOn(
+            facade = facade,
+            scope = backgroundScope,
+            decide = { InterruptionDecision(InterruptionAction.RESUME, RemoteDuckPayload(paused = false, permanent = false)) },
+            emit = { ducks += it },
+            onResumeFailed = { }
+        )
+        assertEquals(listOf(RemoteDuckPayload(paused = false, permanent = false)), ducks)
+        // A backend switch now proceeds at once, as on iOS (it does not wait for the play start).
+        val switched = async { facade.setPlaybackBackend(PlaybackBackendType.STANDARD) }
+        runCurrent()
+        assertTrue(switched.isCompleted)
+        starting.complete(Unit)
+    }
+
+    @Test
     fun activeCrossfadeIsSettledBeforeSnapshot() = runTest {
         val old = FakeBackend(PlaybackBackendType.PING_PONG, snapshot)
         val authority = AndroidPlaybackBackendAuthority()
@@ -1921,7 +1953,11 @@ class PlaybackBackendTransactionTest {
             lifecycleTrace += "$type:activate"
         }
 
+        /** When set, play() waits for it (a play start in progress). */
+        var playGate: CompletableDeferred<Unit>? = null
+
         override suspend fun play() {
+            playGate?.await()
             playCalls += 1
             snapshotValue = snapshotValue.copy(playWhenReady = true)
             setAudible(true)
