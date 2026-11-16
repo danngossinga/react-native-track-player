@@ -474,6 +474,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket.onCancelled = {
             if (state in STABILIZED_WHEN_CANCELLED) {
                 playWhenReady = false
+                // Silent, as iOS (resetEngines): an engine already told to play must not go on.
+                activeEngine.pause()
+                standbyEngine.pause()
                 setState(
                     if (currentIndex in queue.indices) AndroidPlaybackOrchestratorState.PAUSED
                     else AndroidPlaybackOrchestratorState.IDLE
@@ -598,6 +601,8 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.play(rate)
             setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
         } else {
+            // Paused means silent: the engine may have been told to play before this seek.
+            activeEngine.pause()
             setState(AndroidPlaybackOrchestratorState.PAUSED)
         }
         preloadNextIfPossible()
@@ -727,7 +732,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
             throw RejectionException("Crossfade is not supported for this transition.", "crossfade_not_supported")
         }
 
-        val ticket = operationController.begin()
+        // Armed like every operation: its fallback start (startTrackAt) is a load that a seek, a
+        // backend switch or a queue change can cancel.
+        val ticket = beginOperation()
         val cancellation = CompletableDeferred<Unit>()
         try {
             crossfadeRunId += 1
@@ -1008,7 +1015,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
         delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
-        activeEngine.prepare(queue[index], positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        prepareActiveOrFail(queue[index], positionMs, ticket)
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
@@ -1031,7 +1038,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (activeEngine.isPreparedFor(item)) return
         setState(AndroidPlaybackOrchestratorState.LOADING)
-        activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        prepareActiveOrFail(item, positionMs, ticket)
         ticket?.ensureActive()
     }
 
@@ -1054,9 +1061,22 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket?.ensureActive()
     }
 
-    /** Begins an operation (cancelling the one in progress), armed with [stabilizeIfCancelled]. */
+    /**
+     * Begins an operation (cancelling the one in progress), armed with [stabilizeIfCancelled]:
+     * the only way an operation begins (no bare `operationController.begin()`).
+     */
     private fun beginOperation(): PlaybackOperationTicket =
         operationController.begin().also(::stabilizeIfCancelled)
+
+    /** Loads the active track; a load that fails leaves the player in error, as iOS's loadIndex. */
+    private suspend fun prepareActiveOrFail(item: TrackAudioItem, positionMs: Long, ticket: PlaybackOperationTicket?) {
+        try {
+            activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            setState(AndroidPlaybackOrchestratorState.ERROR)
+            throw error
+        }
+    }
 
     private suspend fun <T> withPlaybackOperation(
         block: suspend (PlaybackOperationTicket) -> T

@@ -822,6 +822,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED), delegate.playbackStates.take(2))
             assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
             assertFalse(orchestrator.snapshot().playWhenReady)
+            // Silent, as iOS: the engine told to play is paused too.
+            assertFalse(engines.first.audible || engines.second.audible)
 
             // A backend switch during the start (settle): paused, nothing left loading.
             delegate.playbackStates.clear()
@@ -876,6 +878,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 assertEquals(canceller, AudioPlayerState.LOADING, delegate.playbackStates.first())
                 assertEquals(canceller, AudioPlayerState.PAUSED, delegate.playbackStates[1])
                 assertFalse(canceller, orchestrator.snapshot().playWhenReady)
+                assertFalse(canceller, engines.first.audible || engines.second.audible)
             } finally {
                 orchestrator.release()
             }
@@ -902,6 +905,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             started.await()
             assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED), delegate.playbackStates.take(2))
             assertFalse(orchestrator.snapshot().playWhenReady)
+            assertFalse(engines.first.audible || engines.second.audible)
         } finally {
             orchestrator.release()
         }
@@ -951,6 +955,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 skip.await()
                 assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
                 assertFalse(orchestrator.snapshot().playWhenReady)
+                assertFalse(engines.first.audible || engines.second.audible)
             } finally {
                 orchestrator.release()
             }
@@ -977,6 +982,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 play.await()
                 assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
                 assertFalse(orchestrator.snapshot().playWhenReady)
+                assertFalse(engines.first.audible || engines.second.audible)
             } finally {
                 orchestrator.release()
             }
@@ -999,6 +1005,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 first.await()
                 assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
                 assertFalse(orchestrator.snapshot().playWhenReady)
+                assertFalse(engines.first.audible || engines.second.audible)
             } finally {
                 orchestrator.release()
             }
@@ -1016,6 +1023,62 @@ class AndroidPlaybackOrchestratorCancellationTest {
             val refused = runCatching { orchestrator.crossFadePrepare() }
             assertEquals("crossfade_not_playing", (refused.exceptionOrNull() as RejectionException).code)
             assertEquals(listOf(CrossfadeEvent("cancelled", 0, 1, "not_playing")), delegate.crossfadeEvents)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aCrossfadeFallbackStartCancelledByAnotherCommandEndsPausedAndSilent() = runTest {
+        for (canceller in listOf("seek", "switch", "queue", "handoff")) {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.incomingStallGraceMs = { 300L }
+                val items = testItems(3)
+                orchestrator.setQueue(items)
+                orchestrator.play()
+                runCurrent()
+                // The incoming track stalls: the crossfade falls back to starting it alone, and
+                // that start takes 5 s.
+                engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+                val fade = async { runCatching { orchestrator.crossFade(fadeDuration = 5_000.0) } }
+                advanceTimeBy(1_000L)
+                runCurrent()
+                assertEquals(canceller, AudioPlayerState.LOADING, orchestrator.snapshot().playbackState)
+                var quiescence: AndroidPlaybackHandoffQuiescence? = null
+                when (canceller) {
+                    "seek" -> orchestrator.seekTo(10_000L)
+                    "switch" -> orchestrator.settleActiveTransition()
+                    "handoff" -> quiescence = orchestrator.beginHandoffQuiescence()
+                    else -> orchestrator.setQueue(items + testItems(1))
+                }
+                runCurrent()
+                fade.await()
+                // As iOS (its fallback is a skip, an armed load): not loading, playWhenReady off,
+                // silent; a backend switch captures it paused.
+                assertTrue(canceller, orchestrator.snapshot().orchestratorState != AndroidPlaybackOrchestratorState.LOADING)
+                assertFalse(canceller, orchestrator.snapshot().playWhenReady)
+                assertFalse(canceller, engines.first.audible || engines.second.audible)
+                if (canceller == "handoff") assertFalse(checkNotNull(quiescence).playWhenReady)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
+    fun aLoadThatFailsLeavesThePlayerInErrorAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            // The next track gets no data: its load gives up at the stall timeout.
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val skipped = runCatching { orchestrator.skip(1) }
+            assertEquals("crossfade_prepare_timeout", (skipped.exceptionOrNull() as RejectionException).code)
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
         } finally {
             orchestrator.release()
         }
@@ -1509,7 +1572,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
             ready = true
         }
 
-        override fun play(rate: Float) = Unit
+        /** Told to play and not paused or reset since (a real engine would be heard). */
+        var audible = false
+        override fun play(rate: Float) { audible = true }
 
         override suspend fun awaitPlaying(timeoutMs: Long, stallTimeoutMs: Long, ticket: PlaybackOperationTicket?) {
             lastPlayStartTimeoutMs = timeoutMs
@@ -1533,9 +1598,10 @@ class AndroidPlaybackOrchestratorCancellationTest {
             if (verdict != null) throw RejectionException("$name did not start playing.", "crossfade_play_start_timeout")
         }
 
-        override fun pause() = Unit
+        override fun pause() { audible = false }
 
         override fun reset() {
+            audible = false
             ended = false
             preparedItem = null
             ready = false

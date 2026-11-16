@@ -263,8 +263,8 @@ assert(
 // never a number.
 assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6 &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 6 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 5 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 5 &&
     orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
   'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
 );
@@ -604,6 +604,16 @@ assert(
     engineAwaitPlaying.includes('        ticket?.ensureActive()\n        if (operationGeneration != generation) throw PlaybackOperationCancelledException("engine_reset")\n        if (verdict != null) {') &&
     engineAwaitPlaying.includes('            player.playWhenReady = false\n            player.pause()\n            state = AndroidCrossfadeEngineState.FAILED\n'),
   'Android seventh-review pins must stay in place.'
+);
+
+// Eleventh review: every operation begins armed with the cancelled-operation clean-up (no
+// bare operationController.begin() left), and that clean-up silences the engines.
+assert(
+  (orchestrator.match(/operationController\.begin\(\)/g) || []).length === 2 &&
+    orchestrator.includes('operationController.begin().also(::stabilizeIfCancelled)') &&
+    !/val \w+ = operationController\.begin\(\)/.test(orchestrator) &&
+    section(orchestrator, 'private fun stabilizeIfCancelled(', '    /**').includes('                activeEngine.pause()\n                standbyEngine.pause()'),
+  'Android orchestrator operations must all begin armed, and the clean-up must silence the engines.'
 );
 
 console.log('Android crossfade contracts OK');
