@@ -318,7 +318,7 @@ class MusicService : HeadlessJsTaskService() {
             delegate = object : AndroidPlaybackOrchestratorDelegate {
                 override fun onPlaybackStateChanged(state: AudioPlayerState) {
                     if (!isAuthoritative()) return
-                    emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state))
+                    emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state, includeStandardError = false))
                 }
 
                 override fun onActiveTrackChanged(
@@ -1249,11 +1249,13 @@ class MusicService : HeadlessJsTaskService() {
     private fun getBufferedPositionInSeconds(): Double = activePlaybackBackend().bufferedMs.toSeconds()
 
     @MainThread
-    fun getPlayerStateBundle(state: AudioPlayerState): Bundle {
+    fun getPlayerStateBundle(state: AudioPlayerState, includeStandardError: Boolean = true): Bundle {
         val bundle = Bundle()
         bundle.putString(STATE_KEY, state.asLibState.state)
         if (state == AudioPlayerState.ERROR) {
-            bundle.putBundle(ERROR_KEY, getPlaybackErrorBundle())
+            // The crossfade backend's error has no standard-player error to carry (iOS sends {}):
+            // never a stale KotlinAudio error.
+            bundle.putBundle(ERROR_KEY, if (includeStandardError) getPlaybackErrorBundle() else Bundle())
         }
         return bundle
     }

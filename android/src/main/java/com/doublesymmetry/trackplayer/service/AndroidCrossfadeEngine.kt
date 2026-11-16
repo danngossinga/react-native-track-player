@@ -196,7 +196,10 @@ internal class AndroidCrossfadeEngine(
         preparedItem = item
         preparedTrackKey = trackKey
 
-        // Fails when nothing loads for stallTimeoutMs, or after timeoutMs in all.
+        // Fails when nothing loads for stallTimeoutMs, or after timeoutMs in all. A load that fails
+        // (or is cancelled) leaves no prepared track, so the next play loads it again (iOS:
+        // recoverCurrentItem reloads after an error).
+        try {
         val verdict = awaitWhileProgressing(
             stallTimeoutMs = stallTimeoutMs,
             totalTimeoutMs = timeoutMs,
@@ -224,6 +227,13 @@ internal class AndroidCrossfadeEngine(
         ticket?.ensureActive()
         if (operationGeneration != generation) {
             throw PlaybackOperationCancelledException("engine_reset")
+        }
+        } catch (error: Exception) {
+            if (operationGeneration == generation && preparedTrackKey == trackKey) {
+                preparedItem = null
+                preparedTrackKey = null
+            }
+            throw error
         }
         state = AndroidCrossfadeEngineState.READY
         androidXfadeLog("$name prepare end ready=true durationMs=$durationMs bufferedMs=$bufferedMs")

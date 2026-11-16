@@ -263,8 +263,8 @@ assert(
 // never a number.
 assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 5 &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 5 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 4 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 4 &&
     orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
   'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
 );
@@ -621,6 +621,19 @@ assert(
     !/val \w+ = operationController\.begin\(\)/.test(orchestrator) &&
     section(orchestrator, 'private fun stabilizeIfCancelled(', '    /**').includes('                activeEngine.pause()\n                standbyEngine.pause()'),
   'Android orchestrator operations must all begin armed, and the clean-up must silence the engines.'
+);
+
+// Twelfth review: a failed load leaves no prepared track (play reloads, as iOS), a failed play
+// start is silent, every active load goes through prepareActiveOrFail, and a crossfade error
+// state carries no standard-player error (iOS sends {}).
+assert(
+  section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)').includes('        } catch (error: Exception) {\n            if (operationGeneration == generation && preparedTrackKey == trackKey) {\n                preparedItem = null\n                preparedTrackKey = null\n            }\n            throw error\n        }') &&
+    section(orchestrator, 'private suspend fun awaitPlaybackStart(', '\n    }\n').includes('            playWhenReady = false\n            // Silent, as iOS (loadIndex\'s autoplay failure pauses the engine).\n            activeEngine.pause()\n            setState(AndroidPlaybackOrchestratorState.PAUSED)') &&
+    (orchestrator.match(/activeEngine\.prepare\(/g) || []).length === 1 &&
+    (orchestrator.match(/prepareActiveOrFail\(/g) || []).length === 4 &&
+    musicService.includes('emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(state, includeStandardError = false))') &&
+    musicService.includes('bundle.putBundle(ERROR_KEY, if (includeStandardError) getPlaybackErrorBundle() else Bundle())'),
+  'Android twelfth-review fixes must stay in place.'
 );
 
 console.log('Android crossfade contracts OK');

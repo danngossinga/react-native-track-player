@@ -620,6 +620,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertFalse(orchestrator.playWhenReady)
             assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
             assertEquals("crossfade_play_start_timeout", delegate.playbackErrors.last().first)
+            // Silent, as iOS (its autoplay failure pauses the engine).
+            assertFalse(engineA.audible || engineB.audible)
         } finally {
             orchestrator.release()
         }
@@ -1085,6 +1087,51 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPlayOrASeekAfterStopWhoseLoadFailsEndsInErrorAsOnIos() = runTest {
+        for (command in listOf("play", "seek")) {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                orchestrator.stop()
+                // Stopped: the track is unloaded; loading it again gets no data.
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+                val failed = runCatching {
+                    if (command == "play") orchestrator.play() else orchestrator.seekTo(10_000L)
+                }
+                assertEquals(command, "crossfade_prepare_timeout", (failed.exceptionOrNull() as RejectionException).code)
+                assertEquals(command, AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+                assertFalse(command, engines.first.audible || engines.second.audible)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
+    fun aPlayAfterAFailedLoadLoadsTheTrackAgainAndPlaysAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            runCatching { orchestrator.skip(1) }
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            // The failed load left nothing prepared: play loads the track again (iOS:
+            // recoverCurrentItem) and plays.
+            val loads = engines.first.prepareCalls
+            orchestrator.play()
+            assertEquals(loads + 1, engines.first.prepareCalls)
+            assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
+            assertEquals(1, orchestrator.snapshot().currentIndex)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aSkipDuringAStartPlaysTheNewTrackAsOnIos() = runTest {
         val (orchestrator, engines, delegate) = ninth()
         try {
@@ -1162,6 +1209,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
             runCatching { orchestrator.play() }
             assertEquals(AndroidPlaybackOrchestratorState.PAUSED, orchestrator.snapshot().orchestratorState)
+            assertFalse(engineA.audible || engineB.audible)
         } finally {
             orchestrator.release()
         }
@@ -1530,6 +1578,28 @@ class AndroidPlaybackOrchestratorCancellationTest {
             lastPrepareTicket = ticket
             lastPrepareTimeoutMs = timeoutMs
             lastPrepareStallTimeoutMs = stallTimeoutMs
+            // As the real engine: the track is marked before the wait, and a load that fails or
+            // is cancelled clears it (so the next play loads it again).
+            preparedItem = item
+            ready = false
+            try {
+                prepareWait(item, positionMs, timeoutMs, stallTimeoutMs, ticket)
+            } catch (error: Throwable) {
+                if (preparedItem === item) preparedItem = null
+                throw error
+            }
+            preparedItem = item
+            position = positionMs
+            ready = true
+        }
+
+        private suspend fun prepareWait(
+            item: TrackAudioItem,
+            positionMs: Long,
+            timeoutMs: Long,
+            stallTimeoutMs: Long,
+            ticket: PlaybackOperationTicket?
+        ) {
             simulatedLoad?.let { load ->
                 simulatedLoad = null
                 var bytes = 0L
@@ -1567,9 +1637,6 @@ class AndroidPlaybackOrchestratorCancellationTest {
                     }
                 }
             }
-            preparedItem = item
-            position = positionMs
-            ready = true
         }
 
         /** Told to play and not paused or reset since (a real engine would be heard). */

@@ -393,7 +393,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.reset()
             standbyEngine.reset()
             setState(AndroidPlaybackOrchestratorState.LOADING)
-            activeEngine.prepare(item, 0L, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+            prepareActiveOrFail(item, 0L, ticket)
             ticket.ensureActive()
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
@@ -495,6 +495,8 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         } catch (error: RejectionException) {
             playWhenReady = false
+            // Silent, as iOS (loadIndex's autoplay failure pauses the engine).
+            activeEngine.pause()
             setState(AndroidPlaybackOrchestratorState.PAUSED)
             delegate.onPlaybackError(error.code, error.message)
             throw error
