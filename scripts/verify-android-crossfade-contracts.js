@@ -588,4 +588,20 @@ assert(
   'A stalled Android crossfade seek must pause, fail and leave the player in error, as on iOS.'
 );
 
+// Seventh review: exact pins where the code needs the Android runtime (KotlinAudio's player,
+// the real ExoPlayer engine).
+const engineAwaitPlaying = section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()');
+assert(
+  // The seek adapter forwards the player's own readings.
+  standardBackend.includes('        override val durationMs: Long get() = player.duration\n') &&
+    standardBackend.includes('        override val bufferedPositionMs: Long get() = player.bufferedPosition\n') &&
+    standardBackend.includes('        override val positionMs: Long get() = player.position\n') &&
+    // The engine's play start: a player error fails at once (crossfade_engine_error), a reset
+    // during the wait cancels it, and a give-up leaves the engine failed.
+    engineAwaitPlaying.includes('            if (player.playerError != null) {\n                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED\n                throw RejectionException(player.playerError?.message ?: "$name failed to play.", "crossfade_engine_error")\n            }\n            player.isPlaying') &&
+    engineAwaitPlaying.includes('        ticket?.ensureActive()\n        if (operationGeneration != generation) throw PlaybackOperationCancelledException("engine_reset")\n        if (verdict != null) {') &&
+    engineAwaitPlaying.includes('            player.playWhenReady = false\n            player.pause()\n            state = AndroidCrossfadeEngineState.FAILED\n'),
+  'Android seventh-review pins must stay in place.'
+);
+
 console.log('Android crossfade contracts OK');

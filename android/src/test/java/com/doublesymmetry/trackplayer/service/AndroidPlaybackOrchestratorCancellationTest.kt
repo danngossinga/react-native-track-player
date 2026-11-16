@@ -622,6 +622,48 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aFailedFirstPlayStartLeavesThePlayerPaused() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 1_000L }
+            orchestrator.setQueue(testItems(2))
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            runCatching { orchestrator.play() }
+            assertEquals(AndroidPlaybackOrchestratorState.PAUSED, orchestrator.snapshot().orchestratorState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPreparedCrossfadeThatFailsToStartLeavesNothingPreparedAndTheIncomingTrackSilent() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 1_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            orchestrator.crossFadePrepare(previous = false, seekTo = 5.0)
+            assertEquals(1, orchestrator.privateField("preparedCrossfadeToIndex"))
+            engineB.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val failed = runCatching { orchestrator.crossFade(fadeDuration = 1_000.0) }
+            assertEquals("crossfade_start_failed", (failed.exceptionOrNull() as RejectionException).code)
+            assertNull(orchestrator.privateField("preparedCrossfadeFromIndex"))
+            assertNull(orchestrator.privateField("preparedCrossfadeToIndex"))
+            assertEquals(0L, orchestrator.privateField("preparedCrossfadeSeekToMs"))
+            assertEquals(0f, engineB.currentVolume)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aCrossfadeStartsOnceTheIncomingTrackPlaysAndKeepsTheOutgoingOneWhenItStalls() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")

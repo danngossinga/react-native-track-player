@@ -696,6 +696,72 @@ class PlaybackBackendRuntimePrimitivesTest {
         @Suppress("UNCHECKED_CAST")
         return unsafe.javaClass.getMethod("allocateInstance", Class::class.java).invoke(unsafe, type) as T
     }
+
+    @Test
+    fun aPauseAfterANewerSeekEndsTheNewerSeek() = runTest {
+        // The older seek ends (replaced); it must not forget the newer one still waiting.
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 60_000L }, pollIntervalMs = 1_000L, nowMs = { currentTime })
+        val item = Any()
+        val buffering = { StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, 0L, item = item) }
+        val older = async { runCatching { gate.await(30_000L, item, buffering) } }
+        runCurrent()
+        val newer = async { runCatching { gate.await(40_000L, item, buffering) } }
+        runCurrent()
+        older.await()
+        val at = currentTime
+        gate.cancel("pause")
+        assertEquals("standard_seek_cancelled", (newer.await().exceptionOrNull() as RejectionException).code)
+        assertEquals(0L, currentTime - at)
+    }
+
+    @Test
+    fun onlyAnAutomaticTransitionIsCounted() {
+        val counter = AutoTransitionCounter()
+        val eventTime = bare(com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime::class.java)
+        val position = bare(com.google.android.exoplayer2.Player.PositionInfo::class.java)
+        for (reason in listOf(
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_SEEK,
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_SEEK_ADJUSTMENT,
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_SKIP,
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_REMOVE,
+            com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_INTERNAL
+        )) counter.onPositionDiscontinuity(eventTime, position, position, reason)
+        assertEquals(0L, counter.count)
+        counter.onPositionDiscontinuity(eventTime, position, position, com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_AUTO_TRANSITION)
+        assertEquals(1L, counter.count)
+    }
+
+    @Test
+    fun aPositionReadJustBeforeTheTargetIsAtTheTarget() = runTest {
+        // A position read between two polls may lag the target by up to one poll.
+        val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val item = Any()
+        val started = currentTime
+        gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_950L, 25_000L, item = item) }
+        assertEquals(0L, currentTime - started)
+        // More than one poll before it: not there yet.
+        val early = runCatching {
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_850L, 25_000L, item = item) }
+        }
+        assertEquals("standard_seek_timeout", (early.exceptionOrNull() as RejectionException).code)
+    }
+
+    @Test
+    fun aSeekTimeoutSaysWhetherItStalledOrRanOutOfTime() = runTest {
+        val item = Any()
+        val stalledGate = StandardSeekGate(timeoutMs = { 5_000L }, stallTimeoutMs = { 300L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val stalled = runCatching {
+            stalledGate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, 1_000L, item = item) }
+        }.exceptionOrNull() as RejectionException
+        assertEquals("The native seek made no progress for 300 ms.", stalled.message)
+        var buffered = 0L
+        val slowGate = StandardSeekGate(timeoutMs = { 500L }, stallTimeoutMs = { 5_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val slow = runCatching {
+            slowGate.await(20_000L, item) { buffered += 100L; StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, buffered, item = item) }
+        }.exceptionOrNull() as RejectionException
+        assertEquals("The native seek did not complete within 500 ms.", slow.message)
+    }
+
 }
 
 private fun defaultValue(type: Class<*>): Any? = when (type) {

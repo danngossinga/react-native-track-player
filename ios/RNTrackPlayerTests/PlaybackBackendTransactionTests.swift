@@ -306,7 +306,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/interruption-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 12)
+        XCTAssertEqual(scenarios.count, 13)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             let autoResume = scenario["autoResume"] as? Bool ?? false

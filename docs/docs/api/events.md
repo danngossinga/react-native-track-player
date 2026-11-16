@@ -203,7 +203,22 @@ resume. A refused audio focus request (Android) or audio session activation
 When it resumes, the event with `paused: false` is emitted as soon as the
 resume is issued, before playback has started, and a pause from the user
 during that start runs at once (it does not wait for the start), on both
-platforms and both backends. With `autoHandleInterruptions: false` (default), the app may
+platforms and both backends.
+
+The audio focus (Android) and the audio session (iOS) stay held while playback
+is paused and after the queue ends, until `stop` or `reset`. So this event can
+arrive while nothing plays: on Android, another app taking the audio for good
+emits `paused: true, permanent: true`; on iOS, an interruption emits
+`paused: true, permanent: false` when it begins and `paused: true, permanent:
+true` if it ends without allowing playback to resume (iOS never says up front
+that a loss is permanent). In both cases nothing is paused or resumed, since
+nothing was playing.
+
+Known difference (crossfade backend): on Android, the resume after an
+interruption is awaited inside the command that runs it, so a backend switch
+(`setPlaybackBackend`) issued during that start waits for it, at most
+`playStartTimeoutMs` (a user pause still runs at once). On iOS the resume is
+not awaited and a backend switch does not wait for it. With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

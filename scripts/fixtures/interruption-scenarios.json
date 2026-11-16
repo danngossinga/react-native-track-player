@@ -97,6 +97,15 @@
       ]
     },
     {
+      "id": "FOCUS-03d a permanent loss during an interruption: no resume when it ends",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "lostPermanently", "action": "none", "duck": { "paused": true, "permanent": true } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
       "id": "FOCUS-04 an interruption after the queue ended: no pause, no resume (state unchanged)",
       "autoResume": true, "playing": true, "state": "ended",
       "steps": [

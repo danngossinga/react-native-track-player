@@ -251,4 +251,19 @@ class StartLowTrackSelectionTest {
         factory.createTrackSelections(emptyArray<ExoTrackSelection.Definition>(), shared, period, timeline)
         assertEquals(listOf(96_000L, 48_000L), seen)
     }
+
+    @Test
+    fun aTracksMeterLeavesTransfersAndFirstByteTimesToThePlayersMeter() {
+        val listener = bare(com.google.android.exoplayer2.upstream.DefaultBandwidthMeter::class.java)
+        val shared = object : BandwidthMeter {
+            override fun getBitrateEstimate(): Long = 4_000_000L
+            override fun getTimeToFirstByteEstimateUs(): Long = 123_456L
+            override fun getTransferListener(): TransferListener = listener
+            override fun addEventListener(eventHandler: Handler, eventListener: BandwidthMeter.EventListener) = Unit
+            override fun removeEventListener(eventListener: BandwidthMeter.EventListener) = Unit
+        }
+        val meter = StartLowBandwidthMeter(shared, DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS, hasOwnMeasurement = { false })
+        assertEquals(123_456L, meter.timeToFirstByteEstimateUs)
+        assertTrue(meter.transferListener === listener)
+    }
 }

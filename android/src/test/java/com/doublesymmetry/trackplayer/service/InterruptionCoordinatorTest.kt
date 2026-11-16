@@ -57,6 +57,8 @@ class InterruptionCoordinatorTest {
         var state = AudioPlayerState.PLAYING
         var playFails = false
         val ducks = mutableListOf<RemoteDuckPayload?>()
+        /** The remote-duck payloads emitted when each pause ran. */
+        val ducksAtPause = mutableListOf<Int>()
         /** The remote-duck payloads emitted when each resumed play started. */
         val ducksAtPlay = mutableListOf<Int>()
         lateinit var coordinator: InterruptionCoordinator
@@ -73,7 +75,10 @@ class InterruptionCoordinatorTest {
                             playWhenReady = playing,
                             state = state,
                             decide = decide,
-                            pause = { playing = false },
+                            pause = {
+                                ducksAtPause += emitted.size
+                                playing = false
+                            },
                             play = {
                                 ducksAtPlay += emitted.size
                                 if (playFails) error("play failed") else playing = true
@@ -261,5 +266,25 @@ class InterruptionCoordinatorTest {
         assertNull(harness.receiver.onNoisy)
         assertEquals(1, harness.focus.abandons)
         assertFalse(harness.coordinator.focus.isHeld)
+    }
+
+    @Test
+    fun aUserPlayDuringAnInterruptionCancelsItsResume() {
+        val harness = Harness()
+        harness.userPlay()
+        harness.focus.change(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        // The user plays again during the interruption: the gain does not play a second time.
+        harness.userPlay()
+        harness.focus.change(AudioManager.AUDIOFOCUS_GAIN)
+        assertTrue(harness.ducksAtPlay.isEmpty())
+    }
+
+    @Test
+    fun theRemoteDuckOfALossIsEmittedOnceThePauseIsDone() {
+        val harness = Harness()
+        harness.userPlay()
+        harness.focus.change(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertEquals(listOf(0), harness.ducksAtPause)
+        assertEquals(RemoteDuckPayload(paused = true, permanent = false), harness.ducks.last())
     }
 }
