@@ -1125,6 +1125,8 @@ final class IOSPlaybackOrchestrator {
                                         case .failure(let error):
                                             IOSPlaybackLog.log("loadIndex autoplay failed index=\(index) error=\(error.localizedDescription)")
                                             self.playWhenReady = false
+                                            // As after a failed play(): audio must not start by itself later.
+                                            self.activeEngine.pause()
                                             self.state = .paused
                                         }
                                         self.operationRegistry.performAfterCurrentMutation {
