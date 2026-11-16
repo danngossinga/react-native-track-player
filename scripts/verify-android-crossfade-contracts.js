@@ -395,4 +395,14 @@ assert(
   'PerTrackBandwidthMeter must track a transfer from its start to its end only.'
 );
 
+// The crossfade players' HTTP connect/read timeouts follow stallTimeoutMs at every load and seek.
+assert(
+  enginePrepare.includes('applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)') &&
+    engineSeek.includes('applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)') &&
+    section(engineSource, 'internal fun applyHttpTimeouts(', '\n}').includes('factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs)') &&
+    !/set(Connect|Read)TimeoutMs\(\d/.test(engineSource) &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun theDataSourcesOfACrossfadePlayerFollowTheCurrentStallTimeout()'),
+  'Android crossfade HTTP timeouts must follow stallTimeoutMs.'
+);
+
 console.log('Android crossfade contracts OK');

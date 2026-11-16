@@ -172,6 +172,7 @@ internal class AndroidCrossfadeEngine(
         androidXfadeLog("$name prepare start trackKey=$trackKey positionMs=$positionMs")
         state = AndroidCrossfadeEngineState.LOADING
         configureRequestOptions(item)
+        applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)
         player.playWhenReady = false
         player.pause()
         player.stop()
@@ -274,6 +275,8 @@ internal class AndroidCrossfadeEngine(
         val generation = operationGeneration
         ticket?.ensureActive()
         val target = max(0L, positionMs)
+        // The segments a seek loads follow the current stall timeout too.
+        applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
         val verdict = awaitWhileProgressing(
@@ -330,6 +333,18 @@ internal class AndroidCrossfadeEngine(
             ?: item.audioUrl
     }
 
+}
+
+/**
+ * Makes a crossfade player's HTTP connect and read timeouts follow `stallTimeoutMs`, instead of
+ * ExoPlayer's fixed 8 s: a socket that delivers nothing for that long is the same stall the waits
+ * give up on, and a slow but alive read is not cut sooner. Applied at every load and seek; the
+ * factory gives the values to every data source it creates afterwards. Returns the value used.
+ */
+internal fun applyHttpTimeouts(factory: DefaultHttpDataSource.Factory, stallTimeoutMs: Long): Int {
+    val timeoutMs = stallTimeoutMs.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
+    factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs)
+    return timeoutMs
 }
 
 /** How often an engine's load or seek wait reads its progress (a poll interval, not a limit). */
