@@ -479,6 +479,8 @@ assert(
     section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requested.request(false)\n            player.stop()') &&
     section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('player.playWhenReady = value\n            requested.request(value)') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAnInterruptionResumesWhenTheSDKPausedThePlayerBeforeItWasRead()') &&
+    // reset runs from deinit too: its operation holds the policy, not the module.
+    section(player, 'public func reset(resolve:', 'public func play(resolve:').includes('withActivePlaybackBackendSerialized({ [interruptionPolicy] backend in') &&
     pingPongBackend.includes('var interruptionIsPlaying: Bool { return orchestrator.playWhenReady }') &&
     // Every user command, inside its admitted operation (ordered with the interruption events).
     [['public func play(resolve:', 'public func pause(resolve:'],
