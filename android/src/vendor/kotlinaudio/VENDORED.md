@@ -40,10 +40,8 @@ section 4(b)); line numbers below include that notice.
   - `:240` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
     selector whose selections start each track from `initialBitrateEstimateBps`);
   - `:482-491` the item's HTTP configuration (user agent, redirects, headers) becomes a
-    `configureHttp` block, given with the item to `hooks.httpDataSourceFactory` when set (the
-    host's factory builds each request with the current `stallTimeoutMs` as its connect and read
-    timeouts, and records the item's ended transfers so each track starts from
-    `initialBitrateEstimateBps` until its own transfer is measured), else
+    `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
+    builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream.
 - `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
   passed to `BaseAudioPlayer`.

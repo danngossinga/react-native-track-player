@@ -6,8 +6,6 @@ import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertTrue
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertSame
 import org.junit.Test
 
@@ -90,42 +88,18 @@ class CrossfadeHttpTimeoutsTest {
     fun theStandardPlayersRequestsKeepKotlinAudiosConfigurationAndFollowTheCurrentStallTimeout() {
         var stall = DEFAULT_STALL_TIMEOUT_MS
         val opened = mutableListOf<Pair<String?, Int>>()
-        val transfers = OwnTransferRegistry()
-        val item = Any()
-        val forItem = standardHttpDataSourceFactory({ stall }, transfers) { factory, timeoutMs ->
+        val forItem = standardHttpDataSourceFactory({ stall }) { factory, timeoutMs ->
             val userAgent = DefaultHttpDataSource.Factory::class.java.getDeclaredField("userAgent")
                 .apply { isAccessible = true }.get(factory) as String?
             opened += userAgent to timeoutMs
             RecordingRequest(timeoutMs)
         }
         // KotlinAudio configures the item's factory (here its user agent), then ExoPlayer opens.
-        val source = forItem(item) { setUserAgent("djeeloo-test") }.createDataSource()
+        val source = forItem { setUserAgent("djeeloo-test") }.createDataSource()
         source.open(spec)
-        // A transfer of this item that ended: the item has its own measurement (start-low).
-        assertFalse(transfers.hasMeasured(item))
-        source.close()
-        assertTrue(transfers.hasMeasured(item))
         stall = 30_000L
         source.open(spec)
         assertEquals(listOf("djeeloo-test" to 10_000, "djeeloo-test" to 30_000), opened)
-    }
-
-    @Test
-    fun aRequestThatNeverOpenedIsNotAMeasurement() {
-        val transfers = OwnTransferRegistry()
-        val item = Any()
-        val forItem = standardHttpDataSourceFactory({ DEFAULT_STALL_TIMEOUT_MS }, transfers) { _, _ ->
-            object : com.google.android.exoplayer2.upstream.BaseDataSource(true) {
-                override fun open(dataSpec: com.google.android.exoplayer2.upstream.DataSpec): Long = throw java.io.IOException("refused")
-                override fun read(buffer: ByteArray, offset: Int, length: Int): Int = -1
-                override fun getUri(): android.net.Uri? = null
-                override fun close() = Unit
-            }
-        }
-        val source = forItem(item) {}.createDataSource()
-        runCatching { source.open(spec) }
-        source.close()
-        assertFalse(transfers.hasMeasured(item))
     }
 
     @Test

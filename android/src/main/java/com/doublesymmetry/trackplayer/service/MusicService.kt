@@ -6,6 +6,8 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
+import com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector
+import com.google.android.exoplayer2.util.Clock
 import androidx.media.AudioAttributesCompat
 import android.os.Build
 import android.os.Bundle
@@ -68,8 +70,6 @@ class MusicService : HeadlessJsTaskService() {
     private var playbackOrchestrator: AndroidPlaybackOrchestrator? = null
     private var playbackOrchestratorIdentity: Any? = null
     private var orchestratorAudioContentType: Int = C.AUDIO_CONTENT_TYPE_MUSIC
-    /** The standard player's items whose own transfers ended (start-low, per track). */
-    private val standardTransfers = OwnTransferRegistry()
     /** `androidAudioContentType` for the audio focus request (an AudioAttributesCompat type). */
     private var focusContentType: Int = AudioAttributesCompat.CONTENT_TYPE_MUSIC
     private var orchestratorHandlesAudioFocus: Boolean = false
@@ -98,6 +98,10 @@ class MusicService : HeadlessJsTaskService() {
     private val prepareTimeout = TimeoutSetting(DEFAULT_PREPARE_TIMEOUT_MS)
     /** The standard backend's readiness wait (`standardReadyTimeoutMs`), read at every activation. */
     private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
+    /** How far a restored position may be off at a backend switch (`backendSwitchPositionToleranceMs`). */
+    private val backendSwitchPositionTolerance = TimeoutSetting(DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS)
+    /** Each standard player's automatic transitions (the seek wait reads them). */
+    private val standardAutoTransitions = java.util.WeakHashMap<QueuedAudioPlayer, AutoTransitionCounter>()
     /** How long any of those waits may go on with no progress (`stallTimeoutMs`), read at every wait. */
     private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
     /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
@@ -469,12 +473,14 @@ class MusicService : HeadlessJsTaskService() {
                     transitionGenerationSidecar,
                     readinessGate = StandardPlaybackReadinessGate(
                         timeoutMs = { standardReadyTimeout.milliseconds },
-                        stallTimeoutMs = { stallTimeout.milliseconds }
+                        stallTimeoutMs = { stallTimeout.milliseconds },
+                        positionToleranceMs = { backendSwitchPositionTolerance.milliseconds }
                     ),
                     seekGate = StandardSeekGate(
                         timeoutMs = { standardSeekTimeout.milliseconds },
                         stallTimeoutMs = { stallTimeout.milliseconds }
                     ),
+                    autoTransitions = { standardAutoTransitions[binding.player]?.count ?: 0L },
                     onCommitted = { committed ->
                         if (committed === binding.player) commitStandardPlayerBinding(binding)
                     },
@@ -601,7 +607,9 @@ class MusicService : HeadlessJsTaskService() {
         autoHandleInterruptions = handleAudioFocus
         val playerConfig = PlayerConfig(
             interceptPlayerActionsTriggeredExternally = true,
-            handleAudioBecomingNoisy = true,
+            // Unplugging goes through the service's receiver and backend.pause() (as the
+            // crossfade backend); KotlinAudio's own noisy handling would pause behind it.
+            handleAudioBecomingNoisy = false,
             handleAudioFocus = false,
             audioContentType = audioContentType
         )
@@ -610,7 +618,9 @@ class MusicService : HeadlessJsTaskService() {
         automaticallyUpdateNotificationMetadata = playerOptions?.getBoolean(AUTO_UPDATE_METADATA, true) ?: true
 
         standardPlayerFactory = {
-            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())
+            val transitions = AutoTransitionCounter()
+            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(transitions))
+                .also { standardAutoTransitions[it] = transitions }
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
         focusContentType = focusContentTypeOf(playerConfig.audioContentType)
@@ -641,16 +651,24 @@ class MusicService : HeadlessJsTaskService() {
      * crossfade players do: every track starts from the current `initialBitrateEstimateBps`, and
      * every HTTP request's connect and read timeouts follow the current `stallTimeoutMs`.
      */
-    private fun standardPlayerHooks() = PlayerHooks(
+    private fun standardPlayerHooks(transitions: AutoTransitionCounter) = PlayerHooks(
         configureExoPlayer = { builder ->
+            val loads = OwnMediaLoadRegistry()
             builder.setTrackSelector(
                 DefaultTrackSelector(
                     this@MusicService,
-                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, standardTransfers)
+                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, loads)
                 )
             )
+            // Each track's own media loads (not its playlist, not another track's).
+            builder.setAnalyticsCollector(
+                DefaultAnalyticsCollector(Clock.DEFAULT).apply {
+                    addListener(StartLowLoadListener(loads))
+                    addListener(transitions)
+                }
+            )
         },
-        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }, standardTransfers),
+        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
         hostOwnsAudioFocus = true
     )
 
@@ -691,6 +709,7 @@ class MusicService : HeadlessJsTaskService() {
     private fun applyTimeouts(options: Bundle?) {
         applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)
         applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
+        applyTimeout(options, BACKEND_SWITCH_POSITION_TOLERANCE_KEY, backendSwitchPositionTolerance)
         applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)
         applyTimeout(options, INCOMING_STALL_GRACE_KEY, incomingStallGrace)
         applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)

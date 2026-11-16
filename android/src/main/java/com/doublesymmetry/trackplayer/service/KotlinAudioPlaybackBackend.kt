@@ -149,6 +149,8 @@ internal class KotlinAudioPlaybackBackend(
     private val readinessGate: StandardPlaybackReadinessGate,
     /** Waits for every seek, as on iOS (`standardSeekTimeoutMs`, `stallTimeoutMs`). */
     private val seekGate: StandardSeekGate,
+    /** The player's automatic transitions (AutoTransitionCounter), for the seek wait. */
+    private val autoTransitions: () -> Long = { 0L },
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -346,6 +348,8 @@ internal class KotlinAudioPlaybackBackend(
     }
     override suspend fun seekTo(positionMs: Long) {
         val item = player.currentItem
+        // As iOS: a stopped player unloaded its item; load it again (paused) before the seek.
+        if (item != null && player.playerState == AudioPlayerState.STOPPED) player.prepare()
         if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)
         seekGate.await(positionMs, item) {
             StandardSeekObservation(
@@ -354,7 +358,8 @@ internal class KotlinAudioPlaybackBackend(
                 bufferedPositionMs = player.bufferedPosition,
                 durationMs = player.duration.coerceAtLeast(0L),
                 item = player.currentItem,
-                rate = player.playbackSpeed
+                rate = player.playbackSpeed,
+                autoTransitions = autoTransitions()
             )
         }
     }

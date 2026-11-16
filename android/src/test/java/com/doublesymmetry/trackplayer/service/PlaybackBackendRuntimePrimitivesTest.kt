@@ -159,7 +159,7 @@ class PlaybackBackendRuntimePrimitivesTest {
             timeoutMs = { 100L },
             stallTimeoutMs = { 10_000L },
             pollIntervalMs = 1L,
-            positionToleranceMs = 750L,
+            positionToleranceMs = { 750L },
             nowMs = { currentTime }
         )
 
@@ -433,5 +433,42 @@ class PlaybackBackendRuntimePrimitivesTest {
             StandardSeekObservation(AudioPlayerState.PLAYING, if (currentTime - started >= 500L) position else 25_000L, 30_000L, item = item, rate = 2f)
         }
         assertEquals(500L, currentTime - started)
+    }
+
+    @Test
+    fun theRestoredPositionToleranceIsTheAppsSettingReadAtEveryWait() = runTest {
+        var tolerance = 750L
+        val gate = StandardPlaybackReadinessGate(
+            timeoutMs = { 50L }, stallTimeoutMs = { 10_000L }, pollIntervalMs = 1L,
+            positionToleranceMs = { tolerance }, nowMs = { currentTime }
+        )
+        val offBy500 = StandardPlaybackReadinessObservation(AudioPlayerState.READY, 0, 10_500L, 0L)
+        gate.await(expectedIndex = 0, expectedPositionMs = 10_000L) { offBy500 }
+        tolerance = 200L
+        val failed = runCatching { gate.await(expectedIndex = 0, expectedPositionMs = 10_000L) { offBy500 } }
+        assertEquals("playback_backend_activation_not_ready", (failed.exceptionOrNull() as RejectionException).code)
+    }
+
+    @Test
+    fun aSeekThatPlaysThroughTheEndOfTheTrackIsDoneAsOnIos() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val item = Any()
+        var transitions = 3L
+        val started = currentTime
+        // Repeat-one: a seek near the end loops back to the start; the position never sits at the
+        // target, but the player made an automatic transition (it played to the end).
+        gate.await(59_900L, item) {
+            if (currentTime - started >= 300L) transitions = 4L
+            StandardSeekObservation(AudioPlayerState.PLAYING, 200L, 5_000L, durationMs = 60_000L, item = item, autoTransitions = transitions)
+        }
+        assertEquals(300L, currentTime - started)
+        // The next track began after the seek (repeat off): done too, not cancelled.
+        var current: Any = item
+        var count = 10L
+        gate.await(59_900L, item) {
+            val observation = StandardSeekObservation(AudioPlayerState.PLAYING, 100L, 5_000L, item = current, autoTransitions = count)
+            current = Any(); count = 11L
+            observation
+        }
     }
 }

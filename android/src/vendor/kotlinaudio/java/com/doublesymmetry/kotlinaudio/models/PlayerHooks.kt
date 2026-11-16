@@ -12,11 +12,10 @@ class PlayerHooks(
     /** Applied to the ExoPlayer builder before it builds (for example a track selector). */
     val configureExoPlayer: (ExoPlayer.Builder) -> Unit = {},
     /**
-     * Builds the HTTP data source factory of an item (given, so the host can tell its transfers
-     * from other items') from KotlinAudio's own configuration of it (user agent, redirects,
-     * headers); null keeps a plain DefaultHttpDataSource.Factory.
+     * Builds the HTTP data source factory of an item from KotlinAudio's own configuration of it
+     * (user agent, redirects, headers); null keeps a plain DefaultHttpDataSource.Factory.
      */
-    val httpDataSourceFactory: ((AudioItem, DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory)? = null,
+    val httpDataSourceFactory: ((DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory)? = null,
     /**
      * When true, KotlinAudio never requests audio focus (upstream requests it when the player
      * becomes READY, even while paused) and so neither ducks nor emits its own focus event: the

@@ -390,6 +390,7 @@ internal const val DEFAULT_PREPARE_TIMEOUT_MS = 60_000L
 
 /** How long, in all, the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`). */
 internal const val DEFAULT_STANDARD_READY_TIMEOUT_MS = 60_000L
+internal const val DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS = 750L
 
 /** How long, in all, a crossfade player may take to start playing (`playStartTimeoutMs`, as on iOS). */
 internal const val DEFAULT_PLAY_START_TIMEOUT_MS = 60_000L
@@ -399,6 +400,8 @@ internal const val PLAY_START_TIMEOUT_KEY = "playStartTimeoutMs"
 internal const val DEFAULT_STANDARD_SEEK_TIMEOUT_MS = 60_000L
 internal const val STANDARD_SEEK_TIMEOUT_KEY = "standardSeekTimeoutMs"
 internal const val STANDARD_READY_TIMEOUT_KEY = "standardReadyTimeoutMs"
+/** How far a restored position may be from the snapshot's at a backend switch (iOS: same option). */
+internal const val BACKEND_SWITCH_POSITION_TOLERANCE_KEY = "backendSwitchPositionToleranceMs"
 
 /** How long any of those waits goes on with no progress before it fails (`stallTimeoutMs`). */
 internal const val DEFAULT_STALL_TIMEOUT_MS = 10_000L

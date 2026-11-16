@@ -19,8 +19,6 @@ import com.google.android.exoplayer2.upstream.TransferListener
 internal class CurrentTimeoutHttpDataSourceFactory(
     /** The app's current `stallTimeoutMs`, read at every request. */
     private val stallTimeoutMs: () -> Long,
-    /** Called when a request that opened is closed (a transfer of this item ended). */
-    private val onTransferEnded: () -> Unit = {},
     /** Opens one request with the given timeout (tests replace it). */
     private val newRequestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
 ) : DataSource.Factory {
@@ -47,13 +45,11 @@ internal class CurrentTimeoutHttpDataSourceFactory(
             current?.addTransferListener(transferListener)
         }
 
-        private var opened = false
-
         override fun open(dataSpec: DataSpec): Long {
             val source = openRequestSource()
             listeners.forEach(source::addTransferListener)
             current = source
-            return source.open(dataSpec).also { opened = true }
+            return source.open(dataSpec)
         }
 
         override fun read(buffer: ByteArray, offset: Int, length: Int): Int =
@@ -67,13 +63,7 @@ internal class CurrentTimeoutHttpDataSourceFactory(
         override fun close() {
             val source = current
             current = null
-            val transferred = opened
-            opened = false
-            try {
-                source?.close()
-            } finally {
-                if (transferred) onTransferEnded()
-            }
+            source?.close()
         }
     }
 }
@@ -93,10 +83,7 @@ internal fun httpSourceWithTimeouts(factory: DefaultHttpDataSource.Factory, time
  */
 internal fun standardHttpDataSourceFactory(
     stallTimeoutMs: () -> Long,
-    /** Records each item's ended transfers (start-low: a track follows the meter once measured). */
-    transfers: OwnTransferRegistry = OwnTransferRegistry(),
     newRequestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
-): (Any, DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory = { item, configure ->
-    CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, onTransferEnded = { transfers.transferEnded(item) }, newRequestSource = newRequestSource)
-        .apply { configure(configure) }
+): (DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory = { configure ->
+    CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, newRequestSource).apply { configure(configure) }
 }

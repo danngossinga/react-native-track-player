@@ -44,13 +44,13 @@ internal class StandardPlaybackReadinessGate(
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
     private val pollIntervalMs: Long = 25L,
-    private val positionToleranceMs: Long = 750L,
+    /** The app's `backendSwitchPositionToleranceMs`, read at every wait. */
+    private val positionToleranceMs: () -> Long = { DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS },
     /** A monotonic clock in milliseconds (tests pass their virtual time). */
     private val nowMs: () -> Long = ::monotonicNowMs
 ) {
     init {
         require(pollIntervalMs > 0L)
-        require(positionToleranceMs >= 0L)
     }
 
     suspend fun await(
@@ -59,6 +59,7 @@ internal class StandardPlaybackReadinessGate(
         observe: () -> StandardPlaybackReadinessObservation
     ) {
         var current: StandardPlaybackReadinessObservation? = null
+        val toleranceMs = positionToleranceMs()
         val verdict = awaitWhileProgressing(
             stallTimeoutMs = stallTimeoutMs(),
             totalTimeoutMs = timeoutMs(),
@@ -74,7 +75,7 @@ internal class StandardPlaybackReadinessGate(
             )
             observed.state.isPreparedForActivation() &&
                 observed.currentIndex == expectedIndex &&
-                positionDelta <= positionToleranceMs
+                positionDelta <= toleranceMs
         }
         if (verdict != null) throw notReadyError()
     }
@@ -101,8 +102,29 @@ internal data class StandardSeekObservation(
     /** The player's current item (compared by identity): another item cancels the seek. */
     val item: Any? = null,
     /** The playback speed: how far the position may have moved past the target since the seek. */
-    val rate: Float = 1f
+    val rate: Float = 1f,
+    /** The player's automatic transitions so far (a track played to its end, repeat-one too). */
+    val autoTransitions: Long = 0L
 )
+
+/**
+ * Counts the standard player's automatic transitions (a track played to its end and the next
+ * one, or the same with repeat-one, began): a seek to (or near) the end is done when one happens.
+ */
+internal class AutoTransitionCounter : com.google.android.exoplayer2.analytics.AnalyticsListener {
+    @Volatile
+    var count = 0L
+        private set
+
+    override fun onPositionDiscontinuity(
+        eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
+        oldPosition: com.google.android.exoplayer2.Player.PositionInfo,
+        newPosition: com.google.android.exoplayer2.Player.PositionInfo,
+        reason: Int
+    ) {
+        if (reason == com.google.android.exoplayer2.Player.DISCONTINUITY_REASON_AUTO_TRANSITION) count += 1
+    }
+}
 
 /**
  * Waits for a standard backend seek to complete, as iOS does: done once the player is no longer
@@ -147,6 +169,7 @@ internal class StandardSeekGate(
         // the observed rate.
         var playedMs = 0.0
         var lastCheckAt = nowMs()
+        var transitionsAtStart: Long? = null
         var latest: StandardSeekObservation? = null
         val verdict = try {
             awaitWhileProgressing(
@@ -159,6 +182,10 @@ internal class StandardSeekGate(
             ) {
                 ticket.ensureActive()
                 val observed = observe().also { latest = it }
+                // The track played through the target to its end (repeat-one loops, or the next
+                // track began): the seek is done, as on iOS where the native seek completed.
+                val startTransitions = transitionsAtStart ?: observed.autoTransitions.also { transitionsAtStart = it }
+                if (observed.autoTransitions > startTransitions) return@awaitWhileProgressing true
                 val checkedAt = nowMs()
                 if (observed.state == AudioPlayerState.PLAYING) {
                     playedMs += (checkedAt - lastCheckAt).coerceAtLeast(0L) * observed.rate.coerceAtLeast(0f).toDouble()

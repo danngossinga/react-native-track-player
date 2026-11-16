@@ -487,7 +487,7 @@ abstract class BaseAudioPlayer internal constructor(
                         setDefaultRequestProperties(it.toMap())
                     }
                 }
-                val tempFactory = hooks.httpDataSourceFactory?.invoke(audioItem, configureHttp)
+                val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)
                     ?: DefaultHttpDataSource.Factory().apply(configureHttp)
 
                 enableCaching(tempFactory)
