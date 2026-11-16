@@ -269,7 +269,8 @@ assert(
     prepareGiveUp.includes('self.player.cancelPendingPrerolls()') &&
     prepareGiveUp.includes('loadItem?.cancelPendingSeeks()') &&
     (enginePrepare.match(/guard let self = self, self\.generation == currentGeneration, !settled else \{ return \}/g) || []).length === 4 &&
-    enginePrepare.includes('guard !settled else { return }') &&
+    // The settle step and the preroll callback both refuse a second result after a give-up.
+    (enginePrepare.match(/guard !settled else \{ return \}/g) || []).length === 2 &&
     engineSeek.includes('seekWait = startWait(\n                totalTimeoutMs: prepareTimeoutMs(),') &&
     engineSeek.includes('if watched, completion != nil {') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('finish(.failure(NSError(') &&

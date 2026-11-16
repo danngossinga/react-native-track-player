@@ -122,6 +122,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         var now: TimeInterval = 0
         var pending: [(Int, () -> Void)] = []
         func schedule(_ delayMs: Int, _ work: @escaping () -> Void) { pending.append((delayMs, work)) }
+        /// Fires the checks until none is pending, at most `limit` of them (a broken driver could
+        /// otherwise check forever); returns how many fired.
+        @discardableResult
+        func runUntilIdle(limit: Int = 1_000) -> Int {
+            var fired = 0
+            while fired < limit, step() { fired += 1 }
+            return fired
+        }
         /// Fires the next check after its delay; false when none is pending.
         @discardableResult
         func step() -> Bool {
@@ -158,8 +166,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let driver = makeDriver(clock, readings: { loaded += 0.01; return [loaded] }, gaveUp: { verdicts.append($0) })
         driver.start()
         // A little more every 250 ms: far past the 1 s stall timeout, it fails only at 10 s.
-        var checks = 0
-        while clock.step() { checks += 1 }
+        let checks = clock.runUntilIdle()
         XCTAssertEqual(verdicts, [.capExceeded])
         XCTAssertEqual(checks, 40)
         XCTAssertEqual(clock.now, 10, accuracy: 0.0001)
@@ -171,7 +178,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         var verdicts: [StallVerdict] = []
         let driver = makeDriver(clock, readings: { [3] }, gaveUp: { verdicts.append($0) })
         driver.start()
-        while clock.step() {}
+        clock.runUntilIdle()
         XCTAssertEqual(verdicts, [.stalled])
         XCTAssertEqual(clock.now, 1, accuracy: 0.0001)
     }
@@ -189,14 +196,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         // The stage is reached: the stall clock restarts, the cap still counts from the start.
         signal = [0]
         driver.noteProgress()
-        while clock.step() {}
+        clock.runUntilIdle()
         XCTAssertEqual(verdicts, [.stalled])
         XCTAssertEqual(clock.now, 3, accuracy: 0.0001)
 
         let capped = ManualWaitClock()
         var capVerdicts: [StallVerdict] = []
         makeDriver(capped, totalMs: 3_000, readings: { nil }, gaveUp: { capVerdicts.append($0) }).start()
-        while capped.step() {}
+        capped.runUntilIdle()
         XCTAssertEqual(capVerdicts, [.capExceeded])
         XCTAssertEqual(capped.now, 3, accuracy: 0.0001)
     }
@@ -211,7 +218,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(reads, 5)
         XCTAssertEqual(clock.pending.count, 1)
         driver.cancel()
-        while clock.step() {}
+        clock.runUntilIdle()
         XCTAssertEqual(reads, 5)
         XCTAssertTrue(verdicts.isEmpty)
         XCTAssertTrue(clock.pending.isEmpty)
