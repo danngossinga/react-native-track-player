@@ -1,10 +1,7 @@
 package com.doublesymmetry.trackplayer.service
 
 import android.app.*
-import android.content.BroadcastReceiver
 import android.content.Context
-import android.content.IntentFilter
-import android.media.AudioManager
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
@@ -73,11 +70,18 @@ class MusicService : HeadlessJsTaskService() {
     private var orchestratorHandlesAudioFocus: Boolean = false
     /** `autoHandleInterruptions`: an interruption's end resumes playback (DJE-204/205). */
     private var autoHandleInterruptions = false
-    /** Calls, other apps' audio and headphones: one rule for both backends, as on iOS. */
-    private val interruptionPolicy = InterruptionPolicy { autoHandleInterruptions }
-    /** The crossfade backend's single focus holder (the engines hold none). */
-    private val orchestratorFocus by lazy { OrchestratorAudioFocus(this) { onAudioFocusChange(it) } }
-    private var becomingNoisyReceiver: BroadcastReceiver? = null
+    /**
+     * Calls, other apps' audio and headphones: one rule and one audio focus for both backends, as
+     * on iOS (KotlinAudio and the crossfade engines hold no focus).
+     */
+    private val interruptions by lazy {
+        InterruptionCoordinator(
+            autoResume = { autoHandleInterruptions },
+            focusRequester = SystemAudioFocusRequester(this),
+            noisyReceiver = ContextNoisyReceiverRegistrar(this),
+            onInterruption = ::applyInterruption
+        )
+    }
     private var playbackBackendFacade: PlaybackBackendFacade? = null
     private var orchestratedMediaSurface: AndroidOrchestratedMediaSurface? = null
     private val playbackControlOwnerRegistry = PlaybackControlOwnerRegistry()
@@ -187,9 +191,6 @@ class MusicService : HeadlessJsTaskService() {
         binding.player.automaticallyUpdateNotificationMetadata = automaticallyUpdateNotificationMetadata
         binding.player.ratingType = configuredRatingType
         (binding.player.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
-        val androidOptions = latestOptions?.getBundle(ANDROID_OPTIONS_KEY)
-        binding.player.playerOptions.alwaysPauseOnInterruption =
-            androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
     }
 
     private fun activateStandardPlayerBinding(
@@ -385,17 +386,18 @@ class MusicService : HeadlessJsTaskService() {
                 playbackControlOwnerRegistry.deactivate(identity, physicalDeactivation)
             },
             delegate = object : AndroidOrchestratedMediaSurfaceDelegate {
+                // The same play, pause and stop as the app's (userCommand and focus included).
                 override fun onRemotePlay() =
-                    runOrchestratedRemoteCommand(identity, "play", MusicEvents.BUTTON_PLAY) { it.play() }
+                    runOrchestratedRemoteCommand(identity, "play", MusicEvents.BUTTON_PLAY) { playOn(it) }
                 override fun onRemotePause() =
-                    runOrchestratedRemoteCommand(identity, "pause", MusicEvents.BUTTON_PAUSE) { it.pause() }
+                    runOrchestratedRemoteCommand(identity, "pause", MusicEvents.BUTTON_PAUSE) { pauseOn(it) }
                 override fun onRemoteStop() = runOrchestratedRemoteCommand(
                     identity,
                     "stop",
                     MusicEvents.BUTTON_STOP,
                     refreshAfter = false
                 ) {
-                    it.stop()
+                    stopOn(it)
                     created.hide()
                 }
                 override fun onRemoteNext() =
@@ -589,8 +591,8 @@ class MusicService : HeadlessJsTaskService() {
             "unknown" -> AudioContentType.UNKNOWN
             else -> AudioContentType.MUSIC
         }
-        // The service owns audio focus on both backends (InterruptionPolicy): KotlinAudio requests
-        // it and reports every change (PlayerHooks.onAudioFocusChange); ExoPlayer does not.
+        // The service owns the audio focus on both backends (InterruptionCoordinator): neither
+        // KotlinAudio (PlayerHooks.hostOwnsAudioFocus) nor ExoPlayer requests it.
         autoHandleInterruptions = handleAudioFocus
         val playerConfig = PlayerConfig(
             interceptPlayerActionsTriggeredExternally = true,
@@ -606,9 +608,9 @@ class MusicService : HeadlessJsTaskService() {
             QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
-        // One focus holder for the orchestrator (orchestratorFocus), none per engine.
+        // One focus holder for the service (interruptions.focus), none per engine.
         orchestratorHandlesAudioFocus = false
-        registerBecomingNoisyReceiver()
+        interruptions.start()
 
         val initialType = if (crossfadeEnabled) PlaybackBackendType.PING_PONG else PlaybackBackendType.STANDARD
         val backendFactory = PlaybackBackendFactory { type, identity ->
@@ -643,30 +645,8 @@ class MusicService : HeadlessJsTaskService() {
             )
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
-        onAudioFocusChange = { onAudioFocusChange(it) }
+        hostOwnsAudioFocus = true
     )
-
-    /** An audio focus change of either backend, through the interruption policy. */
-    private fun onAudioFocusChange(focusChange: Int) {
-        applyInterruption { isPlaying -> interruptionPolicy.onFocusChange(focusChange, isPlaying) }
-    }
-
-    /** Headphones unplugged: pause both backends, no resume (the engines do not do it themselves). */
-    private fun registerBecomingNoisyReceiver() {
-        if (becomingNoisyReceiver != null) return
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context?, intent: Intent?) {
-                if (intent?.action != AudioManager.ACTION_AUDIO_BECOMING_NOISY) return
-                applyInterruption { isPlaying -> interruptionPolicy.noisy(isPlaying) }
-            }
-        }
-        // A system broadcast: delivered to a not-exported receiver too.
-        androidx.core.content.ContextCompat.registerReceiver(
-            this, receiver, IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY),
-            androidx.core.content.ContextCompat.RECEIVER_NOT_EXPORTED
-        )
-        becomingNoisyReceiver = receiver
-    }
 
     /**
      * Runs one interruption event on the active backend: reads whether it plays, then pauses or
@@ -677,16 +657,14 @@ class MusicService : HeadlessJsTaskService() {
         scope.launch {
             val duck = runCatching {
                 withActivePlaybackBackend { backend ->
-                    val decision = decide(backend.playWhenReady) ?: return@withActivePlaybackBackend null
+                    val decision = interruptions.applyTo(
+                        isPlaying = backend.playWhenReady,
+                        decide = decide,
+                        pause = { backend.pause() },
+                        play = { backend.play() },
+                        onResumeFailed = { androidXfadeLog("interruption resume failed error=${it.message}") }
+                    ) ?: return@withActivePlaybackBackend null
                     androidXfadeLog("interruption action=${decision.action} backend=${backend.type}")
-                    when (decision.action) {
-                        InterruptionAction.PAUSE -> backend.pause()
-                        InterruptionAction.RESUME -> {
-                            if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
-                            backend.play()
-                        }
-                        InterruptionAction.NONE -> Unit
-                    }
                     decision.duck
                 }
             }.getOrNull() ?: return@launch
@@ -741,10 +719,8 @@ class MusicService : HeadlessJsTaskService() {
 
         ratingType = BundleUtils.getInt(options, "ratingType", RatingCompat.RATING_NONE)
 
-        val alwaysPauseOnInterruption = androidOptions?.getBoolean(PAUSE_ON_INTERRUPTION_KEY) ?: false
-        allPlayers().forEach {
-            it.playerOptions.alwaysPauseOnInterruption = alwaysPauseOnInterruption
-        }
+        // alwaysPauseOnInterruption is deprecated and has no effect: every interruption pauses on
+        // both backends (InterruptionCoordinator), can-duck included.
 
         capabilities = options.getIntegerArrayList("capabilities")?.map { Capability.values()[it] } ?: emptyList()
         notificationCapabilities = options.getIntegerArrayList("notificationCapabilities")?.map { Capability.values()[it] } ?: emptyList()
@@ -1002,9 +978,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun reset() {
-        interruptionPolicy.userCommand()
-        orchestratorFocus.abandon()
         withActivePlaybackBackend { backend ->
+            interruptions.userStop()
             backend.stop()
             backend.clearQueue()
             if (backend.type == PlaybackBackendType.PING_PONG) {
@@ -1021,10 +996,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun play() {
-        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
-            if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
-            backend.play()
+            playOn(backend)
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 refreshOrchestratedMediaSurface(reason = "play")
             }
@@ -1033,10 +1006,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun setPlayWhenReady(value: Boolean) {
-        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
-            if (value && backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()
-            if (value) backend.play() else backend.pause()
+            if (value) playOn(backend) else pauseOn(backend)
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 refreshOrchestratedMediaSurface(reason = "play-when-ready")
             }
@@ -1045,9 +1016,8 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun pause() {
-        interruptionPolicy.userCommand()
         withActivePlaybackBackend { backend ->
-            backend.pause()
+            pauseOn(backend)
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 refreshOrchestratedMediaSurface(reason = "pause")
             }
@@ -1056,14 +1026,31 @@ class MusicService : HeadlessJsTaskService() {
 
     @MainThread
     suspend fun stop() {
-        interruptionPolicy.userCommand()
-        orchestratorFocus.abandon()
         withActivePlaybackBackend { backend ->
-            backend.stop()
+            stopOn(backend)
             if (backend.type == PlaybackBackendType.PING_PONG) {
                 orchestratedMediaSurface?.hide()
             }
         }
+    }
+
+    /**
+     * The user's play, pause and stop on either backend, from the app or a remote control: inside
+     * the admitted operation, so they are ordered with the interruption events.
+     */
+    private suspend fun playOn(backend: AndroidPlaybackBackendRouting) {
+        interruptions.userPlay()
+        backend.play()
+    }
+
+    private suspend fun pauseOn(backend: AndroidPlaybackBackendRouting) {
+        interruptions.userPause()
+        backend.pause()
+    }
+
+    private suspend fun stopOn(backend: AndroidPlaybackBackendRouting) {
+        interruptions.userStop()
+        backend.stop()
     }
 
     @MainThread
@@ -1501,15 +1488,6 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        ownerScope.collectWithAdmission(source.event.onAudioFocusChanged, admission) {
-            if (!isActivePlayer(source, identity)) return@collectWithAdmission
-            Bundle().apply {
-                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, it.isFocusLostPermanently)
-                putBoolean(IS_PAUSED_KEY, it.isPaused)
-                emit(MusicEvents.BUTTON_DUCK, this)
-            }
-        }
-
         ownerScope.collectWithAdmission(source.event.onTimedMetadata, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
             if (useOrchestratedCrossfade()) return@collectWithAdmission
@@ -1687,9 +1665,7 @@ class MusicService : HeadlessJsTaskService() {
     @MainThread
     override fun onDestroy() {
         super.onDestroy()
-        becomingNoisyReceiver?.let { runCatching { unregisterReceiver(it) } }
-        becomingNoisyReceiver = null
-        orchestratorFocus.abandon()
+        interruptions.destroy()
         allPlayers().forEach { it.destroy() }
         playbackOrchestrator?.release()
         playbackOrchestrator = null

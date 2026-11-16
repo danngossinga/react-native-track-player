@@ -333,13 +333,14 @@ class PlaybackBackendRuntimePrimitivesTest {
         var stall = 300L
         var limit = 2_000L
         val gate = StandardSeekGate(timeoutMs = { limit }, stallTimeoutMs = { stall }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val item = Any()
         // Buffering at the target, data arriving: it waits up to its limit.
         var buffered = 0L
         val started = currentTime
         val progressing = runCatching {
-            gate.await(20_000L) {
+            gate.await(20_000L, item) {
                 buffered += 500L
-                StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, buffered)
+                StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, buffered, item = item)
             }
         }
         assertEquals("standard_seek_timeout", (progressing.exceptionOrNull() as RejectionException).code)
@@ -348,20 +349,69 @@ class PlaybackBackendRuntimePrimitivesTest {
         stall = 400L
         val stalledAt = currentTime
         val stalled = runCatching {
-            gate.await(20_000L) { StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, 9_000L) }
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, 9_000L, item = item) }
         }
         assertEquals("standard_seek_timeout", (stalled.exceptionOrNull() as RejectionException).code)
         assertEquals(400L, currentTime - stalledAt)
         // Ready at the target: done at once; a seek past the end completes at the end.
         limit = 60_000L
-        gate.await(20_000L) { StandardSeekObservation(AudioPlayerState.READY, 20_100L, 25_000L) }
-        gate.await(90_000L) { StandardSeekObservation(AudioPlayerState.PAUSED, 60_000L, 60_000L, durationMs = 60_000L) }
+        gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 20_100L, 25_000L, item = item) }
+        gate.await(90_000L, item) { StandardSeekObservation(AudioPlayerState.PAUSED, 60_000L, 60_000L, durationMs = 60_000L, item = item) }
     }
 
     @Test
     fun aStandardSeekFailsAtOnceOnAPlayerError() = runTest {
         val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
-        val failed = runCatching { gate.await(1_000L) { StandardSeekObservation(AudioPlayerState.ERROR, 0L, 0L) } }
+        val item = Any()
+        val failed = runCatching { gate.await(1_000L, item) { StandardSeekObservation(AudioPlayerState.ERROR, 0L, 0L, item = item) } }
         assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
+    }
+
+    @Test
+    fun aStandardSeekWithNoActiveTrackFailsAtOnceAsOnIos() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
+        var observed = false
+        val started = currentTime
+        val failed = runCatching { gate.await(1_000L, item = null) { observed = true; StandardSeekObservation(AudioPlayerState.IDLE, 0L, 0L) } }
+        assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
+        assertEquals(0L, currentTime - started)
+        assertFalse(observed)
+    }
+
+    @Test
+    fun aStandardSeekThatReachesTheEndOfTheTrackCompletes() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
+        val item = Any()
+        val started = currentTime
+        // Far from the target and not ready, but the track ended: the seek is done.
+        gate.await(50_000L, item) { StandardSeekObservation(AudioPlayerState.ENDED, 1_000L, 1_000L, item = item) }
+        assertEquals(0L, currentTime - started)
+    }
+
+    @Test
+    fun aNewerSeekASkipOrAnotherItemEndsTheOlderSeekAtOnce() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 60_000L }, pollIntervalMs = 1_000L, nowMs = { currentTime })
+        val item = Any()
+        val buffering = { StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, 0L, item = item) }
+
+        // A newer seek: the older one ends at once with standard_seek_cancelled.
+        val older = async { runCatching { gate.await(30_000L, item, buffering) } }
+        runCurrent()
+        val newer = async { runCatching { gate.await(40_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 40_000L, 41_000L, item = item) } } }
+        runCurrent()
+        assertEquals("standard_seek_cancelled", (older.await().exceptionOrNull() as RejectionException).code)
+        assertTrue(newer.await().isSuccess)
+
+        // A skip.
+        val skipped = async { runCatching { gate.await(30_000L, item, buffering) } }
+        runCurrent()
+        val skippedAt = currentTime
+        gate.cancel("skip")
+        assertEquals("standard_seek_cancelled", (skipped.await().exceptionOrNull() as RejectionException).code)
+        assertEquals(0L, currentTime - skippedAt)
+
+        // Another item (an auto-advance).
+        val advanced = runCatching { gate.await(30_000L, item) { StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, 0L, item = Any()) } }
+        assertEquals("standard_seek_cancelled", (advanced.exceptionOrNull() as RejectionException).code)
     }
 }

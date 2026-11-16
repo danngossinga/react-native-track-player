@@ -439,8 +439,18 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('player.seek(positionMs, TimeUnit.MILLISECONDS)\n        seekGate.await(positionMs) {') &&
-    section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }'),
+    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)\n        seekGate.await(positionMs, item) {') &&
+    section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('item = player.currentItem') &&
+    // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
+    (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aNewerSeekASkipOrAnotherItemEndsTheOlderSeekAtOnce()') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aStandardSeekThatReachesTheEndOfTheTrackCompletes()') &&
+    // The real engine pauses when its play start gives up.
+    section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('if (verdict != null) {\n            // Audio must not start by itself later, as on iOS.\n            player.playWhenReady = false\n            player.pause()') &&
+    // A natural advance is an operation: a pause during the next track's start cancels it.
+    section(orchestrator, 'private suspend fun monitorActiveEngine()', 'private fun cancelCrossfade(').includes('val ticket = operationController.begin()\n            try {\n                startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aPauseDuringTheNextTracksStartCancelsItWithNoPlaybackError()') &&
+    section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('readings = { longArrayOf(latest?.bufferedPositionMs ?: 0L) }'),
   'Android must wait for a play start and a standard seek like iOS.'
 );
 
@@ -467,31 +477,54 @@ assert(
   'The Android standard player must start each track low and follow stallTimeoutMs per request, like the crossfade path.'
 );
 
-// Calls, other apps' audio and headphones (DJE-204/205/206): one policy for both backends, one
-// focus holder for the crossfade orchestrator (none per engine), the same remote-duck meaning.
+// Calls, other apps' audio and headphones (DJE-204/205/206): one policy and one audio focus for
+// both backends (KotlinAudio and the engines hold none), the same remote-duck meaning, and every
+// user play, pause, stop and reset (app or remote control) through the same service paths.
 const applyInterruptionKt = section(musicService, 'private fun applyInterruption(', '/**');
+const coordinatorKt = read('android/src/main/java/com/doublesymmetry/trackplayer/service/InterruptionCoordinator.kt');
+const focusKt = read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackAudioFocus.kt');
+const remoteSurface = section(musicService, 'override fun onRemotePlay() =', 'override fun onRemoteNext() =');
+const userCommandsKt = section(musicService, 'suspend fun play() {', 'suspend fun removeUpcomingTracks()');
 assert(
-  musicService.includes('private val interruptionPolicy = InterruptionPolicy { autoHandleInterruptions }') &&
+  musicService.includes('autoResume = { autoHandleInterruptions },\n            focusRequester = SystemAudioFocusRequester(this),\n            noisyReceiver = ContextNoisyReceiverRegistrar(this),\n            onInterruption = ::applyInterruption') &&
     musicService.includes('autoHandleInterruptions = handleAudioFocus') &&
     musicService.includes('            handleAudioFocus = false,\n            audioContentType = audioContentType') &&
-    musicService.includes('orchestratorHandlesAudioFocus = false\n        registerBecomingNoisyReceiver()') &&
-    musicService.includes('onAudioFocusChange = { onAudioFocusChange(it) }') &&
-    musicService.includes('applyInterruption { isPlaying -> interruptionPolicy.onFocusChange(focusChange, isPlaying) }') &&
-    musicService.includes('applyInterruption { isPlaying -> interruptionPolicy.noisy(isPlaying) }') &&
-    musicService.includes('IntentFilter(AudioManager.ACTION_AUDIO_BECOMING_NOISY)') &&
-    applyInterruptionKt.includes('val decision = decide(backend.playWhenReady)') &&
-    applyInterruptionKt.includes('InterruptionAction.PAUSE -> backend.pause()') &&
-    applyInterruptionKt.includes('if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()\n                            backend.play()') &&
+    musicService.includes('orchestratorHandlesAudioFocus = false\n        interruptions.start()') &&
+    standardHooks.includes('hostOwnsAudioFocus = true') &&
+    // KotlinAudio never takes the focus itself (upstream: at READY, even while paused).
+    vendoredBase.includes('if (!playerConfig.handleAudioFocus && !hooks.hostOwnsAudioFocus) {\n                    when (value) {') &&
+    !vendoredBase.includes('onAudioFocusChange?.') &&
+    read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt').includes('val hostOwnsAudioFocus: Boolean = false') &&
+    // The only focus requests are the service's.
+    !/requestAudioFocus\(/.test(musicService + orchestrator + engineSource) &&
+    focusKt.includes('.setWillPauseWhenDucked(true)') &&
+    focusKt.includes('AudioManager.AUDIOFOCUS_LOSS -> abandon()') &&
+    coordinatorKt.includes('fun userPlay(): Boolean {\n        policy.userCommand()\n        return focus.requestIfNeeded()') &&
+    coordinatorKt.includes('fun userStop() {\n        policy.userCommand()\n        focus.abandon()') &&
+    coordinatorKt.includes('fun destroy() {\n        noisyReceiver.unregister()\n        focus.abandon()') &&
+    coordinatorKt.includes('InterruptionAction.RESUME -> {\n                focus.requestIfNeeded()') &&
+    applyInterruptionKt.includes('isPlaying = backend.playWhenReady,') &&
+    applyInterruptionKt.includes('pause = { backend.pause() },\n                        play = { backend.play() },') &&
     applyInterruptionKt.includes('putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)') &&
-    ['suspend fun play() {\n        interruptionPolicy.userCommand()', 'suspend fun pause() {\n        interruptionPolicy.userCommand()',
-      'suspend fun setPlayWhenReady(value: Boolean) {\n        interruptionPolicy.userCommand()',
-      'suspend fun stop() {\n        interruptionPolicy.userCommand()\n        orchestratorFocus.abandon()'].every((s) => musicService.includes(s)) &&
-    musicService.includes('if (backend.type == PlaybackBackendType.PING_PONG) orchestratorFocus.requestIfNeeded()\n            backend.play()') &&
-    read('android/src/main/java/com/doublesymmetry/trackplayer/service/OrchestratorAudioFocus.kt').includes('.setWillPauseWhenDucked(true)') &&
-    vendoredBase.includes('hooks.onAudioFocusChange?.let { onChange ->') &&
-    vendoredBase.includes('.setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption || hooks.onAudioFocusChange != null)') &&
-    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionPolicyTest.kt').includes('scripts/fixtures/interruption-scenarios.json'),
-  'Android interruptions must go through InterruptionPolicy on both backends, with one focus holder for the orchestrator.'
+    // User commands: inside the admitted operation (ordered with the interruption events).
+    userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            playOn(backend)') &&
+    userCommandsKt.includes('if (value) playOn(backend) else pauseOn(backend)') &&
+    userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            pauseOn(backend)') &&
+    userCommandsKt.includes('withActivePlaybackBackend { backend ->\n            stopOn(backend)') &&
+    userCommandsKt.includes('private suspend fun playOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userPlay()\n        backend.play()') &&
+    userCommandsKt.includes('private suspend fun pauseOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userPause()\n        backend.pause()') &&
+    userCommandsKt.includes('private suspend fun stopOn(backend: AndroidPlaybackBackendRouting) {\n        interruptions.userStop()\n        backend.stop()') &&
+    section(musicService, 'suspend fun reset() {', '@MainThread').includes('withActivePlaybackBackend { backend ->\n            interruptions.userStop()\n            backend.stop()') &&
+    // Notification, lock screen, Bluetooth and headset commands take the same paths.
+    remoteSurface.includes('runOrchestratedRemoteCommand(identity, "play", MusicEvents.BUTTON_PLAY) { playOn(it) }') &&
+    remoteSurface.includes('runOrchestratedRemoteCommand(identity, "pause", MusicEvents.BUTTON_PAUSE) { pauseOn(it) }') &&
+    remoteSurface.includes('stopOn(it)\n                    created.hide()') &&
+    !/interruptionPolicy|orchestratorFocus|OrchestratorAudioFocus|onAudioFocusChanged/.test(musicService) &&
+    section(musicService, 'override fun onDestroy() {', 'allPlayers().forEach { it.destroy() }').includes('interruptions.destroy()') &&
+    !musicService.includes('alwaysPauseOnInterruption =') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionPolicyTest.kt').includes('scripts/fixtures/interruption-scenarios.json') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/InterruptionCoordinatorTest.kt').includes('fun destroyUnregistersTheReceiverAndGivesTheFocusUp()'),
+  'Android interruptions must go through one InterruptionCoordinator on both backends, with one focus holder for the service.'
 );
 
 // A stalled crossfade seek, as on iOS: the engine pauses and fails, the orchestrator reports an

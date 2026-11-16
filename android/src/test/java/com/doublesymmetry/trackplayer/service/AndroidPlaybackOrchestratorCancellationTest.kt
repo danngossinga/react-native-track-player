@@ -517,6 +517,36 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPauseDuringTheNextTracksStartCancelsItWithNoPlaybackError() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            // The track ends; the next one starts on its own and gets no data.
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 120_000L, nowMs = { currentTime })
+            engineB.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 120_000L, nowMs = { currentTime })
+            engineA.ended = true
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(1, delegate.activeTrackChanges.last().index)
+
+            // The user pauses during that start: it is cancelled, not given up later.
+            orchestrator.pause()
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertTrue(delegate.playbackErrors.isEmpty())
+            assertFalse(orchestrator.playWhenReady)
+            assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aCrossfadeStartsOnceTheIncomingTrackPlaysAndKeepsTheOutgoingOneWhenItStalls() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -544,6 +574,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertTrue(delegate.crossfadeEvents.none { it.state == "started" })
             assertEquals(0, orchestrator.currentIndex)
             assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+            // No fade is left running or prepared.
+            listOf("activeCrossfadeFromIndex", "activeCrossfadeToIndex", "preparedCrossfadeFromIndex", "preparedCrossfadeToIndex")
+                .forEach { assertNull(it, orchestrator.privateField(it)) }
         } finally {
             orchestrator.release()
         }
@@ -830,8 +863,10 @@ class AndroidPlaybackOrchestratorCancellationTest {
             get() = if (ready) durationMs else position
         override val isReady: Boolean
             get() = ready
+        /** The loaded track played to its end (until the next reset). */
+        var ended = false
         override val playbackState: Int
-            get() = if (ready) Player.STATE_READY else Player.STATE_IDLE
+            get() = if (ended) Player.STATE_ENDED else if (ready) Player.STATE_READY else Player.STATE_IDLE
         override val currentVolume: Float
             get() = volume
         override val playerErrorMessage: String? = null
@@ -913,6 +948,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
         override fun pause() = Unit
 
         override fun reset() {
+            ended = false
             preparedItem = null
             ready = false
             position = 0L

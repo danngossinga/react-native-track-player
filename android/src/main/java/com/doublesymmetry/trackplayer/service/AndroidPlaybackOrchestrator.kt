@@ -714,6 +714,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
                 incomingEngine.awaitPlaying(timeoutMs = playStartTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
             } catch (error: RejectionException) {
                 incomingEngine.setVolume(0f)
+                // No fade runs or is prepared any more: a later pause or skip must not see one.
+                activeCrossfadeFromIndex = null
+                activeCrossfadeToIndex = null
+                preparedCrossfadeFromIndex = null
+                preparedCrossfadeToIndex = null
+                preparedCrossfadeSeekToMs = 0L
                 emitCrossfade("error", fromIndex, toIndex, errorCode = "crossfade_start_failed")
                 throw RejectionException(error.message, "crossfade_start_failed")
             }
@@ -1163,7 +1169,16 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val endedPosition = activeEngine.positionMs
         val nextIndex = nextIndexFor(currentIndex)
         if (nextIndex != null) {
-            startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition)
+            // An operation like the user's: a pause, stop or skip during the next track's start
+            // cancels it (no play-start give-up or playback error afterwards).
+            val ticket = operationController.begin()
+            try {
+                startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)
+            } catch (_: PlaybackOperationCancelledException) {
+                androidXfadeLog("natural advance cancelled index=$nextIndex")
+            } finally {
+                operationController.finish(ticket)
+            }
         } else {
             setState(AndroidPlaybackOrchestratorState.ENDED)
             delegate.onQueueEnded(endedIndex, endedPosition)

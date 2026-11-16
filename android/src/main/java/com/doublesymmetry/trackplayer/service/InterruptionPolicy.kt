@@ -19,39 +19,49 @@ internal data class InterruptionDecision(val action: InterruptionAction, val duc
  * away; when it is given back, resume only if the system allows it, `autoHandleInterruptions` is
  * on, playback was playing when it was taken and the user did not pause or play since. A
  * permanent loss or headphones unplugged pause with no resume. A can-duck loss is a transient
- * loss: pause, then resume (iOS has no ducking, so both platforms pause). Main thread only.
+ * loss: pause, then resume (iOS has no ducking, so both platforms pause). A second loss during
+ * an interruption keeps what the first one recorded (the player is paused by then). Main thread
+ * only.
  */
 internal class InterruptionPolicy(
     /** `autoHandleInterruptions`, read at every interruption end. */
     private val autoResume: () -> Boolean
 ) {
     private var resumeOnEnd = false
+    /** An interruption began and has not ended (nor been overtaken by the user or a permanent loss). */
+    private var interrupted = false
 
     fun began(isPlaying: Boolean): InterruptionDecision {
-        resumeOnEnd = isPlaying
+        if (!interrupted) resumeOnEnd = isPlaying
+        interrupted = true
         return InterruptionDecision(if (isPlaying) InterruptionAction.PAUSE else InterruptionAction.NONE, RemoteDuckPayload(paused = true, permanent = false))
     }
 
     fun ended(shouldResume: Boolean): InterruptionDecision {
         val resume = shouldResume && resumeOnEnd && autoResume()
-        resumeOnEnd = false
+        forget()
         return InterruptionDecision(if (resume) InterruptionAction.RESUME else InterruptionAction.NONE, RemoteDuckPayload(paused = !shouldResume, permanent = !shouldResume))
     }
 
     fun lostPermanently(isPlaying: Boolean): InterruptionDecision {
-        resumeOnEnd = false
+        forget()
         return InterruptionDecision(if (isPlaying) InterruptionAction.PAUSE else InterruptionAction.NONE, RemoteDuckPayload(paused = true, permanent = true))
     }
 
     /** Headphones unplugged (becoming noisy). */
     fun noisy(isPlaying: Boolean): InterruptionDecision {
-        resumeOnEnd = false
+        forget()
         return InterruptionDecision(if (isPlaying) InterruptionAction.PAUSE else InterruptionAction.NONE, null)
     }
 
     /** A play or pause from the user (app or remote control): an interruption's end no longer resumes. */
     fun userCommand() {
+        forget()
+    }
+
+    private fun forget() {
         resumeOnEnd = false
+        interrupted = false
     }
 
     /** An Android audio focus change, as an interruption event. */

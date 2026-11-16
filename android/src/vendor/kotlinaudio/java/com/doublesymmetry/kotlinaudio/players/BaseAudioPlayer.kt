@@ -1,3 +1,7 @@
+/*
+ * Modified by the react-native-track-player fork, 2026: see VENDORED.md
+ * (Apache License 2.0, section 4(b)). Originally from KotlinAudio v2.1.0.
+ */
 package com.doublesymmetry.kotlinaudio.players
 
 import android.content.Context
@@ -106,7 +110,8 @@ abstract class BaseAudioPlayer internal constructor(
             if (value != field) {
                 field = value
                 playerEventHolder.updateAudioPlayerState(value)
-                if (!playerConfig.handleAudioFocus) {
+                // Fork: the host may hold the focus for every player (PlayerHooks.hostOwnsAudioFocus).
+                if (!playerConfig.handleAudioFocus && !hooks.hostOwnsAudioFocus) {
                     when (value) {
                         AudioPlayerState.IDLE,
                         AudioPlayerState.ERROR -> abandonAudioFocusIfHeld()
@@ -549,8 +554,7 @@ abstract class BaseAudioPlayer internal constructor(
                     .setContentType(CONTENT_TYPE_MUSIC)
                     .build()
             )
-            // With the host handling focus, a can-duck loss is reported (it pauses) instead of ducked.
-            .setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption || hooks.onAudioFocusChange != null)
+            .setWillPauseWhenDucked(playerOptions.alwaysPauseOnInterruption)
             .build()
 
         val result: Int = if (manager != null && focus != null) {
@@ -580,11 +584,6 @@ abstract class BaseAudioPlayer internal constructor(
     override fun onAudioFocusChange(focusChange: Int) {
         Timber.d("Audio focus changed")
         val isPermanent = focusChange == AUDIOFOCUS_LOSS
-        hooks.onAudioFocusChange?.let { onChange ->
-            if (isPermanent) abandonAudioFocusIfHeld()
-            onChange(focusChange)
-            return
-        }
         val isPaused = when (focusChange) {
             AUDIOFOCUS_LOSS, AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> true
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> playerOptions.alwaysPauseOnInterruption

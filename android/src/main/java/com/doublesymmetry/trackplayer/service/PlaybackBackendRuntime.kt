@@ -97,13 +97,18 @@ internal data class StandardSeekObservation(
     val positionMs: Long,
     val bufferedPositionMs: Long,
     /** The track's duration (0 when unknown): a seek past the end lands at the end. */
-    val durationMs: Long = 0L
+    val durationMs: Long = 0L,
+    /** The player's current item (compared by identity): another item cancels the seek. */
+    val item: Any? = null
 )
 
 /**
  * Waits for a standard backend seek to complete, as iOS does: done once the player is no longer
  * loading or buffering and is at the target; fails when the buffered position does not grow for
- * `stallTimeoutMs`, or after `standardSeekTimeoutMs` in all (`standard_seek_timeout`).
+ * `stallTimeoutMs`, or after `standardSeekTimeoutMs` in all (`standard_seek_timeout`). With no
+ * item it fails at once (`standard_seek_unavailable`, also when the item fails to load); a newer
+ * seek, a skip ([cancel]) or another item (an auto-advance) ends it at once
+ * (`standard_seek_cancelled`), as on iOS. Main thread.
  */
 internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
@@ -112,25 +117,47 @@ internal class StandardSeekGate(
     private val positionToleranceMs: Long = 750L,
     private val nowMs: () -> Long = ::monotonicNowMs
 ) {
-    suspend fun await(targetMs: Long, observe: () -> StandardSeekObservation) {
-        var current: StandardSeekObservation? = null
-        val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs(),
-            totalTimeoutMs = timeoutMs(),
-            pollIntervalMs = pollIntervalMs,
-            nowMs = nowMs,
-            pause = { delay(it) },
-            readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }
-        ) {
-            val observed = observe().also { current = it }
-            if (observed.state == AudioPlayerState.ERROR) {
-                throw RejectionException("The active track failed to load.", "standard_seek_unavailable")
+    private var current: PlaybackOperationTicket? = null
+
+    /** Ends the seek in progress, if any (`standard_seek_cancelled`). */
+    fun cancel(reason: String) {
+        current?.cancel(reason)
+    }
+
+    /** [item] is the player's item when the seek is issued (null: no active track). */
+    suspend fun await(targetMs: Long, item: Any?, observe: () -> StandardSeekObservation) {
+        current?.cancel("newer_seek")
+        if (item == null) {
+            throw RejectionException("No active track is available for seeking.", "standard_seek_unavailable")
+        }
+        val ticket = PlaybackOperationTicket(0L)
+        current = ticket
+        var latest: StandardSeekObservation? = null
+        val verdict = try {
+            awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs(),
+                totalTimeoutMs = timeoutMs(),
+                pollIntervalMs = pollIntervalMs,
+                nowMs = nowMs,
+                pause = { ticket.delayOrThrow(it) },
+                readings = { longArrayOf(latest?.bufferedPositionMs ?: 0L) }
+            ) {
+                ticket.ensureActive()
+                val observed = observe().also { latest = it }
+                if (observed.item !== item) throw PlaybackOperationCancelledException("item_changed")
+                if (observed.state == AudioPlayerState.ERROR) {
+                    throw RejectionException("The active track failed to load.", "standard_seek_unavailable")
+                }
+                val target = targetMs.coerceAtLeast(0L).let { if (observed.durationMs > 0L) minOf(it, observed.durationMs) else it }
+                observed.state == AudioPlayerState.ENDED ||
+                    (observed.state != AudioPlayerState.LOADING &&
+                        observed.state != AudioPlayerState.BUFFERING &&
+                        kotlin.math.abs(observed.positionMs - target) <= positionToleranceMs)
             }
-            val target = targetMs.coerceAtLeast(0L).let { if (observed.durationMs > 0L) minOf(it, observed.durationMs) else it }
-            observed.state == AudioPlayerState.ENDED ||
-                (observed.state != AudioPlayerState.LOADING &&
-                    observed.state != AudioPlayerState.BUFFERING &&
-                    kotlin.math.abs(observed.positionMs - target) <= positionToleranceMs)
+        } catch (cancelled: PlaybackOperationCancelledException) {
+            throw RejectionException("Playback changed before the native seek completed (${cancelled.reason}).", "standard_seek_cancelled")
+        } finally {
+            if (current === ticket) current = null
         }
         if (verdict != null) {
             throw RejectionException(

@@ -17,9 +17,10 @@ class PlayerHooks(
      */
     val httpDataSourceFactory: ((DefaultHttpDataSource.Factory.() -> Unit) -> DataSource.Factory)? = null,
     /**
-     * When set, receives every audio focus change of the focus KotlinAudio holds, and KotlinAudio
-     * neither ducks nor emits its own focus event: the host pauses and resumes (one rule for every
-     * backend). A permanent loss still gives the focus up.
+     * When true, KotlinAudio never requests audio focus (upstream requests it when the player
+     * becomes READY, even while paused) and so neither ducks nor emits its own focus event: the
+     * host holds one focus for every player, requested at the user's play, and pauses and resumes
+     * itself (one rule for every backend).
      */
-    val onAudioFocusChange: ((Int) -> Unit)? = null
+    val hostOwnsAudioFocus: Boolean = false
 )

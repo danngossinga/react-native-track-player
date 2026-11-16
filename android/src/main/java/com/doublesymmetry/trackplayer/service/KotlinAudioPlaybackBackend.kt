@@ -341,13 +341,15 @@ internal class KotlinAudioPlaybackBackend(
     }
     override fun pause() { player.pause() }
     override suspend fun seekTo(positionMs: Long) {
-        player.seek(positionMs, TimeUnit.MILLISECONDS)
-        seekGate.await(positionMs) {
+        val item = player.currentItem
+        if (item != null) player.seek(positionMs, TimeUnit.MILLISECONDS)
+        seekGate.await(positionMs, item) {
             StandardSeekObservation(
                 state = player.playerState,
                 positionMs = player.position,
                 bufferedPositionMs = player.bufferedPosition,
-                durationMs = player.duration.coerceAtLeast(0L)
+                durationMs = player.duration.coerceAtLeast(0L),
+                item = player.currentItem
             )
         }
     }
@@ -433,11 +435,13 @@ internal class KotlinAudioPlaybackBackend(
         if (index !in player.items.indices) {
             throw IndexOutOfBoundsException("The track index is out of bounds: $index")
         }
+        seekGate.cancel("skip")
         runActivatingOperation(
             publishLogicalActivation = index == player.currentIndex
         ) { _ -> player.jumpToItem(index) }
     }
     override suspend fun skipToNext() {
+        seekGate.cancel("skip")
         if (logicalPlaybackState.consumeIdleForNext()) {
             try {
                 selectFirstPhysicalItemIfNeeded()
@@ -452,6 +456,7 @@ internal class KotlinAudioPlaybackBackend(
     }
     override suspend fun skipToPrevious() {
         if (logicalPlaybackState.shouldIgnorePrevious()) return
+        seekGate.cancel("skip")
         player.previous()
     }
     override suspend fun seekBy(offsetMs: Long) { player.seekBy(offsetMs, TimeUnit.MILLISECONDS) }

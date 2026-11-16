@@ -20,25 +20,28 @@ privately, so these need small changes in it.
 
 ## Modified lines (everything else is upstream as-is)
 
-- `java/com/doublesymmetry/kotlinaudio/notification/NotificationManager.kt:23`:
-  `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
+Each modified upstream file starts with a notice that it was modified (Apache License 2.0,
+section 4(b)); line numbers below include that notice.
+
+- `java/com/doublesymmetry/kotlinaudio/notification/NotificationManager.kt`: `:1-4` the notice;
+  `:27` `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
   resources are now merged into this library's namespace).
 - `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
   (defaults keep upstream behaviour).
 - `players/BaseAudioPlayer.kt`:
-  - `:35` import of `PlayerHooks`;
-  - `:87-88` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
-  - `:235` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
+  - `:1-4` the notice;
+  - `:39` import of `PlayerHooks`;
+  - `:91-92` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
+  - `:113-114` audio focus (DJE-204/205): with `hooks.hostOwnsAudioFocus`, the player never
+    requests (upstream: when it becomes READY, even while paused) nor abandons the focus, so it
+    neither ducks nor emits its own focus event. The host holds one focus for both backends,
+    requested at the user's play and at an interruption's resume, and applies one interruption
+    rule (pause, then resume) itself;
+  - `:240` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
     selector whose selections start each track from `initialBitrateEstimateBps`);
-  - `:477-487` the item's HTTP configuration (user agent, redirects, headers) becomes a
+  - `:482-491` the item's HTTP configuration (user agent, redirects, headers) becomes a
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream.
-- `players/QueuedAudioPlayer.kt:17-19`: constructor parameter `hooks`, passed to
-  `BaseAudioPlayer`.
-- Audio focus (DJE-204/205), same file and `models/PlayerHooks.kt`:
-  - `PlayerHooks.onAudioFocusChange`: when set, `onAudioFocusChange` gives the focus up on a
-    permanent loss and passes every change to the host, without ducking or emitting its own
-    event (the host pauses and resumes with one rule for every backend);
-  - `requestAudioFocus`: `setWillPauseWhenDucked(... || hooks.onAudioFocusChange != null)`, so a
-    can-duck loss is reported to the host (which pauses) instead of ducked by the system.
+- `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
+  passed to `BaseAudioPlayer`.
