@@ -250,20 +250,113 @@ assert(
   'iOS legacy crossfade setup must converge to the authoritative pingPong backend.'
 );
 
-// The crossfade engines' load timeout is the app's `prepareTimeoutMs`, never a fixed number.
-const waitForReadyItem = section(engine, 'private func waitForReadyItem(', 'private func waitForPlaying(');
+// The crossfade engine's waits all run on the tested StallWaitDriver (PlaybackBackend.swift):
+// the load (one wait under prepareTimeoutMs, cap-only until the asset is playable, then
+// stallTimeoutMs through the ready wait, the seek and the preroll), every seek (prepareTimeoutMs,
+// as on Android) and the play start (playStartTimeoutMs).
+const enginePrepare = section(engine, 'func prepare(track: Track', 'func seek(to position: Double');
+const engineSeek = section(engine, 'func seek(to position: Double', 'func play(\n        rate: Float,');
+const waitForPlaying = section(engine, 'private func waitForPlaying(', 'private func startWait(');
+const startWait = section(engine, 'private func startWait(', 'private func endWait(');
+const prepareGiveUp = section(enginePrepare, ') { [weak self] verdict, watch in', 'loadWait = wait');
 assert(
-  waitForReadyItem.includes('.milliseconds(prepareTimeoutMs())') &&
-    !/\.milliseconds\(\d+\)/.test(waitForReadyItem),
-  'iOS engine ready wait must use the prepareTimeoutMs provider, not a fixed delay.'
+  enginePrepare.includes('let wait = startWait(\n            totalTimeoutMs: prepareTimeoutMs(),\n            readings: { loadItem.map(Self.loadProgress(of:)) }') &&
+    enginePrepare.includes('loadItem = item\n                wait.noteProgress()') &&
+    (enginePrepare.match(/wait\.noteProgress\(\)/g) || []).length === 2 &&
+    enginePrepare.includes('self.seek(to: position, watched: false)') &&
+    prepareGiveUp.includes('settle(.failure(NSError(') &&
+    prepareGiveUp.includes('self.pendingAsset?.cancelLoading()') &&
+    prepareGiveUp.includes('self.player.cancelPendingPrerolls()') &&
+    prepareGiveUp.includes('loadItem?.cancelPendingSeeks()') &&
+    (enginePrepare.match(/guard let self = self, self\.generation == currentGeneration, !settled else \{ return \}/g) || []).length === 4 &&
+    // The settle step and the preroll callback both refuse a second result after a give-up.
+    (enginePrepare.match(/guard !settled else \{ return \}/g) || []).length === 2 &&
+    engineSeek.includes('seekWait = startWait(\n                totalTimeoutMs: prepareTimeoutMs(),') &&
+    engineSeek.includes('if watched, completion != nil {') &&
+    // Every seek is watched unless it runs inside the load's own wait.
+    engine.includes('func seek(to position: Double, watched: Bool = true, completion: ((Result<Void, Error>) -> Void)? = nil) {') &&
+    (engine.match(/watched: false\)/g) || []).length === 1 &&
+    enginePrepare.includes('self.seek(to: position, watched: false)') &&
+    orchestrator.includes('seekOperation: @escaping SeekOperation = { engine, position, completion in\n            engine.seek(to: position, completion: completion)\n        },') &&
+    !orchestrator.includes('watched:') &&
+    waitForPlaying.includes('weak var observation: NSKeyValueObservation?') &&
+    // A failed start pauses the engine wherever playback starts (play and a load that plays).
+    orchestrator.includes('self.playWhenReady = false\n                                            // As after a failed play(): audio must not start by itself later.\n                                            self.activeEngine.pause()') &&
+    engineSeek.includes('readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }') &&
+    section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
+    // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
+    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            completion(result)') &&
+    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            completion?(result)') &&
+    waitForPlaying.includes('if let playWait = playWait { self.endWait(playWait) }\n            playWait = nil\n            completion(result)') &&
+    startWait.includes('if let self = self, let driver = driver { self.endWait(driver) }\n            onGiveUp(verdict, watch)') &&
+    section(engine, 'private func endWait(_ driver: StallWaitDriver) {', '\n    }').includes('driver.cancel()\n        waits.removeAll { $0 === driver }') &&
+    section(engine, 'func reset() {', 'private func preroll(').includes('waits.forEach { $0.cancel() }\n        waits.removeAll()') &&
+    // Each play-start wait owns its observation; a reset ends them all.
+    waitForPlaying.includes('timeControlObservations.append(observed)') &&
+    waitForPlaying.includes('self.timeControlObservations.removeAll { $0 === observation }') &&
+    !engine.includes('timeControlObservation =') &&
+    section(engine, 'func reset() {', 'private func preroll(').includes('timeControlObservations.forEach { $0.invalidate() }') &&
+    section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('finish(.failure(NSError(') &&
+    waitForPlaying.includes('playWait = startWait(\n            totalTimeoutMs: timeoutMs,') &&
+    waitForPlaying.includes('return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]') &&
+    waitForPlaying.indexOf(') { [weak self] verdict, watch in') > 0 &&
+    waitForPlaying.slice(waitForPlaying.indexOf(') { [weak self] verdict, watch in')).includes('finish(.failure(NSError(') &&
+    startWait.includes('stallTimeoutMs: stallTimeoutMs(),\n            totalTimeoutMs: totalTimeoutMs,') &&
+    startWait.includes('waits.append(created)') &&
+    startWait.includes('created.start()') &&
+    section(engine, 'func reset() {', 'private func preroll(').includes('waits.forEach { $0.cancel() }') &&
+    !engine.includes('asyncAfter') &&
+    !engine.includes('DispatchWorkItem') &&
+    engine.includes('let loadedSeconds = item.loadedTimeRanges.reduce(0.0) { total, value in') &&
+    engine.includes('total + Double(max(0, event.numberOfBytesTransferred))') &&
+    engine.includes('var stallTimeoutMs: () -> Int = { stallTimeoutDefaultMs }') &&
+    engine.includes('waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)') &&
+    orchestrator.includes('engineA.stallTimeoutMs = stallTimeoutMs') &&
+    orchestrator.includes('engineB.stallTimeoutMs = stallTimeoutMs'),
+  'iOS engine load, seek and play start must wait on StallWaitDriver with stallTimeoutMs and their limits.'
+);
+const driverSource = section(facade, 'final class StallWaitDriver {', 'func backendStepTimeout(');
+const transactionTests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+assert(
+  driverSource.includes('let verdict = readings?().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)') &&
+    // A wait releases its closures (the caller's completion, the engine) when it ends.
+    section(driverSource, 'func cancel() {', 'func noteProgress()').includes('readings = nil') &&
+    section(driverSource, 'func cancel() {', 'func noteProgress()').includes('onGiveUp = nil') &&
+    section(driverSource, 'private func tick() {', '\n    }\n}').includes('onGiveUp = nil\n        giveUp?(verdict, watch)') &&
+    facade.includes('let stallCheckIntervalMs = 250') &&
+    standardBackend.includes('deinit {\n            wait?.cancel()\n        }') &&
+    transactionTests.includes('func testWaitDriverReleasesItsClosuresWhenCancelledAndWhenItGivesUp()') &&
+    driverSource.includes('guard isActive else { return }') &&
+    ['testWaitDriverKeepsASlowButProgressingWaitUntilItsCap', 'testWaitDriverFailsAStalledWaitAtTheStallTimeout',
+      'testWaitDriverWithoutASignalIsBoundOnlyByItsCapAndAStageRestartsTheStallClock',
+      'testWaitDriverReschedulesUntilCancelledAndThenNeverGivesUp', 'testCrossfadeIncomingStallReadsTheGraceItIsGiven']
+      .every((name) => transactionTests.includes(`func ${name}()`)),
+  'The iOS wait driver must stay in the tested core with its tests.'
+);
+// The crossfade fallback grace is the app's incomingStallGraceMs, never a number.
+assert(
+  orchestrator.includes('var incomingStallGraceMs: () -> Int = { incomingStallGraceDefaultMs }') &&
+    orchestrator.includes('if crossfadeIncomingStalled(\n            elapsedMs: context.elapsedMs,\n            graceMs: incomingStallGraceMs(),') &&
+    !/elapsedMs >= \d/.test(orchestrator) &&
+    facade.includes('let incomingStallGraceDefaultMs = 2000') &&
+    player.includes('private let incomingStallGrace = TimeoutSetting(optionKey: "incomingStallGraceMs", defaultMs: incomingStallGraceDefaultMs)') &&
+    player.includes('stallTimeout, incomingStallGrace]') &&
+    section(player, 'case .pingPong:', 'return PingPongPlaybackBackend(').includes('orchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }') &&
+    section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:').includes('playbackOrchestrator.incomingStallGraceMs = { [weak self] in self?.incomingStallGrace.milliseconds ?? incomingStallGraceDefaultMs }') &&
+    ['src/interfaces/PlayerOptions.ts', 'src/interfaces/UpdateOptions.ts'].every((f) => read(f).includes('incomingStallGraceMs?: number;')) &&
+    ['docs/docs/api/objects/player-options.md', 'docs/docs/api/objects/update-options.md'].every((f) => read(f).includes('| `incomingStallGraceMs` |')),
+  'iOS crossfade fallback must read incomingStallGraceMs.'
 );
 // Parser, stored setting and step formula live in PlaybackBackend.swift, tested by RNTrackPlayerTests.
 assert(
-  facade.includes('let prepareTimeoutDefaultMs = 5000') &&
+  facade.includes('let prepareTimeoutDefaultMs = 60000') &&
     facade.includes('final class TimeoutSetting') &&
-    facade.includes('let playStartTimeoutDefaultMs = 8000') &&
-    facade.includes('let standardReadyTimeoutDefaultMs = 5000') &&
-    facade.includes('let standardSeekTimeoutDefaultMs = 25000') &&
+    facade.includes('let playStartTimeoutDefaultMs = 60000') &&
+    facade.includes('let standardReadyTimeoutDefaultMs = 60000') &&
+    facade.includes('let standardSeekTimeoutDefaultMs = 60000') &&
+    facade.includes('let stallTimeoutDefaultMs = 10000') &&
+    facade.includes('struct StallWatch') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout') &&
     facade.includes('func backendStepTimeout(loadTimeoutMs: Int, playStartTimeoutMs: Int) -> TimeInterval') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue'),
   'iOS prepareTimeoutMs parsing, setting and step formula must stay in the tested core.'
@@ -287,7 +380,11 @@ const pingPongFactory = section(player, 'case .pingPong:', 'return PingPongPlayb
 const setupPlayerTimeout = section(player, 'public func setupPlayer(', 'installPlaybackBackendFacade(initialKind:');
 assert(
   player.includes('private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)') &&
-    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout]') &&
+    section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('for setting in [prepareTimeout, playStartTimeout, standardReadyTimeout, standardSeekTimeout, stallTimeout, incomingStallGrace]') &&
+    player.includes('private let stallTimeout = TimeoutSetting(optionKey: "stallTimeoutMs", defaultMs: stallTimeoutDefaultMs)') &&
+    pingPongFactory.includes('orchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }') &&
+    setupPlayerTimeout.includes('playbackOrchestrator.stallTimeoutMs = { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs }') &&
+    player.includes('stallTimeoutMs: { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs },') &&
     section(player, 'private func applyTimeouts(', '@objc(updateOptions:').includes('switch setting.apply(options) {') &&
     pingPongFactory.includes('orchestrator.prepareTimeoutMs = { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs }') &&
     setupPlayerTimeout.includes('applyTimeouts(config)') &&
@@ -317,25 +414,46 @@ assert(
     player.includes('private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)') &&
     player.includes('readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs }') &&
     player.includes('seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs }') &&
-    standardBackend2.includes('DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(seekTimeoutMs()), execute: timeout)') &&
+    standardBackend2.includes('let wait = StallWaitDriver(\n            stallTimeoutMs: stallTimeoutMs(),\n            totalTimeoutMs: seekTimeoutMs(),') &&
+    standardBackend2.includes('guard let self = self, let request = request, request.issued else { return nil }') &&
+    standardBackend2.includes('return [self.player.bufferedPosition]') &&
+    standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            player.seek(to: request.position)') &&
+    standardBackend2.includes('request.wait = wait\n        pendingSeeks.append(request)\n        wait.start()') &&
+    section(standardBackend2, 'func finish(_ result: Result<Void, Error>) {', 'private var pendingSeeks').includes('wait?.cancel()') &&
+    !standardBackend2.includes('DispatchWorkItem { [weak self, weak request]') &&
     !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
     !/timeout: TimeInterval = \d/.test(standardBackend2) &&
-    standardBackend2.includes('timeoutMs: readinessTimeoutMs()') &&
-    standardBackend2.includes('timeout: TimeInterval(timeoutMs) / 1000,') &&
+    standardBackend2.includes('timeoutMs: readinessTimeoutMs(),\n                stallTimeoutMs: stallTimeoutMs()') &&
+    standardBackend2.includes('        timeoutMs: timeoutMs,\n        stallTimeoutMs: stallTimeoutMs,\n        observe: {') &&
+    standardBackend2.includes('buffered: player.bufferedPosition') &&
     standardBackend2.includes('self.seekTimeoutMs = seekTimeoutMs') &&
-    standardBackend2.includes('let deadline = Date().addingTimeInterval(timeout)') &&
-    standardBackend2.includes('try waitForStandardPlaybackActivation(player: player, snapshot: snapshot, timeoutMs: readinessTimeoutMs())') &&
+    standardBackend2.includes('self.stallTimeoutMs = stallTimeoutMs') &&
+    standardBackend2.includes('var watch = StallWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: timeoutMs, startedAt: now())') &&
+    standardBackend2.includes('let verdict = watch.check(at: now(), readings: [observation.buffered])') &&
+    !standardBackend2.includes('Date().addingTimeInterval') &&
+    standardBackend2.includes('stallTimeoutMs: @escaping () -> Int,') &&
     standardBackend2.includes('readinessTimeoutMs: @escaping () -> Int,') &&
     standardBackend2.includes('seekTimeoutMs: @escaping () -> Int,') &&
-    engine.slice(engine.indexOf('private func waitForPlaying(')).includes('.milliseconds(timeoutMs)') &&
     !/\.milliseconds\(\d+\)/.test(engine.slice(engine.indexOf('private func waitForPlaying('))) &&
     setupPlayerTimeout.includes('playbackOrchestrator.playStartTimeoutMs = { [weak self] in self?.playStartTimeout.milliseconds ?? playStartTimeoutDefaultMs }') &&
-    ['playStartTimeoutMs', 'standardReadyTimeoutMs', 'standardSeekTimeoutMs'].every((option) =>
+    ['playStartTimeoutMs', 'standardReadyTimeoutMs', 'standardSeekTimeoutMs', 'stallTimeoutMs'].every((option) =>
       playerOptions.includes(`${option}?: number;`) &&
         read('src/interfaces/UpdateOptions.ts').includes(`${option}?: number;`) &&
         playerOptionsDocs.includes(`| \`${option}\` |`) &&
         read('docs/docs/api/objects/update-options.md').includes(`| \`${option}\` |`)),
   'iOS play-start, standard readiness and standard seek waits must read the app\'s settings, not fixed numbers.'
 );
+
+// The seek watch can be skipped only by the load's own seek, anywhere in the module.
+{
+  const fs = require('fs');
+  const path = require('path');
+  const dir = path.join(__dirname, '..', 'ios', 'RNTrackPlayer');
+  const unwatched = fs.readdirSync(dir).filter((f) => f.endsWith('.swift')).reduce((count, f) => {
+    const code = fs.readFileSync(path.join(dir, f), 'utf8').split('\n').filter((line) => !line.trim().startsWith('///') && !line.trim().startsWith('//')).join('\n');
+    return count + (code.match(/watched:\s*false/g) || []).length;
+  }, 0);
+  assert(unwatched === 1, 'Only the load\'s own seek may pass watched: false in ios/RNTrackPlayer (found ' + unwatched + ').');
+}
 
 console.log('iOS crossfade contracts OK');

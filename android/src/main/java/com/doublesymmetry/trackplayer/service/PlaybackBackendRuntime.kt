@@ -9,12 +9,13 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.selects.onTimeout
 import kotlinx.coroutines.selects.select
-import kotlinx.coroutines.withTimeoutOrNull
 
 internal data class StandardPlaybackReadinessObservation(
     val state: AudioPlayerState,
     val currentIndex: Int,
-    val positionMs: Long
+    val positionMs: Long,
+    /** The player's buffered position: its growth is the wait's progress. */
+    val bufferedPositionMs: Long
 )
 
 internal object StandardPlaybackActivationSnapshotValidator {
@@ -36,10 +37,16 @@ internal object StandardPlaybackActivationSnapshotValidator {
 }
 
 internal class StandardPlaybackReadinessGate(
-    /** The app's `standardReadyTimeoutMs`, read at every wait (no default: the caller passes it). */
+    /**
+     * The app's `standardReadyTimeoutMs` (the total limit) and `stallTimeoutMs` (how long the
+     * wait may go on with no progress), read at every wait (no defaults: the caller passes them).
+     */
     private val timeoutMs: () -> Long,
+    private val stallTimeoutMs: () -> Long,
     private val pollIntervalMs: Long = 25L,
-    private val positionToleranceMs: Long = 750L
+    private val positionToleranceMs: Long = 750L,
+    /** A monotonic clock in milliseconds (tests pass their virtual time). */
+    private val nowMs: () -> Long = ::monotonicNowMs
 ) {
     init {
         require(pollIntervalMs > 0L)
@@ -51,23 +58,25 @@ internal class StandardPlaybackReadinessGate(
         expectedPositionMs: Long,
         observe: () -> StandardPlaybackReadinessObservation
     ) {
-        val ready = withTimeoutOrNull(timeoutMs().coerceAtLeast(1L)) {
-            while (true) {
-                val current = observe()
-                if (current.state == AudioPlayerState.ERROR) throw notReadyError()
-                val positionDelta = kotlin.math.abs(
-                    current.positionMs.coerceAtLeast(0L) - expectedPositionMs.coerceAtLeast(0L)
-                )
-                if (current.state.isPreparedForActivation() &&
-                    current.currentIndex == expectedIndex &&
-                    positionDelta <= positionToleranceMs
-                ) {
-                    return@withTimeoutOrNull true
-                }
-                delay(pollIntervalMs)
-            }
+        var current: StandardPlaybackReadinessObservation? = null
+        val verdict = awaitWhileProgressing(
+            stallTimeoutMs = stallTimeoutMs(),
+            totalTimeoutMs = timeoutMs(),
+            pollIntervalMs = pollIntervalMs,
+            nowMs = nowMs,
+            pause = { delay(it) },
+            readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }
+        ) {
+            val observed = observe().also { current = it }
+            if (observed.state == AudioPlayerState.ERROR) throw notReadyError()
+            val positionDelta = kotlin.math.abs(
+                observed.positionMs.coerceAtLeast(0L) - expectedPositionMs.coerceAtLeast(0L)
+            )
+            observed.state.isPreparedForActivation() &&
+                observed.currentIndex == expectedIndex &&
+                positionDelta <= positionToleranceMs
         }
-        if (ready != true) throw notReadyError()
+        if (verdict != null) throw notReadyError()
     }
 
     private fun notReadyError() = RejectionException(

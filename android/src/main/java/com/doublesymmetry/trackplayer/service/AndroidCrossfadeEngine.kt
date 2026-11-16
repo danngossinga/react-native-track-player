@@ -13,10 +13,14 @@ import com.google.android.exoplayer2.MediaMetadata
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.audio.AudioAttributes
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
+import com.google.android.exoplayer2.upstream.DataSource
+import com.google.android.exoplayer2.upstream.DataSpec
+import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import com.google.android.exoplayer2.upstream.DefaultDataSource
-import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
+import com.google.android.exoplayer2.upstream.TransferListener
 import kotlinx.coroutines.delay
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
 internal enum class AndroidCrossfadeEngineState {
@@ -51,8 +55,10 @@ internal interface AndroidCrossfadeEnginePort {
     suspend fun prepare(
         item: TrackAudioItem,
         positionMs: Long = 0L,
-        // No default: every call passes the app's setting (prepareTimeoutMs).
+        // No defaults: every call passes the app's settings (prepareTimeoutMs, the total limit,
+        // and stallTimeoutMs, how long the load may go on with no progress).
         timeoutMs: Long,
+        stallTimeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun play(rate: Float = 1f)
@@ -62,6 +68,7 @@ internal interface AndroidCrossfadeEnginePort {
     suspend fun seekTo(
         positionMs: Long,
         timeoutMs: Long,
+        stallTimeoutMs: Long,
         ticket: PlaybackOperationTicket? = null
     )
     fun setVolume(value: Float)
@@ -72,10 +79,34 @@ internal class AndroidCrossfadeEngine(
     context: Context,
     override val name: String,
     audioContentType: Int,
-    handleAudioFocus: Boolean
+    handleAudioFocus: Boolean,
+    /**
+     * The bandwidth each track starts from before the player has measured any
+     * (`initialBitrateEstimateBps`), read at every load: adaptive streams start low (see
+     * [crossfadeBandwidthMeter]), then follow the measured bandwidth.
+     */
+    initialBitrateEstimateBps: () -> Long,
+    /**
+     * The app's current `stallTimeoutMs`, read at every HTTP request: the connect and read
+     * timeouts follow it (see [CurrentTimeoutHttpDataSourceFactory]).
+     */
+    stallTimeoutMs: () -> Long
 ) : AndroidCrossfadeEnginePort {
-    private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+    private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->
+        crossfadeBandwidthMeter(context, estimate)
+    }
+    /** Bytes this player has downloaded: a load's progress, counted while a segment arrives. */
+    private val bytesLoaded = AtomicLong(0L)
+    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)
     private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
+        .setTransferListener(object : TransferListener {
+            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+                bytesLoaded.addAndGet(bytesTransferred.toLong())
+            }
+            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        })
     private val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
     private var preparedItem: TrackAudioItem? = null
     private var preparedTrackKey: String? = null
@@ -83,6 +114,7 @@ internal class AndroidCrossfadeEngine(
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
+        .setBandwidthMeter(bandwidthMeter)
         .build()
         .apply {
             volume = 0f
@@ -125,10 +157,16 @@ internal class AndroidCrossfadeEngine(
     override val playerErrorMessage: String?
         get() = player.playerError?.message
 
+
+    /** What a wait reads as progress: bytes downloaded and media buffered. */
+    private fun loadProgress(): LongArray =
+        longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)
+
     override suspend fun prepare(
         item: TrackAudioItem,
         positionMs: Long,
         timeoutMs: Long,
+        stallTimeoutMs: Long,
         ticket: PlaybackOperationTicket?
     ) {
         operationGeneration += 1
@@ -142,14 +180,26 @@ internal class AndroidCrossfadeEngine(
         player.pause()
         player.stop()
         player.clearMediaItems()
+        // Every track starts from the app's current estimate, not from the last track's measure.
+        // A start-of-track estimate: a new value waits for the next track; the playing one keeps
+        // following the measured bandwidth.
+        val initialEstimate = bandwidthMeter.startTrack()
+        androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
         player.setMediaItem(buildMediaItem(item))
         player.prepare()
         player.seekTo(max(0L, positionMs))
         preparedItem = item
         preparedTrackKey = trackKey
 
-        val startedAt = SystemClock.elapsedRealtime()
-        while (player.playbackState != Player.STATE_READY) {
+        // Fails when nothing loads for stallTimeoutMs, or after timeoutMs in all.
+        val verdict = awaitWhileProgressing(
+            stallTimeoutMs = stallTimeoutMs,
+            totalTimeoutMs = timeoutMs,
+            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+            nowMs = SystemClock::elapsedRealtime,
+            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+            readings = ::loadProgress
+        ) {
             if (player.playbackState == Player.STATE_ENDED) {
                 if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
                 throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
@@ -158,11 +208,12 @@ internal class AndroidCrossfadeEngine(
                 if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
                 throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
             }
-            if (SystemClock.elapsedRealtime() - startedAt > timeoutMs) {
-                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-                throw RejectionException("$name did not become ready.", "crossfade_prepare_timeout")
-            }
-            if (ticket == null) delay(25) else ticket.delayOrThrow(25)
+            player.playbackState == Player.STATE_READY
+        }
+        if (verdict != null) {
+            if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
+            throw RejectionException("$name did not become ready ($reason).", "crossfade_prepare_timeout")
         }
 
         ticket?.ensureActive()
@@ -221,6 +272,7 @@ internal class AndroidCrossfadeEngine(
     override suspend fun seekTo(
         positionMs: Long,
         timeoutMs: Long,
+        stallTimeoutMs: Long,
         ticket: PlaybackOperationTicket?
     ) {
         val generation = operationGeneration
@@ -228,12 +280,21 @@ internal class AndroidCrossfadeEngine(
         val target = max(0L, positionMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
-        val startedAt = SystemClock.elapsedRealtime()
-        while (player.playbackState == Player.STATE_BUFFERING) {
-            if (SystemClock.elapsedRealtime() - startedAt > timeoutMs) {
-                throw RejectionException("$name did not finish seeking.", "crossfade_seek_timeout")
-            }
-            if (ticket == null) delay(25) else ticket.delayOrThrow(25)
+        val verdict = awaitWhileProgressing(
+            stallTimeoutMs = stallTimeoutMs,
+            totalTimeoutMs = timeoutMs,
+            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+            nowMs = SystemClock::elapsedRealtime,
+            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+            readings = ::loadProgress
+        ) { player.playbackState != Player.STATE_BUFFERING }
+        if (verdict != null) {
+            // As on iOS: the player stops, so audio does not resume by itself when data arrives.
+            player.playWhenReady = false
+            player.pause()
+            if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
+            throw RejectionException("$name did not finish seeking ($reason).", "crossfade_seek_timeout")
         }
         ticket?.ensureActive()
         if (operationGeneration != generation) {
@@ -252,9 +313,9 @@ internal class AndroidCrossfadeEngine(
 
     private fun configureRequestOptions(item: TrackAudioItem) {
         val options = item.options
-        httpDataSourceFactory.setDefaultRequestProperties(options?.headers ?: emptyMap())
-        options?.userAgent?.takeIf { it.isNotBlank() }?.let {
-            httpDataSourceFactory.setUserAgent(it)
+        httpDataSourceFactory.configure {
+            setDefaultRequestProperties(options?.headers ?: emptyMap())
+            options?.userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }
         }
     }
 
@@ -279,15 +340,52 @@ internal class AndroidCrossfadeEngine(
 
 }
 
-/**
- * How long a crossfade engine waits for a track to become ready (`crossfade_prepare_timeout`), or
- * for a seek to finish buffering (`crossfade_seek_timeout`), unless the app sets `prepareTimeoutMs`.
- */
-internal const val DEFAULT_PREPARE_TIMEOUT_MS = 5000L
+/** How often an engine's load or seek wait reads its progress (a poll interval, not a limit). */
+internal const val ENGINE_WAIT_POLL_INTERVAL_MS = 25L
 
-/** How long the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`). */
-internal const val DEFAULT_STANDARD_READY_TIMEOUT_MS = 5000L
+// Every wait for a track gives up when it makes no progress for `stallTimeoutMs`, or when it
+// exceeds its own total limit below, a safety cap for slow but progressing loads.
+
+/**
+ * How long, in all, a crossfade engine may wait for a track to become ready
+ * (`crossfade_prepare_timeout`), or for a seek to finish buffering (`crossfade_seek_timeout`),
+ * unless the app sets `prepareTimeoutMs`.
+ */
+internal const val DEFAULT_PREPARE_TIMEOUT_MS = 60_000L
+
+/** How long, in all, the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`). */
+internal const val DEFAULT_STANDARD_READY_TIMEOUT_MS = 60_000L
 internal const val STANDARD_READY_TIMEOUT_KEY = "standardReadyTimeoutMs"
+
+/** How long any of those waits goes on with no progress before it fails (`stallTimeoutMs`). */
+internal const val DEFAULT_STALL_TIMEOUT_MS = 10_000L
+internal const val STALL_TIMEOUT_KEY = "stallTimeoutMs"
+
+/**
+ * The bandwidth, in bits per second, a crossfade player assumes before it has measured any
+ * (`initialBitrateEstimateBps`, setupPlayer): low, so an adaptive stream starts at its lowest
+ * rendition and climbs as the player measures the network.
+ */
+internal const val DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS = 96_000L
+
+/**
+ * How long a crossfade waits for the incoming track's position to move before it falls back to
+ * playing that track alone (`incomingStallGraceMs`, `incoming_stalled`).
+ */
+internal const val DEFAULT_INCOMING_STALL_GRACE_MS = 2_000L
+internal const val INCOMING_STALL_GRACE_KEY = "incomingStallGraceMs"
+
+/**
+ * The bandwidth meter of a crossfade player: it reports [initialBitrateEstimateBps] until it has
+ * measured the network. ExoPlayer's adaptive selection then picks the highest rendition whose
+ * bitrate fits about 70 % of the estimate (its default bandwidth fraction), or the lowest when
+ * none fits.
+ */
+internal fun crossfadeBandwidthMeter(context: Context, initialBitrateEstimateBps: Long): DefaultBandwidthMeter =
+    DefaultBandwidthMeter.Builder(context)
+        .setInitialBitrateEstimate(initialBitrateEstimateBps)
+        .build()
+internal const val INITIAL_BITRATE_ESTIMATE_KEY = "initialBitrateEstimateBps"
 
 /**
  * A timeout option (`prepareTimeoutMs`, `standardReadyTimeoutMs`), in milliseconds, read from setup
@@ -303,18 +401,34 @@ internal fun timeoutOptionFrom(value: Any?): Long? {
 
 internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
 
-/** One of the app's timeouts: one value, kept until a valid new one comes (main thread only). */
-internal class TimeoutSetting(defaultMs: Long) {
-    var milliseconds: Long = defaultMs
+/**
+ * A whole-number option from 1 to 2147483646 (setup or update options): one value, kept until a
+ * valid new one comes. Written on the main thread; read there and by the players' loading threads
+ * (HTTP timeouts), so it is volatile.
+ */
+internal open class WholeNumberSetting(defaultValue: Long) {
+    @Volatile
+    var value: Long = defaultValue
         private set
 
     /**
      * Takes a valid value (the option's raw value). Returns false when the value is ignored and
      * the current one kept.
      */
-    fun apply(value: Any?): Boolean {
-        val timeout = timeoutOptionFrom(value) ?: return false
-        milliseconds = timeout
+    fun apply(raw: Any?): Boolean {
+        value = timeoutOptionFrom(raw) ?: return false
         return true
     }
+}
+
+/** One of the app's timeouts, in milliseconds. */
+internal class TimeoutSetting(defaultMs: Long) : WholeNumberSetting(defaultMs) {
+    val milliseconds: Long
+        get() = value
+}
+
+/** A bandwidth in bits per second (`initialBitrateEstimateBps`). */
+internal class BitrateSetting(defaultBps: Long) : WholeNumberSetting(defaultBps) {
+    val bitsPerSecond: Long
+        get() = value
 }

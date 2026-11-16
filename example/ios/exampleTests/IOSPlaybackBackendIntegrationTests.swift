@@ -246,6 +246,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                     transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
                     readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
                     seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+                    stallTimeoutMs: { stallTimeoutDefaultMs },
                     automaticallyUpdateNowPlayingInfo: { false },
                     onCommitted: { _ in }, onActivated: { _ in },
                     onDisposed: { _ in }, initiallyAuthoritative: true,
@@ -678,6 +679,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
             readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
             seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+            stallTimeoutMs: { stallTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in committedCount += 1 },
             onActivated: { _ in activatedCount += 1 },
@@ -731,6 +733,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
             readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
             seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+            stallTimeoutMs: { stallTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in },
             onActivated: { _ in },
@@ -847,6 +850,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
             readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
             seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+            stallTimeoutMs: { stallTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { _ in },
             onActivated: { _ in },
@@ -914,6 +918,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                 transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
                 readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
                 seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+                stallTimeoutMs: { stallTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { false },
                 onCommitted: { _ in },
                 onActivated: { _ in },
@@ -1800,6 +1805,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
             transitionGenerationSidecar: sidecar,
             readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
             seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+            stallTimeoutMs: { stallTimeoutDefaultMs },
             automaticallyUpdateNowPlayingInfo: { false },
             onCommitted: { committed in
                 XCTAssertTrue(authority.isAuthoritative(.standard, identity: committed))
@@ -1898,16 +1904,17 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
 
     func test_standardReadinessRequiresStateIndexAndPosition() throws {
         let observations = [
-            StandardPlaybackReadinessObservation(state: .loading, index: 2, position: 11),
-            StandardPlaybackReadinessObservation(state: .ready, index: 2, position: 3),
-            StandardPlaybackReadinessObservation(state: .paused, index: 2, position: 11.2)
+            StandardPlaybackReadinessObservation(state: .loading, index: 2, position: 11, buffered: 0),
+            StandardPlaybackReadinessObservation(state: .ready, index: 2, position: 3, buffered: 0),
+            StandardPlaybackReadinessObservation(state: .paused, index: 2, position: 11.2, buffered: 0)
         ]
         var observationIndex = 0
 
         try StandardPlaybackReadinessGate.wait(
             expectedIndex: 2,
             expectedPosition: 11,
-            timeout: 1,
+            timeoutMs: 1000,
+            stallTimeoutMs: 1000,
             observe: { observations[observationIndex] },
             waitForNextPoll: { observationIndex += 1 }
         )
@@ -1919,21 +1926,58 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
         XCTAssertThrowsError(try StandardPlaybackReadinessGate.wait(
             expectedIndex: 0,
             expectedPosition: 8,
-            timeout: 1,
+            timeoutMs: 1000,
+            stallTimeoutMs: 1000,
             observe: {
-                StandardPlaybackReadinessObservation(state: .failed, index: 0, position: 8)
+                StandardPlaybackReadinessObservation(state: .failed, index: 0, position: 8, buffered: 0)
             },
             waitForNextPoll: {}
         ))
         XCTAssertThrowsError(try StandardPlaybackReadinessGate.wait(
             expectedIndex: 0,
             expectedPosition: 8,
-            timeout: 0,
+            timeoutMs: 0,
+            stallTimeoutMs: 1000,
             observe: {
-                StandardPlaybackReadinessObservation(state: .buffering, index: 0, position: 8)
+                StandardPlaybackReadinessObservation(state: .buffering, index: 0, position: 8, buffered: 0)
             },
             waitForNextPoll: {}
         ))
+    }
+
+    func test_standardReadinessWaitsWhileBufferingProgressesAndFailsWhenItStalls() {
+        // 125 ms per poll; the stall timeout is 300 ms and the total limit 2 s.
+        var clock: TimeInterval = 0
+        var buffered = 0.0
+        var polls = 0
+        // Buffering grows at every poll: the wait outlives the stall timeout, up to the limit.
+        XCTAssertThrowsError(try StandardPlaybackReadinessGate.wait(
+            expectedIndex: 0,
+            expectedPosition: 0,
+            timeoutMs: 2000,
+            stallTimeoutMs: 300,
+            observe: {
+                StandardPlaybackReadinessObservation(state: .buffering, index: 0, position: 0, buffered: buffered)
+            },
+            now: { clock },
+            waitForNextPoll: { clock += 0.125; buffered += 0.5; polls += 1 }
+        ))
+        XCTAssertEqual(polls, 16)
+        // Nothing loads: it fails at the stall timeout.
+        clock = 0
+        polls = 0
+        XCTAssertThrowsError(try StandardPlaybackReadinessGate.wait(
+            expectedIndex: 0,
+            expectedPosition: 0,
+            timeoutMs: 2000,
+            stallTimeoutMs: 300,
+            observe: {
+                StandardPlaybackReadinessObservation(state: .buffering, index: 0, position: 0, buffered: 4)
+            },
+            now: { clock },
+            waitForNextPoll: { clock += 0.125; polls += 1 }
+        ))
+        XCTAssertEqual(polls, 3)
     }
 
     func test_realOrchestratorSeekCancellationWinsOverLateSuccessExactlyOnce() {
@@ -2291,6 +2335,7 @@ final class IOSPlaybackBackendIntegrationTests: XCTestCase {
                 transitionGenerationSidecar: PlaybackTransitionGenerationSidecar(),
                 readinessTimeoutMs: { standardReadyTimeoutDefaultMs },
                 seekTimeoutMs: { standardSeekTimeoutDefaultMs },
+                stallTimeoutMs: { stallTimeoutDefaultMs },
                 automaticallyUpdateNowPlayingInfo: { false },
                 onCommitted: { _ in },
                 onActivated: { _ in },

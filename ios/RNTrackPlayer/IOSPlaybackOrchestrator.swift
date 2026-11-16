@@ -123,6 +123,16 @@ final class IOSPlaybackOrchestrator {
             engineB.playStartTimeoutMs = playStartTimeoutMs
         }
     }
+    /// How long a crossfade waits for the incoming track's time to move before it falls back to
+    /// that track alone (`incomingStallGraceMs`, ms), read at every fade step.
+    var incomingStallGraceMs: () -> Int = { incomingStallGraceDefaultMs }
+    /// How long a load or play start may go on with no progress (ms); both engines read it.
+    var stallTimeoutMs: () -> Int = { stallTimeoutDefaultMs } {
+        didSet {
+            engineA.stallTimeoutMs = stallTimeoutMs
+            engineB.stallTimeoutMs = stallTimeoutMs
+        }
+    }
     private var activeEngine: IOSCrossfadeEngine
     private var standbyEngine: IOSCrossfadeEngine
     private var queue: [Track] = []
@@ -1115,6 +1125,8 @@ final class IOSPlaybackOrchestrator {
                                         case .failure(let error):
                                             IOSPlaybackLog.log("loadIndex autoplay failed index=\(index) error=\(error.localizedDescription)")
                                             self.playWhenReady = false
+                                            // As after a failed play(): audio must not start by itself later.
+                                            self.activeEngine.pause()
                                             self.state = .paused
                                         }
                                         self.operationRegistry.performAfterCurrentMutation {
@@ -1330,8 +1342,12 @@ final class IOSPlaybackOrchestrator {
         }
         crossfadeRampAfterValidationHook()
 
-        if context.elapsedMs >= 2000,
-           standbyEngine.currentTime <= context.incomingStartTime + 0.2 {
+        if crossfadeIncomingStalled(
+            elapsedMs: context.elapsedMs,
+            graceMs: incomingStallGraceMs(),
+            incomingTime: standbyEngine.currentTime,
+            incomingStartTime: context.incomingStartTime
+        ) {
             shouldFallback = true
         } else if activeEngine.duration > 0,
                   activeEngine.currentTime >= max(0, activeEngine.duration - 0.15) {

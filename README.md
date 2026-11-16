@@ -62,20 +62,36 @@ Local release tag: `v4.1.2-bface-pingpong.0`
 Added fork surface:
 
 - `setupPlayer({ crossfade: true })` enables the fork crossfade path.
-- `prepareTimeoutMs` (`setupPlayer` and `updateOptions`, default 5000): how long
-  the crossfade path waits for a track to become ready before it fails. Android
-  bounds the whole load and every seek. iOS bounds the wait from a playable
-  asset to a ready item; a backend switch and the play used to resume after an
-  interruption wait at least this long plus 5 s (at least 10 s). A new value applies to
-  the next load at once. Left out, the current value is kept. Other options
-  left out of an `updateOptions` call (capabilities, progress interval…) are
-  reset, so pass it together with your usual options.
-- `playStartTimeoutMs` (iOS crossfade, default 8000: how long playback may take
-  to start), `standardReadyTimeoutMs` (standard backend, default 5000) and
-  `standardSeekTimeoutMs` (iOS standard, default 25000): the player's other
-  waits, with the same rules. A backend switch and the play used to resume after
-  an interruption wait the longer of the load timeout plus 5 s and the
-  play-start timeout plus 2 s (at least 10 s).
+- `stallTimeoutMs` (`setupPlayer` and `updateOptions`, default 10000): every wait
+  for a track (crossfade load, seek and play start, standard backend readiness and
+  seek) fails when it makes no progress (no new media downloaded or buffered) for
+  this long. A slow load that keeps progressing goes on, up to the wait's own total
+  limit below. On Android the crossfade players' HTTP connect and read timeouts
+  follow it too, from the next request on every track, instead of ExoPlayer's
+  fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
+  value is kept. Other options left out of an `updateOptions` call (capabilities,
+  progress interval…) are reset, so pass it together with your usual options.
+- The total limits, safety caps behind the stall timeout, with the same rules:
+  `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
+  before the asset is playable has no progress signal, so only this limit ends
+  it; an iOS crossfade seek, which had no limit before, now fails on a stall or
+  at this limit and the player then reports an error state), `playStartTimeoutMs` (iOS crossfade play start),
+  `standardReadyTimeoutMs` (standard backend readiness) and
+  `standardSeekTimeoutMs` (iOS standard seek; before the seek is issued only this
+  limit applies, then the buffered position is its only progress signal), each
+  60000 by default. A backend switch and the play used to resume after an
+  interruption wait at most the load limit plus the play-start limit plus 5 s (at
+  least 10 s).
+- `incomingStallGraceMs` (crossfade, `setupPlayer` and `updateOptions`, default
+  2000): how long a crossfade waits for the incoming track to start moving before
+  it falls back to playing that track alone (`incoming_stalled`).
+- `initialBitrateEstimateBps` (Android crossfade, `setupPlayer` and
+  `updateOptions`, default 96000): the bandwidth each track starts from before the
+  player has measured the network. An adaptive stream starts at the highest
+  rendition fitting about 70 % of it, or the lowest when none fits, and climbs as
+  the player measures. It is a start-of-track estimate: a new value is used at
+  the next track start; the playing track is not reset mid-track (its rendition
+  follows the measured bandwidth).
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
 - `crossFade(fadeDuration?, fadeInterval?, fadeToVolume?, waitUntil?)` performs
   the two-player overlap transition.

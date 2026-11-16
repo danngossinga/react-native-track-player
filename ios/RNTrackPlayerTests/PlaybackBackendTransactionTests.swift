@@ -25,9 +25,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testPrepareTimeoutSettingKeepsTheDefaultUntilTheAppGivesAValidValue() {
         let setting = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)
-        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertEqual(setting.milliseconds, 60_000)
         XCTAssertNil(setting.apply(["capabilities": ["play"]]))
-        XCTAssertEqual(setting.milliseconds, 5_000)
+        XCTAssertEqual(setting.milliseconds, 60_000)
         XCTAssertEqual(setting.apply(["prepareTimeoutMs": NSNumber(value: 15_000)]), true)
         XCTAssertEqual(setting.milliseconds, 15_000)
         // An invalid or missing value keeps the current one; a new valid value replaces it.
@@ -38,12 +38,15 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(setting.milliseconds, 30_000)
     }
 
-    func testThePlayerTimeoutsKeepTheirOldValuesUntilTheAppSetsThem() {
-        // The waits that were fixed numbers keep them by default, each read from its own option.
+    func testEachPlayerTimeoutHasItsDefaultUntilTheAppSetsIt() {
+        // Each wait reads its own option; the total limits are safety caps, the stall timeout
+        // decides first.
         let cases: [(String, Int, Int)] = [
-            ("playStartTimeoutMs", playStartTimeoutDefaultMs, 8_000),
-            ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 5_000),
-            ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 25_000),
+            ("playStartTimeoutMs", playStartTimeoutDefaultMs, 60_000),
+            ("standardReadyTimeoutMs", standardReadyTimeoutDefaultMs, 60_000),
+            ("standardSeekTimeoutMs", standardSeekTimeoutDefaultMs, 60_000),
+            ("stallTimeoutMs", stallTimeoutDefaultMs, 10_000),
+            ("incomingStallGraceMs", incomingStallGraceDefaultMs, 2_000),
         ]
         for (key, defaultMs, expectedDefault) in cases {
             XCTAssertEqual(defaultMs, expectedDefault, key)
@@ -55,14 +58,244 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
-    func testBackendStepTimeoutCoversTheLoadOrPlayStartTimeoutAndNeverBelowTen() {
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 8_000), 10)
+    func testBackendStepTimeoutCoversALoadThenAPlayStartAndNeverBelowTen() {
+        // The defaults: 60 s load + 60 s play start + 5 s.
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: prepareTimeoutDefaultMs, playStartTimeoutMs: playStartTimeoutDefaultMs), 125)
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 1_000, playStartTimeoutMs: 1_000), 10)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 35)
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 12_500, playStartTimeoutMs: 8_000), 17.5)
-        // A longer play-start wait makes the step wait longer too (a backend switch only starts
-        // playback; the resume after an interruption may load and start, beyond this margin).
-        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 22)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 30_000, playStartTimeoutMs: 8_000), 43)
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 2_500, playStartTimeoutMs: 5_000), 12.5)
+        // A longer play-start limit makes the step wait longer too.
+        XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 30)
+    }
+
+    // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
+
+    func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {
+        // A load that adds a little media every second, with a 3 s stall timeout: it survives
+        // far beyond 3 s, until its 60 s cap.
+        var watch = StallWatch(stallTimeoutMs: 3_000, totalTimeoutMs: 60_000, startedAt: 100)
+        XCTAssertEqual(watch.check(at: 100, readings: [0]), .wait)
+        for second in 1..<60 {
+            XCTAssertEqual(watch.check(at: 100 + Double(second), readings: [Double(second) * 0.2]), .wait, "\(second)")
+        }
+        XCTAssertEqual(watch.check(at: 160, readings: [12]), .capExceeded)
+    }
+
+    func testStallWatchFailsAStalledLoadAtTheStallTimeout() {
+        var watch = StallWatch(stallTimeoutMs: 3_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [4]), .wait)
+        XCTAssertEqual(watch.check(at: 1, readings: [5]), .wait)
+        // Nothing more loads from t = 1 s: it fails 3 s later, not at the cap.
+        XCTAssertEqual(watch.check(at: 2, readings: [5]), .wait)
+        XCTAssertEqual(watch.check(at: 3.999, readings: [5]), .wait)
+        XCTAssertEqual(watch.check(at: 4, readings: [5]), .stalled)
+    }
+
+    func testStallWatchCountsAnyGrowingReadingAndGrowthAfterADrop() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [10, 0]), .wait)
+        // The second reading (time played) grows while the first does not.
+        XCTAssertEqual(watch.check(at: 0.9, readings: [10, 1]), .wait)
+        XCTAssertEqual(watch.check(at: 1.8, readings: [10, 2]), .wait)
+        // A seek back drops the buffer: not progress, but growth from the lower value is.
+        XCTAssertEqual(watch.check(at: 2.7, readings: [3, 2]), .wait)
+        XCTAssertEqual(watch.check(at: 3.5, readings: [4, 2]), .wait)
+        XCTAssertEqual(watch.check(at: 4.5, readings: [4, 2]), .stalled)
+    }
+
+    func testStallWatchCapWinsAndAStageReachedCountsAsProgress() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 5_000, startedAt: 0)
+        // The playable stage has no signal: only the cap bounds it.
+        XCTAssertEqual(watch.capVerdict(at: 4.9), .wait)
+        XCTAssertEqual(watch.capVerdict(at: 5), .capExceeded)
+        // A playable asset at 4 s restarts the stall clock; the cap still counts from the start.
+        watch.noteProgress(at: 4)
+        XCTAssertEqual(watch.check(at: 4, readings: [0]), .wait)
+        XCTAssertEqual(watch.check(at: 4.9, readings: [0]), .wait)
+        XCTAssertEqual(watch.check(at: 5, readings: [1]), .capExceeded)
+    }
+
+    // The wait driver: the engines' and the standard seek's waits run on it.
+
+    /// A manual clock and scheduler: `run()` fires the pending checks one at a time.
+    private final class ManualWaitClock {
+        var now: TimeInterval = 0
+        var pending: [(Int, () -> Void)] = []
+        func schedule(_ delayMs: Int, _ work: @escaping () -> Void) { pending.append((delayMs, work)) }
+        /// Fires the checks until none is pending, at most `limit` of them (a broken driver could
+        /// otherwise check forever); returns how many fired.
+        @discardableResult
+        func runUntilIdle(limit: Int = 1_000) -> Int {
+            var fired = 0
+            while fired < limit, step() { fired += 1 }
+            return fired
+        }
+        /// Fires the next check after its delay; false when none is pending.
+        @discardableResult
+        func step() -> Bool {
+            guard !pending.isEmpty else { return false }
+            let (delayMs, work) = pending.removeFirst()
+            now += Double(delayMs) / 1000
+            work()
+            return true
+        }
+    }
+
+    private func makeDriver(
+        _ clock: ManualWaitClock,
+        stallMs: Int = 1_000,
+        totalMs: Int = 10_000,
+        readings: @escaping () -> [Double]?,
+        gaveUp: @escaping (StallVerdict) -> Void
+    ) -> StallWaitDriver {
+        StallWaitDriver(
+            stallTimeoutMs: stallMs,
+            totalTimeoutMs: totalMs,
+            intervalMs: 250,
+            now: { clock.now },
+            schedule: { clock.schedule($0, $1) },
+            readings: readings,
+            onGiveUp: { verdict, _ in gaveUp(verdict) }
+        )
+    }
+
+    func testWaitDriverKeepsASlowButProgressingWaitUntilItsCap() {
+        let clock = ManualWaitClock()
+        var loaded = 0.0
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, readings: { loaded += 0.01; return [loaded] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        // A little more every 250 ms: far past the 1 s stall timeout, it fails only at 10 s.
+        let checks = clock.runUntilIdle()
+        XCTAssertEqual(verdicts, [.capExceeded])
+        XCTAssertEqual(checks, 40)
+        XCTAssertEqual(clock.now, 10, accuracy: 0.0001)
+        XCTAssertFalse(driver.isActive)
+    }
+
+    func testWaitDriverFailsAStalledWaitAtTheStallTimeout() {
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, readings: { [3] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        clock.runUntilIdle()
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 1, accuracy: 0.0001)
+    }
+
+    func testWaitDriverWithoutASignalIsBoundOnlyByItsCapAndAStageRestartsTheStallClock() {
+        let clock = ManualWaitClock()
+        var signal: [Double]? = nil
+        var verdicts: [StallVerdict] = []
+        let driver = makeDriver(clock, totalMs: 4_000, readings: { signal }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        // No signal (an asset not yet playable, a seek not yet issued): 2 s pass, no stall.
+        for _ in 0..<8 { clock.step() }
+        XCTAssertTrue(verdicts.isEmpty)
+        XCTAssertEqual(clock.now, 2, accuracy: 0.0001)
+        // The stage is reached: the stall clock restarts, the cap still counts from the start.
+        signal = [0]
+        driver.noteProgress()
+        clock.runUntilIdle()
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 3, accuracy: 0.0001)
+
+        let capped = ManualWaitClock()
+        var capVerdicts: [StallVerdict] = []
+        makeDriver(capped, totalMs: 3_000, readings: { nil }, gaveUp: { capVerdicts.append($0) }).start()
+        capped.runUntilIdle()
+        XCTAssertEqual(capVerdicts, [.capExceeded])
+        XCTAssertEqual(capped.now, 3, accuracy: 0.0001)
+    }
+
+    func testWaitDriverReschedulesUntilCancelledAndThenNeverGivesUp() {
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        var reads = 0
+        let driver = makeDriver(clock, readings: { reads += 1; return [Double(reads)] }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        for _ in 0..<5 { XCTAssertTrue(clock.step()) }
+        XCTAssertEqual(reads, 5)
+        XCTAssertEqual(clock.pending.count, 1)
+        driver.cancel()
+        // The pending check fires once and schedules nothing more.
+        XCTAssertEqual(clock.runUntilIdle(), 1)
+        XCTAssertEqual(reads, 5)
+        XCTAssertTrue(verdicts.isEmpty)
+        XCTAssertTrue(clock.pending.isEmpty)
+    }
+
+    func testWaitDriverReleasesItsClosuresWhenCancelledAndWhenItGivesUp() {
+        // Like an engine wait: the closures reach back to the driver (through the caller's state),
+        // so the driver and the completion it holds are freed only if the closures are released.
+        final class Caller { var driver: StallWaitDriver? }
+        for giveUp in [false, true] {
+            let clock = ManualWaitClock()
+            weak var weakCaller: Caller?
+            weak var weakDriver: StallWaitDriver?
+            var gaveUp = 0
+            autoreleasepool {
+                let caller = Caller()
+                weakCaller = caller
+                let driver = makeDriver(
+                    clock,
+                    readings: { _ = caller.driver; return [1] },
+                    gaveUp: { _ in _ = caller.driver; gaveUp += 1 }
+                )
+                caller.driver = driver
+                weakDriver = driver
+                driver.start()
+                clock.step()
+                if !giveUp { driver.cancel() }
+            }
+            clock.runUntilIdle()
+            XCTAssertEqual(gaveUp, giveUp ? 1 : 0)
+            XCTAssertNil(weakCaller, "closures kept, giveUp=\(giveUp)")
+            XCTAssertNil(weakDriver, "driver kept, giveUp=\(giveUp)")
+        }
+    }
+
+    func testWaitDriverChecksEveryPollIntervalAndStartsOnce() {
+        // The documented poll interval: a wait fails at most this much after its limit.
+        XCTAssertEqual(stallCheckIntervalMs, 250)
+        var delays: [Int] = []
+        let driver = StallWaitDriver(
+            stallTimeoutMs: 1_000,
+            totalTimeoutMs: 10_000,
+            now: { 0 },
+            schedule: { delay, _ in delays.append(delay) },
+            readings: { [0] },
+            onGiveUp: { _, _ in }
+        )
+        driver.start()
+        driver.start()
+        XCTAssertEqual(delays, [stallCheckIntervalMs])
+    }
+
+    func testStallWatchDoesNotCountADropAsProgress() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [8]), .wait)
+        // A seek back drops the reading; nothing loads after it: stalled 1 s after the start.
+        XCTAssertEqual(watch.check(at: 0.5, readings: [2]), .wait)
+        XCTAssertEqual(watch.check(at: 1, readings: [2]), .stalled)
+    }
+
+    func testStallWatchStartsANewBaselineAfterAStage() {
+        var watch = StallWatch(stallTimeoutMs: 1_000, totalTimeoutMs: 60_000, startedAt: 0)
+        XCTAssertEqual(watch.check(at: 0, readings: [5]), .wait)
+        watch.noteProgress(at: 1)
+        // The first reading after the stage is a baseline, not growth from the old reading.
+        XCTAssertEqual(watch.check(at: 1.5, readings: [6]), .wait)
+        XCTAssertEqual(watch.check(at: 2, readings: [6]), .stalled)
+    }
+
+    func testCrossfadeIncomingStallReadsTheGraceItIsGiven() {
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 1_999, graceMs: 2_000, incomingTime: 10, incomingStartTime: 10))
+        XCTAssertTrue(crossfadeIncomingStalled(elapsedMs: 2_000, graceMs: 2_000, incomingTime: 10.2, incomingStartTime: 10))
+        XCTAssertTrue(crossfadeIncomingStalled(elapsedMs: 500, graceMs: 500, incomingTime: 10, incomingStartTime: 10))
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 5_000, graceMs: 6_000, incomingTime: 10, incomingStartTime: 10))
+        // The incoming track moved: no fallback, whatever the grace.
+        XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 5_000, graceMs: 500, incomingTime: 10.3, incomingStartTime: 10))
     }
 
     private let snapshot = PlaybackBackendSnapshot(

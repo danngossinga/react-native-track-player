@@ -1,14 +1,97 @@
 import Foundation
 
-/// How long a crossfade engine waits for a track to become ready before giving up, unless the app
-/// sets `prepareTimeoutMs` (setupPlayer or updateOptions).
-let prepareTimeoutDefaultMs = 5000
-/// How long a crossfade engine waits for playback to start after `play` (`playStartTimeoutMs`).
-let playStartTimeoutDefaultMs = 8000
-/// How long the standard backend waits for a restored track to be ready (`standardReadyTimeoutMs`).
-let standardReadyTimeoutDefaultMs = 5000
-/// How long the standard backend waits for a seek to complete (`standardSeekTimeoutMs`).
-let standardSeekTimeoutDefaultMs = 25000
+// Every wait for a track gives up when it makes no progress for `stallTimeoutMs`, or when it
+// exceeds its own total limit (the options below), a safety cap for slow but progressing loads.
+
+/// How long a crossfade engine's load may take in all (`prepareTimeoutMs`, setupPlayer or
+/// updateOptions): the asset's playable stage, the wait for a ready item, and the seek to the
+/// start position and preroll; also the limit of a crossfade engine's seek (as on Android).
+let prepareTimeoutDefaultMs = 60000
+/// How long a crossfade engine may take in all to start playback after `play` (`playStartTimeoutMs`).
+let playStartTimeoutDefaultMs = 60000
+/// How long the standard backend may take in all for a restored track to be ready (`standardReadyTimeoutMs`).
+let standardReadyTimeoutDefaultMs = 60000
+/// How long the standard backend may take in all to complete a seek (`standardSeekTimeoutMs`).
+let standardSeekTimeoutDefaultMs = 60000
+/// How long any of those waits goes on with no progress (no new media loaded) before it fails
+/// (`stallTimeoutMs`).
+let stallTimeoutDefaultMs = 10000
+/// How often a callback-driven wait (crossfade engine, standard seek) reads its progress, in
+/// milliseconds. A poll interval, not a limit: a wait fails at most this much after its limit.
+let stallCheckIntervalMs = 250
+/// How long a crossfade waits for the incoming track's time to move before it falls back to
+/// playing that track alone (`incomingStallGraceMs`).
+let incomingStallGraceDefaultMs = 2000
+
+/// Whether a running crossfade should give up on its incoming track: `graceMs` (the app's
+/// `incomingStallGraceMs`) have passed and the incoming track has not moved past `toleranceSeconds`.
+func crossfadeIncomingStalled(
+    elapsedMs: Int,
+    graceMs: Int,
+    incomingTime: Double,
+    incomingStartTime: Double,
+    toleranceSeconds: Double = 0.2
+) -> Bool {
+    return elapsedMs >= graceMs && incomingTime <= incomingStartTime + toleranceSeconds
+}
+
+/// What a wait does after reading its progress.
+enum StallVerdict: Equatable {
+    /// Keep waiting.
+    case wait
+    /// No progress for the stall timeout.
+    case stalled
+    /// The wait's total limit is exceeded, progress or not.
+    case capExceeded
+}
+
+/// Decides when a wait gives up: after `stallTimeoutMs` with no progress, or after
+/// `totalTimeoutMs` in all. It is fed readings (for example the seconds of media loaded) and the
+/// time; a reading that grows from the previous one is progress. A reading that drops (a seek
+/// back) is not progress, but the next growth from there is.
+struct StallWatch {
+    let stallTimeoutMs: Int
+    let totalTimeoutMs: Int
+    private let startedAt: TimeInterval
+    private var lastProgressAt: TimeInterval
+    private var previous: [Double]?
+
+    /// `startedAt` and every later time are seconds on one monotonic clock.
+    init(stallTimeoutMs: Int, totalTimeoutMs: Int, startedAt: TimeInterval) {
+        self.stallTimeoutMs = stallTimeoutMs
+        self.totalTimeoutMs = totalTimeoutMs
+        self.startedAt = startedAt
+        self.lastProgressAt = startedAt
+    }
+
+    /// Takes the current readings. The first ones only set the baseline.
+    mutating func check(at now: TimeInterval, readings: [Double]) -> StallVerdict {
+        if let previous = previous, previous.count == readings.count,
+           zip(readings, previous).contains(where: { $0 > $1 }) {
+            lastProgressAt = now
+        }
+        previous = readings
+        return verdict(at: now)
+    }
+
+    /// Counts as progress without a reading (a stage reached, such as a playable asset); the
+    /// next readings set a new baseline.
+    mutating func noteProgress(at now: TimeInterval) {
+        lastProgressAt = now
+        previous = nil
+    }
+
+    /// For a stage with no progress signal (the asset's playable stage): only the total limit.
+    func capVerdict(at now: TimeInterval) -> StallVerdict {
+        return (now - startedAt) * 1000 >= Double(totalTimeoutMs) ? .capExceeded : .wait
+    }
+
+    private func verdict(at now: TimeInterval) -> StallVerdict {
+        if capVerdict(at: now) == .capExceeded { return .capExceeded }
+        if (now - lastProgressAt) * 1000 >= Double(stallTimeoutMs) { return .stalled }
+        return .wait
+    }
+}
 
 /// A timeout option (`prepareTimeoutMs`, `playStartTimeoutMs`...), in milliseconds: nil when it is
 /// not a number from 1 to 2147483646 (booleans refused), so the current value is kept. Same bounds
@@ -51,12 +134,89 @@ final class TimeoutSetting {
     }
 }
 
+/// Drives one wait on a callback queue: every `intervalMs` it reads the progress and asks its
+/// `StallWatch`; it reschedules itself while the verdict is `.wait` and calls `onGiveUp` once
+/// otherwise. `readings` returning nil means the wait has no progress signal yet (an asset not
+/// yet playable, a seek not yet issued): only the total limit applies then. Each wait owns its
+/// driver, so cancelling one never stops another. Not thread-safe: use it from one queue (main).
+final class StallWaitDriver {
+    typealias Schedule = (_ delayMs: Int, _ work: @escaping () -> Void) -> Void
+
+    private var watch: StallWatch
+    private let intervalMs: Int
+    private let now: () -> TimeInterval
+    private let schedule: Schedule
+    // Released when the wait ends (cancel or give-up): they usually hold the caller's completion
+    // and the engine, which would otherwise stay alive through the driver.
+    private var readings: (() -> [Double]?)?
+    private var onGiveUp: ((StallVerdict, StallWatch) -> Void)?
+    private(set) var isActive = false
+
+    init(
+        stallTimeoutMs: Int,
+        totalTimeoutMs: Int,
+        intervalMs: Int = stallCheckIntervalMs,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
+        schedule: @escaping Schedule = { delayMs, work in
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: work)
+        },
+        readings: @escaping () -> [Double]?,
+        onGiveUp: @escaping (StallVerdict, StallWatch) -> Void
+    ) {
+        self.watch = StallWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: totalTimeoutMs, startedAt: now())
+        self.intervalMs = intervalMs
+        self.now = now
+        self.schedule = schedule
+        self.readings = readings
+        self.onGiveUp = onGiveUp
+    }
+
+    func start() {
+        guard !isActive else { return }
+        isActive = true
+        scheduleNext()
+    }
+
+    /// Stops the wait: no more checks, `onGiveUp` is never called.
+    func cancel() {
+        isActive = false
+        readings = nil
+        onGiveUp = nil
+    }
+
+    /// A stage reached (playable asset, ready item, seek issued): restarts the stall clock; the
+    /// total limit still counts from the start.
+    func noteProgress() {
+        watch.noteProgress(at: now())
+    }
+
+    private func scheduleNext() {
+        schedule(intervalMs) { self.tick() }
+    }
+
+    private func tick() {
+        guard isActive else { return }
+        let at = now()
+        let verdict = readings?().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)
+        guard verdict != .wait else {
+            scheduleNext()
+            return
+        }
+        isActive = false
+        let giveUp = onGiveUp
+        readings = nil
+        onGiveUp = nil
+        giveUp?(verdict, watch)
+    }
+}
+
 /// How long a synchronous ping-pong backend step may take (a backend switch, which loads or starts
-/// a track, a rollback, and the play used to resume after an interruption): the load timeout plus
-/// 5 s, or the play-start timeout plus 2 s, whichever is longer, and never less than the 10 s it
-/// always had (10 s with both defaults).
+/// a track, a rollback, and the play used to resume after an interruption, which may load and then
+/// start a track): the load limit plus the play-start limit plus 5 s, never less than 10 s
+/// (125 s with both defaults). The waits inside fail sooner when they stall (`stallTimeoutMs`);
+/// this only bounds a step whose waits keep progressing.
 func backendStepTimeout(loadTimeoutMs: Int, playStartTimeoutMs: Int) -> TimeInterval {
-    max(10, TimeInterval(loadTimeoutMs) / 1000 + 5, TimeInterval(playStartTimeoutMs) / 1000 + 2)
+    max(10, TimeInterval(loadTimeoutMs) / 1000 + TimeInterval(playStartTimeoutMs) / 1000 + 5)
 }
 
 enum PlaybackBackendKind: String {

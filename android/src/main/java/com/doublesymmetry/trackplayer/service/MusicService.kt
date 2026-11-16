@@ -78,6 +78,12 @@ class MusicService : HeadlessJsTaskService() {
     private val prepareTimeout = TimeoutSetting(DEFAULT_PREPARE_TIMEOUT_MS)
     /** The standard backend's readiness wait (`standardReadyTimeoutMs`), read at every activation. */
     private val standardReadyTimeout = TimeoutSetting(DEFAULT_STANDARD_READY_TIMEOUT_MS)
+    /** How long any of those waits may go on with no progress (`stallTimeoutMs`), read at every wait. */
+    private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)
+    /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
+    private val incomingStallGrace = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)
+    /** The bandwidth each crossfade track starts from (`initialBitrateEstimateBps`), read at every track. */
+    private val initialBitrateEstimate = BitrateSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
@@ -281,6 +287,9 @@ class MusicService : HeadlessJsTaskService() {
             scope = scope,
             audioContentType = orchestratorAudioContentType,
             handleAudioFocus = orchestratorHandlesAudioFocus,
+            // Read at every track: a later updateOptions applies to the next track.
+            initialBitrateEstimateBps = { initialBitrateEstimate.bitsPerSecond },
+            requestStallTimeoutMs = { stallTimeout.milliseconds },
             delegate = object : AndroidPlaybackOrchestratorDelegate {
                 override fun onPlaybackStateChanged(state: AudioPlayerState) {
                     if (!isAuthoritative()) return
@@ -342,6 +351,8 @@ class MusicService : HeadlessJsTaskService() {
         )
         // Reads the service's setting at every load: a later updateOptions reaches every engine.
         created.prepareTimeoutMs = { prepareTimeout.milliseconds }
+        created.stallTimeoutMs = { stallTimeout.milliseconds }
+        created.incomingStallGraceMs = { incomingStallGrace.milliseconds }
         Timber.tag("RNTP-Crossfade").d("[XF-ORCH] engine=android-ping-pong")
         return created
     }
@@ -433,7 +444,10 @@ class MusicService : HeadlessJsTaskService() {
                     binding.identity,
                     crossfadeQueue,
                     transitionGenerationSidecar,
-                    readinessGate = StandardPlaybackReadinessGate(timeoutMs = { standardReadyTimeout.milliseconds }),
+                    readinessGate = StandardPlaybackReadinessGate(
+                        timeoutMs = { standardReadyTimeout.milliseconds },
+                        stallTimeoutMs = { stallTimeout.milliseconds }
+                    ),
                     onCommitted = { committed ->
                         if (committed === binding.player) commitStandardPlayerBinding(binding)
                     },
@@ -589,18 +603,25 @@ class MusicService : HeadlessJsTaskService() {
         )
     }
 
-    /** Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`) from setup or update options; any other value is ignored. */
+    /**
+     * Takes the valid timeouts (`prepareTimeoutMs`, `standardReadyTimeoutMs`, `stallTimeoutMs`)
+     * `incomingStallGraceMs` and `initialBitrateEstimateBps` from setup or update options; any
+     * other value is ignored.
+     */
     private fun applyTimeouts(options: Bundle?) {
         applyTimeout(options, PREPARE_TIMEOUT_KEY, prepareTimeout)
         applyTimeout(options, STANDARD_READY_TIMEOUT_KEY, standardReadyTimeout)
+        applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)
+        applyTimeout(options, INCOMING_STALL_GRACE_KEY, incomingStallGrace)
+        applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
     }
 
-    private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting) {
+    private fun applyTimeout(options: Bundle?, key: String, setting: WholeNumberSetting) {
         val value = if (options?.containsKey(key) == true) options.get(key) else return
         if (setting.apply(value)) {
-            androidXfadeLog("$key set to ${setting.milliseconds}ms")
+            androidXfadeLog("$key set to ${setting.value}")
         } else {
-            androidXfadeLog("$key ignored value=$value kept=${setting.milliseconds}ms")
+            androidXfadeLog("$key ignored value=$value kept=${setting.value}")
         }
     }
 
