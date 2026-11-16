@@ -218,8 +218,9 @@ The play that resumes after an interruption is not awaited by the command
 that issues it, on both platforms and both backends: a backend switch
 (`setPlaybackBackend`) or a pause issued while it starts runs at once, and a
 start that fails is reported as any play start is (`playback-error`). A backend switch
-issued while that play starts drops it, on both platforms: the new backend
-takes over the state the switch captured. With `autoHandleInterruptions: false` (default), the app may
+issued while that play starts drops it, on both platforms, and the player is
+paused (as after any command that cancels a play start: a seek, a queue
+change...); the new backend takes over that paused state. With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

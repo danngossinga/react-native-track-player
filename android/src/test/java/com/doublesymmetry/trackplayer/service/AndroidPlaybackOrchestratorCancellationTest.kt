@@ -383,9 +383,11 @@ class AndroidPlaybackOrchestratorCancellationTest {
                 }
                 blockedPrepare.entered.await()
 
-                // A normal command supersedes the operation ticket but does not call
-                // cancelCrossfade(), so stale prepared markers cannot be hidden by cleanup.
-                orchestrator.play()
+                // A normal command supersedes the operation ticket. (A play no longer does: as on
+                // iOS, a play while playing has nothing to start and cancels nothing, so a seek
+                // is the superseding command here.) The late completion below must still not
+                // publish the cancelled preparation's markers.
+                orchestrator.seekTo(0L)
                 runCurrent()
                 blockedPrepare.cancellationObserved.await()
 
@@ -616,6 +618,188 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertTrue(delegate.playbackErrors.isEmpty())
             assertFalse(orchestrator.playWhenReady)
             assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    private fun kotlinx.coroutines.test.TestScope.ninth(): Triple<AndroidPlaybackOrchestrator, Pair<FakeCrossfadeEngine, FakeCrossfadeEngine>, RecordingOrchestratorDelegate> {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        orchestrator.stallTimeoutMs = { 10_000L }
+        return Triple(orchestrator, engineA to engineB, delegate)
+    }
+
+    /** What a play changes: the states emitted and the orchestrator's state, before and after. */
+    private suspend fun kotlinx.coroutines.test.TestScope.assertPlayChangesNothing(
+        orchestrator: AndroidPlaybackOrchestrator,
+        delegate: RecordingOrchestratorDelegate
+    ) {
+        val before = orchestrator.snapshot()
+        delegate.playbackStates.clear()
+        delegate.crossfadeEvents.clear()
+        orchestrator.play()
+        runCurrent()
+        assertEquals(emptyList<AudioPlayerState>(), delegate.playbackStates)
+        assertTrue(delegate.crossfadeEvents.none { it.state == "cancelled" })
+        assertEquals(before.orchestratorState, orchestrator.snapshot().orchestratorState)
+        assertEquals(before.currentIndex, orchestrator.snapshot().currentIndex)
+    }
+
+    @Test
+    fun aPlayWhilePlayingChangesNothingAsOnIos() = runTest {
+        val (orchestrator, _, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            assertPlayChangesNothing(orchestrator, delegate)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayWhilePreparingTheNextTrackChangesNothingAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            val block = PrepareBlock(swallowCancellationUntilReleased = false)
+            engines.second.blockNextPrepare = block
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.PRELOADING_NEXT, orchestrator.snapshot().orchestratorState)
+            assertPlayChangesNothing(orchestrator, delegate)
+            block.release.complete(Unit)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayDuringACrossfadeChangesNothingAsOnIos() = runTest {
+        val (orchestrator, _, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            val fade = async { runCatching { orchestrator.crossFade(fadeDuration = 5_000.0) } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.CROSSFADING, orchestrator.snapshot().orchestratorState)
+            assertPlayChangesNothing(orchestrator, delegate)
+            advanceTimeBy(10_000L)
+            assertTrue(fade.await().isSuccess)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayWhileSeekingOrSkippingChangesNothingAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            // A seek that is loading (the engine waits for data).
+            val seekData = CompletableDeferred<Unit>()
+            engines.first.blockNextSeek = seekData
+            val seek = async { runCatching { orchestrator.seekTo(20_000L) } }
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.SEEKING, orchestrator.snapshot().orchestratorState)
+            assertPlayChangesNothing(orchestrator, delegate)
+            seekData.complete(Unit)
+            assertTrue(seek.await().isSuccess)
+            // SKIPPING (iOS's skipping; the Android orchestrator maps it but no path sets it today).
+            orchestrator.setPrivateField("state", AndroidPlaybackOrchestratorState.SKIPPING)
+            assertPlayChangesNothing(orchestrator, delegate)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aCrossfadePrepareDuringAPlayStartIsRefusedWithoutCancellingIt() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            orchestrator.pause()
+            delegate.playbackStates.clear()
+            engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val started = async { orchestrator.play() }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            val refused = runCatching { orchestrator.crossFadePrepare() }
+            assertEquals("crossfade_not_playing", (refused.exceptionOrNull() as RejectionException).code)
+            started.await()
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PLAYING), delegate.playbackStates)
+            assertTrue(orchestrator.snapshot().playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aStartCancelledByAnotherCommandLeavesThePlayerPausedAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            orchestrator.pause()
+            // A seek during the start (iOS: the start is dropped; the seek ends paused).
+            delegate.playbackStates.clear()
+            engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val started = async { runCatching { orchestrator.play() } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            orchestrator.seekTo(10_000L)
+            assertEquals("cancelled", (started.await().exceptionOrNull() as RejectionException).code)
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED), delegate.playbackStates.take(2))
+            assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
+            assertFalse(orchestrator.snapshot().playWhenReady)
+
+            // A backend switch during the start (settle): paused, nothing left loading.
+            delegate.playbackStates.clear()
+            engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val again = async { runCatching { orchestrator.play() } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            orchestrator.settleActiveTransition()
+            again.await()
+            // As iOS (the cancelled start is stabilized at once): paused, then the switch's own
+            // stop; never left loading with playWhenReady on.
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED, AudioPlayerState.STOPPED), delegate.playbackStates)
+            assertFalse(orchestrator.snapshot().playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aSkipDuringAStartPlaysTheNewTrackAsOnIos() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            orchestrator.pause()
+            delegate.playbackStates.clear()
+            engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val started = async { runCatching { orchestrator.play() } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            orchestrator.skip(1)
+            started.await()
+            // As iOS: a transient paused (the start dropped), then the new track loads and plays.
+            assertEquals(
+                listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED, AudioPlayerState.LOADING, AudioPlayerState.PLAYING),
+                delegate.playbackStates
+            )
+            assertTrue(orchestrator.snapshot().playWhenReady)
+            assertEquals(1, orchestrator.snapshot().currentIndex)
         } finally {
             orchestrator.release()
         }
@@ -1124,6 +1308,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
         var seekCalls = 0
             private set
 
+        /** When set, the next seek waits for it (data not there yet). */
+        var blockNextSeek: CompletableDeferred<Unit>? = null
+
         override suspend fun seekTo(
             positionMs: Long,
             timeoutMs: Long,
@@ -1131,6 +1318,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             ticket: PlaybackOperationTicket?
         ) {
             seekCalls += 1
+            blockNextSeek?.let { blockNextSeek = null; it.await() }
             ticket?.ensureActive()
             failNextSeek?.let { failNextSeek = null; throw it }
             lastSeekTimeoutMs = timeoutMs

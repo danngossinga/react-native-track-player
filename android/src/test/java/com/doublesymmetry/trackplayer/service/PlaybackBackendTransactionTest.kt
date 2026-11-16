@@ -170,7 +170,8 @@ class PlaybackBackendTransactionTest {
         interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { }, { failures += it })
         runCurrent()
         assertEquals(listOf("crossfade_play_start_timeout"), failures.map { (it as RejectionException).code })
-        old.playFailure = PlaybackOperationCancelledException("pause")
+        // What the real crossfade backend throws for a cancelled start.
+        old.playFailure = RejectionException("Playback operation was cancelled.", "cancelled")
         interruptionCoordinator().applyOn(facade, backgroundScope, pauseOrResume, { }, { failures += it })
         runCurrent()
         assertEquals(1, failures.size)
@@ -1882,7 +1883,7 @@ class PlaybackBackendTransactionTest {
 
         override suspend fun settleActiveTransition() {
             // As the real crossfade backend: a play start in progress is dropped.
-            playGate?.takeIf { !it.isCompleted }?.completeExceptionally(PlaybackOperationCancelledException("backend_swap"))
+            playGate?.takeIf { !it.isCompleted }?.completeExceptionally(RejectionException("Playback operation was cancelled.", "cancelled"))
             calls += "settle"
             protocolTrace += "$type:settle"
             if (transitionBarrier?.releaseOnSettle == true) {

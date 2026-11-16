@@ -114,7 +114,11 @@ internal suspend fun InterruptionCoordinator.applyOn(
                     try {
                         backend.play()
                     } catch (error: Exception) {
-                        if (error !is kotlinx.coroutines.CancellationException) onResumeFailed(error)
+                        // A cancelled start (a pause, a seek, a backend switch...) is not a
+                        // failure: the crossfade backend reports it as RejectionException("cancelled").
+                        val cancelled = error is kotlinx.coroutines.CancellationException ||
+                            (error as? com.doublesymmetry.trackplayer.utils.RejectionException)?.code == "cancelled"
+                        if (!cancelled) onResumeFailed(error)
                     }
                 }
             },

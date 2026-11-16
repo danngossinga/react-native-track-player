@@ -411,7 +411,17 @@ internal class AndroidPlaybackOrchestrator private constructor(
         notifySnapshotChanged()
     }
 
-    suspend fun play() = withPlaybackOperation { ticket ->
+    suspend fun play() {
+        // As iOS: already playing, crossfading, preparing the next track, seeking or skipping —
+        // nothing to start and nothing to cancel (a seek or skip in progress plays when it ends).
+        if (state in PLAY_IS_ALREADY_UNDER_WAY) {
+            playWhenReady = true
+            return
+        }
+        playFromStill()
+    }
+
+    private suspend fun playFromStill() = withPlaybackOperation { ticket ->
         playWhenReady = true
         if (state == AndroidPlaybackOrchestratorState.PAUSED_DURING_CROSSFADE) {
             activeEngine.play(rate)
@@ -437,13 +447,31 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ensureActivePrepared(currentIndex, positionMs, ticket)
         ticket.ensureActive()
         // As iOS (play from paused reloads the item): loading while the start is awaited, then
-        // playing, or paused when it fails or a pause cancels it.
+        // playing, or paused when it fails or another command cancels it.
         setState(AndroidPlaybackOrchestratorState.LOADING)
+        stabilizeIfCancelled(ticket)
         activeEngine.setVolume(volume)
         activeEngine.play(rate)
         awaitPlaybackStart(ticket)
         setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
         preloadNextIfPossible()
+    }
+
+    /**
+     * As iOS's stabilizeCancelledOperation: a start that another command cancels (a seek, a skip,
+     * a backend switch, a queue change...) leaves the player paused, not loading with
+     * playWhenReady on; it runs at once, before that command reads the state.
+     */
+    private fun stabilizeIfCancelled(ticket: PlaybackOperationTicket) {
+        ticket.onCancelled = {
+            if (state == AndroidPlaybackOrchestratorState.LOADING) {
+                playWhenReady = false
+                setState(
+                    if (currentIndex in queue.indices) AndroidPlaybackOrchestratorState.PAUSED
+                    else AndroidPlaybackOrchestratorState.IDLE
+                )
+            }
+        }
     }
 
     /**
@@ -511,10 +539,18 @@ internal class AndroidPlaybackOrchestrator private constructor(
         setState(AndroidPlaybackOrchestratorState.STOPPED)
     }
 
-    suspend fun skip(index: Int) = withPlaybackOperation { ticket ->
+    suspend fun skip(index: Int) {
         if (index !in queue.indices) {
             throw RejectionException("The track index is out of bounds.", "index_out_of_bounds")
         }
+        // As iOS: whether it played is read before this skip cancels a start in progress (which
+        // pauses it), so the skip plays the new track if playback was meant to play.
+        val wasPlaying = playWhenReady
+        skipPlaying(index, wasPlaying)
+    }
+
+    private suspend fun skipPlaying(index: Int, wasPlaying: Boolean) = withPlaybackOperation { ticket ->
+        playWhenReady = wasPlaying
         cancelCrossfade("skip", promoteIncoming = false)
         startTrackAt(index, 0L, emitTrackChange = true, oldPositionMs = activeEngine.positionMs, ticket = ticket)
     }
@@ -582,7 +618,18 @@ internal class AndroidPlaybackOrchestrator private constructor(
         notifySnapshotChanged()
     }
 
-    suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) =
+    suspend fun crossFadePrepare(previous: Boolean = false, seekTo: Double = 0.0) {
+        // As iOS: refused before anything is cancelled (a play start in progress goes on).
+        if (!isPlaybackActiveForCrossfade()) {
+            val fromIndex = currentIndex
+            val toIndex = if (previous) previousIndexFor(fromIndex) else nextIndexFor(fromIndex)
+            emitCrossfade("cancelled", fromIndex, toIndex ?: -1, errorCode = "not_playing")
+            throw RejectionException("Crossfade cannot prepare while playback is not active.", "crossfade_not_playing")
+        }
+        prepareCrossfadeOperation(previous, seekTo)
+    }
+
+    private suspend fun prepareCrossfadeOperation(previous: Boolean, seekTo: Double) =
         withPlaybackOperation { ticket ->
         val fromIndex = currentIndex
         val toIndex = if (previous) previousIndexFor(fromIndex) else nextIndexFor(fromIndex)
@@ -957,6 +1004,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
+            ticket?.let(::stabilizeIfCancelled)
             activeEngine.play(rate)
             awaitPlaybackStart(ticket)
             setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
@@ -1319,6 +1367,14 @@ internal class AndroidPlaybackOrchestrator private constructor(
 
         const val PREVIOUS_RESTART_THRESHOLD_MS = 3000L
         const val CROSSFADE_RUNNING_EVENT_INTERVAL_MS = 250L
+        /** States where a play has nothing to start (iOS returns at once in the same ones). */
+        private val PLAY_IS_ALREADY_UNDER_WAY = setOf(
+            AndroidPlaybackOrchestratorState.PLAYING_SINGLE,
+            AndroidPlaybackOrchestratorState.PRELOADING_NEXT,
+            AndroidPlaybackOrchestratorState.CROSSFADING,
+            AndroidPlaybackOrchestratorState.SEEKING,
+            AndroidPlaybackOrchestratorState.SKIPPING
+        )
         const val PREPARED_POSITION_TOLERANCE_MS = 250L
         const val INCOMING_STALL_TOLERANCE_MS = 200L
         const val OUTGOING_END_TOLERANCE_MS = 150L

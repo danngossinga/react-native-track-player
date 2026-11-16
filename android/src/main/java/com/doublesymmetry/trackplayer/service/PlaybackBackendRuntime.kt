@@ -354,9 +354,15 @@ internal class PlaybackOperationTicket internal constructor(
     val cancellationCount: Int
         get() = cancellationCounter.get()
 
+    /** Run once, at once, when the operation is cancelled (before the canceller goes on). */
+    @Volatile
+    internal var onCancelled: (() -> Unit)? = null
+
     internal fun cancel(reason: String) {
         if (cancellationReason.compareAndSet(null, reason)) {
             cancellationCounter.incrementAndGet()
+            onCancelled?.invoke()
+            onCancelled = null
             cancellation.complete(reason)
         }
     }

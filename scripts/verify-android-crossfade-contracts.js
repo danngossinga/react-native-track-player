@@ -424,7 +424,7 @@ assert(
 
 // Android waits for a play to start (playStartTimeoutMs) and for a standard seek
 // (standardSeekTimeoutMs), with the stall rule, as iOS does.
-const playSection = section(orchestrator, 'suspend fun play() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(');
+const playSection = section(orchestrator, 'private suspend fun playFromStill() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(');
 assert(
   playSection.includes('activeEngine.play(rate)\n        awaitPlaybackStart(ticket)\n        setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)') &&
     orchestrator.includes('            activeEngine.play(rate)\n            awaitPlaybackStart(ticket)\n            setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)') &&
@@ -453,7 +453,7 @@ assert(
     section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('isAtSeekTarget(observed.positionMs, target, playedMs.toLong())') &&
     standardBackend.includes('override val rate: Float get() = player.playbackSpeed') &&
     // A play after the queue ended starts the current track from 0, as on iOS.
-    section(orchestrator, 'suspend fun play() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(').includes('if (state == AndroidPlaybackOrchestratorState.ENDED) {') &&
+    section(orchestrator, 'private suspend fun playFromStill() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(').includes('if (state == AndroidPlaybackOrchestratorState.ENDED) {') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aPlayAfterTheQueueEndedStartsTheLastTrackAgainFromTheStartAsOnIos()') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aNewerSeekASkipOrAnotherItemEndsTheOlderSeekAtOnce()') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntimePrimitivesTest.kt').includes('fun aStandardSeekThatReachesTheEndOfTheTrackCompletes()') &&
