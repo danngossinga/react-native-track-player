@@ -452,7 +452,7 @@ assert(
     vendoredBase.includes('val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)') &&
     musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())') &&
     standardHooks.includes('StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond })') &&
-    standardHooks.includes('builder.setTrackSelector(') &&
+    standardHooks.includes('configureExoPlayer = { builder ->\n            builder.setTrackSelector(\n                DefaultTrackSelector(') &&
     standardHooks.includes('httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('StartLowBandwidthMeter(bandwidthMeter, initialBitrateEstimateBps())') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelectionTest.kt').includes('fun everyTrackSelectionReadsTheCurrentSetting()') &&
