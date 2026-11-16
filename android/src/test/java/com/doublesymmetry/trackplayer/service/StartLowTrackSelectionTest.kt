@@ -184,14 +184,15 @@ class StartLowTrackSelectionTest {
 
     @Test
     fun theStandardMeterAndItsSelectionsShareOneUnmeasuredValue() {
-        var setting = 96_000L
+        // Not the default (96 kbps): a meter built from the default would not pass.
+        var setting = 64_000L
         val seen = mutableListOf<BandwidthMeter>()
         val startLow = StandardStartLow({ setting }, { bps -> FakeMeter(bps) }) { _, m, _, _ ->
             seen += m
             emptyArray()
         }
         // The meter is built with the setting as its unmeasured estimate.
-        assertEquals(96_000L, startLow.meter.bitrateEstimate)
+        assertEquals(64_000L, startLow.meter.bitrateEstimate)
         // updateOptions: the next track starts from the new value; the meter (not measured yet)
         // still reports the one it was built with.
         setting = 48_000L
@@ -214,6 +215,9 @@ class StartLowTrackSelectionTest {
         val holder = Any()
         val first = period(track, windowSequenceNumber = 1L, holder = holder)
         val second = period(track, windowSequenceNumber = 2L, holder = holder)
+        // Another item, played earlier in the queue: not retired by this item's replay.
+        val other = period(item(1), windowSequenceNumber = 0L)
+        loadCompleted(listener, other, C.DATA_TYPE_MEDIA)
         loadCompleted(listener, first, C.DATA_TYPE_MEDIA)
         loadCompleted(listener, second, C.DATA_TYPE_MEDIA)
         // Repeat-one: the second play began; the first one ended.
@@ -225,7 +229,8 @@ class StartLowTrackSelectionTest {
         )
         assertFalse(loads.hasMeasured(first))
         assertTrue(loads.hasMeasured(second))
-        assertEquals(1, loads.size)
+        assertTrue(loads.hasMeasured(other))
+        assertEquals(2, loads.size)
     }
 
     @Test

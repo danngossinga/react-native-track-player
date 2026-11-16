@@ -317,16 +317,17 @@ internal fun standardRestoreSteps(
 
 /**
  * Captures the standard player's ExoPlayer (ExoPlayer hands it to its analytics collector when
- * built), so a seek can read ExoPlayer's own state; KotlinAudio keeps its ExoPlayer private. The
- * player is held weakly: the service's map of these must not keep a released player alive.
+ * built), so a seek can read ExoPlayer's own state; KotlinAudio keeps its ExoPlayer private. It
+ * holds the player as DefaultAnalyticsCollector itself does (strongly, also after release):
+ * what bounds retention is MusicService dropping a disposed player's entry
+ * (`standardAnalytics.remove(disposed)`).
  */
 internal class StandardPlayerAnalytics(
     clock: com.google.android.exoplayer2.util.Clock = com.google.android.exoplayer2.util.Clock.DEFAULT
 ) : com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector(clock) {
     @Volatile
-    private var captured: java.lang.ref.WeakReference<com.google.android.exoplayer2.Player>? = null
-    val player: com.google.android.exoplayer2.Player?
-        get() = captured?.get()
+    var player: com.google.android.exoplayer2.Player? = null
+        private set
     val transitions = AutoTransitionCounter()
 
     init {
@@ -335,12 +336,7 @@ internal class StandardPlayerAnalytics(
 
     override fun setPlayer(player: com.google.android.exoplayer2.Player, looper: android.os.Looper) {
         super.setPlayer(player, looper)
-        captured = java.lang.ref.WeakReference(player)
-    }
-
-    override fun release() {
-        captured = null
-        super.release()
+        this.player = player
     }
 }
 

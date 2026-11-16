@@ -487,7 +487,7 @@ assert(
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('return if (hasMeasured && estimate != unmeasuredEstimateBps) estimate else initialEstimateBps') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('loads.retainPeriodsOf(eventTime.timeline)') &&
     standardHooks.includes('builder.setBandwidthMeter(startLow.meter)\n            builder.setTrackSelector(DefaultTrackSelector(this@MusicService, startLow.selectionFactory))\n            analytics.addListener(startLow.loadListener)\n            builder.setAnalyticsCollector(analytics)') &&
-    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('        super.setPlayer(player, looper)\n        captured = java.lang.ref.WeakReference(player)') &&
+    read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('        super.setPlayer(player, looper)\n        this.player = player') &&
     musicService.includes('                        standardAnalytics.remove(disposed)') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('hasOwnMeasurement = { loads.hasMeasured(mediaPeriodId) }') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('if (mediaLoadData.dataType != C.DATA_TYPE_MEDIA) return\n        eventTime.mediaPeriodId?.let(loads::mediaLoaded)') &&

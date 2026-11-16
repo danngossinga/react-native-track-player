@@ -5,6 +5,7 @@ import com.doublesymmetry.trackplayer.utils.RejectionException
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.async
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.currentTime
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -601,17 +602,35 @@ class PlaybackBackendRuntimePrimitivesTest {
 
     @Test
     fun aSeekWhilePlayingFastWithALatePollCompletes() = runTest {
-        // Ready 200 ms after the seek, then playing at 2x; the first poll after that lands
-        // 100 ms late: the position is 200 ms past the target, which playback explains.
+        // Ready 120 ms after the seek, then playing at 2x; the first poll after that lands at
+        // 200 ms (80 ms late): the position is 160 ms past the target, which playback explains.
         val player = MaskingPlayer { currentTime }.apply {
             readyAfterMs = 120L
             playWhenReady = true
             rate = 2f
         }
         val started = currentTime
-        // First poll after ready at 200 ms: 160 ms past the target (80 ms at 2x), more than one poll.
         gate(this).seek(player, 30_000L)
         assertEquals(200L, currentTime - started)
+    }
+
+    @Test
+    fun readyAndPausedIsReadyAndReadyAndPlayingIsPlaying() = runTest {
+        val player = MaskingPlayer { currentTime }
+        player.seekTo(30_000L)
+        advanceTimeBy(400L)
+        // Ready, not asked to play: paused at the target, the position does not move.
+        assertEquals(AudioPlayerState.READY, player.seekObservation().state)
+        player.playWhenReady = true
+        assertEquals(AudioPlayerState.PLAYING, player.seekObservation().state)
+    }
+
+    @Test
+    fun aKotlinAudioErrorFailsTheSeekEvenBeforeExoPlayerReportsIt() = runTest {
+        // KotlinAudio already reports the item's failure; ExoPlayer's state still reads ready.
+        val player = MaskingPlayer { currentTime }.apply { kotlinAudioState = AudioPlayerState.ERROR }
+        val failed = runCatching { gate(this).seek(player, 30_000L) }
+        assertEquals("standard_seek_unavailable", (failed.exceptionOrNull() as RejectionException).code)
     }
 
     @Test
@@ -659,8 +678,11 @@ class PlaybackBackendRuntimePrimitivesTest {
     fun aStandardRestoreLoadsAndSeeksAsOnIos() {
         fun steps(authoritative: Boolean = true, queueChanged: Boolean = false, current: Int = 1, position: Long = 10_000L, tolerance: Long = 750L) =
             standardRestoreSteps(authoritative, queueChanged, current, targetIndex = 1, positionMs = position, targetPositionMs = 10_000L, positionToleranceMs = tolerance)
-        // Same track, close enough: nothing.
+        // Same track, close enough: nothing; exactly at the tolerance still counts as restored
+        // (iOS: the same `>`).
         assertEquals(StandardRestoreSteps(jump = false, seek = false), steps(position = 10_500L))
+        assertEquals(StandardRestoreSteps(jump = false, seek = false), steps(position = 10_750L))
+        assertEquals(StandardRestoreSteps(jump = false, seek = true), steps(position = 10_751L))
         // Same track, further off than the setting: seek only.
         assertEquals(StandardRestoreSteps(jump = false, seek = true), steps(position = 10_500L, tolerance = 200L))
         // Another index, a changed queue or a candidate: load the track again and seek.
