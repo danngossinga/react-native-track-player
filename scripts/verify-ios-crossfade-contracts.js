@@ -273,6 +273,20 @@ assert(
     (enginePrepare.match(/guard !settled else \{ return \}/g) || []).length === 2 &&
     engineSeek.includes('seekWait = startWait(\n                totalTimeoutMs: prepareTimeoutMs(),') &&
     engineSeek.includes('if watched, completion != nil {') &&
+    engineSeek.includes('readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }') &&
+    section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
+    // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
+    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            completion(result)') &&
+    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            completion?(result)') &&
+    waitForPlaying.includes('if let playWait = playWait { self.endWait(playWait) }\n            playWait = nil\n            completion(result)') &&
+    startWait.includes('if let self = self, let driver = driver { self.endWait(driver) }\n            onGiveUp(verdict, watch)') &&
+    section(engine, 'private func endWait(_ driver: StallWaitDriver) {', '\n    }').includes('driver.cancel()\n        waits.removeAll { $0 === driver }') &&
+    section(engine, 'func reset() {', 'private func preroll(').includes('waits.forEach { $0.cancel() }\n        waits.removeAll()') &&
+    // Each play-start wait owns its observation; a reset ends them all.
+    waitForPlaying.includes('timeControlObservations.append(observed)') &&
+    waitForPlaying.includes('self.timeControlObservations.removeAll { $0 === observation }') &&
+    !engine.includes('timeControlObservation =') &&
+    section(engine, 'func reset() {', 'private func preroll(').includes('timeControlObservations.forEach { $0.invalidate() }') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('finish(.failure(NSError(') &&
     waitForPlaying.includes('playWait = startWait(\n            totalTimeoutMs: timeoutMs,') &&
     waitForPlaying.includes('return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]') &&

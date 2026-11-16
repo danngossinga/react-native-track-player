@@ -17,7 +17,6 @@ import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import com.google.android.exoplayer2.upstream.DefaultDataSource
-import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
 import kotlinx.coroutines.delay
 import timber.log.Timber
@@ -86,14 +85,19 @@ internal class AndroidCrossfadeEngine(
      * (`initialBitrateEstimateBps`), read at every load: adaptive streams start low (see
      * [crossfadeBandwidthMeter]), then follow the measured bandwidth.
      */
-    initialBitrateEstimateBps: () -> Long
+    initialBitrateEstimateBps: () -> Long,
+    /**
+     * The app's current `stallTimeoutMs`, read at every HTTP request: the connect and read
+     * timeouts follow it (see [CurrentTimeoutHttpDataSourceFactory]).
+     */
+    stallTimeoutMs: () -> Long
 ) : AndroidCrossfadeEnginePort {
     private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->
         crossfadeBandwidthMeter(context, estimate)
     }
     /** Bytes this player has downloaded: a load's progress, counted while a segment arrives. */
     private val bytesLoaded = AtomicLong(0L)
-    private val httpDataSourceFactory = DefaultHttpDataSource.Factory()
+    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)
     private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
         .setTransferListener(object : TransferListener {
             override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
@@ -172,7 +176,6 @@ internal class AndroidCrossfadeEngine(
         androidXfadeLog("$name prepare start trackKey=$trackKey positionMs=$positionMs")
         state = AndroidCrossfadeEngineState.LOADING
         configureRequestOptions(item)
-        applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)
         player.playWhenReady = false
         player.pause()
         player.stop()
@@ -275,8 +278,6 @@ internal class AndroidCrossfadeEngine(
         val generation = operationGeneration
         ticket?.ensureActive()
         val target = max(0L, positionMs)
-        // The segments a seek loads follow the current stall timeout too.
-        applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
         val verdict = awaitWhileProgressing(
@@ -308,9 +309,9 @@ internal class AndroidCrossfadeEngine(
 
     private fun configureRequestOptions(item: TrackAudioItem) {
         val options = item.options
-        httpDataSourceFactory.setDefaultRequestProperties(options?.headers ?: emptyMap())
-        options?.userAgent?.takeIf { it.isNotBlank() }?.let {
-            httpDataSourceFactory.setUserAgent(it)
+        httpDataSourceFactory.configure {
+            setDefaultRequestProperties(options?.headers ?: emptyMap())
+            options?.userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }
         }
     }
 
@@ -333,18 +334,6 @@ internal class AndroidCrossfadeEngine(
             ?: item.audioUrl
     }
 
-}
-
-/**
- * Makes a crossfade player's HTTP connect and read timeouts follow `stallTimeoutMs`, instead of
- * ExoPlayer's fixed 8 s: a socket that delivers nothing for that long is the same stall the waits
- * give up on, and a slow but alive read is not cut sooner. Applied at every load and seek; the
- * factory gives the values to every data source it creates afterwards. Returns the value used.
- */
-internal fun applyHttpTimeouts(factory: DefaultHttpDataSource.Factory, stallTimeoutMs: Long): Int {
-    val timeoutMs = stallTimeoutMs.coerceIn(1L, Int.MAX_VALUE.toLong()).toInt()
-    factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs)
-    return timeoutMs
 }
 
 /** How often an engine's load or seek wait reads its progress (a poll interval, not a limit). */
@@ -409,20 +398,33 @@ internal fun timeoutOptionFrom(value: Any?): Long? {
 internal const val PREPARE_TIMEOUT_KEY = "prepareTimeoutMs"
 
 /**
- * One of the app's timeouts (or another whole-number option with the same bounds, such as
- * `initialBitrateEstimateBps`): one value, kept until a valid new one comes (main thread only).
+ * A whole-number option from 1 to 2147483646 (setup or update options): one value, kept until a
+ * valid new one comes. Written on the main thread; read there and by the players' loading threads
+ * (HTTP timeouts), so it is volatile.
  */
-internal class TimeoutSetting(defaultMs: Long) {
-    var milliseconds: Long = defaultMs
+internal open class WholeNumberSetting(defaultValue: Long) {
+    @Volatile
+    var value: Long = defaultValue
         private set
 
     /**
      * Takes a valid value (the option's raw value). Returns false when the value is ignored and
      * the current one kept.
      */
-    fun apply(value: Any?): Boolean {
-        val timeout = timeoutOptionFrom(value) ?: return false
-        milliseconds = timeout
+    fun apply(raw: Any?): Boolean {
+        value = timeoutOptionFrom(raw) ?: return false
         return true
     }
+}
+
+/** One of the app's timeouts, in milliseconds. */
+internal class TimeoutSetting(defaultMs: Long) : WholeNumberSetting(defaultMs) {
+    val milliseconds: Long
+        get() = value
+}
+
+/** A bandwidth in bits per second (`initialBitrateEstimateBps`). */
+internal class BitrateSetting(defaultBps: Long) : WholeNumberSetting(defaultBps) {
+    val bitsPerSecond: Long
+        get() = value
 }

@@ -83,12 +83,12 @@ class PrepareTimeoutOptionTest {
     fun theInitialBitrateEstimateIsASetupOptionWithALowDefault() {
         assertEquals("initialBitrateEstimateBps", INITIAL_BITRATE_ESTIMATE_KEY)
         assertEquals(96_000L, DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
-        val setting = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
+        val setting = BitrateSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
         assertFalse(setting.apply(-1.0))
         assertFalse(setting.apply("128000"))
-        assertEquals(96_000L, setting.milliseconds)
+        assertEquals(96_000L, setting.bitsPerSecond)
         assertTrue(setting.apply(64_000))
-        assertEquals(64_000L, setting.milliseconds)
+        assertEquals(64_000L, setting.bitsPerSecond)
     }
 
     @Test

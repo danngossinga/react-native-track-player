@@ -87,7 +87,8 @@ final class IOSCrossfadeEngine {
     private let player = AVPlayer()
     private var pendingAsset: AVURLAsset?
     private var itemStatusObservation: NSKeyValueObservation?
-    private var timeControlObservation: NSKeyValueObservation?
+    /// The play-start waits' observations: each wait owns one, a reset ends them all.
+    private var timeControlObservations: [NSKeyValueObservation] = []
     /// The waits running on this engine; each wait owns its driver, a reset cancels them all.
     private var waits: [StallWaitDriver] = []
     private var generation = 0
@@ -294,6 +295,9 @@ final class IOSCrossfadeEngine {
                 let reason = Self.describe(verdict, watch)
                 IOSPlaybackLog.log("\(self.name) seek timeout \(reason)")
                 item?.cancelPendingSeeks()
+                // The player goes to an error state: audio must not resume by itself when the
+                // data arrives later, as after a failed play start.
+                self.player.pause()
                 self.state = .failed
                 finish(.failure(NSError(
                     domain: "RNTP-Crossfade",
@@ -355,8 +359,8 @@ final class IOSCrossfadeEngine {
         generation += 1
         itemStatusObservation?.invalidate()
         itemStatusObservation = nil
-        timeControlObservation?.invalidate()
-        timeControlObservation = nil
+        timeControlObservations.forEach { $0.invalidate() }
+        timeControlObservations.removeAll()
         waits.forEach { $0.cancel() }
         waits.removeAll()
         pendingAsset?.cancelLoading()
@@ -426,12 +430,17 @@ final class IOSCrossfadeEngine {
     ) {
         var didComplete = false
         var playWait: StallWaitDriver?
+        // Weak: the engine's list owns the observation, so a reset frees it with its block.
+        weak var observation: NSKeyValueObservation?
 
         func finish(_ result: Result<Void, Error>) {
             guard !didComplete else { return }
             didComplete = true
-            self.timeControlObservation?.invalidate()
-            self.timeControlObservation = nil
+            if let observation = observation {
+                observation.invalidate()
+                self.timeControlObservations.removeAll { $0 === observation }
+            }
+            observation = nil
             if let playWait = playWait { self.endWait(playWait) }
             playWait = nil
             completion(result)
@@ -443,7 +452,8 @@ final class IOSCrossfadeEngine {
             return
         }
 
-        timeControlObservation = player.observe(\.timeControlStatus, options: [.new]) { [weak self] observedPlayer, _ in
+        // Its own observation: a second play does not orphan this wait's.
+        let observed = player.observe(\.timeControlStatus, options: [.new]) { [weak self] observedPlayer, _ in
             DispatchQueue.main.async {
                 guard let self = self, self.generation == generation else { return }
                 if observedPlayer.timeControlStatus == .playing {
@@ -453,6 +463,8 @@ final class IOSCrossfadeEngine {
                 }
             }
         }
+        timeControlObservations.append(observed)
+        observation = observed
 
         // Waiting to play while media keeps loading (or time advancing) is progress.
         playWait = startWait(

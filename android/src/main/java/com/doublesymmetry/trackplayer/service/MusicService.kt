@@ -83,7 +83,7 @@ class MusicService : HeadlessJsTaskService() {
     /** How long a crossfade waits for the incoming track to move (`incomingStallGraceMs`), read at every fade step. */
     private val incomingStallGrace = TimeoutSetting(DEFAULT_INCOMING_STALL_GRACE_MS)
     /** The bandwidth each crossfade track starts from (`initialBitrateEstimateBps`), read at every track. */
-    private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
+    private val initialBitrateEstimate = BitrateSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)
     private var latestNotificationConfig: NotificationConfig? = null
     private var latestOrchestratedMediaSurfaceConfig: AndroidOrchestratedMediaSurfaceConfig? = null
     private var automaticallyUpdateNotificationMetadata = true
@@ -288,7 +288,8 @@ class MusicService : HeadlessJsTaskService() {
             audioContentType = orchestratorAudioContentType,
             handleAudioFocus = orchestratorHandlesAudioFocus,
             // Read at every track: a later updateOptions applies to the next track.
-            initialBitrateEstimateBps = { initialBitrateEstimate.milliseconds },
+            initialBitrateEstimateBps = { initialBitrateEstimate.bitsPerSecond },
+            requestStallTimeoutMs = { stallTimeout.milliseconds },
             delegate = object : AndroidPlaybackOrchestratorDelegate {
                 override fun onPlaybackStateChanged(state: AudioPlayerState) {
                     if (!isAuthoritative()) return
@@ -615,12 +616,12 @@ class MusicService : HeadlessJsTaskService() {
         applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)
     }
 
-    private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting) {
+    private fun applyTimeout(options: Bundle?, key: String, setting: WholeNumberSetting) {
         val value = if (options?.containsKey(key) == true) options.get(key) else return
         if (setting.apply(value)) {
-            androidXfadeLog("$key set to ${setting.milliseconds}")
+            androidXfadeLog("$key set to ${setting.value}")
         } else {
-            androidXfadeLog("$key ignored value=$value kept=${setting.milliseconds}")
+            androidXfadeLog("$key ignored value=$value kept=${setting.value}")
         }
     }
 

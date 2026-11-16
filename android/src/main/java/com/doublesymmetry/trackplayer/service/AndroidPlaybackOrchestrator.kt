@@ -111,12 +111,14 @@ internal class AndroidPlaybackOrchestrator private constructor(
         audioContentType: Int,
         handleAudioFocus: Boolean,
         initialBitrateEstimateBps: () -> Long,
+        /** The app's current `stallTimeoutMs`, read by the engines at every HTTP request. */
+        requestStallTimeoutMs: () -> Long,
         delegate: AndroidPlaybackOrchestratorDelegate
     ) : this(
         scope,
         delegate,
-        AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps),
-        AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)
+        AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs),
+        AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)
     )
 
     private var activeEngine = engineA

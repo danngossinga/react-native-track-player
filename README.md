@@ -67,8 +67,8 @@ Added fork surface:
   seek) fails when it makes no progress (no new media downloaded or buffered) for
   this long. A slow load that keeps progressing goes on, up to the wait's own total
   limit below. On Android the crossfade players' HTTP connect and read timeouts
-  follow it too, instead of ExoPlayer's fixed 8 s (the standard KotlinAudio
-  player keeps 8 s). A new value applies to the next wait at once. Left out, the current
+  follow it too, from the next request on every track, instead of ExoPlayer's
+  fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
 - The total limits, safety caps behind the stall timeout, with the same rules:

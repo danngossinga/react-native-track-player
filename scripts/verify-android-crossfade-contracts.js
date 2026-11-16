@@ -313,10 +313,10 @@ assert(
     perTrackMeter.includes('override fun getTransferListener(): TransferListener = this') &&
     read('android/src/androidTest/java/com/doublesymmetry/trackplayer/service/CrossfadeBandwidthMeterInstrumentationTest.kt').includes('crossfadeBandwidthMeter(context, estimate).bitrateEstimate') &&
     orchestrator.includes('initialBitrateEstimateBps: () -> Long,') &&
-    orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
-    orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps)') &&
-    musicService.includes('private val initialBitrateEstimate = TimeoutSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)') &&
-    musicService.includes('initialBitrateEstimateBps = { initialBitrateEstimate.milliseconds },') &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)') &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)') &&
+    musicService.includes('private val initialBitrateEstimate = BitrateSetting(DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS)') &&
+    musicService.includes('initialBitrateEstimateBps = { initialBitrateEstimate.bitsPerSecond },') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, INITIAL_BITRATE_ESTIMATE_KEY, initialBitrateEstimate)'),
   'Android crossfade tracks must each start from the current initialBitrateEstimateBps (setupPlayer and updateOptions).'
 );
@@ -337,8 +337,8 @@ assert(
     applyTimeoutSection.includes('applyTimeout(options, STALL_TIMEOUT_KEY, stallTimeout)') &&
     musicService.includes('private val stallTimeout = TimeoutSetting(DEFAULT_STALL_TIMEOUT_MS)') &&
     musicService.includes('created.stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('setting.apply(value)') &&
-    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: TimeoutSetting)', '@MainThread').includes('if (options?.containsKey(key) == true) options.get(key) else return'),
+    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: WholeNumberSetting)', '@MainThread').includes('setting.apply(value)') &&
+    section(musicService, 'private fun applyTimeout(options: Bundle?, key: String, setting: WholeNumberSetting)', '@MainThread').includes('if (options?.containsKey(key) == true) options.get(key) else return'),
   'Android prepareTimeoutMs must be taken at setup (before the early return) and on updateOptions, and read by every orchestrator.'
 );
 
@@ -395,14 +395,24 @@ assert(
   'PerTrackBandwidthMeter must track a transfer from its start to its end only.'
 );
 
-// The crossfade players' HTTP connect/read timeouts follow stallTimeoutMs at every load and seek.
+// The crossfade players' HTTP connect/read timeouts follow the current stallTimeoutMs at every
+// request: each request builds its DefaultHttpDataSource at open() with the value read then.
+const perRequestHttp = read('android/src/main/java/com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt');
+const perRequestOpen = section(perRequestHttp, 'override fun open(dataSpec: DataSpec): Long {', 'override fun read(');
 assert(
-  enginePrepare.includes('applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)') &&
-    engineSeek.includes('applyHttpTimeouts(httpDataSourceFactory, stallTimeoutMs)') &&
-    section(engineSource, 'internal fun applyHttpTimeouts(', '\n}').includes('factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs)') &&
-    !/set(Connect|Read)TimeoutMs\(\d/.test(engineSource) &&
-    read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun theDataSourcesOfACrossfadePlayerFollowTheCurrentStallTimeout()'),
-  'Android crossfade HTTP timeouts must follow stallTimeoutMs.'
+  engineSource.includes('private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)') &&
+    engineSource.includes('DefaultDataSource.Factory(context, httpDataSourceFactory)') &&
+    perRequestOpen.includes('val source = openRequestSource()') &&
+    perRequestOpen.indexOf('listeners.forEach(source::addTransferListener)') < perRequestOpen.indexOf('return source.open(dataSpec)') &&
+    section(perRequestHttp, 'private fun openRequestSource(): DataSource {', 'private inner class').includes('val timeoutMs = httpTimeoutMs(stallTimeoutMs())') &&
+    perRequestHttp.includes('factory.setConnectTimeoutMs(timeoutMs).setReadTimeoutMs(timeoutMs).createDataSource()') &&
+    perRequestHttp.includes('override fun createDataSource(): DataSource = PerRequestSource()') &&
+    !/set(Connect|Read)TimeoutMs\(\d/.test(engineSource + perRequestHttp) &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineA", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)') &&
+    orchestrator.includes('AndroidCrossfadeEngine(context, "engineB", audioContentType, handleAudioFocus, initialBitrateEstimateBps, requestStallTimeoutMs)') &&
+    musicService.includes('requestStallTimeoutMs = { stallTimeout.milliseconds },') &&
+    read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun aSourceCreatedBeforeAnOptionsChangeOpensWithTheNewTimeout()'),
+  'Android crossfade HTTP timeouts must follow the current stallTimeoutMs at every request.'
 );
 
 console.log('Android crossfade contracts OK');
