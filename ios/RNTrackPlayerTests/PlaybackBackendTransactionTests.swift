@@ -298,6 +298,55 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertFalse(crossfadeIncomingStalled(elapsedMs: 5_000, graceMs: 500, incomingTime: 10.3, incomingStartTime: 10))
     }
 
+    // The interruption policy, run on the scenarios the Android tests run too.
+
+    func testInterruptionPolicyFollowsTheSharedScenarios() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts/fixtures/interruption-scenarios.json")
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
+        XCTAssertEqual(scenarios.count, 8)
+        for scenario in scenarios {
+            let id = scenario["id"] as? String ?? "?"
+            let autoResume = scenario["autoResume"] as? Bool ?? false
+            var playing = scenario["playing"] as? Bool ?? false
+            let policy = InterruptionPolicy(autoResume: { autoResume })
+            for step in try XCTUnwrap(scenario["steps"] as? [[String: Any]]) {
+                let event = step["event"] as? String ?? ""
+                let result: (InterruptionAction, RemoteDuckPayload?)
+                switch event {
+                case "began": result = policy.began(isPlaying: playing)
+                case "ended": result = policy.ended(shouldResume: step["shouldResume"] as? Bool ?? false)
+                case "lostPermanently": result = policy.lostPermanently(isPlaying: playing)
+                case "noisy": result = policy.noisy(isPlaying: playing)
+                case "userPause": policy.userCommand(); playing = false; result = (.none, nil)
+                case "userPlay": policy.userCommand(); playing = true; result = (.none, nil)
+                default: XCTFail("unknown event \(event) in \(id)"); continue
+                }
+                let expectedAction: InterruptionAction
+                switch step["action"] as? String {
+                case "pause": expectedAction = .pause
+                case "resume": expectedAction = .resume
+                default: expectedAction = .none
+                }
+                XCTAssertEqual(result.0, expectedAction, "\(id) \(event)")
+                let duck = step["duck"] as? [String: Bool]
+                XCTAssertEqual(result.1, duck.map { RemoteDuckPayload(paused: $0["paused"] ?? false, permanent: $0["permanent"] ?? false) }, "\(id) \(event)")
+                if result.0 == .pause { playing = false }
+                if result.0 == .resume { playing = true }
+            }
+        }
+    }
+
+    func testInterruptionPolicyReadsTheOptionAtTheEnd() {
+        var autoResume = false
+        let policy = InterruptionPolicy(autoResume: { autoResume })
+        _ = policy.began(isPlaying: true)
+        autoResume = true
+        XCTAssertEqual(policy.ended(shouldResume: true).0, .resume)
+    }
+
     private let snapshot = PlaybackBackendSnapshot(
         queueIDs: ["first", "second"],
         activeIndex: 1,

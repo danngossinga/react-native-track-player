@@ -74,6 +74,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     private var progressUpdateInterval: Double = 0
     private var orchestratedProgressWorkItem: DispatchWorkItem? = nil
     private var shouldResumePlaybackAfterInterruptionEnds: Bool = false
+    /// Calls, other apps' audio and headphones, the same rule for both backends (DJE-204/205/206).
+    private lazy var interruptionPolicy = InterruptionPolicy(autoResume: { [weak self] in
+        self?.shouldResumePlaybackAfterInterruptionEnds ?? false
+    })
     private var crossfadeEnabled: Bool = false
     private var autoUpdateNowPlayingInfo: Bool = true
     private var forwardJumpInterval: NSNumber? = nil;
@@ -258,6 +262,35 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     @objc private func handleAudioSessionRouteChange(notification: Notification) {
         checkpointOrchestratorForSystemEvent("audioRouteChange")
+        let rawReason = notification.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt
+        guard rawReason.flatMap(AVAudioSession.RouteChangeReason.init(rawValue:)) == .oldDeviceUnavailable else { return }
+        // Headphones unplugged: the system stops the audio; both backends pause so their state
+        // (and JS) says paused, and nothing resumes by itself.
+        applyInterruption { policy, isPlaying in policy.noisy(isPlaying: isPlaying) }
+    }
+
+    /// Runs one interruption event through the policy on the active backend: reads whether it
+    /// plays, then pauses or resumes it, and emits the `remote-duck` payload.
+    private func applyInterruption(
+        _ decide: @escaping (InterruptionPolicy, Bool) -> (InterruptionAction, RemoteDuckPayload?)
+    ) {
+        guard hasInitialized, playbackBackendFacade != nil else { return }
+        withActivePlaybackBackendSerialized({ backend -> RemoteDuckPayload? in
+            let (action, duck) = decide(self.interruptionPolicy, backend.publicPlayWhenReady)
+            IOSPlaybackLog.log("interruption action=\(action) backend=\(backend.kind)")
+            switch action {
+            case .pause: backend.pause()
+            case .resume: try backend.play()
+            case .none: break
+            }
+            return duck
+        }) { [weak self] result in
+            guard case .success(let duck?) = result else { return }
+            self?.emit(event: EventType.RemoteDuck, body: [
+                "paused": duck.paused,
+                "permanent": duck.permanent
+            ])
+        }
     }
 
     @objc private func handleAudioSessionMediaServicesWereReset() {
@@ -334,26 +367,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public func handleInterruption(type: InterruptionType) {
         switch type {
         case .began:
-            // Interruption began, take appropriate actions (save state, update user interface)
-            emit(event: EventType.RemoteDuck, body: [
-                "paused": true
-            ])
+            // A call or another app took the audio: pause both backends (JS sees paused).
+            applyInterruption { policy, isPlaying in policy.began(isPlaying: isPlaying) }
         case let .ended(shouldResume):
-            if shouldResume {
-                if (shouldResumePlaybackAfterInterruptionEnds) {
-                    withActivePlaybackBackendSerialized({ try $0.play() }) { _ in }
-                }
-                // Interruption Ended - playback should resume
-                emit(event: EventType.RemoteDuck, body: [
-                    "paused": false
-                ])
-            } else {
-                // Interruption Ended - playback should NOT resume
-                emit(event: EventType.RemoteDuck, body: [
-                    "paused": true,
-                    "permanent": true
-                ])
-            }
+            // Resume only if the system allows it, autoHandleInterruptions is on and the user did
+            // not pause or play meanwhile.
+            applyInterruption { policy, _ in policy.ended(shouldResume: shouldResume) }
         }
     }
 
@@ -1368,6 +1387,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(play:rejecter:)
     public func play(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        interruptionPolicy.userCommand()
         withActivePlaybackBackendAsync({ backend, completion in
             backend.syncQueue(self.playerTracks())
             if backend.kind == .pingPong {
@@ -1387,6 +1407,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(pause:rejecter:)
     public func pause(resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        interruptionPolicy.userCommand()
 
         withActivePlaybackBackendSerialized({ $0.pause() }) { result in
             switch result {
@@ -1399,6 +1420,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     @objc(setPlayWhenReady:resolver:rejecter:)
     public func setPlayWhenReady(playWhenReady: Bool, resolve: @escaping RCTPromiseResolveBlock, reject: @escaping RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
+        interruptionPolicy.userCommand()
         withActivePlaybackBackendAsync({ backend, completion in
             backend.setPlayWhenReady(playWhenReady, completion: completion)
         }) { result in

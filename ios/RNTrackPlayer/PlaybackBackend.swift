@@ -134,6 +134,63 @@ final class TimeoutSetting {
     }
 }
 
+/// What the player does on an interruption event (DJE-204/205/206; Android has the same policy).
+enum InterruptionAction: Equatable {
+    case none
+    case pause
+    case resume
+}
+
+/// The `remote-duck` event for an interruption event: `paused` while the audio is taken away,
+/// `permanent` when it will not be given back (same meaning on iOS and Android).
+struct RemoteDuckPayload: Equatable {
+    let paused: Bool
+    let permanent: Bool
+}
+
+/// The owner's rule for calls, audio focus and headphones: pause when the audio is taken away;
+/// when it is given back, resume only if the system allows it, `autoHandleInterruptions` is on,
+/// playback was playing when it was taken and the user did not pause or play since. A permanent
+/// loss or headphones unplugged pause with no resume. A can-duck loss is treated as a transient
+/// loss: pause, then resume (the platforms differ on ducking, so both pause).
+final class InterruptionPolicy {
+    /// `autoHandleInterruptions`, read at every interruption end.
+    var autoResume: () -> Bool
+    private var resumeOnEnd = false
+
+    init(autoResume: @escaping () -> Bool) {
+        self.autoResume = autoResume
+    }
+
+    func began(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
+        resumeOnEnd = isPlaying
+        return (isPlaying ? .pause : .none, RemoteDuckPayload(paused: true, permanent: false))
+    }
+
+    func ended(shouldResume: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
+        let resume = shouldResume && resumeOnEnd && autoResume()
+        resumeOnEnd = false
+        return (resume ? .resume : .none, RemoteDuckPayload(paused: !shouldResume, permanent: !shouldResume))
+    }
+
+    func lostPermanently(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
+        resumeOnEnd = false
+        return (isPlaying ? .pause : .none, RemoteDuckPayload(paused: true, permanent: true))
+    }
+
+    /// Headphones unplugged (`oldDeviceUnavailable` / becoming noisy).
+    func noisy(isPlaying: Bool) -> (InterruptionAction, RemoteDuckPayload?) {
+        resumeOnEnd = false
+        return (isPlaying ? .pause : .none, nil)
+    }
+
+    /// A play or pause from the user (app or remote control): an interruption's end no longer
+    /// resumes.
+    func userCommand() {
+        resumeOnEnd = false
+    }
+}
+
 /// Drives one wait on a callback queue: every `intervalMs` it reads the progress and asks its
 /// `StallWatch`; it reschedules itself while the verdict is `.wait` and calls `onGiveUp` once
 /// otherwise. `readings` returning nil means the wait has no progress signal yet (an asset not

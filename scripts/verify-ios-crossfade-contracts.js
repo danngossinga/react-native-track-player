@@ -435,4 +435,24 @@ assert(
   'iOS play-start, standard readiness and standard seek waits must read the app\'s settings, not fixed numbers.'
 );
 
+// Calls, other apps' audio and headphones: one policy for both backends (DJE-204/205/206).
+const interruptionSection = section(player, 'public func handleInterruption(type: InterruptionType) {', '// MARK: - Bridged Methods');
+const applyInterruption = section(player, 'private func applyInterruption(', 'private func checkpointOrchestratorForSystemEvent(');
+assert(
+  facade.includes('final class InterruptionPolicy {') &&
+    interruptionSection.includes('applyInterruption { policy, isPlaying in policy.began(isPlaying: isPlaying) }') &&
+    interruptionSection.includes('applyInterruption { policy, _ in policy.ended(shouldResume: shouldResume) }') &&
+    section(player, '@objc private func handleAudioSessionRouteChange(', 'private func applyInterruption(').includes('== .oldDeviceUnavailable else { return }') &&
+    section(player, '@objc private func handleAudioSessionRouteChange(', 'private func applyInterruption(').includes('applyInterruption { policy, isPlaying in policy.noisy(isPlaying: isPlaying) }') &&
+    applyInterruption.includes('decide(self.interruptionPolicy, backend.publicPlayWhenReady)') &&
+    applyInterruption.includes('case .pause: backend.pause()') &&
+    applyInterruption.includes('case .resume: try backend.play()') &&
+    applyInterruption.includes('"permanent": duck.permanent') &&
+    player.includes('self?.shouldResumePlaybackAfterInterruptionEnds ?? false') &&
+    ['public func play(resolve:', 'public func pause(resolve:', 'public func setPlayWhenReady(playWhenReady:'].every((start) =>
+      player.slice(player.indexOf(start), player.indexOf(start) + 400).includes('interruptionPolicy.userCommand()')) &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('scripts/fixtures/interruption-scenarios.json'),
+  'iOS interruptions and unplugging must go through InterruptionPolicy on both backends.'
+);
+
 console.log('iOS crossfade contracts OK');

@@ -1,0 +1,71 @@
+{
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (InterruptionPolicy). Events: began (call or transient focus loss, can-duck included), ended (with shouldResume), lostPermanently, noisy (headphones unplugged / route oldDeviceUnavailable), userPause, userPlay. Each step gives the expected action (pause, resume or none) and the remote-duck payload (null when none is emitted).",
+  "scenarios": [
+    {
+      "id": "FOCUS-01a call or focus loss then end with resume: pause then resume",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "resume", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-01b the option off: pause, no resume",
+      "autoResume": false, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-01c the user paused during the interruption: stays paused",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "userPause", "action": "none", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-01d the user had paused before: stays paused",
+      "autoResume": true, "playing": false,
+      "steps": [
+        { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-01e the system does not allow resuming: stays paused",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": false, "action": "none", "duck": { "paused": true, "permanent": true } }
+      ]
+    },
+    {
+      "id": "FOCUS-01f permanent loss: pause, no resume",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "lostPermanently", "action": "pause", "duck": { "paused": true, "permanent": true } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-02 headphones unplugged: pause, no resume",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "noisy", "action": "pause", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-02b unplugged during an interruption: no resume after it",
+      "autoResume": true, "playing": true,
+      "steps": [
+        { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
+        { "event": "noisy", "action": "none", "duck": null },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    }
+  ]
+}
