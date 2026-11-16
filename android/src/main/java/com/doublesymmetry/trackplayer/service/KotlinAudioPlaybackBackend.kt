@@ -353,7 +353,8 @@ internal class KotlinAudioPlaybackBackend(
                 positionMs = player.position,
                 bufferedPositionMs = player.bufferedPosition,
                 durationMs = player.duration.coerceAtLeast(0L),
-                item = player.currentItem
+                item = player.currentItem,
+                rate = player.playbackSpeed
             )
         }
     }
@@ -464,10 +465,8 @@ internal class KotlinAudioPlaybackBackend(
         seekGate.cancel("skip")
         player.previous()
     }
-    override suspend fun seekBy(offsetMs: Long) {
-        seekGate.cancel("seek_by")
-        player.seekBy(offsetMs, TimeUnit.MILLISECONDS)
-    }
+    // A waited seek with the same limits, as on iOS (it ends a seek in progress, as any seek).
+    override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, player.position + offsetMs))
     override suspend fun retry() {
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()

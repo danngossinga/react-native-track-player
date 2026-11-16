@@ -50,20 +50,27 @@ internal class InterruptionCoordinator(
 
     /**
      * Applies one decision to the active backend: pauses it, or requests the focus and resumes
-     * it. Returns the `remote-duck` payload, also when the resume fails (the gain still happened).
+     * it. [emit] gets the `remote-duck` payload once the pause is done, or before the resumed play
+     * is awaited (as on iOS, where play does not wait), so also when the resume fails.
      */
     suspend fun applyTo(
-        isPlaying: Boolean,
+        playWhenReady: Boolean,
+        state: com.doublesymmetry.kotlinaudio.models.AudioPlayerState,
         decide: (Boolean) -> InterruptionDecision?,
         pause: suspend () -> Unit,
         play: suspend () -> Unit,
+        emit: (RemoteDuckPayload) -> Unit,
         onResumeFailed: (Throwable) -> Unit = {}
     ): InterruptionDecision? {
-        val decision = decide(isPlaying) ?: return null
+        val decision = decide(interruptionCountsAsPlaying(playWhenReady, state)) ?: return null
         when (decision.action) {
-            InterruptionAction.PAUSE -> pause()
+            InterruptionAction.PAUSE -> {
+                pause()
+                decision.duck?.let(emit)
+            }
             InterruptionAction.RESUME -> {
                 focus.requestIfNeeded()
+                decision.duck?.let(emit)
                 try {
                     play()
                 } catch (error: Exception) {
@@ -71,7 +78,7 @@ internal class InterruptionCoordinator(
                     onResumeFailed(error)
                 }
             }
-            InterruptionAction.NONE -> Unit
+            InterruptionAction.NONE -> decision.duck?.let(emit)
         }
         return decision
     }

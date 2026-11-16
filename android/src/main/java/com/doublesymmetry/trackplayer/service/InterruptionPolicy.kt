@@ -1,6 +1,20 @@
 package com.doublesymmetry.trackplayer.service
 
 import android.media.AudioManager
+import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
+
+/**
+ * Whether a backend plays as far as an interruption is concerned, the same rule on all four
+ * backends (iOS: `interruptionCountsAsPlaying`): it was asked to play and has an active track
+ * that has not ended, failed or stopped. After the queue ended, an interruption neither pauses
+ * nor resumes.
+ */
+internal fun interruptionCountsAsPlaying(playWhenReady: Boolean, state: AudioPlayerState): Boolean =
+    playWhenReady && state !in INTERRUPTION_FINISHED_STATES
+
+internal val INTERRUPTION_FINISHED_STATES = setOf(
+    AudioPlayerState.IDLE, AudioPlayerState.ENDED, AudioPlayerState.ERROR, AudioPlayerState.STOPPED
+)
 
 /** What the player does on an interruption event (DJE-204/205/206; iOS has the same policy). */
 internal enum class InterruptionAction { NONE, PAUSE, RESUME }

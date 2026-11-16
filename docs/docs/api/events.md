@@ -184,17 +184,21 @@ Fired when the user presses the bookmark button in the now playing center. Only 
 
 ### `RemoteDuck`
 Fired when the audio is interrupted and when the interruption ends. For example
-when a phone call arrives, a clock or calendar sounds, another app starts
-playing audio (Android audio focus, a can-duck loss included), or the
-headphones are unplugged.
+when a phone call arrives, a clock or calendar sounds, or another app starts
+playing audio (Android audio focus, a can-duck loss included). Unplugged
+headphones pause playback (JS sees `paused`) without this event, on both
+platforms.
 
 The player handles interruptions itself, the same on iOS and Android and on
 both backends: it pauses when the audio is taken away (JS sees `paused`), and
 the app does not need to pause it. With `autoHandleInterruptions: true` in
 `TrackPlayer.setupPlayer`, it also resumes by itself when the interruption
-ends, if the system allows it, playback was playing when it began and the user
-did not play, pause or stop since. A permanent loss or unplugged headphones
-never resume. With `autoHandleInterruptions: false` (default), the app may
+ends, if the system allows it, playback was playing when it began (asked to
+play, with an active track that has not ended, failed or stopped: after the
+queue ended an interruption neither pauses nor resumes) and the user did not
+play, pause or stop since. A permanent loss or unplugged headphones never
+resume. A refused audio focus request (Android) or audio session activation
+(iOS) does not stop playback from starting, on both platforms. With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

@@ -1,6 +1,7 @@
 package com.doublesymmetry.trackplayer.service
 
 import android.media.AudioManager
+import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -41,20 +42,23 @@ class InterruptionPolicyTest {
     @Test
     fun followsTheSharedScenarios() {
         val all = scenarios()
-        assertEquals(11, all.size)
+        assertEquals(12, all.size)
         for (scenario in all) {
             val id = scenario["id"] as String
             val autoResume = scenario["autoResume"] as Boolean
             var playing = scenario["playing"] as Boolean
+            // The backend's state: an ended queue does not count as playing (same rule as iOS).
+            val state = AudioPlayerState.valueOf(((scenario["state"] as String?) ?: "playing").uppercase())
+            fun isPlaying() = interruptionCountsAsPlaying(playing, state)
             val policy = InterruptionPolicy { autoResume }
             @Suppress("UNCHECKED_CAST")
             for (step in scenario["steps"] as List<Map<String, Any?>>) {
                 val event = step["event"] as String
                 val decision = when (event) {
-                    "began" -> policy.began(playing)
+                    "began" -> policy.began(isPlaying())
                     "ended" -> policy.ended(step["shouldResume"] as Boolean)
-                    "lostPermanently" -> policy.lostPermanently(playing)
-                    "noisy" -> policy.noisy(playing)
+                    "lostPermanently" -> policy.lostPermanently(isPlaying())
+                    "noisy" -> policy.noisy(isPlaying())
                     "userPause" -> { policy.userCommand(); playing = false; InterruptionDecision(InterruptionAction.NONE, null) }
                     "userPlay" -> { policy.userCommand(); playing = true; InterruptionDecision(InterruptionAction.NONE, null) }
                     else -> error("unknown event $event in $id")
@@ -95,5 +99,18 @@ class InterruptionPolicyTest {
         policy.began(isPlaying = true)
         autoResume = true
         assertEquals(InterruptionAction.RESUME, policy.ended(shouldResume = true).action)
+    }
+
+    @Test
+    fun onlyAnActiveTrackThatWasAskedToPlayCountsAsPlaying() {
+        val playingStates = AudioPlayerState.values().filter { it !in INTERRUPTION_FINISHED_STATES }
+        assertEquals(
+            setOf(AudioPlayerState.IDLE, AudioPlayerState.ENDED, AudioPlayerState.ERROR, AudioPlayerState.STOPPED),
+            INTERRUPTION_FINISHED_STATES
+        )
+        for (state in AudioPlayerState.values()) {
+            assertEquals("$state", state in playingStates, interruptionCountsAsPlaying(true, state))
+            assertEquals("$state", false, interruptionCountsAsPlaying(false, state))
+        }
     }
 }

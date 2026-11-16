@@ -471,6 +471,22 @@ final class IOSCrossfadeEngine {
             totalTimeoutMs: timeoutMs,
             readings: { [weak self] in
                 guard let self = self else { return nil }
+                // The player failed: give up at once, with Android's code for it.
+                if let failure = self.player.currentItem?.error ?? self.player.error,
+                   self.player.currentItem?.status == .failed || self.player.status == .failed {
+                    DispatchQueue.main.async {
+                        guard self.generation == generation, !didComplete else { return }
+                        self.state = .failed
+                        finish(.failure(NSError(
+                            domain: "RNTP-Crossfade",
+                            code: 7,
+                            userInfo: [
+                                NSLocalizedDescriptionKey: failure.localizedDescription,
+                                "code": "crossfade_engine_error"
+                            ]
+                        )))
+                    }
+                }
                 return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]
             }
         ) { [weak self] verdict, watch in

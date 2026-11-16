@@ -38,13 +38,41 @@ class StartLowTrackSelectionTest {
     }
 
     @Test
+    fun theNextTrackPreparedAheadStartsLowUntilItsOwnTransferIsMeasured() {
+        val shared = FakeMeter(96_000L)
+        val transfers = OwnTransferRegistry()
+        val playing = Any()
+        val next = Any()
+        var item: Any? = next
+        val seen = mutableListOf<BandwidthMeter>()
+        val factory = StartLowTrackSelectionFactory({ DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, transfers, { _, _ -> item }) { _, meter, _, _ ->
+            seen += meter
+            emptyArray()
+        }
+        val period = bare(MediaSource.MediaPeriodId::class.java)
+        @Suppress("UNCHECKED_CAST")
+        val timeline = bare(Class.forName("com.google.android.exoplayer2.source.SinglePeriodTimeline") as Class<Timeline>)
+        factory.createTrackSelections(emptyArray<ExoTrackSelection.Definition>(), shared, period, timeline)
+        val nextMeter = seen.single()
+        // The playing track keeps downloading: the shared meter measures a fast network.
+        shared.estimate = 4_000_000L
+        transfers.transferEnded(playing)
+        assertEquals(96_000L, nextMeter.bitrateEstimate)
+        // The next track's own first transfer ends: it follows the meter from then on.
+        transfers.transferEnded(next)
+        assertEquals(4_000_000L, nextMeter.bitrateEstimate)
+        shared.estimate = 1_000_000L
+        assertEquals(1_000_000L, nextMeter.bitrateEstimate)
+    }
+
+    @Test
     fun everyTrackSelectionReadsTheCurrentSetting() {
         var setting = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS
         val seen = mutableListOf<Long>()
-        val factory = StartLowTrackSelectionFactory({ setting }) { _, meter, _, _ ->
+        val factory = StartLowTrackSelectionFactory({ setting }, adaptive = { _, meter, _, _ ->
             seen += meter.bitrateEstimate
             emptyArray()
-        }
+        })
         val shared = FakeMeter(4_000_000L)
         val period = bare(MediaSource.MediaPeriodId::class.java)
         @Suppress("UNCHECKED_CAST")

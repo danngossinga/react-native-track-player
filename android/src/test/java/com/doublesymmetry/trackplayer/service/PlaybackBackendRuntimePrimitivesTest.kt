@@ -414,4 +414,24 @@ class PlaybackBackendRuntimePrimitivesTest {
         val advanced = runCatching { gate.await(30_000L, item) { StandardSeekObservation(AudioPlayerState.BUFFERING, 0L, 0L, item = Any()) } }
         assertEquals("standard_seek_cancelled", (advanced.exceptionOrNull() as RejectionException).code)
     }
+
+    @Test
+    fun aSeekIsAtItsTargetWithinWhatPlaybackCouldHaveMovedNotAFixedTolerance() = runTest {
+        val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val item = Any()
+        // Ready, but 700 ms past the target right after the seek: not this seek's position yet
+        // (a fixed 750 ms tolerance would have taken it).
+        val early = runCatching {
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 20_700L, 30_000L, item = item) }
+        }
+        assertEquals("standard_seek_timeout", (early.exceptionOrNull() as RejectionException).code)
+        // Playing at 2x for 500 ms since the seek: up to 1 s (plus one poll) past the target is it.
+        var position = 20_000L
+        val started = currentTime
+        gate.await(20_000L, item) {
+            position = 20_000L + (currentTime - started) * 2
+            StandardSeekObservation(AudioPlayerState.PLAYING, if (currentTime - started >= 500L) position else 25_000L, 30_000L, item = item, rate = 2f)
+        }
+        assertEquals(500L, currentTime - started)
+    }
 }

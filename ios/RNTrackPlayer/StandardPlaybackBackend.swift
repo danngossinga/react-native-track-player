@@ -395,6 +395,25 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             self.pumpSeeks()
         }
         request.wait = wait
+        // A newer seek ends the older ones at once (standard_seek_cancelled), as on Android.
+        let superseded = pendingSeeks
+        pendingSeeks.removeAll()
+        superseded.forEach {
+            $0.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))
+        }
+        if let issued = issuedSeek {
+            issuedSeek = nil
+            issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))
+            if issued.track === request.track && issued.position == request.position {
+                // The same target is already issued: this seek takes its native callback over
+                // (a second native seek to it would make the first callback look like ours).
+                issuedSeek = request
+                request.issued = true
+                wait.start()
+                wait.noteProgress()
+                return
+            }
+        }
         pendingSeeks.append(request)
         wait.start()
         pumpSeeks()
@@ -475,17 +494,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
     /// The module's last request, not SwiftAudioEx's own pause at the interruption (see
     /// RequestedPlayback).
+    /// Read on main, where the player and `requested` change.
     var interruptionIsPlaying: Bool {
-        return requested.isPlayingForInterruption(idle: idleWithoutActiveTrack, finished: Self.isFinished(player.playerState))
+        return onMain {
+            interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady, stateRawValue: playbackState.rawValue)
+        }
     }
     private var requested = RequestedPlayback()
 
-    private static func isFinished(_ state: AudioPlayerState) -> Bool {
-        switch state {
-        case .ended, .failed, .stopped, .idle: return true
-        default: return false
-        }
-    }
     var publicRepeatMode: Int { return player.repeatMode.rawValue }
     var queue: [Track] { return queueProvider() }
 

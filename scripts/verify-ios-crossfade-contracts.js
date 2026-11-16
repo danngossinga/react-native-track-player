@@ -418,7 +418,11 @@ assert(
     standardBackend2.includes('guard let self = self, let request = request, request.issued else { return nil }') &&
     standardBackend2.includes('return [self.player.bufferedPosition]') &&
     standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            player.seek(to: request.position)') &&
-    standardBackend2.includes('request.wait = wait\n        pendingSeeks.append(request)\n        wait.start()') &&
+    standardBackend2.includes('request.wait = wait\n        // A newer seek ends the older ones at once (standard_seek_cancelled), as on Android.') &&
+    standardBackend2.includes('        pendingSeeks.append(request)\n        wait.start()\n        pumpSeeks()') &&
+    section(standardBackend2, '// A newer seek ends the older ones at once', 'pendingSeeks.append(request)').includes('issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))') &&
+    section(standardBackend2, '// A newer seek ends the older ones at once', 'pendingSeeks.append(request)').includes('superseded.forEach {') &&
+    standardBackend2.includes('onMain { enqueueSeek(to: player.currentTime + offset, completion: completion) }') &&
     section(standardBackend2, 'func finish(_ result: Result<Void, Error>) {', 'private var pendingSeeks').includes('wait?.cancel()') &&
     !standardBackend2.includes('DispatchWorkItem { [weak self, weak request]') &&
     !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
@@ -472,8 +476,12 @@ assert(
     applyInterruption.includes('completion(.success(duck))') &&
     applyInterruption.includes('"permanent": duck.permanent') &&
     // Was it playing: the module's last request, not SwiftAudioEx's own pause at the interruption.
-    standardBackend.includes('return requested.isPlayingForInterruption(idle: idleWithoutActiveTrack, finished: Self.isFinished(player.playerState))') &&
-    facade.includes('return !idle && playWhenReady && !finished') &&
+    // One rule on all four backends: asked to play, with an active track not ended/failed/stopped.
+    facade.includes('let interruptionFinishedStates: Set<String> = ["none", "ended", "error", "stopped"]') &&
+    facade.includes('return playWhenReady && !interruptionFinishedStates.contains(stateRawValue)') &&
+    standardBackend.includes('return onMain {\n            interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady, stateRawValue: playbackState.rawValue)') &&
+    pingPongBackend.includes('interruptionCountsAsPlaying(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)') &&
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func isPlaying() -> Bool { interruptionCountsAsPlaying(playWhenReady: playing, stateRawValue: state) }') &&
     section(standardBackend, '    func play() throws {', '    func seek(to position: Double) throws {').includes('requested.request(true)\n            player.play()') &&
     section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('requested.request(false)\n            player.pause()') &&
     section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requested.request(false)\n            player.stop()') &&
@@ -481,7 +489,6 @@ assert(
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAnInterruptionResumesWhenTheSDKPausedThePlayerBeforeItWasRead()') &&
     // reset runs from deinit too: its operation holds the policy, not the module.
     section(player, 'public func reset(resolve:', 'public func play(resolve:').includes('withActivePlaybackBackendSerialized({ [interruptionPolicy] backend in') &&
-    pingPongBackend.includes('var interruptionIsPlaying: Bool { return orchestrator.playWhenReady }') &&
     // Every user command, inside its admitted operation (ordered with the interruption events).
     [['public func play(resolve:', 'public func pause(resolve:'],
       ['public func pause(resolve:', 'public func setPlayWhenReady(playWhenReady:'],
@@ -500,11 +507,12 @@ assert(
 // crossfade whose incoming song does not start rejects with crossfade_start_failed, as on Android.
 assert(
   engine.includes('"code": "crossfade_play_start_timeout"') &&
+    engine.includes('"code": "crossfade_engine_error"') &&
     // Where play, a load that plays, skip and a recovery start playback (not the backend switch's
     // activation, which Android does not wait for either).
     section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
     (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
-    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_start_failed"]') &&
+    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed"]') &&
     (player.match(/reject\("seek_failed", "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&

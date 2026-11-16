@@ -223,12 +223,18 @@ struct RequestedPlayback {
     mutating func request(_ value: Bool) {
         playWhenReady = value
     }
+}
 
-    /// Whether it plays as far as an interruption is concerned: requested, with an active track
-    /// that has not ended, failed or stopped.
-    func isPlayingForInterruption(idle: Bool, finished: Bool) -> Bool {
-        return !idle && playWhenReady && !finished
-    }
+/// The playback states (`State` raw values) in which nothing plays for an interruption: no active
+/// track, the queue ended, an error, stopped.
+let interruptionFinishedStates: Set<String> = ["none", "ended", "error", "stopped"]
+
+/// Whether a backend plays as far as an interruption is concerned, the same rule on all four
+/// backends (Android: `interruptionCountsAsPlaying`): it was asked to play and has an active
+/// track that has not ended, failed or stopped. After the queue ended, an interruption neither
+/// pauses nor resumes.
+func interruptionCountsAsPlaying(playWhenReady: Bool, stateRawValue: String) -> Bool {
+    return playWhenReady && !interruptionFinishedStates.contains(stateRawValue)
 }
 
 /// One value shared across threads (a setting read by notification handlers, a reference

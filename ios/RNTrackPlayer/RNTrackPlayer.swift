@@ -398,7 +398,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// Codes iOS rejects with as Android does (its RejectionException's code): a play start that
     /// gives up and a crossfade whose incoming song does not start. Other failures keep the
     /// command's generic code.
-    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_start_failed"]
+    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed"]
 
     private func rejectionCode(_ error: Error, _ fallback: String) -> String {
         guard let code = (error as NSError).userInfo["code"] as? String,

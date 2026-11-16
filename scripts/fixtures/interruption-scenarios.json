@@ -1,5 +1,5 @@
 {
-  "comment": "Shared by the Android JVM tests and the iOS XCTests (InterruptionPolicy). Events: began (call or transient focus loss, can-duck included), ended (with shouldResume), lostPermanently, noisy (headphones unplugged / route oldDeviceUnavailable), userPause, userPlay. Each step gives the expected action (pause, resume or none) and the remote-duck payload (null when none is emitted).",
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (InterruptionPolicy). playing is the backend's playWhenReady and state its playback state (default playing; 'ended' after the queue ended); both platforms count it as playing with the same rule (interruptionCountsAsPlaying). Events: began (call or transient focus loss, can-duck included), ended (with shouldResume), lostPermanently, noisy (headphones unplugged / route oldDeviceUnavailable), userPause, userPlay. Each step gives the expected action (pause, resume or none) and the remote-duck payload (null when none is emitted).",
   "scenarios": [
     {
       "id": "FOCUS-01a call or focus loss then end with resume: pause then resume",
@@ -92,6 +92,14 @@
       "steps": [
         { "event": "began", "action": "pause", "duck": { "paused": true, "permanent": false } },
         { "event": "userPause", "action": "none", "duck": null },
+        { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
+        { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
+      ]
+    },
+    {
+      "id": "FOCUS-04 an interruption after the queue ended: no pause, no resume (state unchanged)",
+      "autoResume": true, "playing": true, "state": "ended",
+      "steps": [
         { "event": "began", "action": "none", "duck": { "paused": true, "permanent": false } },
         { "event": "ended", "shouldResume": true, "action": "none", "duck": { "paused": false, "permanent": false } }
       ]

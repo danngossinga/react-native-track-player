@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
+import androidx.media.AudioAttributesCompat
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
@@ -67,6 +68,10 @@ class MusicService : HeadlessJsTaskService() {
     private var playbackOrchestrator: AndroidPlaybackOrchestrator? = null
     private var playbackOrchestratorIdentity: Any? = null
     private var orchestratorAudioContentType: Int = C.AUDIO_CONTENT_TYPE_MUSIC
+    /** The standard player's items whose own transfers ended (start-low, per track). */
+    private val standardTransfers = OwnTransferRegistry()
+    /** `androidAudioContentType` for the audio focus request (an AudioAttributesCompat type). */
+    private var focusContentType: Int = AudioAttributesCompat.CONTENT_TYPE_MUSIC
     private var orchestratorHandlesAudioFocus: Boolean = false
     /** `autoHandleInterruptions`: an interruption's end resumes playback (DJE-204/205). */
     private var autoHandleInterruptions = false
@@ -77,7 +82,7 @@ class MusicService : HeadlessJsTaskService() {
     private val interruptions by lazy {
         InterruptionCoordinator(
             autoResume = { autoHandleInterruptions },
-            focusRequester = SystemAudioFocusRequester(this),
+            focusRequester = SystemAudioFocusRequester(this) { focusContentType },
             noisyReceiver = ContextNoisyReceiverRegistrar(this),
             onInterruption = ::applyInterruption
         )
@@ -608,6 +613,7 @@ class MusicService : HeadlessJsTaskService() {
             QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks())
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
+        focusContentType = focusContentTypeOf(playerConfig.audioContentType)
         // One focus holder for the service (interruptions.focus), none per engine.
         orchestratorHandlesAudioFocus = false
         interruptions.start()
@@ -640,11 +646,11 @@ class MusicService : HeadlessJsTaskService() {
             builder.setTrackSelector(
                 DefaultTrackSelector(
                     this@MusicService,
-                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond })
+                    StartLowTrackSelectionFactory({ initialBitrateEstimate.bitsPerSecond }, standardTransfers)
                 )
             )
         },
-        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
+        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }, standardTransfers),
         hostOwnsAudioFocus = true
     )
 
@@ -655,23 +661,25 @@ class MusicService : HeadlessJsTaskService() {
     private fun applyInterruption(decide: (Boolean) -> InterruptionDecision?) {
         if (playbackBackendFacade == null) return
         scope.launch {
-            val duck = runCatching {
+            runCatching {
                 withActivePlaybackBackend { backend ->
                     val decision = interruptions.applyTo(
-                        isPlaying = backend.playWhenReady,
+                        playWhenReady = backend.playWhenReady,
+                        state = backend.playbackState,
                         decide = decide,
                         pause = { backend.pause() },
                         play = { backend.play() },
+                        emit = { duck ->
+                            emit(MusicEvents.BUTTON_DUCK, Bundle().apply {
+                                putBoolean(IS_PAUSED_KEY, duck.paused)
+                                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
+                            })
+                        },
                         onResumeFailed = { androidXfadeLog("interruption resume failed error=${it.message}") }
-                    ) ?: return@withActivePlaybackBackend null
-                    androidXfadeLog("interruption action=${decision.action} backend=${backend.type}")
-                    decision.duck
+                    )
+                    androidXfadeLog("interruption action=${decision?.action} backend=${backend.type}")
                 }
-            }.getOrNull() ?: return@launch
-            emit(MusicEvents.BUTTON_DUCK, Bundle().apply {
-                putBoolean(IS_PAUSED_KEY, duck.paused)
-                putBoolean(IS_FOCUS_LOSS_PERMANENT_KEY, duck.permanent)
-            })
+            }
         }
     }
 

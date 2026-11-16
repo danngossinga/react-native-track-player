@@ -99,7 +99,9 @@ internal data class StandardSeekObservation(
     /** The track's duration (0 when unknown): a seek past the end lands at the end. */
     val durationMs: Long = 0L,
     /** The player's current item (compared by identity): another item cancels the seek. */
-    val item: Any? = null
+    val item: Any? = null,
+    /** The playback speed: how far the position may have moved past the target since the seek. */
+    val rate: Float = 1f
 )
 
 /**
@@ -114,10 +116,19 @@ internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
     private val pollIntervalMs: Long = 25L,
-    private val positionToleranceMs: Long = 750L,
     private val nowMs: () -> Long = ::monotonicNowMs
 ) {
     private var current: PlaybackOperationTicket? = null
+
+    /**
+     * At the target: no fixed tolerance. The position may be past the target by as much as
+     * playback has played since the seek ([playedMs]), plus one poll; it may be before it by one
+     * poll (a position read between two polls).
+     */
+    private fun isAtSeekTarget(positionMs: Long, targetMs: Long, playedMs: Long): Boolean {
+        val slackMs = pollIntervalMs
+        return positionMs >= targetMs - slackMs && positionMs <= targetMs + playedMs + slackMs
+    }
 
     /** Ends the seek in progress, if any (`standard_seek_cancelled`). */
     fun cancel(reason: String) {
@@ -132,6 +143,10 @@ internal class StandardSeekGate(
         }
         val ticket = PlaybackOperationTicket(0L)
         current = ticket
+        // How far playback may have moved the position since the seek: time spent playing, at
+        // the observed rate.
+        var playedMs = 0.0
+        var lastCheckAt = nowMs()
         var latest: StandardSeekObservation? = null
         val verdict = try {
             awaitWhileProgressing(
@@ -144,6 +159,11 @@ internal class StandardSeekGate(
             ) {
                 ticket.ensureActive()
                 val observed = observe().also { latest = it }
+                val checkedAt = nowMs()
+                if (observed.state == AudioPlayerState.PLAYING) {
+                    playedMs += (checkedAt - lastCheckAt).coerceAtLeast(0L) * observed.rate.coerceAtLeast(0f).toDouble()
+                }
+                lastCheckAt = checkedAt
                 if (observed.item !== item) throw PlaybackOperationCancelledException("item_changed")
                 if (observed.state == AudioPlayerState.ERROR) {
                     throw RejectionException("The active track failed to load.", "standard_seek_unavailable")
@@ -152,7 +172,7 @@ internal class StandardSeekGate(
                 observed.state == AudioPlayerState.ENDED ||
                     (observed.state != AudioPlayerState.LOADING &&
                         observed.state != AudioPlayerState.BUFFERING &&
-                        kotlin.math.abs(observed.positionMs - target) <= positionToleranceMs)
+                        isAtSeekTarget(observed.positionMs, target, playedMs.toLong()))
             }
         } catch (cancelled: PlaybackOperationCancelledException) {
             throw RejectionException("Playback changed before the native seek completed (${cancelled.reason}).", "standard_seek_cancelled")

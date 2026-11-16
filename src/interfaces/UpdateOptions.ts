@@ -43,7 +43,8 @@ export interface UpdateOptions {
    * (after `play`, a load that plays at once, or the incoming song of a crossfade; the resume of a
    * fade paused mid-way does not wait). A start that loads nothing for `stallTimeoutMs` fails
    * sooner. On both platforms a failed start pauses, rejects with `crossfade_play_start_timeout`
-   * and emits a `playback-error` with that code, and a crossfade whose incoming song does not
+   * (`crossfade_engine_error` when the player fails during the start) and emits a
+   * `playback-error` with that code, and a crossfade whose incoming song does not
    * start rejects with `crossfade_start_failed` while the outgoing song plays on. Defaults to
    * 60000. On iOS, a backend switch and the play used to resume after an interruption wait at
    * most this plus `prepareTimeoutMs` plus 5 s (at least 10 s); on Android these steps do not

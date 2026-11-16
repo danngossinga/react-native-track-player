@@ -517,6 +517,35 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPlayAfterTheQueueEndedStartsTheLastTrackAgainFromTheStartAsOnIos() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(1))
+            orchestrator.play()
+            orchestrator.seekTo(30_000L)
+            engineA.ended = true
+            engineB.ended = true
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(AudioPlayerState.ENDED, delegate.playbackStates.last())
+
+            val started = currentTime
+            orchestrator.play()
+            assertEquals(0L, currentTime - started)
+            assertTrue(delegate.playbackErrors.isEmpty())
+            assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+            assertEquals(0, orchestrator.currentIndex)
+            assertEquals(0L, orchestrator.positionMs)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aPauseDuringTheNextTracksStartCancelsItWithNoPlaybackError() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -931,6 +960,11 @@ class AndroidPlaybackOrchestratorCancellationTest {
         override suspend fun awaitPlaying(timeoutMs: Long, stallTimeoutMs: Long, ticket: PlaybackOperationTicket?) {
             lastPlayStartTimeoutMs = timeoutMs
             lastPlayStartStallTimeoutMs = stallTimeoutMs
+            // An ended player does not start again by itself (as ExoPlayer at STATE_ENDED).
+            if (ended) {
+                if (ticket == null) delay(stallTimeoutMs) else ticket.delayOrThrow(stallTimeoutMs)
+                throw RejectionException("$name did not start playing.", "crossfade_play_start_timeout")
+            }
             val start = simulatedStart?.also { simulatedStart = null } ?: return
             var bytes = 0L
             var elapsed = 0L

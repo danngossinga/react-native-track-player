@@ -9,6 +9,7 @@ import androidx.core.content.ContextCompat
 import androidx.media.AudioAttributesCompat
 import androidx.media.AudioFocusRequestCompat
 import androidx.media.AudioManagerCompat
+import com.doublesymmetry.kotlinaudio.models.AudioContentType
 
 /** The system's audio focus, behind a small interface so the JVM tests can fake it. */
 internal interface AudioFocusRequester {
@@ -70,8 +71,15 @@ internal class PlaybackAudioFocus(
     }
 }
 
-/** [AudioFocusRequester] on the system's AudioManager: one request, reused while registered. */
-internal class SystemAudioFocusRequester(private val context: Context) : AudioFocusRequester {
+/**
+ * [AudioFocusRequester] on the system's AudioManager: one request, reused while registered. Its
+ * content type is the app's `androidAudioContentType` (an AudioAttributesCompat content type),
+ * read when a request is built.
+ */
+internal class SystemAudioFocusRequester(
+    private val context: Context,
+    private val contentType: () -> Int
+) : AudioFocusRequester {
     private var listener: (Int) -> Unit = {}
     private var current: AudioFocusRequestCompat? = null
 
@@ -83,7 +91,7 @@ internal class SystemAudioFocusRequester(private val context: Context) : AudioFo
             .setAudioAttributes(
                 AudioAttributesCompat.Builder()
                     .setUsage(AudioAttributesCompat.USAGE_MEDIA)
-                    .setContentType(AudioAttributesCompat.CONTENT_TYPE_MUSIC)
+                    .setContentType(contentType())
                     .build()
             )
             .setWillPauseWhenDucked(true)
@@ -99,6 +107,15 @@ internal class SystemAudioFocusRequester(private val context: Context) : AudioFo
             AudioManagerCompat.abandonAudioFocusRequest(it, held)
         }
     }
+}
+
+/** The focus request's content type for the app's `androidAudioContentType`. */
+internal fun focusContentTypeOf(type: AudioContentType): Int = when (type) {
+    AudioContentType.MUSIC -> AudioAttributesCompat.CONTENT_TYPE_MUSIC
+    AudioContentType.SPEECH -> AudioAttributesCompat.CONTENT_TYPE_SPEECH
+    AudioContentType.SONIFICATION -> AudioAttributesCompat.CONTENT_TYPE_SONIFICATION
+    AudioContentType.MOVIE -> AudioAttributesCompat.CONTENT_TYPE_MOVIE
+    AudioContentType.UNKNOWN -> AudioAttributesCompat.CONTENT_TYPE_UNKNOWN
 }
 
 /** [NoisyReceiverRegistrar] on the system broadcast (delivered to a not-exported receiver too). */

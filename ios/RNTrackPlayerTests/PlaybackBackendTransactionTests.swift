@@ -306,20 +306,23 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/interruption-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 11)
+        XCTAssertEqual(scenarios.count, 12)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             let autoResume = scenario["autoResume"] as? Bool ?? false
             var playing = scenario["playing"] as? Bool ?? false
+            // The backend's state: an ended queue does not count as playing (same rule as Android).
+            let state = scenario["state"] as? String ?? "playing"
+            func isPlaying() -> Bool { interruptionCountsAsPlaying(playWhenReady: playing, stateRawValue: state) }
             let policy = InterruptionPolicy(autoResume: { autoResume })
             for step in try XCTUnwrap(scenario["steps"] as? [[String: Any]]) {
                 let event = step["event"] as? String ?? ""
                 let result: (InterruptionAction, RemoteDuckPayload?)
                 switch event {
-                case "began": result = policy.began(isPlaying: playing)
+                case "began": result = policy.began(isPlaying: isPlaying())
                 case "ended": result = policy.ended(shouldResume: step["shouldResume"] as? Bool ?? false)
-                case "lostPermanently": result = policy.lostPermanently(isPlaying: playing)
-                case "noisy": result = policy.noisy(isPlaying: playing)
+                case "lostPermanently": result = policy.lostPermanently(isPlaying: isPlaying())
+                case "noisy": result = policy.noisy(isPlaying: isPlaying())
                 case "userPause": policy.userCommand(); playing = false; result = (.none, nil)
                 case "userPlay": policy.userCommand(); playing = true; result = (.none, nil)
                 default: XCTFail("unknown event \(event) in \(id)"); continue
@@ -346,17 +349,23 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         requested.request(true)
         let sdkPlayWhenReady = false
         let policy = InterruptionPolicy(autoResume: { true })
-        XCTAssertEqual(policy.began(isPlaying: requested.isPlayingForInterruption(idle: false, finished: false)).0, .pause)
+        XCTAssertEqual(policy.began(isPlaying: interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady, stateRawValue: "paused")).0, .pause)
         XCTAssertEqual(policy.ended(shouldResume: true).0, .resume)
         // The SDK's value would have lost the resume.
         let fromSDK = InterruptionPolicy(autoResume: { true })
         _ = fromSDK.began(isPlaying: sdkPlayWhenReady)
         XCTAssertEqual(fromSDK.ended(shouldResume: true).0, .none)
-        // Not playing: paused by the module, no active track, or the track ended, failed or stopped.
-        XCTAssertFalse(requested.isPlayingForInterruption(idle: true, finished: false))
-        XCTAssertFalse(requested.isPlayingForInterruption(idle: false, finished: true))
         requested.request(false)
-        XCTAssertFalse(requested.isPlayingForInterruption(idle: false, finished: false))
+        XCTAssertFalse(requested.playWhenReady)
+    }
+
+    func testOnlyAnActiveTrackThatWasAskedToPlayCountsAsPlaying() {
+        XCTAssertEqual(interruptionFinishedStates, ["none", "ended", "error", "stopped"])
+        for state in ["none", "ready", "playing", "paused", "stopped", "buffering", "loading", "error", "ended"] {
+            XCTAssertEqual(interruptionCountsAsPlaying(playWhenReady: true, stateRawValue: state),
+                           !["none", "ended", "error", "stopped"].contains(state), state)
+            XCTAssertFalse(interruptionCountsAsPlaying(playWhenReady: false, stateRawValue: state), state)
+        }
     }
 
     func testInterruptionPolicyReadsTheOptionAtTheEnd() {

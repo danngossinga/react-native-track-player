@@ -1,6 +1,9 @@
 package com.doublesymmetry.trackplayer.service
 
 import android.media.AudioManager
+import com.doublesymmetry.kotlinaudio.models.AudioContentType
+import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
+import androidx.media.AudioAttributesCompat
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -51,8 +54,11 @@ class InterruptionCoordinatorTest {
         val focus = FakeFocus()
         val receiver = FakeReceiver()
         var playing = false
+        var state = AudioPlayerState.PLAYING
         var playFails = false
         val ducks = mutableListOf<RemoteDuckPayload?>()
+        /** The remote-duck payloads emitted when each resumed play started. */
+        val ducksAtPlay = mutableListOf<Int>()
         lateinit var coordinator: InterruptionCoordinator
 
         init {
@@ -62,12 +68,19 @@ class InterruptionCoordinatorTest {
                 noisyReceiver = receiver,
                 onInterruption = { decide ->
                     runTest {
-                        ducks += coordinator.applyTo(
-                            isPlaying = playing,
+                        val emitted = mutableListOf<RemoteDuckPayload>()
+                        coordinator.applyTo(
+                            playWhenReady = playing,
+                            state = state,
                             decide = decide,
                             pause = { playing = false },
-                            play = { if (playFails) error("play failed") else playing = true }
-                        )?.duck
+                            play = {
+                                ducksAtPlay += emitted.size
+                                if (playFails) error("play failed") else playing = true
+                            },
+                            emit = { emitted += it }
+                        )
+                        ducks += emitted.singleOrNull()
                     }
                 }
             )
@@ -152,7 +165,7 @@ class InterruptionCoordinatorTest {
         val focus = FakeFocus()
         var playing = true
         val coordinator = InterruptionCoordinator({ true }, focus, FakeReceiver()) { }
-        coordinator.applyTo(playing, { InterruptionDecision(InterruptionAction.RESUME, null) }, { playing = false }, { playing = true })
+        coordinator.applyTo(playing, AudioPlayerState.PAUSED, { InterruptionDecision(InterruptionAction.RESUME, null) }, { playing = false }, { playing = true }, {})
         assertEquals(1, focus.requests)
         assertTrue(coordinator.focus.isHeld)
     }
@@ -177,9 +190,45 @@ class InterruptionCoordinatorTest {
         harness.coordinator.userStop()
         assertEquals(1, harness.focus.abandons)
         assertFalse(harness.coordinator.focus.isHeld)
-        // A late gain (delivered before the abandon took effect) does not resume.
+        // A late gain (delivered before the abandon took effect) does not resume, nor make the
+        // given-up focus held: the next play requests it again.
         listener(AudioManager.AUDIOFOCUS_GAIN)
         assertFalse(harness.playing)
+        assertFalse(harness.coordinator.focus.isHeld)
+        harness.userPlay()
+        assertEquals(2, harness.focus.requests)
+    }
+
+    @Test
+    fun anInterruptionAfterTheQueueEndedNeitherPausesNorResumes() {
+        val harness = Harness()
+        harness.userPlay()
+        // The queue ended: playWhenReady stays on, but nothing plays.
+        harness.state = AudioPlayerState.ENDED
+        harness.focus.change(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        assertTrue(harness.playing)
+        assertEquals(RemoteDuckPayload(paused = true, permanent = false), harness.ducks.last())
+        harness.focus.change(AudioManager.AUDIOFOCUS_GAIN)
+        assertTrue(harness.ducksAtPlay.isEmpty())
+        assertEquals(RemoteDuckPayload(paused = false, permanent = false), harness.ducks.last())
+    }
+
+    @Test
+    fun theGainIsReportedBeforeTheResumedPlayIsAwaitedAsOnIos() {
+        val harness = Harness()
+        harness.userPlay()
+        harness.focus.change(AudioManager.AUDIOFOCUS_LOSS_TRANSIENT)
+        harness.focus.change(AudioManager.AUDIOFOCUS_GAIN)
+        assertEquals(listOf(1), harness.ducksAtPlay)
+    }
+
+    @Test
+    fun theFocusRequestCarriesTheAppsContentType() {
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_MUSIC, focusContentTypeOf(AudioContentType.MUSIC))
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_SPEECH, focusContentTypeOf(AudioContentType.SPEECH))
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_SONIFICATION, focusContentTypeOf(AudioContentType.SONIFICATION))
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_MOVIE, focusContentTypeOf(AudioContentType.MOVIE))
+        assertEquals(AudioAttributesCompat.CONTENT_TYPE_UNKNOWN, focusContentTypeOf(AudioContentType.UNKNOWN))
     }
 
     @Test

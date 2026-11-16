@@ -428,6 +428,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
             startTrackAt(0, 0L, emitTrackChange = true, oldPositionMs = 0L, ticket = ticket)
             return@withPlaybackOperation
         }
+        if (state == AndroidPlaybackOrchestratorState.ENDED) {
+            // As on iOS: a play after the queue ended starts the current track again from 0 (an
+            // ended engine would not start, and the wait would give up).
+            startTrackAt(currentIndex, 0L, emitTrackChange = true, oldPositionMs = positionMs, ticket = ticket)
+            return@withPlaybackOperation
+        }
         ensureActivePrepared(currentIndex, positionMs, ticket)
         ticket.ensureActive()
         activeEngine.setVolume(volume)
