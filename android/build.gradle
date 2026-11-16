@@ -36,6 +36,15 @@ android {
         sourceCompatibility JavaVersion.VERSION_1_8
         targetCompatibility JavaVersion.VERSION_1_8
     }
+
+    // KotlinAudio v2.1.0, vendored (see src/vendor/kotlinaudio/VENDORED.md): built with this
+    // library instead of the JitPack artifact.
+    sourceSets {
+        main {
+            java.srcDirs += 'src/vendor/kotlinaudio/java'
+            res.srcDirs += 'src/vendor/kotlinaudio/res'
+        }
+    }
 }
 
 def fallbackCodegenJniDir = file("$projectDir/src/main/jni/RNTrackPlayerSpec")
@@ -71,16 +80,11 @@ repositories {
 }
 
 dependencies {
-    implementation('com.github.doublesymmetry:kotlinaudio:v2.1.0') {
-        // KotlinAudio v2.1.0 accidentally publishes its Android test stack as
-        // runtime dependencies. Keep those out of the library graph so the
-        // instrumented contract test can use the maintained runner/JUnit pair.
-        exclude group: 'androidx.test', module: 'rules'
-        exclude group: 'androidx.test', module: 'runner'
-        exclude group: 'junit', module: 'junit'
-    }
-    // used when building against local maven
-//    implementation "com.github.doublesymmetry:kotlin-audio:2.1.0"
+    // The vendored KotlinAudio's own dependencies, at the versions its v2.1.0 build declares.
+    implementation 'io.coil-kt:coil:2.2.0'
+    api 'com.google.android.exoplayer:exoplayer:2.19.0'
+    api 'com.google.android.exoplayer:extension-mediasession:2.19.0'
+    api 'com.jakewharton.timber:timber:5.0.1'
 
     //noinspection GradleDynamicVersion
     implementation "com.facebook.react:react-native:+"

@@ -22,10 +22,8 @@ class SharedFlowAdmissionTest {
         Dispatchers.setMain(main)
         try {
             val holder = PlayerEventHolder()
-            val update = holder.javaClass.getDeclaredMethod(
-                "updateAudioPlayerState\$kotlin_audio_release",
-                AudioPlayerState::class.java
-            )
+            // KotlinAudio is vendored into this module, so its internal update is callable directly.
+            val update: (AudioPlayerState) -> Unit = holder::updateAudioPlayerState
             val gate = SharedFlowAdmissionGate()
             val received = mutableListOf<AudioPlayerState>()
             val collector = backgroundScope.collectWithAdmission(
@@ -34,10 +32,10 @@ class SharedFlowAdmissionTest {
                 received::add
             )
 
-            update.invoke(holder, AudioPlayerState.LOADING)
+            update(AudioPlayerState.LOADING)
             gate.admitAfterProducerDrain(backgroundScope)
             runCurrent()
-            update.invoke(holder, AudioPlayerState.PAUSED)
+            update(AudioPlayerState.PAUSED)
             runCurrent()
 
             assertEquals(listOf(AudioPlayerState.PAUSED), received)
