@@ -367,8 +367,7 @@ final class StallWaitDriver {
 }
 
 /// How long a synchronous ping-pong backend step may take (a backend switch, which loads or starts
-/// a track, a rollback, and the play used to resume after an interruption, which may load and then
-/// start a track): the load limit plus the play-start limit plus 5 s, never less than 10 s
+/// a track, and a rollback; the resume after an interruption does not wait): the load limit plus the play-start limit plus 5 s, never less than 10 s
 /// (125 s with both defaults). The waits inside fail sooner when they stall (`stallTimeoutMs`);
 /// this only bounds a step whose waits keep progressing.
 func backendStepTimeout(loadTimeoutMs: Int, playStartTimeoutMs: Int) -> TimeInterval {

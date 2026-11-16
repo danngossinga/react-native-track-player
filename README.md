@@ -80,10 +80,10 @@ Added fork surface:
   `standardSeekTimeoutMs` (standard seek, iOS and Android; on iOS, before the seek
   is issued only this limit applies, then the buffered position is its only
   progress signal), each
-  60000 by default. On iOS, a backend switch and the play used to resume after an
-  interruption wait at most the load limit plus the play-start limit plus 5 s (at
-  least 10 s); on Android these steps do not block a thread and are bounded by
-  the load and play-start waits themselves.
+  60000 by default. On iOS, a backend switch waits at most the load limit plus
+  the play-start limit plus 5 s (at least 10 s); on Android it does not block a
+  thread and is bounded by the load and play-start waits themselves. The play
+  that resumes after an interruption is not awaited on either platform.
 - `incomingStallGraceMs` (crossfade, `setupPlayer` and `updateOptions`, default
   2000): how long a crossfade waits for the incoming track to start moving before
   it falls back to playing that track alone (`incoming_stalled`).

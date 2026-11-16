@@ -143,10 +143,10 @@ export interface PlayerOptions {
    * (`crossfade_engine_error` when the player fails during the start) and emits a
    * `playback-error` with that code, and a crossfade whose incoming song does not
    * start rejects with `crossfade_start_failed` while the outgoing song plays on. Defaults to
-   * 60000. On iOS, a backend switch and the play used to resume after an interruption wait at
-   * most this plus `prepareTimeoutMs` plus 5 s (at least 10 s); on Android these steps do not
-   * block a thread and are bounded by the load and play-start waits themselves. Same bounds as
-   * `stallTimeoutMs`.
+   * 60000. On iOS, a backend switch waits at most this plus `prepareTimeoutMs` plus 5 s (at
+   * least 10 s); on Android it does not block a thread and is bounded by the load and play-start
+   * waits themselves. The play that resumes after an interruption is not awaited on either
+   * platform. Same bounds as `stallTimeoutMs`.
    */
   playStartTimeoutMs?: number;
   /**
