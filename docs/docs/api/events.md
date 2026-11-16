@@ -217,10 +217,14 @@ nothing was playing.
 The play that resumes after an interruption is not awaited by the command
 that issues it, on both platforms and both backends: a backend switch
 (`setPlaybackBackend`) or a pause issued while it starts runs at once, and a
-start that fails is reported as any play start is (`playback-error`). A backend switch
-issued while that play starts drops it, on both platforms, and the player is
-paused (as after any command that cancels a play start: a seek, a queue
-change...); the new backend takes over that paused state. With `autoHandleInterruptions: false` (default), the app may
+start that fails is reported as any play start is (`playback-error`). On both platforms, a
+command that cancels a load, a play start or a seek in progress (a seek, a
+skip, a pause, a backend switch) leaves the player paused with `playWhenReady`
+off, as iOS always did; a skip still plays its new track when playback was
+meant to play. A backend switch issued while that play starts therefore drops
+it, and the new backend takes over the paused state (Android also emits
+`stopped` for the old crossfade player; iOS emits only `paused`). Known
+difference: on Android, a queue change during a play start ends `stopped`. With `autoHandleInterruptions: false` (default), the app may
 resume when this event has `paused: false`.
 
 | Param     | Type      | Description                                  |

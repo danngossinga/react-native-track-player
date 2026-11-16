@@ -386,18 +386,23 @@ internal class PlaybackOperationController {
     private var generation = 0L
     private var current: PlaybackOperationTicket? = null
 
-    @Synchronized
+    // The superseded ticket is cancelled after the lock is released (as iOS's registry does):
+    // its onCancelled hook changes the orchestrator's state and emits events.
     fun begin(): PlaybackOperationTicket {
-        current?.cancel("superseded")
-        generation += 1
-        return PlaybackOperationTicket(generation).also { current = it }
+        val (previous, next) = synchronized(this) {
+            val previous = current
+            generation += 1
+            previous to PlaybackOperationTicket(generation).also { current = it }
+        }
+        previous?.cancel("superseded")
+        return next
     }
 
-    @Synchronized
     fun invalidate(reason: String): PlaybackOperationTicket? {
-        val invalidated = current
+        val invalidated = synchronized(this) {
+            current.also { current = null }
+        }
         invalidated?.cancel(reason)
-        current = null
         return invalidated
     }
 

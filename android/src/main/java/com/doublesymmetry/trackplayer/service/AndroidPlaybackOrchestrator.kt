@@ -32,8 +32,10 @@ internal enum class AndroidPlaybackOrchestratorState {
     PRELOADING_NEXT,
     CROSSFADING,
     PAUSED,
+    /** Unreachable today: no Android path sets it (read for parity with iOS's state). */
     PAUSED_DURING_CROSSFADE,
     SEEKING,
+    /** Unreachable today: no Android path sets it (read for parity with iOS's state). */
     SKIPPING,
     STOPPED,
     ENDED,
@@ -415,7 +417,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
         // As iOS: already playing, crossfading, preparing the next track, seeking or skipping —
         // nothing to start and nothing to cancel (a seek or skip in progress plays when it ends).
         if (state in PLAY_IS_ALREADY_UNDER_WAY) {
-            playWhenReady = true
+            if (!playWhenReady) {
+                playWhenReady = true
+                // Rule 13: the notification and every reader see it at once (iOS refreshes the
+                // now-playing info here too).
+                notifySnapshotChanged()
+            }
             return
         }
         playFromStill()
@@ -449,7 +456,6 @@ internal class AndroidPlaybackOrchestrator private constructor(
         // As iOS (play from paused reloads the item): loading while the start is awaited, then
         // playing, or paused when it fails or another command cancels it.
         setState(AndroidPlaybackOrchestratorState.LOADING)
-        stabilizeIfCancelled(ticket)
         activeEngine.setVolume(volume)
         activeEngine.play(rate)
         awaitPlaybackStart(ticket)
@@ -458,13 +464,15 @@ internal class AndroidPlaybackOrchestrator private constructor(
     }
 
     /**
-     * As iOS's stabilizeCancelledOperation: a start that another command cancels (a seek, a skip,
-     * a backend switch, a queue change...) leaves the player paused, not loading with
-     * playWhenReady on; it runs at once, before that command reads the state.
+     * As iOS's stabilizeCancelledOperation, armed when each operation begins (iOS: loadIndex and
+     * seek): an operation that another command cancels while it is loading or seeking (a seek,
+     * a skip, a backend switch, a queue change...) leaves the player paused with playWhenReady
+     * off, not loading with playWhenReady on. It runs at once, before that command reads the
+     * state.
      */
     private fun stabilizeIfCancelled(ticket: PlaybackOperationTicket) {
         ticket.onCancelled = {
-            if (state == AndroidPlaybackOrchestratorState.LOADING) {
+            if (state in STABILIZED_WHEN_CANCELLED) {
                 playWhenReady = false
                 setState(
                     if (currentIndex in queue.indices) AndroidPlaybackOrchestratorState.PAUSED
@@ -1004,7 +1012,6 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
-            ticket?.let(::stabilizeIfCancelled)
             activeEngine.play(rate)
             awaitPlaybackStart(ticket)
             setState(AndroidPlaybackOrchestratorState.PLAYING_SINGLE)
@@ -1047,10 +1054,14 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket?.ensureActive()
     }
 
+    /** Begins an operation (cancelling the one in progress), armed with [stabilizeIfCancelled]. */
+    private fun beginOperation(): PlaybackOperationTicket =
+        operationController.begin().also(::stabilizeIfCancelled)
+
     private suspend fun <T> withPlaybackOperation(
         block: suspend (PlaybackOperationTicket) -> T
     ): T {
-        val ticket = operationController.begin()
+        val ticket = beginOperation()
         return try {
             block(ticket)
         } catch (_: PlaybackOperationCancelledException) {
@@ -1228,7 +1239,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         if (nextIndex != null) {
             // An operation like the user's: a pause, stop or skip during the next track's start
             // cancels it (no play-start give-up or playback error afterwards).
-            val ticket = operationController.begin()
+            val ticket = beginOperation()
             try {
                 startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)
             } catch (_: PlaybackOperationCancelledException) {
@@ -1367,7 +1378,18 @@ internal class AndroidPlaybackOrchestrator private constructor(
 
         const val PREVIOUS_RESTART_THRESHOLD_MS = 3000L
         const val CROSSFADE_RUNNING_EVENT_INTERVAL_MS = 250L
-        /** States where a play has nothing to start (iOS returns at once in the same ones). */
+        /** States an operation is cancelled in that leave the player paused (iOS: the same). */
+        private val STABILIZED_WHEN_CANCELLED = setOf(
+            AndroidPlaybackOrchestratorState.LOADING,
+            AndroidPlaybackOrchestratorState.SEEKING,
+            // Unreachable today: no Android path sets SKIPPING (kept for parity with iOS).
+            AndroidPlaybackOrchestratorState.SKIPPING
+        )
+
+        /**
+         * States where a play has nothing to start (iOS returns at once in the same ones).
+         * SKIPPING is unreachable today (no Android path sets it); kept for parity with iOS.
+         */
         private val PLAY_IS_ALREADY_UNDER_WAY = setOf(
             AndroidPlaybackOrchestratorState.PLAYING_SINGLE,
             AndroidPlaybackOrchestratorState.PRELOADING_NEXT,

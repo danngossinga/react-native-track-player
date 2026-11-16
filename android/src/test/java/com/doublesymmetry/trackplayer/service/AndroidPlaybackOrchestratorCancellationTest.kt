@@ -415,6 +415,67 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun cancelledCrossfadePrepareNeverPublishesPreparedMarkersWhenAnotherPreparationSupersedesIt() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(
+            backgroundScope,
+            delegate,
+            engineA,
+            engineB
+        )
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            orchestrator.skip(1)
+            runCurrent()
+
+            val blockedPrepare = PrepareBlock(swallowCancellationUntilReleased = true)
+            engineB.blockNextPrepare = blockedPrepare
+            supervisorScope {
+                val preparation = async(start = CoroutineStart.UNDISPATCHED) {
+                    orchestrator.crossFadePrepare(previous = true, seekTo = 3.0)
+                }
+                blockedPrepare.entered.await()
+
+                // Another preparation supersedes the operation ticket and does not call
+                // cancelCrossfade(), so stale prepared markers cannot be hidden by cleanup. Its
+                // own preparation stays blocked, so it publishes nothing either.
+                val secondBlock = PrepareBlock(swallowCancellationUntilReleased = false)
+                engineB.blockNextPrepare = secondBlock
+                val second = async(start = CoroutineStart.UNDISPATCHED) {
+                    runCatching { orchestrator.crossFadePrepare(previous = true, seekTo = 3.0) }
+                }
+                runCurrent()
+                blockedPrepare.cancellationObserved.await()
+
+                assertNull(orchestrator.privateField("preparedCrossfadeFromIndex"))
+                assertNull(orchestrator.privateField("preparedCrossfadeToIndex"))
+                assertEquals(0L, orchestrator.privateField("preparedCrossfadeSeekToMs"))
+
+                blockedPrepare.release.complete(Unit)
+                runCurrent()
+                val error = runCatching { preparation.await() }.exceptionOrNull()
+                assertTrue(error is RejectionException)
+                assertEquals("cancelled", (error as RejectionException).code)
+                assertNull(orchestrator.privateField("preparedCrossfadeFromIndex"))
+                assertNull(orchestrator.privateField("preparedCrossfadeToIndex"))
+                assertFalse(delegate.playbackStates.contains(AudioPlayerState.ERROR))
+                // The cancelled preparation is reported with an event (like iOS), never as prepared.
+                second.cancel()
+                assertEquals(
+                    listOf(CrossfadeEvent("cancelled", 1, 0, "superseded")),
+                    delegate.crossfadeEvents.filter { it.state == "cancelled" || it.state == "prepared" }
+                )
+            }
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun everyLoadUsesTheLoadTimeoutSetAtThatMoment() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
@@ -770,10 +831,191 @@ class AndroidPlaybackOrchestratorCancellationTest {
             runCurrent()
             orchestrator.settleActiveTransition()
             again.await()
-            // As iOS (the cancelled start is stabilized at once): paused, then the switch's own
-            // stop; never left loading with playWhenReady on.
+            // The cancelled start is stabilized at once (paused, as iOS), then Android's switch
+            // stops the old orchestrator (iOS emits only paused here); never left loading with
+            // playWhenReady on.
             assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED, AudioPlayerState.STOPPED), delegate.playbackStates)
             assertFalse(orchestrator.snapshot().playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    /** Skips to track 1 while playing; its prepare ends at once, its play start takes 5 s. */
+    private suspend fun kotlinx.coroutines.test.TestScope.skipIntoAStart(
+        orchestrator: AndroidPlaybackOrchestrator,
+        engines: Pair<FakeCrossfadeEngine, FakeCrossfadeEngine>,
+        delegate: RecordingOrchestratorDelegate
+    ): kotlinx.coroutines.Deferred<Result<Unit>> {
+        orchestrator.setQueue(testItems(3))
+        orchestrator.play()
+        runCurrent()
+        delegate.playbackStates.clear()
+        engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+        val skip = async { runCatching { orchestrator.skip(1) } }
+        advanceTimeBy(1_000L)
+        runCurrent()
+        assertEquals(AudioPlayerState.LOADING, orchestrator.snapshot().playbackState)
+        return skip
+    }
+
+    @Test
+    fun aSkipsStartCancelledByASeekPauseOrBackendSwitchEndsPausedAsOnIos() = runTest {
+        for (canceller in listOf("seek", "pause", "switch")) {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                val skip = skipIntoAStart(orchestrator, engines, delegate)
+                when (canceller) {
+                    "seek" -> orchestrator.seekTo(10_000L)
+                    "pause" -> orchestrator.pause()
+                    else -> orchestrator.settleActiveTransition()
+                }
+                runCurrent()
+                skip.await()
+                assertTrue(canceller, delegate.playbackStates.contains(AudioPlayerState.PAUSED))
+                assertEquals(canceller, AudioPlayerState.LOADING, delegate.playbackStates.first())
+                assertEquals(canceller, AudioPlayerState.PAUSED, delegate.playbackStates[1])
+                assertFalse(canceller, orchestrator.snapshot().playWhenReady)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
+    fun aStartAfterTheQueueEndedCancelledByASeekEndsPaused() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(1))
+            orchestrator.play()
+            engines.first.ended = true
+            engines.second.ended = true
+            advanceTimeBy(1_000L)
+            runCurrent()
+            assertEquals(AudioPlayerState.ENDED, delegate.playbackStates.last())
+            delegate.playbackStates.clear()
+            engines.first.simulatedStart = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+            val started = async { runCatching { orchestrator.play() } }
+            advanceTimeBy(1_000L)
+            runCurrent()
+            orchestrator.seekTo(10_000L)
+            started.await()
+            assertEquals(listOf(AudioPlayerState.LOADING, AudioPlayerState.PAUSED), delegate.playbackStates.take(2))
+            assertFalse(orchestrator.snapshot().playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayDuringAPausedSeekPlaysWhenItEndsAndIsSeenAtOnce() = runTest {
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            orchestrator.pause()
+            val seekData = CompletableDeferred<Unit>()
+            engines.first.blockNextSeek = seekData
+            val seek = async { runCatching { orchestrator.seekTo(20_000L) } }
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.SEEKING, orchestrator.snapshot().orchestratorState)
+            delegate.snapshots.clear()
+            orchestrator.play()
+            // Rule 13: the notification (snapshot listener) sees playWhenReady at once.
+            assertTrue(delegate.snapshots.last().playWhenReady)
+            seekData.complete(Unit)
+            assertTrue(seek.await().isSuccess)
+            // As iOS: the seek in progress plays when it ends.
+            assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
+            assertTrue(orchestrator.snapshot().playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aSeekDuringALoadOrASeekEndsPausedAsOnIos() = runTest {
+        // P1: a seek during a skip's prepare, while playing.
+        run {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+                val skip = async { runCatching { orchestrator.skip(1) } }
+                advanceTimeBy(1_000L)
+                runCurrent()
+                orchestrator.seekTo(10_000L)
+                runCurrent()
+                skip.await()
+                assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
+                assertFalse(orchestrator.snapshot().playWhenReady)
+            } finally {
+                orchestrator.release()
+            }
+        }
+        // P2: a seek during a play from paused that must load the track again.
+        run {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+                val skip = async { runCatching { orchestrator.skip(1) } }
+                advanceTimeBy(1_000L)
+                runCurrent()
+                orchestrator.pause()
+                skip.await()
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 256L, readyAfterMs = 5_000L, nowMs = { currentTime })
+                val play = async { runCatching { orchestrator.play() } }
+                advanceTimeBy(1_000L)
+                runCurrent()
+                orchestrator.seekTo(10_000L)
+                runCurrent()
+                play.await()
+                assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
+                assertFalse(orchestrator.snapshot().playWhenReady)
+            } finally {
+                orchestrator.release()
+            }
+        }
+        // P3: a seek during a seek, while playing.
+        run {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                val gate = CompletableDeferred<Unit>()
+                engines.first.blockNextSeek = gate
+                val first = async { runCatching { orchestrator.seekTo(20_000L) } }
+                runCurrent()
+                orchestrator.seekTo(30_000L)
+                runCurrent()
+                gate.complete(Unit)
+                runCurrent()
+                first.await()
+                assertEquals(AudioPlayerState.PAUSED, orchestrator.snapshot().playbackState)
+                assertFalse(orchestrator.snapshot().playWhenReady)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
+    fun aCrossfadePrepareWhilePausedReportsNotPlayingAsOnIos() = runTest {
+        val (orchestrator, _, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            orchestrator.pause()
+            delegate.crossfadeEvents.clear()
+            val refused = runCatching { orchestrator.crossFadePrepare() }
+            assertEquals("crossfade_not_playing", (refused.exceptionOrNull() as RejectionException).code)
+            assertEquals(listOf(CrossfadeEvent("cancelled", 0, 1, "not_playing")), delegate.crossfadeEvents)
         } finally {
             orchestrator.release()
         }

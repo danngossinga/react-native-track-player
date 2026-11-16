@@ -460,7 +460,7 @@ assert(
     // The real engine pauses when its play start gives up.
     section(engineSource, 'override suspend fun awaitPlaying(', 'override fun pause()').includes('if (verdict != null) {\n            // Audio must not start by itself later, as on iOS.\n            player.playWhenReady = false\n            player.pause()') &&
     // A natural advance is an operation: a pause during the next track's start cancels it.
-    section(orchestrator, 'private suspend fun monitorActiveEngine()', 'private fun cancelCrossfade(').includes('val ticket = operationController.begin()\n            try {\n                startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)') &&
+    section(orchestrator, 'private suspend fun monitorActiveEngine()', 'private fun cancelCrossfade(').includes('val ticket = beginOperation()\n            try {\n                startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aPauseDuringTheNextTracksStartCancelsItWithNoPlaybackError()') &&
     section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('readings = { longArrayOf(latest?.bufferedPositionMs ?: 0L) }'),
   'Android must wait for a play start and a standard seek like iOS.'
