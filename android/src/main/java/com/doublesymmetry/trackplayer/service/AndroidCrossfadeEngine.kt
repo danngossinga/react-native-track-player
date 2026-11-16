@@ -324,6 +324,10 @@ internal class AndroidCrossfadeEngine(
             readings = ::loadProgress
         ) { player.playbackState != Player.STATE_BUFFERING }
         if (verdict != null) {
+            // As on iOS: the player stops, so audio does not resume by itself when data arrives.
+            player.playWhenReady = false
+            player.pause()
+            if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
             val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
             throw RejectionException("$name did not finish seeking ($reason).", "crossfade_seek_timeout")
         }
