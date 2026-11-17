@@ -1787,6 +1787,15 @@ final class FailedLoadRule {
         selectionPending = true
     }
 
+    /// `item` left the queue: when it was the reported (or active) track, there is none any more,
+    /// reported at once (the next track is reported once it loaded).
+    func removed(_ item: ObjectIdentifier?) -> Report? {
+        guard let item = item else { return nil }
+        if active == item { active = nil }
+        if current == item { current = nil }
+        return reported == item ? reportTrack(nil) : nil
+    }
+
     /// The app was told about `item` another way (a logical idle activation).
     func published(_ item: ObjectIdentifier?) {
         current = item

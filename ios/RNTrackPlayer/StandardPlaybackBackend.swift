@@ -479,8 +479,23 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
     }
 
-    private func report(_ change: FailedLoadRule.Report) {
-        onActiveTrackChanged(player, indexOfItem(change.to), trackOf(change.from), indexOfItem(change.from), lastItemPosition)
+    private func report(_ change: FailedLoadRule.Report, lastIndex: Int?? = nil, lastTrack: Track? = nil) {
+        onActiveTrackChanged(
+            player,
+            indexOfItem(change.to),
+            lastTrack ?? trackOf(change.from),
+            lastIndex ?? indexOfItem(change.from),
+            lastItemPosition
+        )
+    }
+
+    /// The reported track left the queue: no active track, reported at once (as the crossfade
+    /// path's queue change); the player's next track is reported once it loaded. As Android.
+    private func reportRemovedTrack(_ before: [AudioItem]) {
+        guard let reported = failedLoads.reported, indexOfItem(reported) == nil else { return }
+        let lastIndex = before.firstIndex { ObjectIdentifier($0 as AnyObject) == reported }
+        let lastTrack = lastIndex.flatMap { before[$0] as? Track }
+        if let change = failedLoads.removed(reported) { report(change, lastIndex: .some(lastIndex), lastTrack: lastTrack) }
     }
 
     /// The player moved to `item` (its current-item event, with the last track's position):
@@ -583,6 +598,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // timeout does not make a late, identical SDK event distinguishable.
             request.finish(.failure(self.seekError("standard_seek_timeout", message)))
             self.pumpSeeks()
+            self.pokeLoadWatchAfterSeek()
         }
         request.wait = wait
         // A newer seek ends the older ones at once (standard_seek_cancelled), as on Android.
@@ -652,6 +668,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             ? .success(())
             : .failure(seekError("standard_seek_cancelled", "The native seek was interrupted.")))
         pumpSeeks()
+        pokeLoadWatchAfterSeek()
     }
 
     private func cancelPendingSeeks() {
@@ -662,6 +679,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         let error = seekError("standard_seek_cancelled", "Playback changed before the native seek completed.")
         issuedSeek?.finish(.failure(error))
         waiting.forEach { $0.finish(.failure(error)) }
+        pokeLoadWatchAfterSeek()
+    }
+
+    /// A seek ended (done, cancelled, given up): it no longer owns the loading, so the load watch
+    /// looks again at once (as Android's seekTo finally), after the current change settles.
+    private func pokeLoadWatchAfterSeek() {
+        DispatchQueue.main.async { [weak self] in self?.loadDriver?.poke() }
     }
 
     var playbackState: State {
@@ -947,10 +971,16 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 throw AudioPlayerError.QueueError.invalidIndex(index: invalid, message: "One or more indexes were out of bounds.")
             }
             if indexes.contains(player.currentIndex) { cancelPendingSeeks() }
+            let before = player.items
             for index in indexes {
                 try player.removeItem(at: index)
             }
-            if player.items.isEmpty { idleWithoutActiveTrack = false }
+            if player.items.isEmpty {
+                idleWithoutActiveTrack = false
+                failedLoads.reset()
+            } else {
+                reportRemovedTrack(before)
+            }
         }
     }
 
@@ -961,7 +991,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func removeUpcomingTracks() {
         onMain {
             guard !idleWithoutActiveTrack else { return }
+            let before = player.items
             player.removeUpcomingItems()
+            reportRemovedTrack(before)
         }
     }
 

@@ -9,7 +9,7 @@ class FailedLoadRuleTest {
     fun followsTheSharedScenarios() {
         @Suppress("UNCHECKED_CAST")
         val scenarios = readSharedFixture("scripts/fixtures/failed-load-scenarios.json")["scenarios"] as List<Map<String, Any?>>
-        assertEquals(8, scenarios.size)
+        assertEquals(9, scenarios.size)
         for (scenario in scenarios) {
             val id = scenario["id"] as String
             val rule = FailedLoadRule()
@@ -31,6 +31,7 @@ class FailedLoadRuleTest {
                     "command" -> assertReport(rule.command())
                     "play" -> assertEquals(where, item(step["reload"]), rule.play())
                     "reset" -> rule.reset()
+                    "remove" -> assertReport(rule.removed(item(step["item"])))
                     else -> error("unknown event $event in $id")
                 }
                 assertEquals("$where active", item(step["active"]), rule.active)

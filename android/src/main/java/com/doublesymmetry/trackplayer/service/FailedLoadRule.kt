@@ -81,6 +81,17 @@ internal class FailedLoadRule {
         selectionPending = true
     }
 
+    /**
+     * [item] left the queue: when it was the reported (or active) track, there is none any more,
+     * reported at once (the next track is reported once it loaded).
+     */
+    fun removed(item: Any?): Report? {
+        if (item == null) return null
+        if (active === item) active = null
+        if (current === item) current = null
+        return if (reported === item) reportCurrentTrack(null) else null
+    }
+
     /** The app was told about [item] another way (a logical idle activation). */
     fun published(item: Any?) {
         current = item

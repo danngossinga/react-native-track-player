@@ -177,7 +177,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 8)
+        XCTAssertEqual(scenarios.count, 9)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -201,6 +201,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 case "command": XCTAssertEqual(rule.command(), expected, at)
                 case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
                 case "reset": rule.reset()
+                case "remove": XCTAssertEqual(rule.removed(identity(step["item"])), expected, at)
                 default: XCTFail("unknown event in \(at)")
                 }
                 XCTAssertEqual(rule.active, identity(step["active"]), "\(at) active")

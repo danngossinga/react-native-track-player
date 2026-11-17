@@ -723,7 +723,9 @@ assert(
       section(player, 'func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {', '\n    }\n').includes('Metadata.update(for: source, with: track.toObject())') &&
       // The crossfade play after a failed first load retries the track that failed (Android too).
       section(orchestrator, '        case .error:', '        }\n        refreshNowPlaying()').includes('indexToPlayAfterFailedLoad(') &&
-      read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()'),
+      read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()') &&
+      section(backendSource, 'private func cancelPendingSeeks() {', '\n    }\n').includes('pokeLoadWatchAfterSeek()') &&
+      section(backendSource, 'func remove(at indexes: [Int]) throws {', '\n    }\n').includes('reportRemovedTrack(before)'),
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );
 }

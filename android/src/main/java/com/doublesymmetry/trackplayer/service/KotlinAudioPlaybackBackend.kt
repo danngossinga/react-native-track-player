@@ -483,9 +483,20 @@ internal class KotlinAudioPlaybackBackend(
         if (failedLoads.isPending(player.currentItem)) onLoadFailed(indexOfItem(failedLoads.reported))
     }
 
-    private fun report(change: FailedLoadRule.Report) {
+    private fun report(change: FailedLoadRule.Report, lastIndex: Int? = indexOfItem(change.from)) {
         val lastItem = change.from as? TrackAudioItem
-        onActiveTrackChanged(indexOfItem(change.to), indexOfItem(change.from), lastItem, lastItemPositionMs)
+        onActiveTrackChanged(indexOfItem(change.to), lastIndex, lastItem, lastItemPositionMs)
+    }
+
+    /**
+     * The reported track left the queue: no active track, reported at once (as the crossfade
+     * path's queue change); the player's next track is reported once it loaded.
+     */
+    private fun reportRemovedTrack(before: List<Any?>) {
+        val reported = failedLoads.reported ?: return
+        if (indexOfItem(reported) != null) return
+        val lastIndex = before.indexOfFirst { it === reported }.takeIf { it >= 0 }
+        failedLoads.removed(reported)?.let { report(it, lastIndex) }
     }
 
     /** Before a play or retry after a failed load: the previous track, else the failed one, loads. */
@@ -553,22 +564,27 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun remove(indexes: List<Int>) {
+        val before = player.items.toList()
         player.remove(indexes)
-        if (player.items.isEmpty()) forgetReportedTrack()
+        if (player.items.isEmpty()) forgetReportedTrack() else reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
 
     override fun removeUpcomingTracks() {
         if (!logicalPlaybackState.hasLogicalActiveItem(player.currentIndex)) return
+        val before = player.items.toList()
         player.removeUpcomingItems()
+        reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
 
     override fun removePreviousTracks() {
         if (!logicalPlaybackState.hasLogicalActiveItem(player.currentIndex)) return
+        val before = player.items.toList()
         player.removePreviousItems()
+        reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }

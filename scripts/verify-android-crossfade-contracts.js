@@ -888,7 +888,8 @@ assert(
 {
   const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
   assert(
-    fixture.scenarios.length === 8 &&
+    fixture.scenarios.length === 9 &&
+      section(standardBackend, 'override fun remove(indexes: List<Int>) {', '\n    }\n').includes('reportRemovedTrack(before)') &&
       read('android/src/test/java/com/doublesymmetry/trackplayer/service/FailedLoadRuleTest.kt').includes('readSharedFixture("scripts/fixtures/failed-load-scenarios.json")') &&
       standardBackend.includes('get() = if (failedLoads.isPending(player.currentItem)) reportedIndex() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
       section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('failLoadedTrack()') &&
