@@ -876,6 +876,19 @@ assert(
       watchSource.includes('private fun loadOf(item: Any): Load? = current.get()?.takeIf { it.item === item }') &&
       ['thePreviousTracksSegmentRequestDoesNotEndTheNextLoadsPlaylistProgress', 'thePreviousTracksBytesAreNotTheNextLoadsProgress']
         .every((t) => read('android/src/test/java/com/doublesymmetry/trackplayer/service/LoadedBytesTest.kt').includes(`fun ${t}()`)) &&
+      // A give-up's error stays until the next command (iOS: hostFailure): the play-when-ready
+      // change that follows the stop does not turn it into PAUSED; a seek loads the track again.
+      vendored.includes('if (!player.playWhenReady && playerState != AudioPlayerState.STOPPED && !isHostFailure()) {') &&
+      vendored.includes('playerState == AudioPlayerState.ERROR && playbackError?.fromHost == true') &&
+      standardBackend.includes('if (it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true) AudioPlayerState.STOPPED else it') &&
+      // The real vendored player and backend against a stalled server.
+      read('android/robolectric-tests/build.gradle.kts').includes('from("${rootProject.projectDir}/../src/vendor/kotlinaudio/java")') &&
+      read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt",') &&
+      ['aStalledTrackTappedWhileAnotherPlaysEndsInErrorWithThePreviousTrackActive', 'aStalledFirstTrackEndsInErrorWithNoActiveTrack',
+        'aStalledSeekWhilePlayingEndsInErrorAtItsTarget', 'theNextCommandEndsTheErrorASeekLoadsTheTrackAgainAtItsTarget',
+        'failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions']
+        .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)) &&
+      hlsTest.includes('fun failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions()') &&
       vendored.includes('MediaType.HLS -> createHlsSource(mediaItem, playlistFactory, mediaFactory)') &&
       musicService.includes('onLoadStart = { item -> standardAnalytics[binding.player]?.loadedBytes?.startLoad(item) }') &&
       ['slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyStandardTrackGiveUp', 'slowPlaylistsCountAgainForTheNextStandardTrack']

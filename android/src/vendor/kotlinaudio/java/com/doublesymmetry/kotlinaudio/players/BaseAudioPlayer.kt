@@ -433,6 +433,10 @@ abstract class BaseAudioPlayer internal constructor(
         playerState = AudioPlayerState.ERROR
     }
 
+    /** Fork: in the error of a host give-up ([failLoad]), which no player event ends. */
+    private fun isHostFailure(): Boolean =
+        playerState == AudioPlayerState.ERROR && playbackError?.fromHost == true
+
     @CallSuper
     open fun clear() {
         exoPlayer.clearMediaItems()
@@ -765,7 +769,9 @@ abstract class BaseAudioPlayer internal constructor(
                         }
                     }
                     Player.EVENT_PLAY_WHEN_READY_CHANGED -> {
-                        if (!player.playWhenReady && playerState != AudioPlayerState.STOPPED) {
+                        // Fork: the play-when-ready change of a host give-up ([failLoad]) comes
+                        // after it; the player stays in that error until the next command.
+                        if (!player.playWhenReady && playerState != AudioPlayerState.STOPPED && !isHostFailure()) {
                             playerState = AudioPlayerState.PAUSED
                         }
                     }

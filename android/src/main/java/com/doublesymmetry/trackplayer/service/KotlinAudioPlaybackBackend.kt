@@ -520,7 +520,12 @@ internal class KotlinAudioPlaybackBackend(
     /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
     private val seekPlayer = object : StandardSeekPlayer {
         override val currentItem: Any? get() = player.currentItem
-        override val kotlinAudioState: AudioPlayerState get() = player.playerState
+        // A give-up (failLoad) left the player stopped and in error until the next command: a
+        // seek loads the track again, as after a stop (iOS: hostFailure cleared, item reloaded).
+        override val kotlinAudioState: AudioPlayerState
+            get() = player.playerState.let {
+                if (it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true) AudioPlayerState.STOPPED else it
+            }
         override val exo: ExoSeekState = CapturedExoSeekState { analytics()?.player }
         override val positionMs: Long get() = player.position
         override val bufferedPositionMs: Long get() = player.bufferedPosition

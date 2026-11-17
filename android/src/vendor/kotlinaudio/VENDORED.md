@@ -41,11 +41,11 @@ section 4(b)); line numbers below include that notice.
     rule (pause, then resume) itself;
   - `:241` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
     selector whose selections start each track from `initialBitrateEstimateBps`);
-  - `:496-505` the item's HTTP configuration (user agent, redirects, headers) becomes a
+  - `:500-509` the item's HTTP configuration (user agent, redirects, headers) becomes a
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream;
-  - `:511-543` media requests and the rest are split: the media requests (HLS segments, DASH
+  - `:515-547` media requests and the rest are split: the media requests (HLS segments, DASH
     and SmoothStreaming chunks, a progressive file) report their bytes to the listener
     `hooks.mediaTransferListener` makes for the item, the playlists, manifests and keys to the one
     `hooks.playlistTransferListener` makes (HLS through an `HlsDataSourceFactory` by data type):
@@ -55,7 +55,11 @@ section 4(b)); line numbers below include that notice.
   - `:423-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error
-    (reported as a playback error for a load no command waits for).
+    (reported as a playback error for a load no command waits for);
+  - `:436-438` `isHostFailure()` (new) and `:772-774` in `onEvents`: the play-when-ready change
+    ExoPlayer reports a message after `failLoad`'s stop no longer turns that error into PAUSED
+    (upstream: any pause while not stopped); the player stays in the host's error until the next
+    command (iOS: `hostFailure`). A pause after an ExoPlayer error is upstream as-is.
 - `models/PlaybackError.kt`: `:1-4` the notice; `:10-11` `fromHost` (new, default false): the
   error's code is the host's own (`crossfade_prepare_timeout`, `standard_seek_timeout`), emitted
   without the `android-` prefix of ExoPlayer's codes.

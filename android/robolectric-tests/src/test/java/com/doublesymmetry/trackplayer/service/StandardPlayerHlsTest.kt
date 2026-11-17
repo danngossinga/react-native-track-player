@@ -213,6 +213,25 @@ class StandardPlayerHlsTest {
     }
 
     @Test
+    fun failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions() {
+        // Each segment fails (503) shortly before the stall timeout: the player then loads another
+        // rendition's playlist. After the first segment request playlists are not progress: the
+        // load gives up at the stall timeout from that request (as CrossfadeEngineHlsTest's).
+        val failing = HlsTestServer(LADDER, failingStatus = 503, failingAfterMs = STALL_TIMEOUT_MS * 4 / 5)
+            .also { servers += it }
+        val watched = watchedStandardPlayer()
+        load(watched.player, failing, play = true)
+        awaitTrue("a give-up; requests ${failing.requests}", AWAIT_MS) { watched.gaveUpAtMs.isNotEmpty() }
+        val firstSegmentAt = failing.stalledRequestTimesMs.first()
+        val gaveUpAt = watched.gaveUpAtMs.first()
+        assertTrue(
+            "gave up ${gaveUpAt - firstSegmentAt}ms after the first segment request (renditions asked: ${failing.segmentRenditions()}); stallTimeoutMs is $STALL_TIMEOUT_MS",
+            gaveUpAt - firstSegmentAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS
+        )
+        assertTrue("the player fell back to another rendition: ${failing.segmentRenditions()}", failing.segmentRenditions().toSet().size > 1)
+    }
+
+    @Test
     fun aStalledStandardSeekGivesUpAtTheStallTimeoutAndStopsLoading() {
         // Segments from the fourth on (12 s) never come; the seek to 20 s stalls.
         val server = server(LADDER, segmentCount = 8, stalledFrom = 3)
