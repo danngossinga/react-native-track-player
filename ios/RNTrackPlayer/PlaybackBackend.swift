@@ -1882,3 +1882,11 @@ func indexToPlayAfterFailedLoad(currentIndex: Int, failedIndex: Int?, count: Int
     guard let failedIndex = failedIndex, (0..<count).contains(failedIndex) else { return nil }
     return failedIndex
 }
+
+/// Whether a standard native seek that ended stops loading: one that ended unfinished on its
+/// own track and was the latest (no newer seek replaced it: AVPlayer ends a replaced seek
+/// unfinished, which is not a failure), as `settleCrossfadeSeek` on the crossfade path. A seek
+/// that gives up (`standard_seek_timeout`) stops loading too; a player failure has stopped it.
+func standardSeekEndStopsLoading(didFinish: Bool, sameTrack: Bool, isLatest: Bool) -> Bool {
+    return !didFinish && sameTrack && isLatest
+}

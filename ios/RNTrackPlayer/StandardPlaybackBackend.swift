@@ -662,8 +662,19 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private func didCompleteNativeSeek(position: Double, didFinish: Bool) {
         // Matched by the seek it completes, not by position alone (A, B, then A again).
         guard let request = nativeSeeks.completed(at: position) else { return }
-        if issuedSeek === request { issuedSeek = nil }
+        let wasIssued = issuedSeek === request
+        if wasIssued { issuedSeek = nil }
         let sameTrack = (player.currentItem as? Track) === request.track
+        // A seek that fails for any reason stops loading (as the crossfade path); one a newer
+        // seek replaced does not.
+        if !disposed, standardSeekEndStopsLoading(didFinish: didFinish, sameTrack: sameTrack, isLatest: wasIssued && pendingSeeks.isEmpty) {
+            giveUp(
+                log: "seek interrupted",
+                failure: IOSPlaybackErrorSnapshot(message: "The native seek was interrupted.", code: "standard_seek_cancelled"),
+                report: false,
+                keptPosition: request.position
+            )
+        }
         request.finish(didFinish && sameTrack && !disposed
             ? .success(())
             : .failure(seekError("standard_seek_cancelled", "The native seek was interrupted.")))

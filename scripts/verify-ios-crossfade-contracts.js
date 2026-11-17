@@ -529,7 +529,7 @@ assert(
   standardBackend.includes('        let superseded = pendingSeeks\n        pendingSeeks.removeAll()\n        superseded.forEach {\n            $0.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
     standardBackend.includes('        if let issued = issuedSeek {\n            // Its native callback still comes (NativeSeekLedger) but resolves nothing.\n            issuedSeek = nil\n            nativeSeeks.release(issued)\n            issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
     standardBackend.includes('            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
-    standardBackend.includes('        guard let request = nativeSeeks.completed(at: position) else { return }\n        if issuedSeek === request { issuedSeek = nil }') &&
+    standardBackend.includes('        guard let request = nativeSeeks.completed(at: position) else { return }\n        let wasIssued = issuedSeek === request\n        if wasIssued { issuedSeek = nil }') &&
     !standardBackend.includes('request.position == position') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testANativeSeekCallbackResolvesOnlyTheSeekItCompletes()') &&
     // The module's request follows every playWhenReady it sets (restore, a cancelled handoff,
@@ -726,6 +726,7 @@ assert(
       section(orchestrator, '        case .error:', '        }\n        refreshNowPlaying()').includes('indexToPlayAfterFailedLoad(') &&
       read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()') &&
       section(backendSource, 'private func cancelPendingSeeks() {', '\n    }\n').includes('pokeLoadWatchAfterSeek()') &&
+      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('standardSeekEndStopsLoading(didFinish: didFinish, sameTrack: sameTrack, isLatest: wasIssued && pendingSeeks.isEmpty)') &&
       section(backendSource, 'func remove(at indexes: [Int]) throws {', '\n    }\n').includes('reportRemovedTrack(before)'),
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );

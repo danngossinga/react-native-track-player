@@ -234,6 +234,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertNil(indexToPlayAfterFailedLoad(currentIndex: -1, failedIndex: 5, count: 3))
     }
 
+    func testAStandardSeekThatEndsUnfinishedStopsLoadingUnlessANewerOneReplacedIt() {
+        // As settleCrossfadeSeek: the latest seek that fails stops loading; a replaced one does not.
+        XCTAssertTrue(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: true))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: false))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: false, isLatest: true))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: true, sameTrack: true, isLatest: true))
+    }
+
     func testAFailedStandardSeekKeepsItsTargetAsThePosition() {
         // SwiftAudioEx's stop resets its position to 0; the backend reports the seek's target,
         // as a failed crossfade seek and Android's standard player (ExoPlayer keeps it).
