@@ -277,27 +277,14 @@ class StandardPlayerHlsTest {
         lateinit var driver: StandardLoadDriver
         val seekGate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS })
         val gaveUpAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
-        /**
-         * When ExoPlayer's playback thread had processed each give-up's stop (its clock): a
-         * message sent right after stop() runs there after it (messages to a player run in order).
-         */
-        val stopProcessedAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
-        /** When the player started each media load (segment request), on its playback thread's clock. */
-        val mediaLoadsStartedAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
+        /** The player's load starts in order, with where it had processed each give-up's stop. */
+        val loads = PlayerLoadLog().also(analytics::addListener)
+        val stopsProcessed = java.util.Collections.synchronizedList(mutableListOf<PlayerLoadLog.Marker>())
         /** When the player moved to another item (a natural advance): that item's load starts. */
         @Volatile
         var transitionAtMs = 0L
 
         init {
-            analytics.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
-                override fun onLoadStarted(
-                    eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
-                    loadEventInfo: com.google.android.exoplayer2.source.LoadEventInfo,
-                    mediaLoadData: com.google.android.exoplayer2.source.MediaLoadData
-                ) {
-                    if (mediaLoadData.dataType == com.google.android.exoplayer2.C.DATA_TYPE_MEDIA) mediaLoadsStartedAtMs += eventTime.realtimeMs
-                }
-            })
             player.addListener(object : Player.Listener {
                 override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
                     transitionAtMs = monotonicNowMs()
@@ -310,7 +297,7 @@ class StandardPlayerHlsTest {
             gaveUpAtMs += monotonicNowMs()
             player.playWhenReady = false
             player.stop()
-            player.createMessage { _, _ -> stopProcessedAtMs += android.os.SystemClock.elapsedRealtime() }.send()
+            stopsProcessed += loads.mark(player)
         }
 
         fun assertGivesUpAtTheStallTimeoutAndStopsLoading(server: HlsTestServer, givenUpBefore: Int = 0) {
@@ -324,8 +311,8 @@ class StandardPlayerHlsTest {
                 "gave up ${gaveUpAt - loadAt}ms after the load began; stallTimeoutMs is $STALL_TIMEOUT_MS",
                 gaveUpAt - loadAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS
             )
-            awaitTrue("the stop processed by the player") { stopProcessedAtMs.size > givenUpBefore }
-            val stoppedAt = stopProcessedAtMs[givenUpBefore]
+            awaitTrue("the stop processed by the player") { stopsProcessed.getOrNull(givenUpBefore)?.reached == true }
+            val stopped = stopsProcessed[givenUpBefore]
             // ExoPlayer's default policy retries a failed request after 0, 1, 2 s...: wait past those.
             Thread.sleep(3 * STALL_TIMEOUT_MS)
             // The player starts no load once it has stopped. (A stalled request's own read timeout
@@ -334,9 +321,10 @@ class StandardPlayerHlsTest {
             // a few milliseconds later: the server's arrival times cannot tell it from a request
             // made after the stop, the player's own load events can.)
             assertEquals(
-                "media loads started after the stop (started ${mediaLoadsStartedAtMs.toList()}, stop processed at $stoppedAt; requests at ${server.stalledRequestTimesMs.map { it - gaveUpAt }} from the give-up)",
-                0,
-                mediaLoadsStartedAtMs.count { it > stoppedAt }
+                "media loads started after the stop (requests at ${server.stalledRequestTimesMs.map { it - gaveUpAt }} from the give-up)",
+                emptyList<PlayerLoadLog.LoadStart>(),
+                // Of this give-up's track or any other: the stopped player loads nothing.
+                loads.mediaLoadsAfter(stopped)
             )
             // No later request (a retry after a delay, another rendition): none arrives once the
             // stop's in-flight request could have.

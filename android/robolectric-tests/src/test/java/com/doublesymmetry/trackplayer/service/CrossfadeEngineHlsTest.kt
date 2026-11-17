@@ -52,6 +52,8 @@ class CrossfadeEngineHlsTest {
     private val engineThread = Handler(thread.looper).asCoroutineDispatcher()
     private val servers = mutableListOf<HlsTestServer>()
     private val engines = mutableListOf<AndroidCrossfadeEngine>()
+    /** Each engine's player's load starts, in order ([PlayerLoadLog]). */
+    private val loadLogs = mutableMapOf<AndroidCrossfadeEngine, PlayerLoadLog>()
     private val loads = mutableListOf<Job>()
 
     /**
@@ -395,6 +397,10 @@ class CrossfadeEngineHlsTest {
         gaveUpAtMs: Long
     ) {
         val requestsAtGiveUp = server.stalledRequestTimesMs.size
+        // The give-up stopped the player before the operation failed: a marker sent now runs on
+        // its playback thread after that stop.
+        val log = loadLogs.getValue(engine)
+        val stopped = runBlocking(engineThread) { log.mark(engine.player) }
         // The open requests end by their read timeout (stallTimeoutMs). Then watch as long again:
         // ExoPlayer's default policy would retry within 1 s of such a failure.
         waitUntil(STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS) {
@@ -406,6 +412,9 @@ class CrossfadeEngineHlsTest {
             requestsAtGiveUp,
             server.stalledRequestTimesMs.size
         )
+        // Nor does the stopped player start a load (its own load order, as StandardPlayerHlsTest).
+        awaitTrue("the stop processed by the player") { stopped.reached }
+        assertEquals("media loads started after the stop", emptyList<PlayerLoadLog.LoadStart>(), log.mediaLoadsAfter(stopped))
         assertEquals(
             "every stalled request is closed by the player (closed at ${server.stalledRequestClosedTimesMs.map { it - gaveUpAtMs }})",
             server.stalledRequestTimesMs.size,
@@ -472,7 +481,10 @@ class CrossfadeEngineHlsTest {
             initialBitrateEstimateBps = { initialBitrateEstimateBps },
             stallTimeoutMs = { stallTimeoutMs },
             requestSource = requestSource
-        ).also { engines += it }
+        ).also {
+            engines += it
+            loadLogs[it] = PlayerLoadLog().also(it.player::addAnalyticsListener)
+        }
     }
 
     /** Starts loading the server's track; the load goes on in the background. */

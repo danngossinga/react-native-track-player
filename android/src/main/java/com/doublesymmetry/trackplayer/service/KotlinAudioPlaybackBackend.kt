@@ -613,7 +613,10 @@ internal class KotlinAudioPlaybackBackend(
      * A seek, pause or stop that cancelled a command's wait while its track loads
      * ([standardTrackToReturnTo]): the cancelled command does not take effect, as crossfade's
      * operation cancelled while it loads. The player goes back to the reported track, paused, at
-     * [positionMs] (null: where the player left that track), which stops the other track's load.
+     * [positionMs] (null: where the player left that track): ExoPlayer releases the other track's
+     * media period, so none of its media loads any more. Its source stays prepared while the track
+     * is in the queue: a playlist request already under way completes, and the source then fetches
+     * its primary media playlist (an HLS track; iOS cancels the asset's loading instead).
      */
     private fun returnToReportedTrack(cancelledWait: Boolean, positionMs: Long?) {
         val target = standardTrackToReturnTo(cancelledWait, player.currentItem, failedLoads.reported) ?: return

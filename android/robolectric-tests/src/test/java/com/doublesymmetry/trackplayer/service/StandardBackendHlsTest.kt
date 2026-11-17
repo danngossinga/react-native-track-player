@@ -507,18 +507,20 @@ class StandardBackendHlsTest {
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
         val skip = launchCommand { backed.backend.skip(2) }
         awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
-        assertNull(command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
+        // The seek goes back to A at once (then waits for its target there).
+        val seek = launchCommand { backed.backend.seekTo(LOADABLE_TARGET_MS) }
+        val jumpedBack = backed.markProcessed()
+        awaitTrue("the seek ends") { seek() != null }
+        assertTrue("the seek succeeded: ${seek()}", seek()!!.isSuccess)
         awaitTrue("the skip ends") { skip() != null }
         assertEquals("cancelled", (skip()!!.exceptionOrNull() as RejectionException).code)
+        backed.assertTheSkipsLoadEnded(target, jumpedBack)
         assertEquals("the track the seek acted on", 0, backed.player.currentIndex)
         assertEquals(0, backed.backend.currentIndex)
         assertTrue("at the seek's target: ${backed.player.position}", backed.player.position >= LOADABLE_TARGET_MS)
         assertFalse("paused, as a crossfade operation cancelled while it loads", backed.backend.playWhenReady)
-        val targetRequests = target.requests.size
-        pump(STALL_TIMEOUT_MS * 2)
         assertEquals("C is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
         assertEquals(0, backed.backend.currentIndex)
-        assertEquals("C's load stopped", targetRequests, target.requests.size)
     }
 
     @Test
@@ -531,25 +533,52 @@ class StandardBackendHlsTest {
         assertACommandDuringASkipsLoadLeavesTheActiveTrack { it.stop() }
     }
 
-    private fun assertACommandDuringASkipsLoadLeavesTheActiveTrack(interrupt: (KotlinAudioPlaybackBackend) -> Unit) {
+    // The race behind the earlier flake, made certain: the pause lands while the skip's track is
+    // still fetching its playlists (ExoPlayer started that fetch before it processed the jump back).
+    @Test
+    fun aPauseWhileTheSkipsTrackFetchesItsPlaylistsLoadsNoneOfItsMedia() {
+        val target = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS / 4)
+            .also { servers += it }
+        assertACommandDuringASkipsLoadLeavesTheActiveTrack(target, interruptOnceRequested = true) { it.pause() }
+    }
+
+    @Test
+    fun aStopWhileTheSkipsTrackFetchesItsPlaylistsLoadsNoneOfItsMedia() {
+        val target = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS / 4)
+            .also { servers += it }
+        assertACommandDuringASkipsLoadLeavesTheActiveTrack(target, interruptOnceRequested = true) { it.stop() }
+    }
+
+    private fun assertACommandDuringASkipsLoadLeavesTheActiveTrack(
+        target: HlsTestServer = slowServer(),
+        /** Interrupt once the skip's track asked for its master playlist (still answering). */
+        interruptOnceRequested: Boolean = false,
+        interrupt: (KotlinAudioPlaybackBackend) -> Unit
+    ) {
         val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
-        val target = slowServer()
         val backed = backed()
         backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(target, 3L)))
         command { backed.backend.play() }
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
         val skip = launchCommand { backed.backend.skip(2) }
         awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
+        if (interruptOnceRequested) awaitTrue("C asked for its master playlist") { target.requests.isNotEmpty() }
         val positionOfA = backed.backend.positionMs
         interrupt(backed.backend)
+        val jumpedBack = backed.markProcessed()
         awaitTrue("the skip ends") { skip() != null }
         assertEquals("cancelled", (skip()!!.exceptionOrNull() as RejectionException).code)
+        backed.assertTheSkipsLoadEnded(target, jumpedBack)
+        if (interruptOnceRequested) {
+            // The race made certain: only C's master playlist had been asked for at the jump back.
+            assertEquals(
+                listOf(target.masterUrl),
+                backed.loads.loadsBefore(jumpedBack, target).map { it.uri }
+            )
+        }
         assertEquals("the player's track", 0, backed.player.currentIndex)
         assertEquals(0, backed.backend.currentIndex)
         assertFalse(backed.backend.playWhenReady)
-        val targetRequests = target.requests.size
-        pump(STALL_TIMEOUT_MS)
-        assertEquals("C's load stopped", targetRequests, target.requests.size)
         assertNull(command { backed.backend.play() })
         awaitTrue("A plays again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
         assertTrue("from A's last position (${backed.player.position} ms, left at $positionOfA ms)", backed.player.position >= positionOfA)
@@ -611,10 +640,9 @@ class StandardBackendHlsTest {
             standardPlayerHooks(RuntimeEnvironment.getApplication(), analytics, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, { STALL_TIMEOUT_MS })
         )
         val gaveUpAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
-        /** When ExoPlayer's playback thread had processed each give-up's stop (its clock). */
-        val stopProcessedAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
-        /** When the player started each media load (segment request), on its playback thread's clock. */
-        val mediaLoadsStartedAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
+        /** The player's load starts in order, with where it had processed each give-up's stop. */
+        val loads = PlayerLoadLog().also(analytics::addListener)
+        val stopsProcessed = java.util.Collections.synchronizedList(mutableListOf<PlayerLoadLog.Marker>())
         val activeTrackChanges = mutableListOf<Pair<Int?, Int?>>()
         val loadFailures = mutableListOf<Int?>()
         /** What the notification was told to show (MusicService's onNowPlaying), in order. */
@@ -664,20 +692,8 @@ class StandardBackendHlsTest {
         init {
             eventScope.launch { player.event.stateChange.collect { events += "state:$it" } }
             eventScope.launch { player.event.playbackError.collect { events += "error:${it.code}" } }
-            analytics.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
-                override fun onLoadStarted(
-                    eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
-                    loadEventInfo: com.google.android.exoplayer2.source.LoadEventInfo,
-                    mediaLoadData: com.google.android.exoplayer2.source.MediaLoadData
-                ) {
-                    // The playback thread's clock when the load started (the event reaches this
-                    // thread later).
-                    if (mediaLoadData.dataType == com.google.android.exoplayer2.C.DATA_TYPE_MEDIA) mediaLoadsStartedAtMs += loadEventInfo.elapsedRealtimeMs
-                }
-            })
         }
 
-        /** A message sent now runs on the playback thread after the stop just issued. */
         /** What a command left when it returned (or threw), read at that moment. */
         inner class Returned(val index: Int, val exoState: Int, val reported: List<Int?>)
 
@@ -692,8 +708,38 @@ class StandardBackendHlsTest {
             return returned!!
         }
 
+        /** Marks where the player had processed the commands issued so far (a stop, a jump). */
+        fun markProcessed(): PlayerLoadLog.Marker = loads.mark(analytics.player as ExoPlayer)
+
         fun markStopProcessed() {
-            (analytics.player as ExoPlayer).createMessage { _, _ -> stopProcessedAtMs += android.os.SystemClock.elapsedRealtime() }.send()
+            stopsProcessed += markProcessed()
+        }
+
+        /**
+         * A command that cancelled a skip while its track ([server]) loads made the player go
+         * back to the active track ([jumpedBack]: marked right after the command): from the point
+         * where the player processed that, no load of the skip's track is part of its playback (a segment, or any
+         * load of one of its media periods), and the server got no segment request for it that
+         * the player had not started before. ExoPlayer keeps the source of an item in its playlist
+         * prepared (it only releases it when the item leaves the playlist, or on a stop), so a
+         * playlist request already in flight completes and its source then fetches its primary
+         * media playlist; no segment follows (iOS: SwiftAudioEx's load of the active track cancels
+         * the skip's asset loading and removes its item, so nothing of it loads).
+         */
+        fun assertTheSkipsLoadEnded(server: HlsTestServer, jumpedBack: PlayerLoadLog.Marker) {
+            awaitTrue("the jump back processed by the player") { jumpedBack.reached }
+            // Past the slow server's segment delay: a period still loading would ask for more.
+            pump(STALL_TIMEOUT_MS)
+            val after = loads.loadsAfter(jumpedBack, server)
+            assertEquals(
+                "loads of the skip's track by a media period or for media after the jump back: $after (before: ${loads.loadsBefore(jumpedBack, server)}; requests ${server.requests})",
+                emptyList<PlayerLoadLog.LoadStart>(),
+                after.filter { it.isMedia || it.ofAMediaPeriod }
+            )
+            assertTrue(
+                "segment requests ${server.segmentRenditions()} vs media loads started before the jump back ${loads.loadsBefore(jumpedBack, server).filter { it.isMedia }}",
+                server.segmentRenditions().size <= loads.loadsBefore(jumpedBack, server).count { it.isMedia }
+            )
         }
 
         fun assertGivesUpAtTheStallTimeoutAndStopsLoading(server: HlsTestServer) {
@@ -713,14 +759,14 @@ class StandardBackendHlsTest {
         /** As StandardPlayerHlsTest's: no load once the stop was processed, every request closed. */
         fun assertStopsLoading(server: HlsTestServer) {
             val gaveUpAt = gaveUpAtMs.first()
-            awaitTrue("the stop processed by the player") { stopProcessedAtMs.isNotEmpty() }
-            val stoppedAt = stopProcessedAtMs.first()
+            awaitTrue("the stop processed by the player") { stopsProcessed.firstOrNull()?.reached == true }
+            val stopped = stopsProcessed.first()
             // ExoPlayer's default policy retries a failed request after 0, 1, 2 s...: wait past those.
             pump(3 * STALL_TIMEOUT_MS)
             assertEquals(
-                "media loads started after the stop (started ${mediaLoadsStartedAtMs.toList()}, stop processed at $stoppedAt; requests at ${server.stalledRequestTimesMs.map { it - gaveUpAt }} from the give-up)",
-                0,
-                mediaLoadsStartedAtMs.count { it > stoppedAt }
+                "media loads started after the stop (requests at ${server.stalledRequestTimesMs.map { it - gaveUpAt }} from the give-up)",
+                emptyList<PlayerLoadLog.LoadStart>(),
+                loads.mediaLoadsAfter(stopped)
             )
             assertTrue(
                 "stalled requests after the give-up: ${server.stalledRequestTimesMs.map { it - gaveUpAt }}",
