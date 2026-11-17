@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 
 // Every wait for a track gives up when it makes no progress for `stallTimeoutMs`, or when it
@@ -129,6 +130,42 @@ struct PlaybackAdvanceFailure: Equatable {
 
 /// The code of an advance failure whose error names none (a player error), as on Android.
 let playbackAdvanceFailureDefaultCode = "crossfade_engine_error"
+
+extension PlaybackAdvanceFailure {
+    /// The `PlaybackError` event's body: the same fields as Android's orchestrator sends.
+    var eventBody: [String: Any] {
+        return ["code": code, "message": message]
+    }
+}
+
+/// Starts the track after an ended one with `skip` and hands its failure, if any, to `report`
+/// (once; nothing for a start or a cancellation). The orchestrator's end observer runs it.
+func advanceAfterTrackEnd(
+    skip: (@escaping (Result<Void, Error>) -> Void) -> Void,
+    /// Whether the player is in error once the skip completed: only a failed load is the
+    /// advance's to report (a play start that gave up reported itself).
+    playerInError: @escaping () -> Bool = { true },
+    report: @escaping (PlaybackAdvanceFailure) -> Void
+) {
+    skip { result in
+        guard let failure = PlaybackAdvanceFailure(result, playerInError: playerInError()) else { return }
+        report(failure)
+    }
+}
+
+/// The player a crossfade engine stops loading on (AVPlayer; tests may pass another).
+protocol ItemLoadingPlayer: AnyObject {
+    func replaceCurrentItem(with item: AVPlayerItem?)
+}
+
+extension AVPlayer: ItemLoadingPlayer {}
+
+/// Stops a load or seek the engine gave up on: the item leaves the player, so it stops
+/// requesting the item's media (it would otherwise keep a stalled request going in the
+/// background). As Android's engine stops its player.
+func stopLoading(_ player: ItemLoadingPlayer) {
+    player.replaceCurrentItem(with: nil)
+}
 
 /// A timeout option (`prepareTimeoutMs`, `playStartTimeoutMs`...), in milliseconds: nil when it is
 /// not a number from 1 to 2147483646 (booleans refused), so the current value is kept. Same bounds

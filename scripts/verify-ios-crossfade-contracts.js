@@ -608,11 +608,12 @@ assert(
   const observeEnd = section(orchestrator, 'private func observeEnd() {', 'private func stabilizeCancelledOperation() {');
   const delegateImpl = section(player, 'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure) {', '\n    }\n');
   assert(
-    observeEnd.includes('guard let self = self,\n                          let failure = PlaybackAdvanceFailure(result, playerInError: self.state == .error) else { return }') &&
+    observeEnd.includes('advanceAfterTrackEnd(\n                    skip: { completion in self.skip(to: next, initialTime: 0, completion: completion) },') &&
+      observeEnd.includes('playerInError: { [weak self] in self?.state == .error },') &&
       observeEnd.includes('self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)') &&
       !observeEnd.includes('{ _ in }') &&
       delegateImpl.includes('isAuthoritative(.pingPong, identity: orchestrator)') &&
-      delegateImpl.includes('emit(event: EventType.PlaybackError, body: ["code": failure.code, "message": failure.message])') &&
+      delegateImpl.includes('emit(event: EventType.PlaybackError, body: failure.eventBody)') &&
       facade.includes('struct PlaybackAdvanceFailure: Equatable {'),
     'A failed iOS natural advance must emit playback-error with its code and message.'
   );
@@ -625,7 +626,8 @@ assert(
   const seek = section(engine, 'func seek(to position: Double, watched: Bool = true,', 'player.seek(to: time,');
   assert(
     engine.includes('private func abandonLoad() {') &&
-      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('player.replaceCurrentItem(with: nil)') &&
+      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('stopLoading(player)') &&
+      section(facade, 'func stopLoading(_ player: ItemLoadingPlayer) {', '\n}\n').includes('player.replaceCurrentItem(with: nil)') &&
       prepare.includes('self.abandonLoad()') &&
       prepare.includes('"code": "crossfade_prepare_timeout"') &&
       seek.includes('self.abandonLoad()') &&
@@ -651,5 +653,13 @@ assert(
     'iOS must commit the active track only once its load succeeded.'
   );
 }
+
+// After a failed seek the position is its target (the item was dropped), as on Android.
+assert(
+  section(orchestrator, 'func seek(to position: Double, completion:', 'func seek(by offset: Double')
+    .includes('self.checkpoint(position: position, reason: "seek_failed")\n                    self.state = .error') &&
+    section(orchestrator, 'private func observeEnd() {', 'if total > 0').includes('state == .playingSingle || state == .preloadingNext'),
+  'An iOS failed seek must report its target; the end observer must act while preloading.'
+);
 
 console.log('iOS crossfade contracts OK');

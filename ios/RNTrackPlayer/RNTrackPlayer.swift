@@ -2086,7 +2086,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
               orchestrator === playbackOrchestrator else { return }
         // Same event and fields as Android's orchestrator.
-        emit(event: EventType.PlaybackError, body: ["code": failure.code, "message": failure.message])
+        emit(event: EventType.PlaybackError, body: failure.eventBody)
     }
 
     func playbackOrchestrator(
