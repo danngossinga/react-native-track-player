@@ -1,3 +1,13 @@
+# Unreleased (fork: fix/standard-stall-parity)
+
+- **ios:** Breaking: commands reject with Android's code when their error has one. `skip`, `skipToNext`, `skipToPrevious` (before `skip_failed`) and `load` (before `playback_backend_load_failed`) now reject with `crossfade_prepare_timeout` or `cancelled`; `seekTo` and `seekBy` (before `seek_failed`) with `standard_seek_timeout`, `standard_seek_cancelled`, `standard_seek_unavailable`, `crossfade_seek_timeout`, `crossfade_prepare_timeout` or `cancelled`; other commands (`play`, `retry`, `crossFade`) pass these codes through too (`crossfade_engine_error`, `crossfade_play_start_timeout`, `crossfade_start_failed` and `audio_focus_refused` already did). `standard_seek_invalid_position` still rejects as `seek_failed` (iOS only)
+- **RN:** Standard backend (both platforms): `skip`, `skipToNext`, `skipToPrevious` and `load` resolve once their track loaded and is the active one, as the crossfade backend; a track that fails to load rejects them and the previous track stays active
+- **RN:** A `seekTo`, `pause` or `stop` while a skip or load waits for its track cancels it (`cancelled`): the cancelled track is never reported and the player goes back to the active track, paused
+- **RN:** A track becomes the active one (`PlaybackActiveTrackChanged`) once it loaded, never for a track that failed to load (both backends, both platforms)
+- **RN:** Standard backend: a load or seek with no progress for `stallTimeoutMs` gives up (`crossfade_prepare_timeout`, `standard_seek_timeout`), stops loading and leaves the player in error until the next command (on iOS the countdown starts once the player item exists)
+- **RN:** A failed load no command waits for emits the `PlaybackState` error event, then `PlaybackError` (Android's standard backend sent `PlaybackError` first)
+- **RN:** Standard backend: a seek in a track the player cannot seek in (a stream with no length) resolves where the player lands instead of timing out
+
 ## [4.1.2](https://github.com/doublesymmetry/react-native-track-player/compare/v4.1.1...v4.1.2) (2025-08-12)
 
 

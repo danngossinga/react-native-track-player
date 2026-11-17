@@ -84,7 +84,15 @@ Added fork surface:
   and progress is buffered media and the item's transferred bytes, which
   AVFoundation does not split between playlists and media (before, the iOS
   standard backend applied `stallTimeoutMs` from the start of the load, so a
-  playlist slower than it failed the track). On Android the
+  playlist slower than it failed the track). Remaining gap: on iOS an HLS
+  segment counts only once it has completely arrived. AVFoundation updates neither
+  the access log nor the loaded time ranges (the buffered position) while a
+  segment downloads, nor any other public signal of the item (measured with
+  AVFoundation on macOS: a 4 s segment sent over 8 s showed no change until its
+  last byte). A segment whose download takes longer than `stallTimeoutMs` therefore
+  gives up on iOS (both backends) though its bytes keep coming, while Android counts
+  them as they arrive and keeps loading. Keep `stallTimeoutMs` above the longest
+  expected download time of one segment. On Android the
   no-progress countdown of a crossfade load runs from the start of the load:
   until its first segment is requested, playlist and key bytes reset it; after
   that only media bytes (and buffered media) do. When it reaches
