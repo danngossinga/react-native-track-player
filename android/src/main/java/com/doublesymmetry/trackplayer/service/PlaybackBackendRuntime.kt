@@ -300,6 +300,24 @@ internal suspend fun StandardSeekGate.seek(player: StandardSeekPlayer, positionM
     await(positionMs, item) { player.seekObservation() }
 }
 
+/**
+ * A standard seek that, when it gives up (`standard_seek_timeout`), first has [giveUp] stop the
+ * player's loading and leave it in error, as a crossfade seek that gives up; the rejection is the
+ * report (no playback error on top of it).
+ */
+internal suspend fun StandardSeekGate.seekOrGiveUp(
+    player: StandardSeekPlayer,
+    positionMs: Long,
+    giveUp: (RejectionException) -> Unit
+) {
+    try {
+        seek(player, positionMs)
+    } catch (error: RejectionException) {
+        if (error.code == STANDARD_SEEK_TIMEOUT_CODE) giveUp(error)
+        throw error
+    }
+}
+
 /** What a standard restore does (iOS: the same rule). */
 internal data class StandardRestoreSteps(val jump: Boolean, val seek: Boolean)
 

@@ -175,6 +175,40 @@ class StandardPlayerHlsTest {
         watched.assertGivesUpAtTheStallTimeoutAndStopsLoading(stalled, givenUpBefore = 1)
     }
 
+    @Test
+    fun aStalledStandardSeekGivesUpAtTheStallTimeoutAndStopsLoading() {
+        // Segments from the fourth on (12 s) never come; the seek to 20 s stalls.
+        val server = server(LADDER, segmentCount = 8, stalledFrom = 3)
+        val watched = watchedStandardPlayer()
+        load(watched.player, server)
+        awaitTrue("the track is ready") { runBlocking(playerThread) { watched.player.playbackState == Player.STATE_READY } }
+        val gate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS })
+        val seekPlayer = exoSeekPlayer(watched.player)
+        val seekedAt = monotonicNowMs()
+        val error = runBlocking(playerThread) {
+            runCatching { gate.seekOrGiveUp(seekPlayer, 20_000L) { watched.giveUp() } }
+        }.exceptionOrNull()
+        assertEquals("standard_seek_timeout", (error as com.doublesymmetry.trackplayer.utils.RejectionException).code)
+        assertTrue("gave up ${monotonicNowMs() - seekedAt}ms after the seek", monotonicNowMs() - seekedAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS)
+        // The seek's give-up only: the load watch did not give up too (one report).
+        watched.assertGivesUpAtTheStallTimeoutAndStopsLoading(server)
+    }
+
+    /** The seek gate's view of a plain ExoPlayer (KotlinAudio's adapter reads the same values). */
+    private fun exoSeekPlayer(player: ExoPlayer) = object : StandardSeekPlayer {
+        override val currentItem: Any? get() = player.currentMediaItem
+        override val kotlinAudioState: com.doublesymmetry.kotlinaudio.models.AudioPlayerState
+            get() = com.doublesymmetry.kotlinaudio.models.AudioPlayerState.READY
+        override val exo: ExoSeekState = CapturedExoSeekState { player }
+        override val positionMs: Long get() = player.currentPosition
+        override val bufferedPositionMs: Long get() = player.bufferedPosition
+        override val durationMs: Long get() = player.duration
+        override val rate: Float get() = player.playbackParameters.speed
+        override val autoTransitions: Long get() = 0L
+        override fun prepare() = player.prepare()
+        override fun seekTo(positionMs: Long) = player.seekTo(positionMs)
+    }
+
     private inner class WatchedPlayer(val player: ExoPlayer) {
         val gaveUpAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
         /** When the player moved to another item (a natural advance): that item's load starts. */

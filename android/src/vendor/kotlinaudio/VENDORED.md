@@ -27,23 +27,28 @@ section 4(b)); line numbers below include that notice.
   `:27` `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
   resources are now merged into this library's namespace).
 - `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
-  (defaults keep upstream behaviour).
+  (defaults keep upstream behaviour), including `mediaTransferListener` (told of the media
+  requests' bytes only: a load's progress for the host's load watch).
 - `players/BaseAudioPlayer.kt`:
   - `:1-4` the notice;
-  - `:39` import of `PlayerHooks`;
+  - `:39` import of `PlayerHooks`; `:70` import of `HlsDataSourceFactory`;
   - `:91-92` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
   - `:113-114` audio focus (DJE-204/205): with `hooks.hostOwnsAudioFocus`, the player never
     requests (upstream: when it becomes READY, even while paused) nor abandons the focus, so it
     neither ducks nor emits its own focus event. The host holds one focus for both backends,
     requested at the user's play and at an interruption's resume, and applies one interruption
     rule (pause, then resume) itself;
-  - `:240` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
+  - `:241` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
     selector whose selections start each track from `initialBitrateEstimateBps`);
-  - `:482-491` the item's HTTP configuration (user agent, redirects, headers) becomes a
+  - `:496-505` the item's HTTP configuration (user agent, redirects, headers) becomes a
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
-    applied to a plain `DefaultHttpDataSource.Factory` as upstream.
-  - `:422-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
+    applied to a plain `DefaultHttpDataSource.Factory` as upstream;
+  - `:511-539` media requests and the rest are split: with `hooks.mediaTransferListener`, the
+    media requests (HLS segments, DASH and SmoothStreaming chunks, a progressive file) report
+    their bytes to it, playlists, manifests and keys do not (HLS through an `HlsDataSourceFactory`
+    by data type), as the crossfade engines count only media bytes;
+  - `:423-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error
     (reported as a playback error for a load no command waits for).

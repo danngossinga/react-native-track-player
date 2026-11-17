@@ -79,4 +79,12 @@ class StandardLoadWatchTest {
         assertNull(observe(null, Player.STATE_BUFFERING))
         assertNull(observe(a, Player.STATE_BUFFERING))
     }
+
+    @Test
+    fun aGiveUpsCodeIsTheHostsOwnAndExoPlayersKeepsItsPrefix() {
+        val host = com.doublesymmetry.kotlinaudio.models.PlaybackError(PREPARE_TIMEOUT_CODE, "stalled", fromHost = true)
+        val exo = com.doublesymmetry.kotlinaudio.models.PlaybackError("io-network-connection-failed", "failed")
+        assertEquals("crossfade_prepare_timeout", standardPlaybackErrorCode(host))
+        assertEquals("android-io-network-connection-failed", standardPlaybackErrorCode(exo))
+    }
 }

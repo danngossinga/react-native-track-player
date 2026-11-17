@@ -535,8 +535,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onLoadGaveUp: { [weak self] source, failure, report in
                     self?.handleStandardLoadGaveUp(source: source, failure: failure, report: report)
                 },
-                onFailedLoadReverted: { [weak self] source, index, failedIndex in
-                    self?.handleStandardFailedLoadReverted(source: source, index: index, failedIndex: failedIndex)
+                onActiveTrackCorrected: { [weak self] source, index, lastIndex in
+                    self?.handleStandardActiveTrackCorrected(source: source, index: index, lastIndex: lastIndex)
                 },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
                     self?.autoUpdateNowPlayingInfo ?? true
@@ -1988,17 +1988,17 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
     }
 
-    /// A standard load failed: the previous track is the active one again (none when there was
-    /// none), as on the crossfade path; the app is told with an active-track change back to it
-    /// (lastIndex: the failed track). Same event as Android's standard player.
-    func handleStandardFailedLoadReverted(source: QueuedAudioPlayer, index: Int?, failedIndex: Int) {
+    /// The standard player's active track as FailedLoadRule reports it: after a failed load the
+    /// previous track again (none when there was none; lastIndex: the failed track), as on the
+    /// crossfade path; then the player's own track after a command. Same event as Android's.
+    func handleStandardActiveTrackCorrected(source: QueuedAudioPlayer, index: Int?, lastIndex: Int?) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         var body: Dictionary<String, Any> = ["lastPosition": 0]
         if let index = index, source.items.indices.contains(index), let track = source.items[index] as? Track {
             body["index"] = index
             body["track"] = track.toObject()
         }
-        if source.items.indices.contains(failedIndex), let failed = source.items[failedIndex] as? Track {
+        if let failedIndex = lastIndex, source.items.indices.contains(failedIndex), let failed = source.items[failedIndex] as? Track {
             body["lastIndex"] = failedIndex
             body["lastTrack"] = failed.toObject()
         }
@@ -2022,6 +2022,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         if pendingStandardIdleTrackActivation?.source == ObjectIdentifier(source) {
             pendingStandardIdleTrackActivation?.emittedByPhysicalPlayer = true
+        }
+
+        // After a play that reloaded the previous track (a failed load), the app has it already.
+        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
+           backend.identity === source, !backend.reportsItemMove(item) {
+            return
         }
 
         let eventKey = standardActiveTrackEventKey(source: source, item: item, index: index)

@@ -7,15 +7,19 @@ package com.doublesymmetry.trackplayer.service
  * there was none), and the next play loads that previous track. Items are compared by identity.
  * Shared scenarios: scripts/fixtures/failed-load-scenarios.json (iOS: FailedLoadRule).
  *
- * The standard players move to an item before it loads (and report it then); this rule tells
- * them what to report back when that load fails ([failed]) and what a play reloads ([play]).
+ * A standard player moves to an item before it loads and reports it then ([moved]); the rule
+ * also keeps what the app was last told, so each correction is reported once: back to the
+ * previous track when a load fails ([failed]), to the player's own track when a command acts
+ * after that ([command]) or when a track that was never reported becomes ready ([ready]), and
+ * not again when a play reloads the previous track ([play], then [moved]).
  */
 internal class FailedLoadRule {
-    /** What a failed load reports: the track active again ([to]; null: none). */
-    data class Revert(val to: Any?)
+    /** A change of the active track to report: [to] (null: none). */
+    data class Report(val to: Any?)
 
     private var current: Any? = null
     private var lastReady: Any? = null
+    private var reported: Any? = null
     private var reverted = false
 
     /** The active track: the last one that loaded. */
@@ -26,23 +30,34 @@ internal class FailedLoadRule {
     val isReverted: Boolean
         get() = reverted
 
-    /** The player moved to [item] (a load, a skip, a natural advance). */
+    /** The player is on [item] (polled). */
     fun loaded(item: Any?) {
-        if (item === current) return
         current = item
     }
 
-    /** The current item is ready (plays or has media): it is the active track. */
-    fun ready() {
+    /** The player moved to [item] and would report it: whether to (false: the app has it). */
+    fun moved(item: Any?): Boolean {
+        current = item
+        if (item === reported) return false
+        reported = item
+        return true
+    }
+
+    /** The current item is ready: it is the active track; a report when the app was not told. */
+    fun ready(): Report? {
         lastReady = current
         reverted = false
+        if (current === reported) return null
+        reported = current
+        return Report(current)
     }
 
     /** The current item's load failed: the revert to report, or null when it was the active one. */
-    fun failed(): Revert? {
+    fun failed(): Report? {
         if (current === lastReady) return null
         reverted = true
-        return Revert(lastReady)
+        reported = lastReady
+        return Report(lastReady)
     }
 
     /** A play: the item to load first (the active one after a revert), or null to play the current. */
@@ -54,8 +69,12 @@ internal class FailedLoadRule {
         return target
     }
 
-    /** Another command acted on the player: it reports its own item again. */
-    fun command() {
+    /** Another command acts on the player's own track: a report when the app was told another. */
+    fun command(): Report? {
+        if (!reverted) return null
         reverted = false
+        if (current === reported) return null
+        reported = current
+        return Report(current)
     }
 }

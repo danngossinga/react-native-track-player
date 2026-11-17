@@ -1615,35 +1615,52 @@ func standardLoadGiveUpMessage(_ verdict: StallVerdict, stallTimeoutMs: Int, tot
 /// track. Items are compared by identity. Shared scenarios:
 /// scripts/fixtures/failed-load-scenarios.json.
 ///
-/// The standard player moves to an item before it loads (and reports it then); this rule tells it
-/// what to report back when that load fails (`failed`) and what a play reloads (`play`).
+/// A standard player moves to an item before it loads and reports it then (`moved`); the rule
+/// also keeps what the app was last told, so each correction is reported once: back to the
+/// previous track when a load fails (`failed`), to the player's own track when a command acts
+/// after that (`command`) or when a track never reported becomes ready (`ready`), and not again
+/// when a play reloads the previous track (`play`, then `moved`).
 final class FailedLoadRule {
-    /// What a failed load reports: the track active again (nil: none).
+    /// A change of the active track to report: `to` (nil: none).
     struct Revert: Equatable {
         let to: ObjectIdentifier?
     }
+    typealias Report = Revert
 
     private var current: ObjectIdentifier?
+    private var reported: ObjectIdentifier?
     private(set) var active: ObjectIdentifier?
     /// A failed load was reverted and no command has acted since: `active` is what to report.
     private(set) var isReverted = false
 
-    /// The player moved to `item` (a load, a skip, a natural advance).
+    /// The player is on `item` (polled).
     func loaded(_ item: ObjectIdentifier?) {
         current = item
     }
 
-    /// The current item is ready (plays or has media): it is the active track.
-    func ready() {
+    /// The player moved to `item` and would report it: whether to (false: the app has it).
+    func moved(_ item: ObjectIdentifier?) -> Bool {
+        current = item
+        guard item != reported else { return false }
+        reported = item
+        return true
+    }
+
+    /// The current item is ready: it is the active track; a report when the app was not told.
+    func ready() -> Report? {
         active = current
         isReverted = false
+        guard current != reported else { return nil }
+        reported = current
+        return Report(to: current)
     }
 
     /// The current item's load failed: the revert to report, or nil when it was the active one.
-    func failed() -> Revert? {
+    func failed() -> Report? {
         guard current != active else { return nil }
         isReverted = true
-        return Revert(to: active)
+        reported = active
+        return Report(to: active)
     }
 
     /// A play: the item to load first (the active one after a revert), or nil to play the current.
@@ -1655,8 +1672,12 @@ final class FailedLoadRule {
         return target
     }
 
-    /// Another command acted on the player: it reports its own item again.
-    func command() {
+    /// Another command acts on the player's own track: a report when the app was told another.
+    func command() -> Report? {
+        guard isReverted else { return nil }
         isReverted = false
+        guard current != reported else { return nil }
+        reported = current
+        return Report(to: current)
     }
 }

@@ -177,7 +177,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 5)
+        XCTAssertEqual(scenarios.count, 7)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -190,10 +190,13 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             let rule = FailedLoadRule()
             for (index, step) in try XCTUnwrap(scenario["steps"] as? [[String: Any]]).enumerated() {
                 let at = "\(id) step \(index)"
+                // A report expected (absent: none), and to which track (null: none).
+                let expected: FailedLoadRule.Report? = step.keys.contains("report") ? FailedLoadRule.Report(to: identity(step["report"])) : nil
                 switch step["event"] as? String ?? "" {
-                case "load": rule.loaded(identity(step["item"]))
-                case "ready": rule.ready()
-                case "fail": XCTAssertEqual(rule.failed()?.to, identity(step["revert"]), at)
+                case "load": XCTAssertEqual(rule.moved(identity(step["item"])), step["report"] as? Bool, at)
+                case "ready": XCTAssertEqual(rule.ready(), expected, at)
+                case "fail": XCTAssertEqual(rule.failed(), expected, at)
+                case "command": XCTAssertEqual(rule.command(), expected, at)
                 case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
                 default: XCTFail("unknown event in \(at)")
                 }

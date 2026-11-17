@@ -703,7 +703,9 @@ assert(
       section(backendSource, 'private func pollLoads() {', 'private func giveUp(').includes('followLoad(observed)') &&
       section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n').includes('if report { revertFailedLoad() }') &&
       backendSource.includes('loadActiveTrackAfterFailedLoad()\n            requested.request(true)\n            player.play()') &&
-      player.includes('func handleStandardFailedLoadReverted(source: QueuedAudioPlayer, index: Int?, failedIndex: Int) {'),
+      player.includes('func handleStandardActiveTrackCorrected(source: QueuedAudioPlayer, index: Int?, lastIndex: Int?) {') &&
+      player.includes('backend.identity === source, !backend.reportsItemMove(item) {') &&
+      !/failedLoads\.command\(\)\n/.test(backendSource),
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );
 }
