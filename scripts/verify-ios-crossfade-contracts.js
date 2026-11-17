@@ -662,4 +662,36 @@ assert(
   'An iOS failed seek must report its target; the end observer must act while preloading.'
 );
 
+// The standard player's loads follow the stall rule (no command waits for them), as the crossfade
+// path and Android's standard player: a load with no progress for stallTimeoutMs (buffered media)
+// or over prepareTimeoutMs stops loading (SwiftAudioEx stop: the item leaves the AVPlayer), is in
+// error and reports crossfade_prepare_timeout as a PlaybackError; a stalled seek stops loading and
+// leaves the player in error (its rejection is the report).
+{
+  const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
+  const poll = section(backendSource, 'private func pollLoads() {', 'private func giveUp(');
+  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
+  const gaveUp = section(player, 'func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
+  const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  assert(
+    poll.includes('if !isAuthoritative || issuedSeek != nil || !pendingSeeks.isEmpty || hostFailure != nil {') &&
+      poll.includes('phase: standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition),') &&
+      poll.includes('code: standardPrepareTimeoutCode') &&
+      giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
+      giveUp.includes('player.stop()') &&
+      backendSource.includes('if hostFailure != nil { return .error }') &&
+      backendSource.includes('return hostFailure ?? iosPlaybackErrorSnapshot(from: player.playbackError)') &&
+      (backendSource.match(/clearHostFailure\(\)/g) || []).length === 13 &&
+      section(backendSource, 'let wait = StallWaitDriver(', 'request.wait = wait').includes('failure: IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),\n                    report: false') &&
+      player.includes('prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },\n                onLoadGaveUp:') &&
+      gaveUp.includes('emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: State.error, error: failure))') &&
+      gaveUp.includes('emit(event: EventType.PlaybackError, body: failure.dictionary)') &&
+      facade.includes('let standardPrepareTimeoutCode = "crossfade_prepare_timeout"') &&
+      ['testStandardLoadAnItemLoadingThatNeverWasReadyGivesUpAtTheStallTimeout', 'testStandardLoadARebufferAfterReadyIsNotALoad',
+        'testStandardLoadARetryAfterAStopOrAFailureIsANewLoad', 'testStandardLoadPhaseCountsAnItemReadyOnlyOnceItPlaysOrHasMedia']
+        .every((t) => tests.includes(`func ${t}()`)),
+    'The iOS standard player must give up a load with no progress at stallTimeoutMs, as crossfade and Android.'
+  );
+}
+
 console.log('iOS crossfade contracts OK');

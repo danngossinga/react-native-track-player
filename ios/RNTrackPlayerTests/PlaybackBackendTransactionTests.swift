@@ -171,6 +171,98 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertNil(player.currentItem, "the player keeps no item, so it requests nothing more")
     }
 
+    // The standard player's load watch (same rules as Android's StandardLoadWatchTest).
+
+    private final class LoadWatchHarness {
+        var now: TimeInterval = 0
+        var stallMs = 10_000
+        lazy var watch = StandardLoadWatch(stallTimeoutMs: { self.stallMs }, totalTimeoutMs: { 60_000 }, now: { self.now })
+        let a = NSObject()
+        let b = NSObject()
+
+        func observe(_ item: NSObject?, _ phase: StandardLoadPhase, buffered: Double = 0) -> StallVerdict? {
+            return watch.check(StandardLoadObservation(item: item.map(ObjectIdentifier.init), phase: phase, readings: [buffered]))
+        }
+    }
+
+    func testStandardLoadAnItemLoadingThatNeverWasReadyGivesUpAtTheStallTimeout() {
+        let h = LoadWatchHarness()
+        XCTAssertNil(h.observe(h.a, .loading))
+        h.now = 9.999
+        XCTAssertNil(h.observe(h.a, .loading))
+        h.now = 10
+        XCTAssertEqual(h.observe(h.a, .loading), .stalled)
+    }
+
+    func testStandardLoadASlowButProgressingLoadGoesOnUntilTheTotalLimit() {
+        let h = LoadWatchHarness()
+        var buffered = 0.0
+        while h.now < 59 {
+            XCTAssertNil(h.observe(h.a, .loading, buffered: buffered), "\(h.now)")
+            h.now += 1
+            buffered += 0.1
+        }
+        h.now = 60
+        XCTAssertEqual(h.observe(h.a, .loading, buffered: buffered), .capExceeded)
+    }
+
+    func testStandardLoadARebufferAfterReadyIsNotALoad() {
+        let h = LoadWatchHarness()
+        _ = h.observe(h.a, .ready)
+        _ = h.observe(h.a, .loading)
+        h.now = 30
+        XCTAssertNil(h.observe(h.a, .loading))
+    }
+
+    func testStandardLoadAnotherItemIsANewLoadWithTheSettingsOfThatMoment() {
+        let h = LoadWatchHarness()
+        _ = h.observe(h.a, .ready)
+        h.stallMs = 2_000
+        XCTAssertNil(h.observe(h.b, .loading))
+        h.now = 2
+        XCTAssertEqual(h.observe(h.b, .loading), .stalled)
+        XCTAssertEqual(h.watch.lastStallTimeoutMs, 2_000)
+    }
+
+    func testStandardLoadARetryAfterAStopOrAFailureIsANewLoad() {
+        let h = LoadWatchHarness()
+        _ = h.observe(h.a, .ready)
+        _ = h.observe(h.a, .idle)
+        XCTAssertNil(h.observe(h.a, .loading))
+        h.now = 10
+        XCTAssertEqual(h.observe(h.a, .loading), .stalled)
+        _ = h.observe(h.a, .failed)
+        h.now = 20
+        XCTAssertNil(h.observe(h.a, .loading))
+        h.now = 30
+        XCTAssertEqual(h.observe(h.a, .loading), .stalled)
+    }
+
+    func testStandardLoadWithNoItemOrAnotherOwnerNothingIsWatched() {
+        let h = LoadWatchHarness()
+        XCTAssertNil(h.observe(h.a, .loading))
+        XCTAssertNil(h.observe(nil, .loading))
+        h.now = 30
+        XCTAssertNil(h.observe(nil, .loading))
+        XCTAssertNil(h.observe(h.a, .loading))
+    }
+
+    func testStandardLoadPhaseCountsAnItemReadyOnlyOnceItPlaysOrHasMedia() {
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "loading", bufferedPosition: 0), .loading)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "buffering", bufferedPosition: 4), .loading)
+        // An HLS item "ready to play" before any segment arrived is still loading.
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "ready", bufferedPosition: 0), .loading)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "paused", bufferedPosition: 0), .loading)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "ready", bufferedPosition: 4), .ready)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "playing", bufferedPosition: 0), .ready)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "ended", bufferedPosition: 0), .ready)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "stopped", bufferedPosition: 4), .idle)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "idle", bufferedPosition: 0), .idle)
+        XCTAssertEqual(standardLoadPhase(stateRawValue: "failed", bufferedPosition: 0), .failed)
+        XCTAssertEqual(standardLoadGiveUpMessage(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000), "The track did not become ready (no progress for 10000ms).")
+        XCTAssertEqual(standardPrepareTimeoutCode, "crossfade_prepare_timeout")
+    }
+
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
 
     func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {

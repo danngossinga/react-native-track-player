@@ -1485,3 +1485,125 @@ final class PlaybackBackendFacade {
         )
     }
 }
+
+/// The code a load that gives up reports, on both backends and both platforms (Android:
+/// `PREPARE_TIMEOUT_CODE`).
+let standardPrepareTimeoutCode = "crossfade_prepare_timeout"
+
+/// Where the standard player's current item is in its load, for `StandardLoadWatch`.
+enum StandardLoadPhase: Equatable {
+    /// Loading: no media yet, or waiting for it.
+    case loading
+    /// Has played or has media to play (ready, playing, ended; or paused or ready with media).
+    case ready
+    /// Stopped or with no item: whatever loads next is a new load.
+    case idle
+    /// The player failed (it reports its own error).
+    case failed
+}
+
+/// The phase of a SwiftAudioEx state (`AVPlayerWrapperState.rawValue`) with the item's buffered
+/// position: an item is ready once it plays or has media, as ExoPlayer's READY (an HLS item can be
+/// "ready to play" before any segment arrived).
+func standardLoadPhase(stateRawValue: String, bufferedPosition: Double) -> StandardLoadPhase {
+    switch stateRawValue {
+    case "failed": return .failed
+    case "idle", "stopped": return .idle
+    case "playing", "ended": return .ready
+    case "ready", "paused": return bufferedPosition > 0 ? .ready : .loading
+    default: return .loading
+    }
+}
+
+/// What the standard player's load watch reads of the player, once per poll.
+struct StandardLoadObservation {
+    /// The current item's identity; nil with none, or when another owner waits (a seek, a
+    /// candidate backend).
+    let item: ObjectIdentifier?
+    let phase: StandardLoadPhase
+    /// Its progress: the buffered position (the only one SwiftAudioEx exposes).
+    let readings: [Double]
+}
+
+/// The stall rule for the standard player's loads, as the crossfade engines apply it to theirs
+/// and as Android's `StandardLoadWatch` (same rules): an item loading that has not been ready
+/// since it was loaded (an item change, a load after a stop or an error: a retry) gives up after
+/// `stallTimeoutMs` with no progress, or after `prepareTimeoutMs` in all. A rebuffer after ready
+/// is not a load. Main thread.
+final class StandardLoadWatch {
+    private let stallTimeoutMs: () -> Int
+    private let totalTimeoutMs: () -> Int
+    private let now: () -> TimeInterval
+    private var readyItem: ObjectIdentifier?
+    private var watchedItem: ObjectIdentifier?
+    private var watch: StallWatch?
+    /// The limits of the last load watched (what a give-up reports).
+    private(set) var lastStallTimeoutMs = 0
+    private(set) var lastTotalTimeoutMs = 0
+
+    init(
+        stallTimeoutMs: @escaping () -> Int,
+        totalTimeoutMs: @escaping () -> Int,
+        now: @escaping () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }
+    ) {
+        self.stallTimeoutMs = stallTimeoutMs
+        self.totalTimeoutMs = totalTimeoutMs
+        self.now = now
+    }
+
+    var isWatching: Bool { return watch != nil }
+
+    /// Takes one observation: the verdict that ends a load the caller must give up, else nil.
+    func check(_ observed: StandardLoadObservation) -> StallVerdict? {
+        guard let item = observed.item, observed.phase != .failed else {
+            readyItem = nil
+            disarm()
+            return nil
+        }
+        switch observed.phase {
+        case .ready:
+            readyItem = item
+            disarm()
+            return nil
+        case .idle, .failed:
+            readyItem = nil
+            disarm()
+            return nil
+        case .loading:
+            break
+        }
+        if readyItem == item {
+            disarm()
+            return nil
+        }
+        if watch == nil || watchedItem != item {
+            let created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: now())
+            watch = created
+            watchedItem = item
+            lastStallTimeoutMs = created.stallTimeoutMs
+            lastTotalTimeoutMs = created.totalTimeoutMs
+        }
+        let verdict = watch!.check(at: now(), readings: observed.readings)
+        guard verdict != .wait else { return nil }
+        disarm()
+        return verdict
+    }
+
+    /// Forgets the load in progress.
+    func reset() {
+        readyItem = nil
+        disarm()
+    }
+
+    private func disarm() {
+        watch = nil
+        watchedItem = nil
+    }
+}
+
+/// The message of a load that gave up (Android: `standardLoadGiveUpMessage`, same text).
+func standardLoadGiveUpMessage(_ verdict: StallVerdict, stallTimeoutMs: Int, totalTimeoutMs: Int) -> String {
+    return "The track did not become ready (" +
+        (verdict == .stalled ? "no progress for \(stallTimeoutMs)ms" : "over the \(totalTimeoutMs)ms limit") +
+        ")."
+}

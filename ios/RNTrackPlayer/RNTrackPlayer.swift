@@ -530,6 +530,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 },
                 seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs },
                 stallTimeoutMs: { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs },
+                // The stall rule on its loads, with the load limit (prepareTimeoutMs).
+                prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },
+                onLoadGaveUp: { [weak self] source, failure, report in
+                    self?.handleStandardLoadGaveUp(source: source, failure: failure, report: report)
+                },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
                     self?.autoUpdateNowPlayingInfo ?? true
                 },
@@ -1924,6 +1929,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     func handleAudioPlayerStateChange(source: QueuedAudioPlayer, state: AVPlayerWrapperState) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+        // A load or seek given up stopped the player: it is in error (handleStandardLoadGaveUp
+        // emitted it), not stopped.
+        if state == .stopped, let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
+           backend.identity === source, backend.hostFailure != nil {
+            return
+        }
         emit(
             event: EventType.PlaybackState,
             body: getPlaybackStateBodyKeyValues(
@@ -1961,6 +1972,17 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         let metadata = metadata.first?.items ?? []
         let metadataItem = MetadataAdapter.legacyConversion(metadata: metadata)
         emit(event: EventType.PlaybackMetadataReceived, body: metadataItem)
+    }
+
+    /// A standard load or seek given up (no progress for stallTimeoutMs, or over its limit): the
+    /// error state with the error, and for a load (no command waits for it) a playback error with
+    /// the code and message a crossfade advance sends. Same events as Android's standard player.
+    func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+        emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: State.error, error: failure))
+        if report {
+            emit(event: EventType.PlaybackError, body: failure.dictionary)
+        }
     }
 
     func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {
