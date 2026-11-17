@@ -179,6 +179,7 @@ final class IOSCrossfadeEngine {
         var loadItem: AVPlayerItem?
         var settled = false
         var loadWait: StallWaitDriver?
+        let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
         func settle(_ result: Result<Void, Error>) {
             guard !settled else { return }
             settled = true
@@ -188,7 +189,7 @@ final class IOSCrossfadeEngine {
         }
         let wait = startWait(
             totalTimeoutMs: prepareTimeoutMs(),
-            readings: { loadItem.map(Self.loadProgress(of:)) }
+            readings: { loadItem.map(reader.readings) }
         ) { [weak self] verdict, watch in
             guard let self = self, self.generation == currentGeneration, !settled else { return }
             let reason = Self.describe(verdict, watch)
@@ -247,8 +248,10 @@ final class IOSCrossfadeEngine {
                     case .success:
                         // Reaching ready is progress; the seek and preroll stay under this wait.
                         wait.noteProgress()
+                        reader.noteSeek(before: item)
                         self.seek(to: position, watched: false) { [weak self] seekResult in
                             guard let self = self, self.generation == currentGeneration, !settled else { return }
+                            reader.seekFinished(after: item)
                             switch seekResult {
                             case .failure(let error):
                                 self.state = .failed
@@ -282,6 +285,7 @@ final class IOSCrossfadeEngine {
         let seekNumber = seeks.begin()
         var done = false
         var seekWait: StallWaitDriver?
+        var seekReader: ItemLoadReader<AVPlayerItem>?
         func finish(_ result: Result<Void, Error>) {
             guard !done else { return }
             done = true
@@ -296,9 +300,11 @@ final class IOSCrossfadeEngine {
         }
         if watched, completion != nil {
             let item = player.currentItem
+            let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
+            seekReader = reader
             seekWait = startWait(
                 totalTimeoutMs: prepareTimeoutMs(),
-                readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }
+                readings: { item.map(reader.readings) ?? [0, 0] }
             ) { [weak self] verdict, watch in
                 guard let self = self, self.generation == currentGeneration, !done else { return }
                 let reason = Self.describe(verdict, watch)
@@ -317,6 +323,9 @@ final class IOSCrossfadeEngine {
                     ]
                 )))
             }
+        }
+        if let seekReader = seekReader, let current = player.currentItem {
+            seekReader.noteSeek(before: current)
         }
         player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
             DispatchQueue.main.async {
@@ -492,11 +501,12 @@ final class IOSCrossfadeEngine {
         observation = observed
 
         // Waiting to play while media keeps loading (or time advancing) is progress.
+        let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
         playWait = startWait(
             totalTimeoutMs: timeoutMs,
             readings: { [weak self] in
                 guard let self = self else { return nil }
-                return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]
+                return (self.player.currentItem.map(reader.readings) ?? [0, 0]) + [self.currentTime]
             }
         ) { [weak self] verdict, watch in
             guard let self = self, self.generation == generation, !didComplete else { return }
@@ -535,20 +545,6 @@ final class IOSCrossfadeEngine {
     private func endWait(_ driver: StallWaitDriver) {
         driver.cancel()
         waits.removeAll { $0 === driver }
-    }
-
-    /// The progress of a load or of a start that waits: the seconds of media the item has loaded,
-    /// and the bytes its access log reports downloaded (which grow while a first segment arrives,
-    /// before any loaded time range exists).
-    private static func loadProgress(of item: AVPlayerItem) -> [Double] {
-        let loadedSeconds = item.loadedTimeRanges.reduce(0.0) { total, value in
-            let seconds = value.timeRangeValue.duration.seconds
-            return seconds.isFinite ? total + seconds : total
-        }
-        let bytes = item.accessLog()?.events.reduce(0.0) { total, event in
-            total + Double(max(0, event.numberOfBytesTransferred))
-        } ?? 0
-        return [loadedSeconds, bytes]
     }
 
     private static func describe(_ verdict: StallVerdict, _ watch: StallWatch) -> String {

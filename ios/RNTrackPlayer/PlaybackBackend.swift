@@ -94,6 +94,170 @@ struct StallWatch {
     }
 }
 
+/// One reading of an AVPlayerItem's loading, as a crossfade wait sees it. Measured on the iOS
+/// 26.5 simulator with a real AVPlayer and a local HLS server (packed AAC and AES-128 CMAF/fMP4):
+/// - the loaded time ranges grow while a segment arrives, partial bytes included, on the loads
+///   measured; after a CMAF seek they did not grow until the target's segment had arrived;
+/// - the access log's bytes are media only (playlists and error bodies never count). They can be
+///   posted late: a packed-audio segment's bytes when it completes, and the partial bytes of a
+///   variant's failed requests when the player leaves that variant;
+/// - after a failed segment mid-track, the new variant downloads again the segments before the
+///   failed one: bytes for media already buffered. The loaded ranges cover no new time, but they
+///   can empty (on fMP4) and fill again with the same time at the switch;
+/// - a failed request adds an error-log entry; a variant switch adds access-log events, and so
+///   does a seek past the buffer. Every event's URI is nil and a variant that loaded nothing has
+///   no indicated bitrate, so the counts are the signal. The first event is the first variant's
+///   (with fMP4 it opens with the first segment request, its bytes growing in flight).
+struct ItemLoadSnapshot: Equatable {
+    /// The loaded time ranges, in seconds of the item's timeline.
+    var loadedRanges: [ClosedRange<Double>]
+    var transferredBytes: Double
+    var accessLogEvents: Int
+    var errorLogEntries: Int
+}
+
+extension ItemLoadSnapshot {
+    init(of item: AVPlayerItem) {
+        loadedRanges = item.loadedTimeRanges.compactMap { value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = start + range.duration.seconds
+            return start.isFinite && end.isFinite && end >= start ? start...end : nil
+        }
+        let events = item.accessLog()?.events ?? []
+        transferredBytes = events.reduce(0.0) { total, event in
+            total + Double(max(0, event.numberOfBytesTransferred))
+        }
+        accessLogEvents = events.count
+        errorLogEntries = item.errorLog()?.events.count ?? 0
+    }
+}
+
+/// The time a wait has seen buffered: the union of every loaded range it read. It grows only
+/// when media of a time not buffered before in this wait arrives: a buffer that empties and
+/// fills again with the same time adds nothing, while a seek's new range does.
+struct BufferedTimeSeen: Equatable {
+    private(set) var ranges: [ClosedRange<Double>] = []
+
+    var seconds: Double { ranges.reduce(0) { $0 + ($1.upperBound - $1.lowerBound) } }
+
+    /// Adds these ranges; returns the seconds of time they add.
+    mutating func add(_ newRanges: [ClosedRange<Double>]) -> Double {
+        let before = seconds
+        var merged: [ClosedRange<Double>] = []
+        for range in (ranges + newRanges).sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            if let last = merged.last, range.lowerBound <= last.upperBound {
+                merged[merged.count - 1] = last.lowerBound...max(last.upperBound, range.upperBound)
+            } else {
+                merged.append(range)
+            }
+        }
+        ranges = merged
+        return seconds - before
+    }
+}
+
+/// Whether a wait counts the bytes its item's access log posts.
+enum ItemByteCounting: Equatable {
+    /// The posted bytes are progress, with new buffered time.
+    case counting
+    /// A request failed, or a new access-log event opened that is neither the first variant's
+    /// nor that of a seek the wait noted (a switch): the bytes posted now (the left variant's
+    /// failed transfers, segments downloaded again) are not progress. New buffered time is, and
+    /// it resumes the count, unless the same reading brings another failure or event.
+    case pausedUntilMedia
+}
+
+/// One wait's progress, read from its item: [seconds of time buffered, counted bytes], both
+/// running totals, for a `StallWatch`. A new error-log entry, or an access-log event that is
+/// neither the first variant's nor that of a seek the wait issued (`noteSeek`), pauses the byte
+/// count (`ItemByteCounting`). Each wait has its own (a load, a seek, a play start), so a switch
+/// during one never affects another, on this engine or the other.
+struct ItemLoadProgress {
+    private(set) var byteCounting: ItemByteCounting = .counting
+    private var previous: ItemLoadSnapshot?
+    private var buffered = BufferedTimeSeen()
+    private var countedBytes: Double = 0
+    /// Seeks the wait issued whose access-log event has not appeared yet.
+    private var seeksAwaitingEvent = 0
+
+    /// The wait is about to issue a seek; `snapshot` is its item just before it. A seek past the
+    /// buffer opens an access-log event (about 0.1 s later on the simulator), which is not a
+    /// switch. When the wait has no reading yet, this one is its baseline, so the seek's event
+    /// comes after it and is matched however many polls later it appears. When it already has
+    /// one (the load's seek to its start position), the note takes none: an event or bytes since
+    /// the last poll are judged in the next reading together with the seek's event, so a switch
+    /// just before the seek counts as a switch and the bytes posted with it are not progress.
+    mutating func noteSeek(before snapshot: ItemLoadSnapshot) {
+        seeksAwaitingEvent += 1
+        if previous == nil {
+            _ = readings(for: snapshot)
+        }
+    }
+
+    /// The seek completed; `snapshot` is its item now. A seek past the buffer usually opens its
+    /// event before completing, and this reading then matches it; what is left of the allowance
+    /// (a seek inside the buffer opens no event) is dropped. On packed AAC the event was first
+    /// seen in the poll just after the completion: it then counts as a switch, the bytes posted
+    /// with it are not progress (they are not counted later either), and progress comes from
+    /// the new buffered time the moved buffer brings at once.
+    mutating func seekFinished(after snapshot: ItemLoadSnapshot) {
+        _ = readings(for: snapshot)
+        seeksAwaitingEvent = 0
+    }
+
+    /// The readings for this snapshot. The first one only sets the baseline.
+    mutating func readings(for snapshot: ItemLoadSnapshot) -> [Double] {
+        defer { previous = snapshot }
+        let newTime = buffered.add(snapshot.loadedRanges)
+        guard let previous = previous else {
+            countedBytes = snapshot.transferredBytes
+            return [buffered.seconds, countedBytes]
+        }
+        // New events beyond the first variant's and the seeks' are a switch (several at once too).
+        let firstEvent = previous.accessLogEvents == 0 ? 1 : 0
+        let newEvents = max(0, snapshot.accessLogEvents - previous.accessLogEvents - firstEvent)
+        let seekEvents = min(newEvents, seeksAwaitingEvent)
+        seeksAwaitingEvent -= seekEvents
+        let failedOrSwitched = snapshot.errorLogEntries > previous.errorLogEntries
+            || newEvents > seekEvents
+        let newBytes = max(0, snapshot.transferredBytes - previous.transferredBytes)
+        if failedOrSwitched {
+            byteCounting = .pausedUntilMedia
+        } else if byteCounting == .pausedUntilMedia, newTime > 0 {
+            byteCounting = .counting
+        }
+        if byteCounting == .counting {
+            countedBytes += newBytes
+        }
+        return [buffered.seconds, countedBytes]
+    }
+}
+
+/// One wait's reader of its item's progress (see `ItemLoadProgress`): create one per wait.
+final class ItemLoadReader<Item> {
+    private var progress = ItemLoadProgress()
+    private let snapshot: (Item) -> ItemLoadSnapshot
+
+    init(_ snapshot: @escaping (Item) -> ItemLoadSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func readings(_ item: Item) -> [Double] {
+        return progress.readings(for: snapshot(item))
+    }
+
+    /// The wait is about to seek `item` (see `ItemLoadProgress.noteSeek`).
+    func noteSeek(before item: Item) {
+        progress.noteSeek(before: snapshot(item))
+    }
+
+    /// The wait's seek of `item` completed (see `ItemLoadProgress.seekFinished`).
+    func seekFinished(after item: Item) {
+        progress.seekFinished(after: snapshot(item))
+    }
+}
+
 /// What the app is told when the track that should follow an ended one fails to start: no
 /// command waits for that load, so its failure (a stall at `stallTimeoutMs`, the total limit, a
 /// player error) is reported as a playback error with the error's code and message. Nothing is
