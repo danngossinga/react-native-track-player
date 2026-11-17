@@ -217,6 +217,20 @@ class QueuedAudioPlayer(
     }
 
     /**
+     * Fork: the item at [index] (not the current one) gets a new source, not prepared, in place of
+     * the one ExoPlayer prepared for it, which is released: none of its loading goes on (an HLS
+     * source keeps fetching its playlists while its item stays in the playlist). The item, its
+     * place and the current item stay as they are.
+     */
+    fun releaseSource(index: Int) {
+        if (index == currentIndex || index !in queue.indices) return
+        val mediaSource = getMediaSourceFromAudioItem(items[index])
+        queue[index] = mediaSource
+        exoPlayer.addMediaSource(index + 1, mediaSource)
+        exoPlayer.removeMediaItem(index)
+    }
+
+    /**
      * Replaces item at index in queue.
      * If updating current index, we update the notification metadata if [automaticallyUpdateNotificationMetadata] is true.
      */

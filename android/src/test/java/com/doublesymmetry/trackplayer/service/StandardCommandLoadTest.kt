@@ -3,6 +3,7 @@ package com.doublesymmetry.trackplayer.service
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -158,16 +159,20 @@ class StandardCommandLoadTest {
         rule.moved(second)
         assertTrue("one was waiting", loads.cancel())
         assertEquals(listOf<StandardCommandLoad.Outcome>(StandardCommandLoad.Outcome.Cancelled), outcomes)
-        assertTrue(standardTrackToReturnTo(cancelledWait = true, playerItem = second, reported = rule.reported) === first)
+        val back = standardCancelledLoad(cancelledWait = true, playerItem = second, reported = rule.reported)
+        assertTrue("back to A: $back", back is StandardCancelledLoad.ReturnsTo && back.item === first)
         rule.moved(first)
         assertEquals(FailedLoadRule.Phase.Loaded(first), rule.phase)
         assertNull("nothing reported, nothing to reload", rule.play())
         // No wait cancelled (after a failed load too, LOAD-06): the player's own track.
         assertFalse("none waits any more", loads.cancel())
-        assertNull(standardTrackToReturnTo(cancelledWait = false, playerItem = second, reported = first))
-        // Already on the reported track, or none reported (the first load failed): it stays.
-        assertNull(standardTrackToReturnTo(cancelledWait = true, playerItem = first, reported = first))
-        assertNull(standardTrackToReturnTo(cancelledWait = true, playerItem = second, reported = null))
+        assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = second, reported = first))
+        assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = second, reported = null))
+        // Already on the reported track: it stays.
+        assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = true, playerItem = first, reported = first))
+        // None reported (the first load failed): the cancelled load stops, no active track (as
+        // crossfade's active index -1), so the cancelled track is never reported.
+        assertSame(StandardCancelledLoad.StopsInIdle, standardCancelledLoad(cancelledWait = true, playerItem = second, reported = null))
     }
 
     @Test

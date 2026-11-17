@@ -442,24 +442,37 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('        val cancelledWait = commandLoads.cancel()\n        failedLoads.command()\n        returnToReportedTrack(cancelledWait, positionMs)\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
+    standardBackend.includes('        val cancelledWait = commandLoads.cancel()\n        failedLoads.command()\n        leaveCancelledLoad(cancelledWait, positionMs)\n') &&
+    // With no active track (a cancel with none reported stopped the load): the seek rejects, the
+    // player's own item does not load (StandardBackendHlsTest.aSeekCancellingASkipWithNoActiveTrack...).
+    section(standardBackend, 'leaveCancelledLoad(cancelledWait, positionMs)\n', 'seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->').includes('if (logicalPlaybackState.isIdle) {\n            seekGate.cancel("seek")\n            throw RejectionException("No active track is available for seeking.", STANDARD_SEEK_UNAVAILABLE_CODE)') &&
     // A seek that gives up, or finds its track failed to load, leaves that track failed: the next
     // play loads the active track (FailedLoadRule; StandardBackendHlsTest's seek-after-failed-skip tests).
     standardBackend.includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)\n                // Its track failed (again): the next play loads the active track, as after a failed\n                // load (FailedLoadRule.failed changes nothing on the loaded track).\n                failLoadedTrack()') &&
     standardBackend.includes('if (error.code == STANDARD_SEEK_UNAVAILABLE_CODE && player.currentItem != null) failLoadedTrack()') &&
-    // A seek, pause or stop that cancels a waiting skip or load goes back to the reported track
-    // (crossfade's cancelled operation; standardTrackToReturnTo).
-    standardBackend.includes('returnToReportedTrack(commandLoads.cancel(), positionMs = null)\n        player.pause()') &&
-    standardBackend.includes('returnToReportedTrack(cancelledWait, positionMs = null)\n        player.stop()') &&
-    standardBackend.includes('val target = standardTrackToReturnTo(cancelledWait, player.currentItem, failedLoads.reported) ?: return') &&
+    // A seek, pause or stop that cancels a waiting skip or load goes back to the reported track,
+    // releasing the cancelled track's source, or with none reported stops in idle (crossfade's
+    // cancelled operation; standardCancelledLoad).
+    standardBackend.includes('leaveCancelledLoad(commandLoads.cancel(), positionMs = null)\n        player.pause()') &&
+    standardBackend.includes('leaveCancelledLoad(cancelledWait, positionMs = null)\n        player.stop()') &&
+    standardBackend.includes('when (val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported)) {') &&
+    standardBackend.includes('                player.jumpToItem(index, playWhenReady = false)\n                player.seek(position, TimeUnit.MILLISECONDS)\n                // Its source is released') &&
+    standardBackend.includes('                player.releaseSource(cancelled)\n') &&
+    standardBackend.includes('            StandardCancelledLoad.StopsInIdle -> {\n                player.stop()\n                logicalPlaybackState.enterIdle(player.items.size)') &&
+    read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/QueuedAudioPlayer.kt').includes('        exoPlayer.addMediaSource(index + 1, mediaSource)\n        exoPlayer.removeMediaItem(index)\n    }') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
     // So do a pause, a stop, a load and a relative seek (iOS: cancelPendingSeeks).
     ['seekGate.cancel("pause")\n        // As crossfade\'s pause', 'seekGate.cancel("stop")\n        // As crossfade\'s stop',
       'seekGate.cancel("load")\n        runActivatingOperation('].every((s) => standardBackend.includes(s)) &&
-    // seekBy is a waited seek with the same limits, as on iOS.
-    standardBackend.includes('override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, player.position + offsetMs))') &&
+    // seekBy is a waited seek with the same limits, as on iOS, relative to the position the app
+    // reads (the reported track's while another loads: StandardBackendHlsTest.aSeekByDuringASkipsLoad...).
+    standardBackend.includes('override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, positionMs + offsetMs))') &&
+    // The remote jump buttons are that seekBy (the standard notification's FORWARD/REWIND go to
+    // JS, which calls seekBy).
+    musicService.includes('{ runStartingCommand(it, null) { it.seekBy(interval * 1000L) } }') &&
+    musicService.includes('{ runStartingCommand(it, null) { it.seekBy(-interval * 1000L) } }') &&
     // At the target: no fixed tolerance and not the sampling period (what playback played since
     // the seek and since the last reading).
     !section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal interface StandardSeekPlayer {').includes('positionToleranceMs') &&

@@ -67,4 +67,10 @@ section 4(b)); line numbers below include that notice.
   error's code is the host's own (`crossfade_prepare_timeout`, `standard_seek_timeout`), emitted
   without the `android-` prefix of ExoPlayer's codes.
 - `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
-  passed to `BaseAudioPlayer`.
+  passed to `BaseAudioPlayer`;
+  `:219-231` `releaseSource(index)` (new): a new, unprepared source for a non-current item in place
+  of the prepared one, which ExoPlayer releases (removed from its playlist; the item, its place
+  and the current item unchanged). The standard backend calls it on the track of a skip that a
+  pause or seek cancelled while it loaded: ExoPlayer keeps an item's source prepared while the
+  item is in its playlist, and an HLS source would go on fetching its playlists (iOS cancels the
+  asset's loading; the crossfade engine drops it).

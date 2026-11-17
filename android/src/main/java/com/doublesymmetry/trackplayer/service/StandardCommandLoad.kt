@@ -89,7 +89,7 @@ internal class StandardCommandLoad {
 
     /**
      * A newer command that loads, seeks, pauses or stops: the wait in progress ends cancelled.
-     * Returns whether one was waiting ([standardTrackToReturnTo]).
+     * Returns whether one was waiting ([standardCancelledLoad]).
      */
     fun cancel(): Boolean {
         val current = wait ?: return false
@@ -120,16 +120,34 @@ internal class StandardCommandLoad {
 }
 
 /**
- * Where a seek, pause or stop leaves the player: when it cancelled a command's wait
+ * Where a seek, pause or stop leaves the player when it cancelled a command's wait
  * ([StandardCommandLoad.cancel] returned true: a skip, next, previous or load whose track was
- * still loading), the reported track (null: none), as crossfade's operation cancelled while it
- * loads: the cancelled command does not take effect, the player goes back to the active track
- * (paused, which the seek acts on). Else, or with no reported track, null: the player stays on
- * its own item (after a failed load too: LOAD-06, a command acts on the player's own track).
- * iOS: the same rule (`standardTrackToReturnTo`).
+ * still loading), as crossfade's operation cancelled while it loads: the cancelled command does
+ * not take effect, and its track is never reported. iOS: the same rule (`standardCancelledLoad`).
  */
-internal fun standardTrackToReturnTo(cancelledWait: Boolean, playerItem: Any?, reported: Any?): Any? =
-    reported.takeIf { cancelledWait && it != null && it !== playerItem }
+internal sealed class StandardCancelledLoad {
+    /** No wait cancelled (after a failed load too: LOAD-06, a command acts on the player's own track), or the player is on the reported track: it stays. */
+    object Stays : StandardCancelledLoad()
+
+    /** The player goes back to the reported track [item], paused (the seek acts there). */
+    class ReturnsTo(val item: Any) : StandardCancelledLoad()
+
+    /**
+     * No track is reported (the first load failed, or the reported one left the queue): the
+     * cancelled load stops and the player has no active track (logical idle, as crossfade's
+     * active index -1): nothing loads or is reported until a play, skip or load selects a track
+     * again (a play from idle starts the first track, as crossfade's).
+     */
+    object StopsInIdle : StandardCancelledLoad()
+}
+
+/** What a cancel leaves ([StandardCancelledLoad]); [reported]: the track the app was told is active. */
+internal fun standardCancelledLoad(cancelledWait: Boolean, playerItem: Any?, reported: Any?): StandardCancelledLoad = when {
+    !cancelledWait -> StandardCancelledLoad.Stays
+    reported == null -> StandardCancelledLoad.StopsInIdle
+    reported === playerItem -> StandardCancelledLoad.Stays
+    else -> StandardCancelledLoad.ReturnsTo(reported)
+}
 
 /**
  * Whether a command's wait must start its track's load: the track is not the loaded one and the
