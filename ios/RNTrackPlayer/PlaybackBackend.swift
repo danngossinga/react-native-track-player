@@ -189,6 +189,34 @@ func settleCrossfadeLoad(
     complete(result)
 }
 
+/// Numbers an engine's seeks. AVPlayer ends a seek unfinished when a newer seek replaces it: that
+/// is not a failure of the track, so only the latest seek's failure stops loading.
+final class SeekSequence {
+    private(set) var latest = 0
+
+    func begin() -> Int {
+        latest += 1
+        return latest
+    }
+
+    func isLatest(_ seek: Int) -> Bool {
+        return seek == latest
+    }
+}
+
+/// Ends a crossfade seek: the latest seek that failed for any reason (a stall, the limit, an
+/// unfinished seek, an item error) stops loading first, as Android's engine does for every failed
+/// seek; a seek a newer one replaced does not. Then the caller learns the result.
+func settleCrossfadeSeek(
+    _ result: Result<Void, Error>,
+    isLatest: Bool,
+    stopLoading: () -> Void,
+    complete: (Result<Void, Error>) -> Void
+) {
+    if case .failure = result, isLatest { stopLoading() }
+    complete(result)
+}
+
 /// The player a crossfade engine stops loading on (AVPlayer; tests may pass another).
 protocol ItemLoadingPlayer: AnyObject {
     func replaceCurrentItem(with item: AVPlayerItem?)

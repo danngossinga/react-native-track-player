@@ -92,6 +92,7 @@ final class IOSCrossfadeEngine {
     /// The waits running on this engine; each wait owns its driver, a reset cancels them all.
     private var waits: [StallWaitDriver] = []
     private var generation = 0
+    private let seeks = SeekSequence()
     private let name: String
     private(set) var state: IOSCrossfadeEngineState = .idle
 
@@ -204,9 +205,8 @@ final class IOSCrossfadeEngine {
                 domain: "RNTP-Crossfade",
                 code: 5,
                 userInfo: [
-                    NSLocalizedDescriptionKey: loadItem == nil
-                        ? "Crossfade engine did not become playable (\(reason))."
-                        : crossfadeLoadTimeoutMessage(reason),
+                    // The same words whichever stage gave up (the log names it), as on Android.
+                    NSLocalizedDescriptionKey: crossfadeLoadTimeoutMessage(reason),
                     "code": "crossfade_prepare_timeout"
                 ]
             )))
@@ -279,6 +279,7 @@ final class IOSCrossfadeEngine {
         let time = CMTime(seconds: max(0, position), preferredTimescale: 1000)
         let tolerance = CMTime(seconds: 0.05, preferredTimescale: 1000)
         IOSPlaybackLog.log("\(name) seek to=\(max(0, position))")
+        let seekNumber = seeks.begin()
         var done = false
         var seekWait: StallWaitDriver?
         func finish(_ result: Result<Void, Error>) {
@@ -286,7 +287,12 @@ final class IOSCrossfadeEngine {
             done = true
             if let seekWait = seekWait { endWait(seekWait) }
             seekWait = nil
-            completion?(result)
+            settleCrossfadeSeek(
+                result,
+                isLatest: seeks.isLatest(seekNumber),
+                stopLoading: { self.abandonLoad() },
+                complete: { completion?($0) }
+            )
         }
         if watched, completion != nil {
             let item = player.currentItem
@@ -301,7 +307,6 @@ final class IOSCrossfadeEngine {
                 // The player goes to an error state: audio must not resume by itself when the
                 // data arrives later, as after a failed play start.
                 self.player.pause()
-                self.abandonLoad()
                 self.state = .failed
                 finish(.failure(NSError(
                     domain: "RNTP-Crossfade",
@@ -321,7 +326,10 @@ final class IOSCrossfadeEngine {
                     finish(.failure(NSError(
                         domain: "RNTP-Crossfade",
                         code: 3,
-                        userInfo: [NSLocalizedDescriptionKey: "Crossfade engine seek failed."]
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Crossfade engine seek failed.",
+                            "code": "crossfade_engine_error"
+                        ]
                     )))
                     return
                 }

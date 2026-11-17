@@ -286,7 +286,7 @@ assert(
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
     // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
     enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)') &&
-    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            completion?(result)') &&
+    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            settleCrossfadeSeek(\n                result,\n                isLatest: seeks.isLatest(seekNumber),\n                stopLoading: { self.abandonLoad() },\n                complete: { completion?($0) }\n            )') &&
     waitForPlaying.includes('if let playWait = playWait { self.endWait(playWait) }\n            playWait = nil\n            completion(result)') &&
     startWait.includes('if let self = self, let driver = driver { self.endWait(driver) }\n            onGiveUp(verdict, watch)') &&
     section(engine, 'private func endWait(_ driver: StallWaitDriver) {', '\n    }').includes('driver.cancel()\n        waits.removeAll { $0 === driver }') &&
@@ -632,7 +632,8 @@ assert(
       section(facade, 'func settleCrossfadeLoad(', '\n}\n').includes('if case .failure = result { stopLoading() }') &&
       section(engine, 'private func abandonLoad() {', '\n    }\n').includes('pendingAsset?.cancelLoading()') &&
       prepare.includes('"code": "crossfade_prepare_timeout"') &&
-      seek.includes('self.abandonLoad()') &&
+      seek.includes('let seekNumber = seeks.begin()') &&
+      section(facade, 'func settleCrossfadeSeek(', '\n}\n').includes('if case .failure = result, isLatest { stopLoading() }') &&
       seek.includes('"code": "crossfade_seek_timeout"'),
     'An iOS engine that gives up on a load or seek must remove the item (stop loading) and name the code.'
   );
@@ -729,5 +730,12 @@ assert(
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );
 }
+
+// A load that gives up says the same as on Android whichever stage it reached.
+assert(
+  !engine.includes('did not become playable') &&
+    section(engine, 'func prepare(track: Track, position: Double, completion:', 'asset.loadValuesAsynchronously(').includes('NSLocalizedDescriptionKey: crossfadeLoadTimeoutMessage(reason),'),
+  'An iOS load that gives up must use the shared give-up message at every stage.'
+);
 
 console.log('iOS crossfade contracts OK');

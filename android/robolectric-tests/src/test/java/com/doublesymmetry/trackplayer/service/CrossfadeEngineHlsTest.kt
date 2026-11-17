@@ -182,6 +182,26 @@ class CrossfadeEngineHlsTest {
     }
 
     @Test
+    fun aSlowKeyBeforeTheFirstSegmentDoesNotMakeAHealthyTrackGiveUp() {
+        // Encrypted track: playlists, then the key (slow), then the first segment (slow to start).
+        // The key arriving is progress, since no segment was asked for yet; without it the gap from
+        // the media playlist to the first segment bytes would exceed the stall timeout.
+        val engine = engine(STALL_TIMEOUT_MS)
+        val encrypted = HlsTestServer(
+            LADDER,
+            segmentCount = 8,
+            stalledFrom = 8,
+            keyDelayMs = STALL_TIMEOUT_MS * 3 / 4,
+            segmentDelayMs = STALL_TIMEOUT_MS / 2
+        ).also { servers += it }
+        val result = runBlocking(engineThread) {
+            runCatching { engine.prepare(hlsItem(encrypted), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+        }
+        assertTrue("a healthy encrypted track loads, got $result (requests: ${encrypted.requests})", result.isSuccess)
+        assertTrue("the key was asked for", encrypted.requests.any { it.endsWith("/key.bin") })
+    }
+
+    @Test
     fun slowPlaylistsCountAgainForTheNextTrackOnTheSameEngine() {
         // The previous track asked for segments; the next one's playlists are progress again.
         val engine = engine(STALL_TIMEOUT_MS)
@@ -265,6 +285,29 @@ class CrossfadeEngineHlsTest {
         // The position reported after a failed seek is its target (as iOS), where the next play
         // loads the track again.
         assertEquals(SEEK_TARGET_MS, runBlocking(engineThread) { engine.positionMs })
+    }
+
+    @Test
+    fun aSeekThatFailsWithAPlayerErrorAlsoStopsLoadingAsOnIos() {
+        // The segments the seek lands in are gone (404 on every rendition): after its retries the
+        // player fails. As for a load, the seek reports it (not "finished") and the engine stops
+        // and forgets the track. The stall timeout is long here, so the player error comes first.
+        val stallTimeoutMs = PREPARE_TIMEOUT_MS / 2
+        val engine = engine(stallTimeoutMs)
+        val server = server(LADDER, segmentCount = 8, stalledFrom = 3, failingStatus = 404)
+        val item = hlsItem(server)
+        runBlocking(engineThread) {
+            engine.prepare(item, 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stallTimeoutMs)
+        }
+        val error = runBlocking(engineThread) {
+            runCatching { engine.seekTo(SEEK_TARGET_MS, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stallTimeoutMs) }
+        }.exceptionOrNull()
+        assertTrue("the seek must fail, got $error", error is RejectionException)
+        assertEquals("crossfade_engine_error", (error as RejectionException).code)
+        runBlocking(engineThread) {
+            assertFalse("a track whose seek failed is not prepared", engine.isPreparedFor(item))
+            assertEquals(Player.STATE_IDLE, engine.playbackState)
+        }
     }
 
     private fun assertGivesUpAtTheStallTimeoutAndStopsLoading(

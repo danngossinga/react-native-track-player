@@ -32,7 +32,14 @@ internal class HlsTestServer(
     /** When set, the master playlist's body instead of the renditions (a broken playlist). */
     private val masterBody: String? = null,
     /** How long the master and each media playlist take to answer (a busy proxy or origin). */
-    private val playlistDelayMs: Long = 0L
+    private val playlistDelayMs: Long = 0L,
+    /**
+     * When set, the segments are AES-128 encrypted (EXT-X-KEY) and the key takes this long to
+     * answer; null: clear segments.
+     */
+    private val keyDelayMs: Long? = null,
+    /** How long a served segment takes before its first byte. */
+    private val segmentDelayMs: Long = 0L
 ) : AutoCloseable {
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
@@ -83,6 +90,10 @@ internal class HlsTestServer(
                         Thread.sleep(playlistDelayMs)
                         respond(connection, mediaPlaylist().toByteArray(), PLAYLIST_TYPE)
                     }
+                    path.endsWith("/$KEY_FILE") && keyDelayMs != null -> {
+                        Thread.sleep(keyDelayMs)
+                        respond(connection, KEY, "application/octet-stream")
+                    }
                     segment != null && segment >= stalledFrom && failingStatus != null -> {
                         stalledRequestTimesMs += monotonicNowMs()
                         Thread.sleep(failingAfterMs)
@@ -92,7 +103,11 @@ internal class HlsTestServer(
                         stallUntilClosed(connection)
                         return
                     }
-                    segment != null -> respond(connection, adtsSegment(segment), "audio/aac")
+                    segment != null -> {
+                        Thread.sleep(segmentDelayMs)
+                        val clear = adtsSegment(segment)
+                        respond(connection, if (keyDelayMs != null) encrypt(clear) else clear, "audio/aac")
+                    }
                     else -> respond(connection, ByteArray(0), PLAYLIST_TYPE, status = "404 Not Found")
                 }
             }
@@ -141,6 +156,7 @@ internal class HlsTestServer(
     private fun mediaPlaylist(): String = buildString {
         append("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:$SEGMENT_SECONDS\n")
         append("#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n")
+        if (keyDelayMs != null) append("#EXT-X-KEY:METHOD=AES-128,URI=\"$KEY_FILE\",IV=0x$IV_HEX\n")
         for (index in 0 until segmentCount) {
             append("#EXTINF:$SEGMENT_SECONDS.0,\n").append(segmentName(index)).append('\n')
         }
@@ -168,6 +184,22 @@ internal class HlsTestServer(
         private const val FRAME_PAYLOAD_BYTES = 32
 
         fun segmentName(index: Int) = "segment-%03d.aac".format(index)
+
+        private const val KEY_FILE = "key.bin"
+        private val KEY = "0123456789abcdef".toByteArray()
+        private const val IV_HEX = "ed2425f2779b684e97fc315b2b1cb450"
+
+        /** AES-128-CBC with PKCS#7 padding, as HLS (javax.crypto, offline). */
+        private fun encrypt(clear: ByteArray): ByteArray {
+            val iv = IV_HEX.chunked(2).map { it.toInt(16).toByte() }.toByteArray()
+            val cipher = javax.crypto.Cipher.getInstance("AES/CBC/PKCS5Padding")
+            cipher.init(
+                javax.crypto.Cipher.ENCRYPT_MODE,
+                javax.crypto.spec.SecretKeySpec(KEY, "AES"),
+                javax.crypto.spec.IvParameterSpec(iv)
+            )
+            return cipher.doFinal(clear)
+        }
 
         /**
          * One packed-audio HLS segment: the ID3 timestamp HLS requires, then AAC LC frames

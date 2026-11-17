@@ -265,6 +265,7 @@ assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
     (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 4 &&
     (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 4 &&
+    (orchestrator.match(/prepareActiveOrFail\(/g) || []).length === 4 &&
     orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
   'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
 );
@@ -728,7 +729,9 @@ assert(
       abandon.includes('load abandoned ($why)') &&
       prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation, "load ${error.code}: ${error.message}")\n            throw error') &&
       section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "load $reason")') &&
-      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")'),
+      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")') &&
+      seekBody.includes('player.playerError?.let { error ->') &&
+      seekBody.includes('abandonLoad(generation, "seek ${error.code}: ${error.message}")'),
     'An Android engine that gives up on a load or seek must stop the player and forget the track.'
   );
 }
@@ -741,8 +744,9 @@ assert(
   const advance = section(orchestrator, 'private suspend fun advanceToNextTrack(', 'private fun cancelCrossfade(');
   assert(
     startTrack.includes('prepareActiveOrFail(queue[index], positionMs, ticket)') &&
-      section(orchestrator, 'private suspend fun prepareActiveOrFail(', '\n    }\n').includes('        } catch (error: RejectionException) {') &&
-      section(section(orchestrator, 'private suspend fun prepareActiveOrFail(', '\n    }\n'), '} catch (error: RejectionException) {', 'throw error').includes('setState(AndroidPlaybackOrchestratorState.ERROR)') &&
+      section(orchestrator, 'private suspend fun ensureActivePrepared(', 'private suspend fun prepareStandby(').includes('prepareActiveOrFail(item, positionMs, ticket)') &&
+      section(orchestrator, 'suspend fun load(item: TrackAudioItem)', 'fun setNowPlayingOverride(').includes('prepareActiveOrFail(item, 0L, ticket)') &&
+      section(orchestrator, 'private suspend fun prepareActiveOrFail(', 'private suspend fun prepareStandby(').includes('} catch (error: RejectionException) {\n            // With no active track, the next play from the error state retries it\n            // (indexToPlayAfterFailedLoad; only read in ERROR, so a cancelled load is harmless).\n            failedLoadItem = item\n            ticket?.ensureActive()\n            setState(AndroidPlaybackOrchestratorState.ERROR)\n            throw error') &&
       monitor.includes('advanceToNextTrack(nextIndex, endedPosition)') &&
       !monitor.includes('startTrackAt(') &&
       advance.includes('val ticket = beginOperation()') &&

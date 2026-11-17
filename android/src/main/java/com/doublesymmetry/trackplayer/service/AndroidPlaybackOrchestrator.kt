@@ -1065,6 +1065,25 @@ internal class AndroidPlaybackOrchestrator private constructor(
         ticket?.ensureActive()
     }
 
+    /**
+     * Loads [item] on the active engine. As iOS's load: a track that fails to load (a stall, the
+     * total limit, a player error) leaves the player in an error state, not loading forever,
+     * whichever command started the load (skip, play, seek, load, an advance). A newer command
+     * that took over says otherwise.
+     */
+    private suspend fun prepareActiveOrFail(item: TrackAudioItem, positionMs: Long, ticket: PlaybackOperationTicket?) {
+        try {
+            activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            // With no active track, the next play from the error state retries it
+            // (indexToPlayAfterFailedLoad; only read in ERROR, so a cancelled load is harmless).
+            failedLoadItem = item
+            ticket?.ensureActive()
+            setState(AndroidPlaybackOrchestratorState.ERROR)
+            throw error
+        }
+    }
+
     private suspend fun prepareStandby(
         index: Int,
         positionMs: Long,
@@ -1090,20 +1109,6 @@ internal class AndroidPlaybackOrchestrator private constructor(
      */
     private fun beginOperation(): PlaybackOperationTicket =
         operationController.begin().also(::stabilizeIfCancelled)
-
-    /** Loads the active track; a load that fails leaves the player in error, as iOS's loadIndex. */
-    private suspend fun prepareActiveOrFail(item: TrackAudioItem, positionMs: Long, ticket: PlaybackOperationTicket?) {
-        try {
-            activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
-        } catch (error: RejectionException) {
-            // A track that fails to load (a stall, a player error) leaves the player in an error
-            // state, not loading forever. A newer command that took over says otherwise.
-            ticket?.ensureActive()
-            failedLoadItem = item
-            setState(AndroidPlaybackOrchestratorState.ERROR)
-            throw error
-        }
-    }
 
     private suspend fun <T> withPlaybackOperation(
         block: suspend (PlaybackOperationTicket) -> T

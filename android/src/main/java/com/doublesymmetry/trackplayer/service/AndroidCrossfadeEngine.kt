@@ -370,14 +370,26 @@ internal class AndroidCrossfadeEngine(
         val target = max(0L, positionMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
-        val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs,
-            totalTimeoutMs = timeoutMs,
-            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
-            nowMs = SystemClock::elapsedRealtime,
-            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
-            readings = ::loadProgress
-        ) { player.playbackState != Player.STATE_BUFFERING }
+        val verdict = try {
+            awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs,
+                totalTimeoutMs = timeoutMs,
+                pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                nowMs = SystemClock::elapsedRealtime,
+                pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+                readings = ::loadProgress
+            ) {
+                // A player error ends the seek as a failure, not as "done buffering".
+                player.playerError?.let { error ->
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+                    throw RejectionException(error.message ?: "Crossfade engine seek failed.", "crossfade_engine_error")
+                }
+                player.playbackState != Player.STATE_BUFFERING
+            }
+        } catch (error: RejectionException) {
+            abandonLoad(generation, "seek ${error.code}: ${error.message}")
+            throw error
+        }
         if (verdict != null) {
             // As on iOS: the player stops, so audio does not resume by itself when data arrives.
             player.playWhenReady = false

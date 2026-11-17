@@ -411,6 +411,25 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(events, ["complete"])
     }
 
+    func testAFailedLatestSeekStopsLoadingAndAReplacedOneDoesNot() {
+        let seeks = SeekSequence()
+        let replaced = seeks.begin()
+        let latest = seeks.begin()
+        var events: [String] = []
+        let unfinished = NSError(domain: "RNTP-Crossfade", code: 3, userInfo: ["code": "crossfade_engine_error"])
+        settleCrossfadeSeek(.failure(unfinished), isLatest: seeks.isLatest(replaced),
+                            stopLoading: { events.append("stop") }, complete: { _ in events.append("complete") })
+        XCTAssertEqual(events, ["complete"], "a seek a newer one replaced does not stop the track")
+        events.removeAll()
+        settleCrossfadeSeek(.failure(unfinished), isLatest: seeks.isLatest(latest),
+                            stopLoading: { events.append("stop") }, complete: { _ in events.append("complete") })
+        XCTAssertEqual(events, ["stop", "complete"])
+        events.removeAll()
+        settleCrossfadeSeek(.success(()), isLatest: seeks.isLatest(latest),
+                            stopLoading: { events.append("stop") }, complete: { _ in events.append("complete") })
+        XCTAssertEqual(events, ["complete"])
+    }
+
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
 
     func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {
