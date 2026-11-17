@@ -107,6 +107,144 @@ struct StallWatch: Equatable {
     }
 }
 
+/// One reading of an AVPlayerItem's loading, as a crossfade wait sees it. Measured on the iOS
+/// 26.5 simulator with a real AVPlayer and a local HLS server (packed AAC and AES-128 CMAF/fMP4):
+/// - the loaded time ranges grow while a segment arrives, partial bytes included;
+/// - the access log's bytes are media only (playlists and error bodies never count). They can be
+///   posted late: a packed-audio segment's bytes when it completes, and the partial bytes of a
+///   variant's failed requests when the player leaves that variant;
+/// - after a failed segment mid-track, the new variant downloads again the segments before the
+///   failed one: bytes for media already buffered. The loaded ranges cover no new time, but they
+///   can empty (on fMP4) and fill again with the same time at the switch;
+/// - a failed request adds an error-log entry; a variant switch adds access-log events, and so
+///   does a seek past the buffer. Every event's URI is nil and a variant that loaded nothing has
+///   no indicated bitrate, so the counts are the signal. The first event is the first variant's
+///   (with fMP4 it opens with the first segment request, its bytes growing in flight).
+struct ItemLoadSnapshot: Equatable {
+    /// The loaded time ranges, in seconds of the item's timeline.
+    var loadedRanges: [ClosedRange<Double>]
+    var transferredBytes: Double
+    var accessLogEvents: Int
+    var errorLogEntries: Int
+}
+
+extension ItemLoadSnapshot {
+    init(of item: AVPlayerItem) {
+        loadedRanges = item.loadedTimeRanges.compactMap { value in
+            let range = value.timeRangeValue
+            let start = range.start.seconds
+            let end = start + range.duration.seconds
+            return start.isFinite && end.isFinite && end >= start ? start...end : nil
+        }
+        let events = item.accessLog()?.events ?? []
+        transferredBytes = events.reduce(0.0) { total, event in
+            total + Double(max(0, event.numberOfBytesTransferred))
+        }
+        accessLogEvents = events.count
+        errorLogEntries = item.errorLog()?.events.count ?? 0
+    }
+}
+
+/// The time a wait has seen buffered: the union of every loaded range it read. It grows only
+/// when media of a time not buffered before in this wait arrives: a buffer that empties and
+/// fills again with the same time adds nothing, while a seek's new range does.
+struct BufferedTimeSeen: Equatable {
+    private(set) var ranges: [ClosedRange<Double>] = []
+
+    var seconds: Double { ranges.reduce(0) { $0 + ($1.upperBound - $1.lowerBound) } }
+
+    /// Adds these ranges; returns the seconds of time they add.
+    mutating func add(_ newRanges: [ClosedRange<Double>]) -> Double {
+        let before = seconds
+        var merged: [ClosedRange<Double>] = []
+        for range in (ranges + newRanges).sorted(by: { $0.lowerBound < $1.lowerBound }) {
+            if let last = merged.last, range.lowerBound <= last.upperBound {
+                merged[merged.count - 1] = last.lowerBound...max(last.upperBound, range.upperBound)
+            } else {
+                merged.append(range)
+            }
+        }
+        ranges = merged
+        return seconds - before
+    }
+}
+
+/// Whether a wait counts the bytes its item's access log posts.
+enum ItemByteCounting: Equatable {
+    /// The posted bytes are progress, with new buffered time.
+    case counting
+    /// A request failed, the player switched variant, or a seek opened a new access-log event:
+    /// the bytes posted now (the left variant's failed transfers, segments downloaded again) are
+    /// not progress. New buffered time is, and it resumes the count, unless the same reading
+    /// brings another failure or event.
+    case pausedUntilMedia
+}
+
+/// One wait's progress, read from its item: [seconds of time buffered, counted bytes], both
+/// running totals, for a `StallWatch`. A new error-log entry, or an access-log event that is
+/// neither the first variant's nor that of a seek the wait issued (`noteSeek`), pauses the byte
+/// count (`ItemByteCounting`). Each wait has its own (a load, a seek, a play start), so a switch
+/// during one never affects another, on this engine or the other.
+struct ItemLoadProgress {
+    private(set) var byteCounting: ItemByteCounting = .counting
+    private var previous: ItemLoadSnapshot?
+    private var buffered = BufferedTimeSeen()
+    private var countedBytes: Double = 0
+    /// Seeks issued whose access-log event has not appeared yet.
+    private var seeksAwaitingEvent = 0
+
+    /// The wait issues a seek: a seek past the buffer opens an access-log event, not a switch.
+    mutating func noteSeek() {
+        seeksAwaitingEvent += 1
+    }
+
+    /// The readings for this snapshot. The first one only sets the baseline.
+    mutating func readings(for snapshot: ItemLoadSnapshot) -> [Double] {
+        defer { previous = snapshot }
+        let newTime = buffered.add(snapshot.loadedRanges)
+        guard let previous = previous else {
+            countedBytes = snapshot.transferredBytes
+            return [buffered.seconds, countedBytes]
+        }
+        // New events beyond the first variant's and the seeks' are a switch (several at once too).
+        let firstEvent = previous.accessLogEvents == 0 ? 1 : 0
+        let newEvents = max(0, snapshot.accessLogEvents - previous.accessLogEvents - firstEvent)
+        let seekEvents = min(newEvents, seeksAwaitingEvent)
+        seeksAwaitingEvent -= seekEvents
+        let failedOrSwitched = snapshot.errorLogEntries > previous.errorLogEntries
+            || newEvents > seekEvents
+        let newBytes = max(0, snapshot.transferredBytes - previous.transferredBytes)
+        if failedOrSwitched {
+            byteCounting = .pausedUntilMedia
+        } else if byteCounting == .pausedUntilMedia, newTime > 0 {
+            byteCounting = .counting
+        }
+        if byteCounting == .counting {
+            countedBytes += newBytes
+        }
+        return [buffered.seconds, countedBytes]
+    }
+}
+
+/// One wait's reader of its item's progress (see `ItemLoadProgress`): create one per wait.
+final class ItemLoadReader<Item> {
+    private var progress = ItemLoadProgress()
+    private let snapshot: (Item) -> ItemLoadSnapshot
+
+    init(_ snapshot: @escaping (Item) -> ItemLoadSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    func readings(_ item: Item) -> [Double] {
+        return progress.readings(for: snapshot(item))
+    }
+
+    /// The wait issues a seek (see `ItemLoadProgress.noteSeek`).
+    func noteSeek() {
+        progress.noteSeek()
+    }
+}
+
 /// What the app is told when the track that should follow an ended one fails to start: no
 /// command waits for that load, so its failure (a stall at `stallTimeoutMs`, the total limit, a
 /// player error) is reported as a playback error with the error's code and message. Nothing is
@@ -2848,8 +2986,9 @@ func standardAssetURL(source: String, isFile: Bool) -> URL? {
     return isFile ? URL(fileURLWithPath: source) : URL(string: source)
 }
 
-/// What the standard load watch reads of a load: its bytes (`StandardLoadBytes.read`) and the
-/// player's buffered position, or nil while SwiftAudioEx's player has no AVPlayerItem (`player`:
+/// What the standard load watch reads of a load: its progress (`StandardLoadBytes.read`) and its
+/// item's buffered time (`StandardLoadBytes.buffered`; the player's buffered position before the
+/// load has its item), or nil while SwiftAudioEx's player has no AVPlayerItem (`player`:
 /// `standardPlayerItem`): before the asset is playable nothing shows progress, so that stage has
 /// only the total limit (`StandardLoadWatch.Watch.playable`), as crossfade's prepare. When the
 /// player's item cannot be read (another SwiftAudioEx layout) the readings are kept: the stall
@@ -2860,9 +2999,10 @@ func standardLoadReadings(_ player: StandardPlayerItemLookup, bytes: Double, buf
     return [bytes, buffered]
 }
 
-/// The bytes each access-log entry of `item` (an AVPlayerItem) reports transferred.
-func standardAccessLogBytes(_ item: AnyObject) -> [Int64] {
-    return (item as? AVPlayerItem)?.accessLog()?.events.map { $0.numberOfBytesTransferred } ?? []
+/// What a standard load reads of its item (an AVPlayerItem, `ItemLoadSnapshot`); nil for another
+/// object.
+func standardItemLoadSnapshot(_ item: AnyObject) -> ItemLoadSnapshot? {
+    return (item as? AVPlayerItem).map(ItemLoadSnapshot.init(of:))
 }
 
 /// The standard player's load progress from AVFoundation's access log, the closest to Android's
@@ -2879,7 +3019,13 @@ func standardAccessLogBytes(_ item: AnyObject) -> [Int64] {
 ///   segment, and the log grows without it: the load is read at each check.
 /// So a load's progress is: one when its item appears (the asset's playable stage done; for HLS,
 /// its playlists arrived, the progress Android counts in playlist bytes before the first segment
-/// request), then every byte of its item's access log (media, which Android counts always).
+/// request), then the bytes of its item's access log (media, which Android counts always), read
+/// as crossfade's waits read theirs (`ItemLoadProgress`, one per item of the load): after a
+/// failed request or a rendition switch (a new error-log entry, or an access-log event that is
+/// neither the first one nor that of a seek the backend issued: `noteSeek`), the bytes posted
+/// (the left rendition's failed transfers, segments downloaded again) stop counting until new
+/// time is buffered. Its buffered reading is the item's time buffered in the load
+/// (`buffered`: a buffer that empties and fills again with the same time adds nothing).
 ///
 /// Progress belongs to one load (Android: `startLoad`): its item is the player's own current item
 /// (`playerItem`) or, when the player's item cannot be read, the first item of the load's URL that
@@ -2893,18 +3039,30 @@ final class StandardLoadBytes {
 
     private var url: URL?
     private weak var item: AnyObject?
-    private var itemBytes: Int64 = 0
+    /// The load's item's progress (its bytes and buffered time), a new one for each item.
+    private var itemProgress = ItemLoadProgress()
+    /// The bytes `itemProgress` counted so far.
+    private var itemBytes: Double = 0
     private var earlier: [Earlier] = []
     /// The progress of the loads so far: grows with each load's item and bytes.
     private(set) var progress: Double = 0
+    /// The time the load's item has buffered in this load (`ItemLoadProgress`'s first reading),
+    /// as last read; nil while the load has no item.
+    private(set) var buffered: Double?
 
     /// A new load of the track whose asset is at `url`.
     func startLoad(url: URL?) {
         if let item = item { earlier.append(Earlier(item)) }
         earlier.removeAll { $0.item == nil }
         item = nil
-        itemBytes = 0
+        resetItemProgress()
         self.url = url
+    }
+
+    /// The backend issues a seek on the player's item: the access-log event a seek past the
+    /// buffer opens is not a switch (`ItemLoadProgress.noteSeek`).
+    func noteSeek() {
+        itemProgress.noteSeek()
     }
 
     /// The player's own current item (`standardPlayerItem`): the load's item (a reload within the
@@ -2933,15 +3091,16 @@ final class StandardLoadBytes {
         return loggedItem(candidate, url: url)
     }
 
-    /// The progress after reading the load's item's access log (`entries`: bytes per entry,
-    /// negative when unknown).
-    func read(_ entries: (AnyObject) -> [Int64]) -> Double {
-        guard let item = item else { return progress }
-        let total = entries(item).reduce(Int64(0)) { $0 + max(0, $1) }
-        if total > itemBytes {
-            progress += Double(total - itemBytes)
-            itemBytes = total
+    /// The progress after reading the load's item (`snapshot`: `standardItemLoadSnapshot`; nil:
+    /// nothing to read).
+    func read(_ snapshot: (AnyObject) -> ItemLoadSnapshot?) -> Double {
+        guard let item = item, let read = snapshot(item) else { return progress }
+        let readings = itemProgress.readings(for: read)
+        if readings[1] > itemBytes {
+            progress += readings[1] - itemBytes
+            itemBytes = readings[1]
         }
+        buffered = readings[0]
         return progress
     }
 
@@ -2952,7 +3111,13 @@ final class StandardLoadBytes {
     private func bind(_ candidate: AnyObject) {
         if let item = item { earlier.append(Earlier(item)) }
         item = candidate
-        itemBytes = 0
+        resetItemProgress()
         progress += 1
+    }
+
+    private func resetItemProgress() {
+        itemProgress = ItemLoadProgress()
+        itemBytes = 0
+        buffered = nil
     }
 }

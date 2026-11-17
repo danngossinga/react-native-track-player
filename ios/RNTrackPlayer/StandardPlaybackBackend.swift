@@ -534,10 +534,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             loadBytes.playerItem(current)
         }
         // None while the player has no AVPlayerItem (the playable stage: only the total limit).
+        let progress = loadBytes.read(standardItemLoadSnapshot)
         let observed = StandardLoadObservation(
             item: item,
             phase: phase,
-            readings: standardLoadReadings(playerItem, bytes: loadBytes.read(standardAccessLogBytes), buffered: player.bufferedPosition),
+            readings: standardLoadReadings(playerItem, bytes: progress, buffered: loadBytes.buffered ?? player.bufferedPosition),
             ownedElsewhere: ownedElsewhere
         )
         loads.followLoad(observed)
@@ -789,6 +790,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 return
             }
             pendingSeeks.removeFirst()
+            // Its access-log event is not a rendition switch for the load's progress.
+            loadBytes.noteSeek()
             issuedSeek = request
             request.issued = true
             request.wait?.noteProgress()

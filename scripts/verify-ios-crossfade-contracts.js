@@ -703,12 +703,18 @@ assert(
       poll.includes('let phase = standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition)') &&
       poll.includes('let ownedElsewhere = issuedSeek != nil || !pendingSeeks.isEmpty') &&
       // A load's progress (StandardLoadBytes, tested): started per load before its first reading,
-      // its item read from SwiftAudioEx's AVPlayer, its access-log bytes with the buffered position.
+      // its item read from SwiftAudioEx's AVPlayer as crossfade's waits read theirs
+      // (ItemLoadSnapshot, ItemLoadProgress): its bytes and its buffered time.
       poll.includes('if watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [], ownedElsewhere: ownedElsewhere)) {\n            loadBytes.startLoad(url: currentAssetURL())') &&
       poll.includes('let playerItem = standardPlayerItem(of: player)\n        if case let .item(current) = playerItem {\n            loadBytes.playerItem(current)') &&
       // No readings while the player has no AVPlayerItem (standardLoadReadings, tested): the
       // playable stage has only the total limit, as crossfade's prepare.
-      poll.includes('readings: standardLoadReadings(playerItem, bytes: loadBytes.read(standardAccessLogBytes), buffered: player.bufferedPosition),') &&
+      poll.includes('let progress = loadBytes.read(standardItemLoadSnapshot)') &&
+      poll.includes('readings: standardLoadReadings(playerItem, bytes: progress, buffered: loadBytes.buffered ?? player.bufferedPosition),') &&
+      facade.includes('func standardItemLoadSnapshot(_ item: AnyObject) -> ItemLoadSnapshot? {\n    return (item as? AVPlayerItem).map(ItemLoadSnapshot.init(of:))') &&
+      // A seek the backend issues is noted, so its access-log event is not a switch (tested
+      // through StandardLoadBytes.noteSeek).
+      section(backendSource, 'private func pumpSeeks() {', '\n    }\n').includes('pendingSeeks.removeFirst()\n            // Its access-log event is not a rendition switch for the load\'s progress.\n            loadBytes.noteSeek()\n            issuedSeek = request') &&
       section(backendSource, 'private func currentAssetURL() -> URL? {', '\n    }\n').includes('return standardAssetURL(source: track.getSourceUrl(), isFile: track.getSourceType() == .file)') &&
       // AVFoundation's item events check the load at once when they are its item's.
       backendSource.includes('itemObservers = [.AVPlayerItemNewAccessLogEntry, .AVPlayerItemNewErrorLogEntry, .AVPlayerItemFailedToPlayToEndTime].map { name in') &&
@@ -787,6 +793,10 @@ assert(
         'testStandardLoadBytesALoadCountsOnlyItsOwnItem',
         'testStandardLoadBytesALoadWatchedAgainAfterASeekKeepsCountingItsItem',
         'testStandardLoadBytesWithoutThePlayersItemTheLoadTakesTheFirstLoggedItemOfItsURL',
+        'testStandardLoadBytesAfterASwitchTheLateBytesAreNotProgress',
+        'testStandardLoadBytesNewTimeBufferedAfterASwitchResumesTheBytes',
+        'testStandardLoadBytesASeekTheBackendIssuedIsNotASwitch',
+        'testStandardLoadBytesEachItemOfALoadIsReadFromItsOwnStart',
         'testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper',
         'testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching',
         'testStandardGiveUpOfALoadNoCommandWaitsForIsAnErrorStateAndAPlaybackError',

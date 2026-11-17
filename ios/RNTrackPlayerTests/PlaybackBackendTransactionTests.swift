@@ -1,4 +1,5 @@
 import AVFoundation
+import Network
 import XCTest
 @testable import RNTrackPlayerBackendCore
 
@@ -547,6 +548,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         var playerItem: NSObject?
         /// The bytes per access-log entry of each item.
         var logs: [ObjectIdentifier: [Int64]] = [:]
+        /// Each item's whole reading, when a test sets one (else its `logs`' bytes, no events).
+        var snapshots: [ObjectIdentifier: ItemLoadSnapshot] = [:]
         var buffered = 0.0
 
         func observe(_ phase: StandardLoadPhase = .loading, owned: Bool = false) -> StallVerdict? {
@@ -555,8 +558,11 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 bytes.startLoad(url: url)
             }
             bytes.playerItem(playerItem)
-            let progress = bytes.read { [unowned self] in self.logs[ObjectIdentifier($0)] ?? [] }
-            return watch.watch.check(StandardLoadObservation(item: item, phase: phase, readings: [progress, buffered], ownedElsewhere: owned))
+            let progress = bytes.read { [unowned self] in
+                self.snapshots[ObjectIdentifier($0)] ?? loggedBytes(self.logs[ObjectIdentifier($0)] ?? [])
+            }
+            // As observeLoad: the item's buffered time once the load has its item.
+            return watch.watch.check(StandardLoadObservation(item: item, phase: phase, readings: [progress, bytes.buffered ?? buffered], ownedElsewhere: owned))
         }
     }
 
@@ -604,9 +610,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let bytes = StandardLoadBytes()
         bytes.startLoad(url: nil)
         bytes.playerItem(item)
-        XCTAssertEqual(bytes.read { _ in [50] }, 51)
-        XCTAssertEqual(bytes.read { _ in [-1, 60] }, 61)
-        XCTAssertEqual(bytes.read { _ in [-1] }, 61, "a log that reads lower is no progress")
+        XCTAssertEqual(bytes.read { _ in loggedBytes([50]) }, 51)
+        XCTAssertEqual(bytes.read { _ in loggedBytes([-1, 60]) }, 61)
+        XCTAssertEqual(bytes.read { _ in loggedBytes([-1]) }, 61, "a log that reads lower is no progress")
     }
 
     func testStandardLoadBytesALoadWatchedAgainAfterASeekKeepsCountingItsItem() {
@@ -637,7 +643,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let old = NSObject()
         let new = NSObject()
         var logs: [ObjectIdentifier: [Int64]] = [ObjectIdentifier(old): [100]]
-        let entries: (AnyObject) -> [Int64] = { logs[ObjectIdentifier($0)] ?? [] }
+        let entries: (AnyObject) -> ItemLoadSnapshot? = { loggedBytes(logs[ObjectIdentifier($0)] ?? []) }
         bytes.startLoad(url: url)
         bytes.playerItem(old)
         XCTAssertEqual(bytes.read(entries), 101)
@@ -678,13 +684,137 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertFalse(bytes.loggedItem(late, url: url), "the load has its item")
         XCTAssertTrue(bytes.isLoadEvent(mine, url: url, player: .unavailable))
         XCTAssertFalse(bytes.isLoadEvent(late, url: url, player: .unavailable))
-        XCTAssertEqual(bytes.read { _ in [7] }, 8)
+        XCTAssertEqual(bytes.read { _ in loggedBytes([7]) }, 8)
         // With the player's item read, only its events check the load.
         let current = AVPlayerItem(url: URL(string: "https://media.example/a.m3u8")!)
         XCTAssertTrue(bytes.isLoadEvent(current, url: url, player: .item(current)))
         XCTAssertFalse(bytes.isLoadEvent(mine, url: url, player: .item(current)))
         XCTAssertFalse(bytes.isLoadEvent(mine, url: url, player: .item(nil)))
-        XCTAssertEqual(standardAccessLogBytes(current), [], "no access log before it loads")
+        XCTAssertEqual(
+            standardItemLoadSnapshot(current),
+            ItemLoadSnapshot(loadedRanges: [], transferredBytes: 0, accessLogEvents: 0, errorLogEntries: 0),
+            "no access log before it loads"
+        )
+        XCTAssertNil(standardItemLoadSnapshot(mine), "not an AVPlayerItem: nothing to read")
+    }
+
+    // A standard load reads its item as crossfade's waits do (ItemLoadProgress): after a failed
+    // request or a rendition switch, the bytes posted and the time buffered again are not
+    // progress until new time is buffered.
+
+    private func itemReading(_ ranges: [ClosedRange<Double>], bytes: Double, events: Int, errors: Int) -> ItemLoadSnapshot {
+        ItemLoadSnapshot(loadedRanges: ranges, transferredBytes: bytes, accessLogEvents: events, errorLogEntries: errors)
+    }
+
+    func testStandardLoadBytesAfterASwitchTheLateBytesAreNotProgress() {
+        // A load mid-way (a retry at the kept position 30 s; the measured sequence, scaled): media
+        // at 1 s, then every rendition's segment fails part way and each switch posts the left
+        // rendition's bytes late, with segments downloaded again (the buffer dips and refills
+        // with the same time). The load gives up one stall timeout after its last media, not
+        // after the last switch's bytes.
+        let h = LoadBytesHarness()
+        let item = NSObject()
+        let key = ObjectIdentifier(item)
+        h.playerItem = item
+        h.snapshots[key] = itemReading([], bytes: 0, events: 0, errors: 0)
+        XCTAssertNil(h.observe())
+        h.watch.now = 1
+        h.snapshots[key] = itemReading([30...34], bytes: 3_000, events: 1, errors: 0)
+        XCTAssertNil(h.observe(), "media")
+        h.watch.now = 6
+        h.snapshots[key] = itemReading([30...34], bytes: 9_000, events: 2, errors: 1)
+        XCTAssertNil(h.observe(), "a switch: its bytes are not progress")
+        h.watch.now = 8
+        h.snapshots[key] = itemReading([], bytes: 40_000, events: 3, errors: 2)
+        XCTAssertNil(h.observe())
+        h.watch.now = 10
+        h.snapshots[key] = itemReading([30...34], bytes: 52_000, events: 3, errors: 2)
+        XCTAssertNil(h.observe(), "the same time buffered again: not progress")
+        h.watch.now = 10.9
+        h.snapshots[key] = itemReading([30...34], bytes: 60_000, events: 3, errors: 3)
+        XCTAssertNil(h.observe())
+        h.watch.now = 11
+        XCTAssertEqual(h.observe(), .stalled, "one stall timeout after the last media (1 s)")
+    }
+
+    func testStandardLoadBytesNewTimeBufferedAfterASwitchResumesTheBytes() {
+        // A slow but healthy fallback: after a switch, the new rendition buffers new time, then
+        // its bytes are progress again; the load goes on.
+        let h = LoadBytesHarness()
+        let item = NSObject()
+        let key = ObjectIdentifier(item)
+        h.playerItem = item
+        h.snapshots[key] = itemReading([0...2], bytes: 3_000, events: 1, errors: 0)
+        XCTAssertNil(h.observe())
+        h.watch.now = 5
+        h.snapshots[key] = itemReading([0...2], bytes: 6_000, events: 2, errors: 1)
+        XCTAssertNil(h.observe())
+        h.watch.now = 9
+        h.snapshots[key] = itemReading([0...2.5], bytes: 6_000, events: 2, errors: 1)
+        XCTAssertNil(h.observe(), "new time buffered")
+        XCTAssertEqual(h.bytes.buffered, 2.5)
+        h.watch.now = 18
+        h.snapshots[key] = itemReading([0...2.5], bytes: 9_000, events: 2, errors: 1)
+        XCTAssertNil(h.observe(), "bytes count again after the new time")
+        h.watch.now = 27
+        XCTAssertNil(h.observe(), "progress at 18 s")
+        h.watch.now = 28
+        XCTAssertEqual(h.observe(), .stalled)
+    }
+
+    func testStandardLoadBytesASeekTheBackendIssuedIsNotASwitch() {
+        // A seek during the load (it owns the loading meanwhile) opens an access-log event: noted
+        // by the backend as it issues the seek, it does not pause the load's byte count.
+        let h = LoadBytesHarness()
+        let item = NSObject()
+        let key = ObjectIdentifier(item)
+        h.playerItem = item
+        h.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 1, errors: 0)
+        XCTAssertNil(h.observe())
+        h.watch.now = 1
+        h.bytes.noteSeek()
+        h.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 2, errors: 0)
+        XCTAssertNil(h.observe(owned: true))
+        h.watch.now = 2
+        h.snapshots[key] = itemReading([0...1], bytes: 4_000, events: 2, errors: 0)
+        XCTAssertNil(h.observe())
+        XCTAssertEqual(h.bytes.progress, 1 + 4_000, "the item's appearance, then every byte")
+        // Without the note, the same event is a switch: the bytes after it wait for new time.
+        let unnoted = LoadBytesHarness()
+        unnoted.playerItem = item
+        unnoted.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 1, errors: 0)
+        XCTAssertNil(unnoted.observe())
+        unnoted.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 2, errors: 0)
+        XCTAssertNil(unnoted.observe(owned: true))
+        unnoted.snapshots[key] = itemReading([0...1], bytes: 4_000, events: 2, errors: 0)
+        XCTAssertNil(unnoted.observe())
+        XCTAssertEqual(unnoted.bytes.progress, 1 + 1_000)
+    }
+
+    func testStandardLoadBytesEachItemOfALoadIsReadFromItsOwnStart() {
+        // A switch paused the byte count of one item; the next load's item (or a reload within
+        // the load) starts its own reading: its first reading is a baseline, its bytes count.
+        let bytes = StandardLoadBytes()
+        let first = NSObject(), retry = NSObject()
+        var readings: [ObjectIdentifier: ItemLoadSnapshot] = [
+            ObjectIdentifier(first): itemReading([0...1], bytes: 1_000, events: 1, errors: 0),
+        ]
+        let read: (AnyObject) -> ItemLoadSnapshot? = { readings[ObjectIdentifier($0)] }
+        bytes.startLoad(url: nil)
+        bytes.playerItem(first)
+        XCTAssertEqual(bytes.read(read), 1 + 1_000)
+        readings[ObjectIdentifier(first)] = itemReading([0...1], bytes: 5_000, events: 2, errors: 1)
+        XCTAssertEqual(bytes.read(read), 1 + 1_000, "paused by the switch")
+        XCTAssertEqual(bytes.buffered, 1)
+        // A retry: a new load with a new item, whose log already holds events and errors.
+        bytes.startLoad(url: nil)
+        XCTAssertNil(bytes.buffered, "no item yet")
+        bytes.playerItem(retry)
+        readings[ObjectIdentifier(retry)] = itemReading([0...0.5], bytes: 2_000, events: 2, errors: 1)
+        XCTAssertEqual(bytes.read(read), 1 + 1_000 + 1 + 2_000, "its first reading is a baseline")
+        readings[ObjectIdentifier(retry)] = itemReading([0...0.5], bytes: 3_000, events: 2, errors: 1)
+        XCTAssertEqual(bytes.read(read), 1 + 1_000 + 1 + 3_000, "counting")
+        XCTAssertEqual(bytes.buffered, 0.5)
     }
 
     func testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper() {
@@ -1798,6 +1928,344 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         // The first reading after the stage is a baseline, not growth from the old reading.
         XCTAssertEqual(watch.check(at: 1.5, readings: [6]), .wait)
         XCTAssertEqual(watch.check(at: 2, readings: [6]), .stalled)
+    }
+
+    // A wait's progress from its AVPlayerItem: after a failed request or a variant switch, the
+    // bytes the access log posts late are not progress until new media is buffered.
+
+    /// A snapshot whose buffer is `loaded` seconds from the start of the track.
+    private func snapshot(
+        loaded: Double, bytes: Double, events: Int, errors: Int
+    ) -> ItemLoadSnapshot {
+        snapshot(ranges: loaded > 0 ? [0...loaded] : [], bytes: bytes, events: events, errors: errors)
+    }
+
+    private func snapshot(
+        ranges: [ClosedRange<Double>], bytes: Double, events: Int, errors: Int
+    ) -> ItemLoadSnapshot {
+        ItemLoadSnapshot(loadedRanges: ranges, transferredBytes: bytes, accessLogEvents: events, errorLogEntries: errors)
+    }
+
+    func testItemLoadProgressPausesTheByteCountAfterAnErrorOrASwitchUntilNewMediaIsBuffered() {
+        // The simulator's sequence when every segment fails part way (3000 bytes, then the
+        // connection drops): r0's partial bytes are buffered, its retries fail, then the player
+        // switches to r1 and only then posts r0's bytes, while the buffer drops to r1's part.
+        var progress = ItemLoadProgress()
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 0)), [0, 0])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 3.67, bytes: 0, events: 0, errors: 0)), [3.67, 0])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 3.67, bytes: 0, events: 0, errors: 1)), [3.67, 0])
+        XCTAssertEqual(progress.byteCounting, .pausedUntilMedia)
+        // The switch posts the left variant's 3000 bytes: not counted.
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 1.06, bytes: 3_000, events: 1, errors: 2)), [3.67, 0])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 1.06, bytes: 3_000, events: 1, errors: 2)), [3.67, 0])
+        // Buffering again time that was buffered before is not new media either.
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 3.5, bytes: 3_000, events: 1, errors: 2)), [3.67, 0])
+        XCTAssertEqual(progress.byteCounting, .pausedUntilMedia)
+        // Mid-track (the simulator, every rendition failing its third segment): each switch
+        // downloads the new rendition's first two segments again, media already buffered. Those
+        // bytes do not move the buffer and are not progress.
+        var midTrack = ItemLoadProgress()
+        XCTAssertEqual(midTrack.readings(for: snapshot(loaded: 8.02, bytes: 6_390, events: 1, errors: 0)), [8.02, 6_390])
+        XCTAssertEqual(midTrack.readings(for: snapshot(loaded: 8.02, bytes: 34_325, events: 2, errors: 1)), [8.02, 6_390])
+        XCTAssertEqual(midTrack.readings(for: snapshot(loaded: 8.02, bytes: 97_947, events: 3, errors: 2)), [8.02, 6_390])
+        XCTAssertEqual(midTrack.readings(for: snapshot(loaded: 8.02, bytes: 97_947, events: 3, errors: 7)), [8.02, 6_390])
+        // An error entry alone (bytes posted on the variant's open event, no new event) pauses too.
+        var afterError = ItemLoadProgress()
+        _ = afterError.readings(for: snapshot(loaded: 29.35, bytes: 50_752, events: 1, errors: 0))
+        XCTAssertEqual(afterError.readings(for: snapshot(loaded: 29.35, bytes: 50_752, events: 1, errors: 1)), [29.35, 50_752])
+        XCTAssertEqual(afterError.readings(for: snapshot(loaded: 29.35, bytes: 53_752, events: 1, errors: 1)), [29.35, 50_752])
+        // A new event alone (a switch the error log did not record) pauses too.
+        var afterSwitch = ItemLoadProgress()
+        _ = afterSwitch.readings(for: snapshot(loaded: 8, bytes: 20_000, events: 1, errors: 0))
+        XCTAssertEqual(afterSwitch.readings(for: snapshot(loaded: 8, bytes: 23_000, events: 2, errors: 0)), [8, 20_000])
+        // Media of a time not buffered before is new: it counts and resumes the byte count.
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 4, bytes: 3_000, events: 1, errors: 2)), [4, 0])
+        XCTAssertEqual(progress.byteCounting, .counting)
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 4, bytes: 14_000, events: 1, errors: 2)), [4, 11_000])
+    }
+
+    func testABufferDipAndRefillAtASwitchIsNotProgress() {
+        // Encrypted CMAF mid-track (the simulator, every rendition failing its third segment):
+        // at the second switch the buffer reads 0 for one poll, then 12 s again: the media
+        // already buffered, not new media. The refill must neither count nor resume the bytes.
+        var progress = ItemLoadProgress()
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 12, bytes: 147_440, events: 1, errors: 0)), [12, 147_440])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 12, bytes: 438_560, events: 2, errors: 1)), [12, 147_440])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 536_448, events: 3, errors: 2)), [12, 147_440])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 12, bytes: 536_448, events: 3, errors: 2)), [12, 147_440])
+        XCTAssertEqual(progress.byteCounting, .pausedUntilMedia)
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 12, bytes: 600_000, events: 3, errors: 2)), [12, 147_440])
+    }
+
+    /// The measured CMAF mid-track sequence (`fmp4~fail.all.503.3000~from.2`), each reading held
+    /// until the next measured change: buffered 12 s from 0.5 s, a switch with segments
+    /// downloaded again at 9.5 s, a second at 12.54 s with the buffer at 0 for one poll, refilled
+    /// at 12.75 s, then failures only.
+    private func cmafMidTrackFailure(at time: TimeInterval) -> ItemLoadSnapshot {
+        let measured: [(at: Double, loaded: Double, bytes: Double, events: Int, errors: Int)] = [
+            (0, 0, 0, 0, 0), (0.5, 12, 147_440, 1, 0), (9.5, 12, 438_560, 2, 1),
+            (12.54, 0, 536_448, 3, 2), (12.75, 12, 536_448, 3, 2), (15.75, 12, 536_448, 3, 3),
+            (18.76, 12, 536_448, 3, 6),
+        ]
+        let reading = measured.last { $0.at <= time + 1e-9 } ?? measured[0]
+        return snapshot(loaded: reading.loaded, bytes: reading.bytes, events: reading.events, errors: reading.errors)
+    }
+
+    func testAWaitThroughABufferDipGivesUpOneStallTimeoutAfterItStarted() {
+        // A seek or play-start wait started at several moments of that sequence, some of whose
+        // polls fall inside the dip (12.55 s): nothing after its first reading is new media, so
+        // each gives up one stall timeout after it started.
+        for (startsAt, stallMs) in [(1.05, 10_000), (3.1, 10_000), (6.05, 10_000), (9.05, 10_000), (1.05, 15_000)] {
+            let clock = ManualWaitClock()
+            clock.now = startsAt
+            var verdicts: [StallVerdict] = []
+            let reader = ItemLoadReader { [unowned self] (time: TimeInterval) in self.cmafMidTrackFailure(at: time) }
+            let driver = makeDriver(clock, stallMs: stallMs, totalMs: 60_000, readings: { reader.readings(clock.now) }, gaveUp: { verdicts.append($0) })
+            driver.start()
+            clock.runUntilIdle()
+            XCTAssertEqual(verdicts, [.stalled], "start \(startsAt)")
+            XCTAssertEqual(clock.now, startsAt + Double(stallMs) / 1000, accuracy: 0.001, "start \(startsAt), stall \(stallMs)")
+        }
+    }
+
+    func testMediaInTheSameReadingAsASwitchCountsButDoesNotResumeTheBytes() {
+        // A healthy fallback (the simulator: r0's segment answers 503, r1 and r2 serve theirs):
+        // the error lands one poll before the switch, whose reading brings three access-log
+        // events at once (a switch, though the log had none), new media and the bytes posted with
+        // the switch. The media is progress; the bytes wait for a later reading.
+        var progress = ItemLoadProgress()
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 0)), [0, 0])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 1)), [0, 0])
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 7.99, bytes: 79_220, events: 3, errors: 1)), [7.99, 0])
+        XCTAssertEqual(progress.byteCounting, .pausedUntilMedia)
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 11.93, bytes: 166_921, events: 3, errors: 1)), [11.93, 87_701])
+        XCTAssertEqual(progress.byteCounting, .counting)
+    }
+
+    func testAFirstAccessLogEventThatComesWithASwitchDoesNotCount() {
+        // Packed AAC whose segments fail part way: the first access-log event appears only at
+        // the switch, with the left rendition's late bytes. The pause then rests on the error
+        // log: as measured, its entry lands before the event (each retry adds one) or in the same
+        // poll (partial bytes, then a hung connection).
+        var retried = ItemLoadProgress()
+        _ = retried.readings(for: snapshot(loaded: 3.67, bytes: 0, events: 0, errors: 0))
+        XCTAssertEqual(retried.readings(for: snapshot(loaded: 3.67, bytes: 0, events: 0, errors: 4)), [3.67, 0])
+        XCTAssertEqual(retried.readings(for: snapshot(loaded: 1.06, bytes: 3_000, events: 1, errors: 5)), [3.67, 0])
+        var hung = ItemLoadProgress()
+        _ = hung.readings(for: snapshot(loaded: 3.67, bytes: 0, events: 0, errors: 0))
+        XCTAssertEqual(hung.readings(for: snapshot(loaded: 1.06, bytes: 3_000, events: 1, errors: 1)), [3.67, 0])
+        XCTAssertEqual(hung.byteCounting, .pausedUntilMedia)
+    }
+
+    func testASeekTheWaitIssuedIsNotASwitch() {
+        // A seek past the buffer (the simulator, CMAF): the buffer moves to the target's
+        // segments and a new access-log event opens. If the next segment's bytes then grow in
+        // flight while the buffer does not (as measured on a CMAF load; not seen after a seek),
+        // they must count: the wait noted its seek, so that event is the seek's, not a switch.
+        var seek = ItemLoadProgress()
+        XCTAssertEqual(seek.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0)), [12, 147_440])
+        seek.noteSeek()
+        XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [24, 294_336])
+        XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 310_000, events: 2, errors: 0)), [24, 310_000])
+        XCTAssertEqual(seek.byteCounting, .counting)
+        // The seek's event is matched: a later event is a switch again.
+        XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 320_000, events: 3, errors: 0)), [24, 310_000])
+        XCTAssertEqual(seek.byteCounting, .pausedUntilMedia)
+        // Its first reading may come after the event: then the event is part of the baseline,
+        // and the seek noted stays unmatched (a later lone event is taken for the seek's).
+        var late = ItemLoadProgress()
+        late.noteSeek()
+        XCTAssertEqual(late.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [12, 294_336])
+        XCTAssertEqual(late.readings(for: snapshot(ranges: [24...36], bytes: 310_000, events: 2, errors: 0)), [12, 310_000])
+        // A seek back to a time not buffered in this wait adds its seconds to the time seen.
+        late.noteSeek()
+        XCTAssertEqual(late.readings(for: snapshot(ranges: [0...12], bytes: 320_000, events: 3, errors: 0)), [24, 320_000])
+        // A seek the wait did not issue (an event with no error) is a switch: bytes wait for new
+        // buffered time, which the moved buffer brings at once.
+        var unnoted = ItemLoadProgress()
+        _ = unnoted.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        XCTAssertEqual(unnoted.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [24, 147_440])
+        XCTAssertEqual(unnoted.byteCounting, .pausedUntilMedia)
+        // Two events with one seek noted: one is a switch.
+        var both = ItemLoadProgress()
+        _ = both.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        both.noteSeek()
+        XCTAssertEqual(both.readings(for: snapshot(ranges: [0...12], bytes: 200_000, events: 3, errors: 0)), [12, 147_440])
+        XCTAssertEqual(both.byteCounting, .pausedUntilMedia)
+    }
+
+    func testItemLoadProgressCountsPostedBytesWithoutAnErrorOrASwitch() {
+        // An encrypted CMAF track (AES-128 fMP4, as the app's) behind slow playlists: the first
+        // access-log event opens with the first segment request and its bytes grow in flight,
+        // ahead of the buffer. That first event is the first variant's, not a switch.
+        var first = ItemLoadProgress()
+        XCTAssertEqual(first.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 0)), [0, 0])
+        XCTAssertEqual(first.readings(for: snapshot(loaded: 0, bytes: 8_768, events: 1, errors: 0)), [0, 8_768])
+        XCTAssertEqual(first.byteCounting, .counting)
+        XCTAssertEqual(first.readings(for: snapshot(loaded: 0, bytes: 16_768, events: 1, errors: 0)), [0, 16_768])
+        // A healthy load: the buffer grows while a segment arrives, its bytes are posted when it
+        // completes; both are progress. The first reading of a wait is its baseline, so a seek
+        // wait on an item whose logs already hold entries starts counting.
+        var progress = ItemLoadProgress()
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 14.68, bytes: 11_410, events: 1, errors: 3)), [14.68, 11_410])
+        XCTAssertEqual(progress.byteCounting, .counting)
+        XCTAssertEqual(progress.readings(for: snapshot(loaded: 14.68, bytes: 50_752, events: 1, errors: 3)), [14.68, 50_752])
+    }
+
+    func testEachWaitReadsItsOwnItemProgress() {
+        // Two waits (one per engine, or a load then the next load): a switch during one pauses
+        // only that one's byte count.
+        let first = ItemLoadReader { (item: ItemLoadSnapshot) in item }
+        let second = ItemLoadReader { (item: ItemLoadSnapshot) in item }
+        let failing = [
+            snapshot(loaded: 0, bytes: 0, events: 0, errors: 0),
+            snapshot(loaded: 0, bytes: 3_000, events: 1, errors: 1),
+        ]
+        let healthy = [
+            snapshot(loaded: 4, bytes: 10_000, events: 1, errors: 0),
+            snapshot(loaded: 4, bytes: 20_000, events: 1, errors: 0),
+        ]
+        XCTAssertEqual(first.readings(failing[0]), [0, 0])
+        XCTAssertEqual(second.readings(healthy[0]), [4, 10_000])
+        XCTAssertEqual(first.readings(failing[1]), [0, 0])
+        XCTAssertEqual(second.readings(healthy[1]), [4, 20_000])
+        // A new wait on the same item starts counting, whatever an earlier wait saw.
+        let next = ItemLoadReader { (item: ItemLoadSnapshot) in item }
+        XCTAssertEqual(next.readings(failing[1]), [0, 3_000])
+        XCTAssertEqual(next.readings(snapshot(loaded: 0, bytes: 6_000, events: 1, errors: 1)), [0, 6_000])
+    }
+
+    /// An item whose segments fail part way on every rendition (the measured sequence, scaled):
+    /// a little media is buffered at 0.5 s; every `switchEverySeconds` a request fails and the
+    /// player switches to the next rendition, which posts the left one's 3000 bytes late while
+    /// the buffer drops to the new one's part. With `partial: false` the segments fail with no
+    /// data (a 503): nothing is buffered or posted. With `mediaEverySeconds`, the last rendition
+    /// then buffers a little more media at that interval (a slow but healthy fallback).
+    private func failingRenditions(
+        at time: TimeInterval,
+        renditions: Int,
+        switchEverySeconds: Double,
+        mediaEverySeconds: Double? = nil,
+        partial: Bool = true
+    ) -> ItemLoadSnapshot {
+        guard time >= 0.5 else { return snapshot(loaded: 0, bytes: 0, events: 0, errors: 0) }
+        let switches = min(renditions - 1, Int((time - 0.5) / switchEverySeconds))
+        var loaded = partial ? [3.67, 1.06, 0.6, 0.4, 0.3, 0.2][switches] : 0
+        if let every = mediaEverySeconds, switches == renditions - 1 {
+            let since = time - 0.5 - Double(switches) * switchEverySeconds
+            loaded += 0.1 * Double(Int(since / every))
+        }
+        return snapshot(loaded: loaded, bytes: partial ? Double(switches) * 3_000 : 0, events: switches, errors: switches)
+    }
+
+    func testFailingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions() {
+        // As Android's failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions:
+        // the player switches rendition within each stall timeout (at 0.8 of it), and each
+        // switch posts late bytes. The load gives up one stall timeout after its last media
+        // (0.5 s), not at the next switch's bytes and not at its total limit.
+        let stallMs = 2_000
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        let reader = ItemLoadReader { [unowned self] (time: TimeInterval) in
+            self.failingRenditions(at: time, renditions: 6, switchEverySeconds: Double(stallMs) * 0.8 / 1000)
+        }
+        let driver = makeDriver(clock, stallMs: stallMs, totalMs: 60_000, readings: { reader.readings(clock.now) }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        clock.runUntilIdle()
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 0.5 + Double(stallMs) / 1000, accuracy: 0.26)
+    }
+
+    func testASlowButHealthyFallbackAfterFailedSegmentsKeepsLoading() {
+        // Two renditions fail with a 503 (as measured, a healthy fallback buffers at once), then
+        // the third buffers a little media every 0.5 s: the load goes on until its total limit,
+        // as a slow but steady load.
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        let reader = ItemLoadReader { [unowned self] (time: TimeInterval) in
+            self.failingRenditions(at: time, renditions: 3, switchEverySeconds: 0.4, mediaEverySeconds: 0.5, partial: false)
+        }
+        let driver = makeDriver(clock, stallMs: 2_000, totalMs: 20_000, readings: { reader.readings(clock.now) }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        clock.runUntilIdle()
+        XCTAssertEqual(verdicts, [.capExceeded])
+        XCTAssertEqual(clock.now, 20, accuracy: 0.26)
+    }
+
+    func testARealPlayerWhoseSegmentsFailPartWayGivesUpAtTheStallTimeoutDespiteTheLateBytesOfItsSwitch() throws {
+        // A real AVPlayer against a local HLS server whose segments all fail part way: 3000 bytes,
+        // then the connection drops. The player retries, then switches rendition (about 16 s in
+        // on the iOS 26.5 simulator) and only then posts the failed bytes in its access log. Those
+        // bytes are not progress: the wait gives up one stall timeout after the first media (the
+        // 3000 bytes, buffered in the first seconds), not one after the switch.
+        let server = try PartialSegmentHLSServer()
+        defer { server.stop() }
+        let stallMs = 20_000
+        let player = AVPlayer()
+        player.automaticallyWaitsToMinimizeStalling = true
+        player.volume = 0
+        let item = AVPlayerItem(url: server.masterURL)
+        item.preferredForwardBufferDuration = 6
+        let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
+        var trace: [String] = []
+        var previous: [Double]?
+        var lastProgressAt: TimeInterval = 0
+        var verdict: StallVerdict?
+        var gaveUpAt: TimeInterval = 0
+        let startedAt = ProcessInfo.processInfo.systemUptime
+        // The times below are the wait's own clock readings: the one each check takes before it
+        // reads the item, and the one of the check that gives up.
+        var checkedAt = startedAt
+        var lastProgressClock = startedAt
+        var gaveUpClock = startedAt
+        let gaveUp = expectation(description: "the wait gives up")
+        let driver = StallWaitDriver(
+            stallTimeoutMs: stallMs,
+            totalTimeoutMs: 60_000,
+            now: {
+                checkedAt = ProcessInfo.processInfo.systemUptime
+                return checkedAt
+            },
+            readings: {
+                let readings = reader.readings(item)
+                let at = checkedAt - startedAt
+                if let previous = previous, zip(readings, previous).contains(where: { $0 > $1 }) {
+                    lastProgressAt = at
+                    lastProgressClock = checkedAt
+                }
+                previous = readings
+                trace.append(String(format: "%.2f %@", at, readings.description))
+                return readings
+            },
+            onGiveUp: { result, _ in
+                verdict = result
+                gaveUpAt = checkedAt - startedAt
+                gaveUpClock = checkedAt
+                gaveUp.fulfill()
+            }
+        )
+        player.replaceCurrentItem(with: item)
+        driver.start()
+        wait(for: [gaveUp], timeout: 65)
+        let posted = ItemLoadSnapshot(of: item).transferredBytes
+        player.replaceCurrentItem(with: nil)
+        let history = trace.suffix(12).joined(separator: " | ")
+        XCTAssertEqual(verdict, .stalled, history)
+        // The case under test happened: the player switched before the give-up and posted bytes.
+        let switchedAt = server.firstRequestAt { $0.hasPrefix("/r1/") }.map { $0 - startedAt }
+        XCTAssertNotNil(switchedAt, "requests: \(server.paths)")
+        XCTAssertLessThan(switchedAt ?? .infinity, gaveUpAt, "requests: \(server.paths)")
+        XCTAssertGreaterThan(posted, 0, history)
+        // Nothing after the switch was progress; the give-up came one stall timeout after the
+        // last progress, the first media: never sooner (both times are the wait's clock), and at
+        // most one poll later, plus the main queue's delay, which one more poll covers.
+        XCTAssertLessThan(lastProgressAt, switchedAt ?? 0, history)
+        let checkSlackMs = 2 * stallCheckIntervalMs
+        print(String(format: "real-player timing: lastProgressAt=%.3f switchedAt=%.3f gaveUpAt=%.3f afterLastProgress=%.3f",
+                     lastProgressAt, switchedAt ?? -1, gaveUpAt, gaveUpAt - lastProgressAt))
+        // The same arithmetic as StallWatch's verdict, on the same clock readings.
+        XCTAssertGreaterThanOrEqual((gaveUpClock - lastProgressClock) * 1000, Double(stallMs), history)
+        XCTAssertLessThanOrEqual((gaveUpClock - lastProgressClock) * 1000, Double(stallMs + checkSlackMs), history)
     }
 
     func testCrossfadeIncomingStallReadsTheGraceItIsGiven() {
@@ -3725,6 +4193,130 @@ private final class TransactionBarrier {
         inFlight -= 1
         lock.unlock()
     }
+}
+
+/// A local HLS server (Network framework) for the real-player test: a master playlist of three
+/// audio renditions (r0, r1, r2), each a VOD playlist of four 4 s segments, and segments that
+/// fail part way: the full Content-Length is announced, 3000 bytes of packed AAC are sent, the
+/// connection is held for 2 s, then closed. It records each request's path and arrival time.
+private final class PartialSegmentHLSServer {
+    private let listener: NWListener
+    private let queue = DispatchQueue(label: "rntp.test.hls-server")
+    private let lock = NSLock()
+    private var requests: [(path: String, at: TimeInterval)] = []
+    private var connections: [NWConnection] = []
+
+    init() throws {
+        let parameters = NWParameters.tcp
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: .any)
+        listener = try NWListener(using: parameters)
+        let ready = DispatchSemaphore(value: 0)
+        listener.stateUpdateHandler = { state in
+            if case .ready = state { ready.signal() }
+        }
+        listener.newConnectionHandler = { [weak self] connection in self?.accept(connection) }
+        listener.start(queue: queue)
+        guard ready.wait(timeout: .now() + 5) == .success else { throw URLError(.cannotConnectToHost) }
+    }
+
+    var masterURL: URL {
+        URL(string: "http://127.0.0.1:\(listener.port?.rawValue ?? 0)/master.m3u8")!
+    }
+
+    var paths: [String] {
+        lock.lock(); defer { lock.unlock() }
+        return requests.map { $0.path }
+    }
+
+    func firstRequestAt(_ matches: (String) -> Bool) -> TimeInterval? {
+        lock.lock(); defer { lock.unlock() }
+        return requests.first { matches($0.path) }?.at
+    }
+
+    func stop() {
+        listener.cancel()
+        queue.sync { connections.forEach { $0.cancel() } }
+    }
+
+    private func accept(_ connection: NWConnection) {
+        connections.append(connection)
+        connection.start(queue: queue)
+        receiveRequest(on: connection, buffer: Data())
+    }
+
+    private func receiveRequest(on connection: NWConnection, buffer: Data) {
+        connection.receive(minimumIncompleteLength: 1, maximumLength: 65_536) { [weak self] data, _, isComplete, error in
+            guard let self = self, error == nil else { return }
+            var request = buffer
+            if let data = data { request.append(data) }
+            guard let end = request.range(of: Data("\r\n\r\n".utf8)) else {
+                if !isComplete { self.receiveRequest(on: connection, buffer: request) }
+                return
+            }
+            let head = String(decoding: request[..<end.lowerBound], as: UTF8.self)
+            let path = head.split(separator: " ").dropFirst().first.map(String.init) ?? "/"
+            self.lock.lock()
+            self.requests.append((path, ProcessInfo.processInfo.systemUptime))
+            self.lock.unlock()
+            self.respond(to: path, on: connection)
+        }
+    }
+
+    private func respond(to path: String, on connection: NWConnection) {
+        let playlist = "application/vnd.apple.mpegurl"
+        if path == "/master.m3u8" {
+            var body = "#EXTM3U\n#EXT-X-VERSION:3\n"
+            for (name, bandwidth) in [("r0", 64_000), ("r1", 128_000), ("r2", 256_000)] {
+                body += "#EXT-X-STREAM-INF:BANDWIDTH=\(bandwidth),CODECS=\"mp4a.40.2\"\n\(name)/index.m3u8\n"
+            }
+            send(Data(body.utf8), type: playlist, on: connection)
+        } else if path.hasSuffix("/index.m3u8") {
+            var body = "#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-TARGETDURATION:4\n#EXT-X-MEDIA-SEQUENCE:0\n#EXT-X-PLAYLIST-TYPE:VOD\n"
+            for index in 0..<4 { body += "#EXTINF:4.0,\nsegment-\(index).aac\n" }
+            body += "#EXT-X-ENDLIST\n"
+            send(Data(body.utf8), type: playlist, on: connection)
+        } else if path.hasSuffix(".aac") {
+            let segment = Self.packedAudioSegment()
+            let head = "HTTP/1.1 200 OK\r\nContent-Type: audio/aac\r\nContent-Length: \(segment.count)\r\n\r\n"
+            connection.send(content: Data(head.utf8) + segment.prefix(3_000), completion: .contentProcessed { _ in })
+            queue.asyncAfter(deadline: .now() + 2) { connection.cancel() }
+        } else {
+            send(Data(), type: "text/plain", status: "404 Not Found", on: connection)
+        }
+    }
+
+    private func send(_ body: Data, type: String, status: String = "200 OK", on connection: NWConnection) {
+        let head = "HTTP/1.1 \(status)\r\nContent-Type: \(type)\r\nContent-Length: \(body.count)\r\n\r\n"
+        connection.send(content: Data(head.utf8) + body, completion: .contentProcessed { [weak self] _ in
+            self?.receiveRequest(on: connection, buffer: Data())
+        })
+    }
+
+    /// One 4 s packed-audio segment: the ID3 timestamp HLS requires, then AAC LC frames (44.1 kHz,
+    /// stereo) with silent payloads.
+    private static func packedAudioSegment() -> Data {
+        func syncSafe(_ value: Int) -> [UInt8] {
+            [UInt8((value >> 21) & 0x7F), UInt8((value >> 14) & 0x7F), UInt8((value >> 7) & 0x7F), UInt8(value & 0x7F)]
+        }
+        let body = Array("com.apple.streaming.transportStreamTimestamp".utf8) + [0] + [UInt8](repeating: 0, count: 8)
+        let frame = Array("PRIV".utf8) + syncSafe(body.count) + [0, 0] + body
+        var data = Data(Array("ID3".utf8) + [4, 0, 0] + syncSafe(frame.count) + frame)
+        // A silent AAC LC raw data block (single channel pair element) padded to a fixed size.
+        let payload = [UInt8](repeating: 0, count: 32)
+        let length = 7 + payload.count
+        let header: [UInt8] = [
+            0xFF, 0xF1, UInt8((1 << 6) | (4 << 2)), UInt8((2 << 6) | (length >> 11)),
+            UInt8((length >> 3) & 0xFF), UInt8(((length & 7) << 5) | 0x1F), 0xFC,
+        ]
+        for _ in 0..<(4 * 44_100 / 1_024 + 1) { data.append(contentsOf: header + payload) }
+        return data
+    }
+}
+
+/// An item's reading with only its access log's bytes (`entries`: per entry, negative when
+/// unknown, as ItemLoadSnapshot(of:) sums them): no loaded range, no event or error counted.
+private func loggedBytes(_ entries: [Int64]) -> ItemLoadSnapshot {
+    ItemLoadSnapshot(loadedRanges: [], transferredBytes: entries.reduce(0.0) { $0 + Double(max(0, $1)) }, accessLogEvents: 0, errorLogEntries: 0)
 }
 
 /// SwiftAudioEx 1.1.0's layout around its AVPlayer (AudioPlayer.wrapper → AVPlayerWrapper.avPlayer).
