@@ -16,15 +16,19 @@ import java.util.concurrent.Executors
  * renditions (in the order given), a VOD media playlist per rendition of [segmentCount] segments
  * of [SEGMENT_SECONDS] s, and the segments: synthetic AAC (ADTS) audio for those before
  * [stalledFrom], and for the others nothing at all: the request is accepted and never answered,
- * like a stalled CDN, until the client closes it. It records every request and every stalled
- * request the client closed, in order.
+ * like a stalled CDN, until the client closes it; or, with [failingStatus], an HTTP error after
+ * [failingAfterMs] (a CDN that fails, which makes the player fall back to another rendition).
+ * It records every request and every stalled request the client closed, in order.
  */
 internal class HlsTestServer(
     /** The renditions, in master playlist order: (name, BANDWIDTH in bits per second). */
     private val renditions: List<Pair<String, Int>>,
     private val segmentCount: Int = 2,
     /** The first segment that never arrives (0: none does). */
-    private val stalledFrom: Int = 0
+    private val stalledFrom: Int = 0,
+    /** When set, the segments from [stalledFrom] on answer this HTTP status instead of stalling. */
+    private val failingStatus: Int? = null,
+    private val failingAfterMs: Long = 0L
 ) : AutoCloseable {
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
@@ -69,6 +73,11 @@ internal class HlsTestServer(
                 when {
                     path == "/master.m3u8" -> respond(connection, masterPlaylist().toByteArray(), PLAYLIST_TYPE)
                     path.endsWith("/index.m3u8") -> respond(connection, mediaPlaylist().toByteArray(), PLAYLIST_TYPE)
+                    segment != null && segment >= stalledFrom && failingStatus != null -> {
+                        stalledRequestTimesMs += monotonicNowMs()
+                        Thread.sleep(failingAfterMs)
+                        respond(connection, ByteArray(0), "audio/aac", status = "$failingStatus Failing")
+                    }
                     segment != null && segment >= stalledFrom -> {
                         stallUntilClosed(connection)
                         return

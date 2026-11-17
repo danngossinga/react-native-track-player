@@ -132,6 +132,27 @@ class CrossfadeEngineHlsTest {
     }
 
     @Test
+    fun failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions() {
+        // Each segment fails (503) shortly before the stall timeout: the player then loads another
+        // rendition's playlist. Playlists are not media: those loads must not count as progress.
+        val engine = engine(STALL_TIMEOUT_MS)
+        val failing = server(LADDER, failingStatus = 503, failingAfterMs = STALL_TIMEOUT_MS * 4 / 5)
+        val startedAtMs = monotonicNowMs()
+        val error = runBlocking(engineThread) {
+            runCatching {
+                engine.prepare(hlsItem(failing), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS)
+            }
+        }.exceptionOrNull()
+        val gaveUpAfterMs = monotonicNowMs() - startedAtMs
+        assertTrue("the load must fail, got $error", error is RejectionException)
+        assertEquals("crossfade_prepare_timeout", (error as RejectionException).code)
+        assertTrue(
+            "gave up after ${gaveUpAfterMs}ms (renditions asked: ${failing.segmentRenditions()}); stallTimeoutMs is $STALL_TIMEOUT_MS",
+            gaveUpAfterMs < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS
+        )
+    }
+
+    @Test
     fun aStalledLoadAfterAPlayingTrackGivesUpAtTheStallTimeoutAndStopsLoading() {
         // Device case: a track plays, the fan taps an uncached track whose segment never comes.
         val engine = engine(STALL_TIMEOUT_MS)
@@ -163,7 +184,7 @@ class CrossfadeEngineHlsTest {
         }
         val seekedAtMs = monotonicNowMs()
         val error = runBlocking(engineThread) {
-            runCatching { engine.seekTo(20_000L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+            runCatching { engine.seekTo(SEEK_TARGET_MS, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
         }.exceptionOrNull()
         val gaveUpAtMs = monotonicNowMs()
         assertTrue("the seek must fail, got $error", error is RejectionException)
@@ -173,6 +194,9 @@ class CrossfadeEngineHlsTest {
             gaveUpAtMs - seekedAtMs < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS
         )
         assertStopsLoading(engine, item, server, gaveUpAtMs)
+        // The position reported after a failed seek is its target (as iOS), where the next play
+        // loads the track again.
+        assertEquals(SEEK_TARGET_MS, runBlocking(engineThread) { engine.positionMs })
     }
 
     private fun assertGivesUpAtTheStallTimeoutAndStopsLoading(
@@ -204,8 +228,12 @@ class CrossfadeEngineHlsTest {
         gaveUpAtMs: Long
     ) {
         val requestsAtGiveUp = server.stalledRequestTimesMs.size
-        // ExoPlayer's default policy retries a failed request after 0, 1, 2 s...: wait past those.
-        Thread.sleep(3 * STALL_TIMEOUT_MS)
+        // The open requests end by their read timeout (stallTimeoutMs). Then watch as long again:
+        // ExoPlayer's default policy would retry within 1 s of such a failure.
+        waitUntil(STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS) {
+            server.stalledRequestClosedTimesMs.size == server.stalledRequestTimesMs.size
+        }
+        waitUntil(STALL_TIMEOUT_MS) { server.stalledRequestTimesMs.size > requestsAtGiveUp }
         assertEquals(
             "stalled requests after the give-up (times ${server.stalledRequestTimesMs.map { it - gaveUpAtMs }})",
             requestsAtGiveUp,
@@ -231,8 +259,11 @@ class CrossfadeEngineHlsTest {
     private fun server(
         renditions: List<Pair<String, Int>>,
         segmentCount: Int = 2,
-        stalledFrom: Int = 0
-    ): HlsTestServer = HlsTestServer(renditions, segmentCount, stalledFrom).also { servers += it }
+        stalledFrom: Int = 0,
+        failingStatus: Int? = null,
+        failingAfterMs: Long = 0L
+    ): HlsTestServer =
+        HlsTestServer(renditions, segmentCount, stalledFrom, failingStatus, failingAfterMs).also { servers += it }
 
     private fun engine(stallTimeoutMs: Long): AndroidCrossfadeEngine = runBlocking(engineThread) {
         AndroidCrossfadeEngine(
@@ -259,11 +290,17 @@ class CrossfadeEngineHlsTest {
         return server.segmentRenditions().first()
     }
 
+    /** Waits until [condition] holds or [timeoutMs] passes (the caller asserts what it needs). */
+    private fun waitUntil(timeoutMs: Long, condition: () -> Boolean) {
+        val deadline = monotonicNowMs() + timeoutMs
+        while (monotonicNowMs() < deadline && !condition()) Thread.sleep(POLL_MS)
+    }
+
     private fun awaitTrue(what: String, condition: () -> Boolean) {
         val deadline = monotonicNowMs() + AWAIT_MS
         while (monotonicNowMs() < deadline) {
             if (condition()) return
-            Thread.sleep(20)
+            Thread.sleep(POLL_MS)
         }
         fail("timed out waiting for $what")
     }
@@ -280,12 +317,14 @@ class CrossfadeEngineHlsTest {
         const val TEST_DECODER = "test.aac.decoder"
         const val CODEC_BUFFER_BYTES = 100 * 1024
         val LADDER = listOf("v064" to 64_000, "v128" to 128_000, "v192" to 192_000)
-        const val STALL_TIMEOUT_MS = 1_500L
+        const val STALL_TIMEOUT_MS = 2_000L
         const val PREPARE_TIMEOUT_MS = 60_000L
         const val PLAYED_MS = 1_000L
-        /** Time for the wait's poll and the threads around a give-up. */
-        const val GIVE_UP_SLACK_MS = 750L
+        const val SEEK_TARGET_MS = 20_000L
+        /** Time for the wait's poll and the threads around a give-up: half the stall timeout. */
+        const val GIVE_UP_SLACK_MS = STALL_TIMEOUT_MS / 2
         const val AWAIT_MS = 15_000L
         const val CLOCK_TICK_MS = 5L
+        const val POLL_MS = 20L
     }
 }
