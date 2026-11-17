@@ -755,4 +755,22 @@ assert(
   );
 }
 
+// As iOS's loadIndex: the active track is committed once its load succeeded; a load that fails or
+// is cancelled leaves the previous track active (load() of a new track: none, -1).
+{
+  const startTrack = section(orchestrator, 'private suspend fun startTrackAt(', 'private suspend fun ensureActivePrepared(');
+  const loadBody = section(orchestrator, 'suspend fun load(item: TrackAudioItem) = withPlaybackOperation', 'fun setNowPlayingOverride(');
+  const test = read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt');
+  assert(
+    startTrack.indexOf('prepareActiveOrFail(queue[index], positionMs, ticket)') < startTrack.indexOf('currentIndex = index') &&
+      startTrack.indexOf('prepareActiveOrFail(queue[index], positionMs, ticket)') < startTrack.indexOf('delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)') &&
+      (startTrack.match(/currentIndex = /g) || []).length === 1 &&
+      loadBody.includes('            queue = listOf(item)\n            currentIndex = -1\n') &&
+      loadBody.indexOf('prepareActiveOrFail(item, 0L, ticket)') < loadBody.indexOf('            currentIndex = 0\n') &&
+      ['fun aFailedSkipKeepsThePreviousTrackActiveAndAPlayReloadsItAsOnIos()', 'fun aFailedLoadOfANewTrackLeavesNoActiveTrackAsOnIos()',
+        'fun aPlayOrASeekAfterAFailedSkipWhoseReloadFailsEndsInErrorAsOnIos()'].every((t) => test.includes(t)),
+    'Android must commit the active track only once its load succeeded, as iOS.'
+  );
+}
+
 console.log('Android crossfade contracts OK');

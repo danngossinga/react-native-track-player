@@ -29,6 +29,7 @@ import kotlinx.coroutines.withContext
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Test
@@ -330,7 +331,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
             orchestrator.settleActiveTransition()
             blockedPrepare.cancellationObserved.await()
             val settled = orchestrator.snapshot()
-            assertEquals(1, settled.currentIndex)
+            // The cancelled skip's track never loaded: the previous one stays active (iOS's
+            // loadIndex commits the index on success only).
+            assertEquals(0, settled.currentIndex)
             assertEquals(AndroidPlaybackOrchestratorState.STOPPED, settled.orchestratorState)
             assertEquals(AudioPlayerState.STOPPED, settled.playbackState)
             assertFalse(settled.playWhenReady)
@@ -348,7 +351,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             blockedPrepare.release.complete(Unit)
             runCurrent()
             assertEquals(1, bridgeFailures.size)
-            assertEquals(1, orchestrator.currentIndex)
+            assertEquals(0, orchestrator.currentIndex)
             assertEquals(AndroidPlaybackOrchestratorState.STOPPED, orchestrator.state)
             assertFalse(delegate.playbackStates.contains(AudioPlayerState.ERROR))
             assertTrue(delegate.playbackErrors.isEmpty())
@@ -585,7 +588,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
             assertEquals(listOf("crossfade_prepare_timeout"), delegate.playbackErrors.map { it.first })
             assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
             assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
-            assertEquals(1, orchestrator.currentIndex)
+            // The track that failed to load does not become active (iOS: loadIndex commits on success).
+            assertEquals(0, orchestrator.currentIndex)
+            assertTrue(delegate.activeTrackChanges.none { it.index == 1 })
         } finally {
             orchestrator.release()
         }
@@ -1194,6 +1199,87 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aFailedSkipKeepsThePreviousTrackActiveAndAPlayReloadsItAsOnIos() = runTest {
+        // iOS's loadIndex commits the index (and the active-track event) once the track loaded:
+        // a skip whose load fails leaves the previous track active, the player in error, and the
+        // next play reloads that previous track (recoverCurrentItem).
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            val items = testItems(3)
+            orchestrator.setQueue(items)
+            orchestrator.play()
+            runCurrent()
+            delegate.activeTrackChanges.clear()
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val skipped = runCatching { orchestrator.skip(1) }
+            assertEquals("crossfade_prepare_timeout", (skipped.exceptionOrNull() as RejectionException).code)
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            assertEquals(0, orchestrator.currentIndex)
+            assertEquals(0, orchestrator.snapshot().currentIndex)
+            assertTrue("no active-track change to a track that did not load", delegate.activeTrackChanges.isEmpty())
+
+            orchestrator.play()
+            assertSame(items[0], engines.first.lastPrepareItem)
+            assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
+            assertEquals(0, orchestrator.currentIndex)
+            assertTrue(delegate.activeTrackChanges.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aFailedLoadOfANewTrackLeavesNoActiveTrackAsOnIos() = runTest {
+        // iOS's load replaces the queue with no active track (-1) and commits index 0 once loaded.
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            orchestrator.setQueue(testItems(1))
+            orchestrator.play()
+            runCurrent()
+            delegate.activeTrackChanges.clear()
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            engines.second.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            // A track not in the queue (another queue id).
+            val newTrack = testItems(1).single().also { item ->
+                Track::class.java.getDeclaredField("queueId").apply { isAccessible = true }.setLong(item.track, 42L)
+            }
+            runCatching { orchestrator.load(newTrack) }
+            assertTrue("the new track was loaded", engines.first.lastPrepareItem === newTrack || engines.second.lastPrepareItem === newTrack)
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            assertEquals(-1, orchestrator.currentIndex)
+            assertTrue(delegate.activeTrackChanges.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayOrASeekAfterAFailedSkipWhoseReloadFailsEndsInErrorAsOnIos() = runTest {
+        // The retry after a failed load fails too: an error state again, not loading.
+        for (command in listOf("play", "seek")) {
+            val (orchestrator, engines, delegate) = ninth()
+            try {
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+                runCatching { orchestrator.skip(1) }
+                assertEquals(command, AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+                engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+                val retried = runCatching {
+                    if (command == "play") orchestrator.play() else orchestrator.seekTo(10_000L)
+                }
+                assertEquals(command, "crossfade_prepare_timeout", (retried.exceptionOrNull() as RejectionException).code)
+                assertEquals(command, AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+                assertEquals(command, AudioPlayerState.ERROR, delegate.playbackStates.last())
+                assertFalse(command, engines.first.audible || engines.second.audible)
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
     fun aSkipAfterTheQueueEndedPausedFirstStaysSilent() = runTest {
         // The service's refusal (decision B) when the audio focus was lost while the queue
         // ended: it pauses, then runs the skip. Without that pause the skip plays at once.
@@ -1268,7 +1354,8 @@ class AndroidPlaybackOrchestratorCancellationTest {
             orchestrator.play()
             assertEquals(loads + 1, engines.first.prepareCalls)
             assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
-            assertEquals(1, orchestrator.snapshot().currentIndex)
+            // The skip's track never became active: play reloads the previous one, as iOS.
+            assertEquals(0, orchestrator.snapshot().currentIndex)
         } finally {
             orchestrator.release()
         }
@@ -1667,6 +1754,9 @@ class AndroidPlaybackOrchestratorCancellationTest {
         var blockNextPrepare: PrepareBlock? = null
         var prepareCalls = 0
             private set
+        /** The item of the last prepare (the track a load or reload asked for). */
+        var lastPrepareItem: TrackAudioItem? = null
+            private set
         var lastPrepareTicket: PlaybackOperationTicket? = null
             private set
         var lastPrepareTimeoutMs: Long? = null
@@ -1721,6 +1811,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             lastPrepareTicket = ticket
             lastPrepareTimeoutMs = timeoutMs
             lastPrepareStallTimeoutMs = stallTimeoutMs
+            lastPrepareItem = item
             // As the real engine: the track is marked before the wait, and a load that fails or
             // is cancelled clears it (so the next play loads it again).
             preparedItem = item

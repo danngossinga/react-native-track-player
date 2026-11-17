@@ -634,4 +634,22 @@ assert(
   );
 }
 
+// A track becomes the active one once it loaded (loadIndex's success branches only): a load that
+// fails or is cancelled leaves the previous track active, and play reloads that one. Android
+// aligns on it (startTrackAt). Chosen alignment for the parity docs.
+{
+  const loadIndex = section(orchestrator, 'private func loadIndex(', 'private func startCrossfade(');
+  const beforeSuccess = loadIndex.slice(0, loadIndex.indexOf('case .success:'));
+  const failure = loadIndex.slice(loadIndex.lastIndexOf('case .failure(let error):'));
+  assert(
+    !beforeSuccess.includes('currentIndex = index') &&
+      !beforeSuccess.includes('didChangeActiveTrack') &&
+      (loadIndex.match(/self\.currentIndex = index/g) || []).length === 2 &&
+      !failure.includes('currentIndex') &&
+      failure.includes('self.state = .error') &&
+      section(orchestrator, 'func load(track: Track, completion:', 'func play(').includes('replaceQueue([track], currentIndex: -1)'),
+    'iOS must commit the active track only once its load succeeded.'
+  );
+}
+
 console.log('iOS crossfade contracts OK');

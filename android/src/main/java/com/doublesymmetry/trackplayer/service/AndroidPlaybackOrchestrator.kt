@@ -388,13 +388,15 @@ internal class AndroidPlaybackOrchestrator private constructor(
         if (existingIndex >= 0) {
             startTrackAt(existingIndex, 0L, emitTrackChange = true, oldPositionMs = activeEngine.positionMs, ticket = ticket)
         } else {
+            // As iOS's load: the queue is the new track with no active track until it loaded.
             queue = listOf(item)
-            currentIndex = 0
+            currentIndex = -1
             activeEngine.reset()
             standbyEngine.reset()
             setState(AndroidPlaybackOrchestratorState.LOADING)
             prepareActiveOrFail(item, 0L, ticket)
             ticket.ensureActive()
+            currentIndex = 0
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
             delegate.onNowPlayingChanged(0)
@@ -1009,16 +1011,19 @@ internal class AndroidPlaybackOrchestrator private constructor(
         preloadTargetIndex = null
         activeEngine.reset()
         standbyEngine.reset()
-        currentIndex = index
         nowPlayingOverride = null
         setState(AndroidPlaybackOrchestratorState.LOADING)
+        notifySnapshotChanged()
+        prepareActiveOrFail(queue[index], positionMs, ticket)
+        ticket?.ensureActive()
+        // As iOS's loadIndex: the track becomes the active one once it loaded. A load that fails
+        // (or is cancelled) leaves the previous track active, so the next play reloads that one.
+        currentIndex = index
         if (emitTrackChange) {
             delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)
         }
         delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
-        prepareActiveOrFail(queue[index], positionMs, ticket)
-        ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
             activeEngine.play(rate)
