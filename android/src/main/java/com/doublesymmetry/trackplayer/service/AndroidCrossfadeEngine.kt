@@ -13,6 +13,7 @@ import com.google.android.exoplayer2.MediaMetadata
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.audio.AudioAttributes
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
+import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
@@ -120,6 +121,7 @@ internal class AndroidCrossfadeEngine(
     val player: ExoPlayer = ExoPlayer.Builder(context)
         .setMediaSourceFactory(mediaSourceFactory)
         .setBandwidthMeter(bandwidthMeter)
+        .setTrackSelector(crossfadeTrackSelector(context))
         .build()
         .apply {
             volume = 0f
@@ -200,26 +202,32 @@ internal class AndroidCrossfadeEngine(
         // (or is cancelled) leaves no prepared track, so the next play loads it again (iOS:
         // recoverCurrentItem reloads after an error).
         try {
-        val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs,
-            totalTimeoutMs = timeoutMs,
-            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
-            nowMs = SystemClock::elapsedRealtime,
-            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
-            readings = ::loadProgress
-        ) {
-            if (player.playbackState == Player.STATE_ENDED) {
-                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
-                throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
+        val verdict = try {
+            awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs,
+                totalTimeoutMs = timeoutMs,
+                pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                nowMs = SystemClock::elapsedRealtime,
+                pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+                readings = ::loadProgress
+            ) {
+                if (player.playbackState == Player.STATE_ENDED) {
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
+                    throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
+                }
+                if (player.playerError != null) {
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+                    throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
+                }
+                player.playbackState == Player.STATE_READY
             }
-            if (player.playerError != null) {
-                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-                throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
-            }
-            player.playbackState == Player.STATE_READY
+        } catch (error: RejectionException) {
+            abandonLoad(generation)
+            throw error
         }
         if (verdict != null) {
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+            abandonLoad(generation)
             val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
             throw RejectionException("$name did not become ready ($reason).", "crossfade_prepare_timeout")
         }
@@ -338,6 +346,7 @@ internal class AndroidCrossfadeEngine(
             player.playWhenReady = false
             player.pause()
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+            abandonLoad(generation)
             val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
             throw RejectionException("$name did not finish seeking ($reason).", "crossfade_seek_timeout")
         }
@@ -350,6 +359,21 @@ internal class AndroidCrossfadeEngine(
 
     override fun setVolume(value: Float) {
         player.volume = value
+    }
+
+    /**
+     * Ends a load or seek the engine gave up on: the player stops loading at once (ExoPlayer would
+     * otherwise keep the stalled request open and retry it in the background, for minutes with its
+     * default retry policy), and the track is no longer prepared, so the next play loads it again.
+     * Only for the operation that gave up: a newer load owns the player.
+     */
+    private fun abandonLoad(generation: Long) {
+        if (operationGeneration != generation) return
+        androidXfadeLog("$name load abandoned positionMs=$positionMs")
+        player.playWhenReady = false
+        player.stop()
+        preparedItem = null
+        preparedTrackKey = null
     }
 
     override fun setRate(value: Float) {
@@ -442,6 +466,25 @@ internal fun crossfadeBandwidthMeter(context: Context, initialBitrateEstimateBps
         .setInitialBitrateEstimate(initialBitrateEstimateBps)
         .build()
 internal const val INITIAL_BITRATE_ESTIMATE_KEY = "initialBitrateEstimateBps"
+
+/**
+ * The track selector of a crossfade player: the audio renditions of an HLS (or DASH) track adapt.
+ * An HLS master playlist gives each rendition's bitrate and codec but not its channel count or
+ * sample rate; ExoPlayer's default selector only adapts between renditions where both are known
+ * and equal, so it fell back to a fixed choice, always the highest bitrate, whatever the bandwidth
+ * estimate. Allowing renditions whose count or rate is unknown or different to adapt lets the
+ * selection start from the estimate ([crossfadeBandwidthMeter]): the lowest rendition at the
+ * default estimate, then up as the player measures.
+ */
+internal fun crossfadeTrackSelector(context: Context): DefaultTrackSelector =
+    DefaultTrackSelector(context, crossfadeTrackSelectorParameters(DefaultTrackSelector.Parameters.Builder(context)))
+
+internal fun crossfadeTrackSelectorParameters(
+    builder: DefaultTrackSelector.Parameters.Builder
+): DefaultTrackSelector.Parameters = builder
+    .setAllowAudioMixedChannelCountAdaptiveness(true)
+    .setAllowAudioMixedSampleRateAdaptiveness(true)
+    .build()
 
 /**
  * A timeout option (`prepareTimeoutMs`, `standardReadyTimeoutMs`), in milliseconds, read from setup

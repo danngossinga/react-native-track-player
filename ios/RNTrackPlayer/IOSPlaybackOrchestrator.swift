@@ -44,6 +44,8 @@ protocol IOSPlaybackOrchestratorDelegate: AnyObject {
     /// Playback did not start (after play, or a load that plays at once): reported as a
     /// `playback-error`, as on Android.
     func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailPlaybackStart code: String, message: String)
+    /// The track that should follow an ended one failed to start (no command waits for it).
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure)
 }
 
 private final class IOSCrossfadeContext {
@@ -1787,7 +1789,13 @@ final class IOSPlaybackOrchestrator {
         let total = duration
         if total > 0 && currentTime >= max(0, total - 0.15) {
             if let next = nextIndex(after: currentIndex) {
-                skip(to: next, initialTime: 0) { _ in }
+                // The load leaves the player in error when it fails; the app learns why from a
+                // playback error, as from a failed skip's rejection.
+                skip(to: next, initialTime: 0) { [weak self] result in
+                    guard let self = self, let failure = PlaybackAdvanceFailure(result) else { return }
+                    IOSPlaybackLog.log("advance failed toIndex=\(next) error=\(failure.code)")
+                    self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)
+                }
             } else {
                 state = .ended
                 emitStateIfNeeded()

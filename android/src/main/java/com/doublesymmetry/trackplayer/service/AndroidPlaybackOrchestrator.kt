@@ -1075,6 +1075,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
         try {
             activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
         } catch (error: RejectionException) {
+            // A track that fails to load (a stall, a player error) leaves the player in an error
+            // state, not loading forever. A newer command that took over says otherwise.
+            ticket?.ensureActive()
             setState(AndroidPlaybackOrchestratorState.ERROR)
             throw error
         }
@@ -1259,19 +1262,33 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val endedPosition = activeEngine.positionMs
         val nextIndex = nextIndexFor(currentIndex)
         if (nextIndex != null) {
-            // An operation like the user's: a pause, stop or skip during the next track's start
-            // cancels it (no play-start give-up or playback error afterwards).
-            val ticket = beginOperation()
-            try {
-                startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition, ticket = ticket)
-            } catch (_: PlaybackOperationCancelledException) {
-                androidXfadeLog("natural advance cancelled index=$nextIndex")
-            } finally {
-                operationController.finish(ticket)
-            }
+            advanceToNextTrack(nextIndex, endedPosition)
         } else {
             setState(AndroidPlaybackOrchestratorState.ENDED)
             delegate.onQueueEnded(endedIndex, endedPosition)
+        }
+    }
+
+    /**
+     * Starts the next track when the playing one ends: a playback operation like a skip, so a
+     * newer command cancels it. No command waits for its result, so a load that fails (a stall at
+     * `stallTimeoutMs`, a player error, the total limit) is reported as a playback error, with the
+     * code a skip would reject with, after the player went to its error state.
+     */
+    private suspend fun advanceToNextTrack(nextIndex: Int, endedPositionMs: Long) {
+        // An operation like the user's: a pause, stop or skip during the next track's start
+        // cancels it (no play-start give-up or playback error afterwards).
+        val ticket = beginOperation()
+        try {
+            startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPositionMs, ticket = ticket)
+        } catch (_: PlaybackOperationCancelledException) {
+            // A newer command took over; it reports its own outcome.
+            androidXfadeLog("natural advance cancelled index=$nextIndex")
+        } catch (error: RejectionException) {
+            androidXfadeLog("advance failed toIndex=$nextIndex error=${error.code}")
+            delegate.onPlaybackError(error.code, error.message)
+        } finally {
+            operationController.finish(ticket)
         }
     }
 

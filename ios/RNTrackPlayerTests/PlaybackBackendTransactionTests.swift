@@ -68,6 +68,42 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(backendStepTimeout(loadTimeoutMs: 5_000, playStartTimeoutMs: 20_000), 30)
     }
 
+    // The track after an ended one fails to start: no command waits for it, so the app is told
+    // with a playback error (as Android's orchestrator), unless a newer command cancelled it.
+
+    func testAStalledAdvanceIsReportedWithItsCodeAndMessage() {
+        let stall = NSError(domain: "RNTP-Crossfade", code: 5, userInfo: [
+            NSLocalizedDescriptionKey: "Crossfade engine did not become ready (no progress for 10000ms).",
+            "code": "crossfade_prepare_timeout"
+        ])
+        XCTAssertEqual(
+            PlaybackAdvanceFailure(.failure(stall)),
+            PlaybackAdvanceFailure(
+                code: "crossfade_prepare_timeout",
+                message: "Crossfade engine did not become ready (no progress for 10000ms)."
+            )
+        )
+    }
+
+    func testAnAdvanceErrorWithoutACodeIsReportedAsAnEngineError() {
+        let playerError = NSError(domain: "AVFoundationErrorDomain", code: -11800, userInfo: [
+            NSLocalizedDescriptionKey: "The operation could not be completed"
+        ])
+        XCTAssertEqual(
+            PlaybackAdvanceFailure(.failure(playerError)),
+            PlaybackAdvanceFailure(code: "crossfade_engine_error", message: "The operation could not be completed")
+        )
+    }
+
+    func testAnAdvanceThatStartedOrWasCancelledIsNotReported() {
+        XCTAssertNil(PlaybackAdvanceFailure(.success(())))
+        let cancelled = NSError(domain: "RNTP-Orchestrator", code: 1, userInfo: [
+            NSLocalizedDescriptionKey: "Playback load was cancelled by skip.",
+            "code": "cancelled"
+        ])
+        XCTAssertNil(PlaybackAdvanceFailure(.failure(cancelled)))
+    }
+
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
 
     func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {

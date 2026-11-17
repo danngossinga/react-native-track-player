@@ -95,6 +95,33 @@ struct StallWatch {
     }
 }
 
+/// What the app is told when the track that should follow an ended one fails to start: no
+/// command waits for that load, so its failure (a stall at `stallTimeoutMs`, the total limit, a
+/// player error) is reported as a playback error with the error's code and message. Nothing is
+/// reported when it started, or when a newer command cancelled it (that command reports its own
+/// outcome). Same report as Android's.
+struct PlaybackAdvanceFailure: Equatable {
+    let code: String
+    let message: String
+
+    init(code: String, message: String) {
+        self.code = code
+        self.message = message
+    }
+
+    /// The report for an advance's result: nil for a success or a cancellation.
+    init?(_ result: Result<Void, Error>) {
+        guard case .failure(let error) = result else { return nil }
+        let nsError = error as NSError
+        let code = nsError.userInfo["code"] as? String ?? playbackAdvanceFailureDefaultCode
+        guard code != "cancelled" else { return nil }
+        self.init(code: code, message: nsError.localizedDescription)
+    }
+}
+
+/// The code of an advance failure whose error names none (a player error), as on Android.
+let playbackAdvanceFailureDefaultCode = "crossfade_engine_error"
+
 /// A timeout option (`prepareTimeoutMs`, `playStartTimeoutMs`...), in milliseconds: nil when it is
 /// not a number from 1 to 2147483646 (booleans refused), so the current value is kept. Same bounds
 /// as Android.
