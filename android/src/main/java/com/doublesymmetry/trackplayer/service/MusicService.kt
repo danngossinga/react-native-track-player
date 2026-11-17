@@ -533,7 +533,8 @@ class MusicService : HeadlessJsTaskService() {
                     },
                     loadWatch = StandardLoadWatch(
                         stallTimeoutMs = { stallTimeout.milliseconds },
-                        totalTimeoutMs = { prepareTimeout.milliseconds }
+                        totalTimeoutMs = { prepareTimeout.milliseconds },
+                        onLoadStart = { standardAnalytics[binding.player]?.loadedBytes?.startLoad() }
                     ),
                     initiallyAuthoritative = initiallyAuthoritative
                 ).also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }
@@ -676,8 +677,10 @@ class MusicService : HeadlessJsTaskService() {
             configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
-        // Only media bytes are a load's progress (playlists and keys are not), as on the crossfade path.
+        // A load's progress, as on the crossfade path: media bytes always, playlists and keys
+        // until the track's first segment is asked for.
         mediaTransferListener = analytics.loadedBytes,
+        playlistTransferListener = analytics.loadedBytes.playlists,
         hostOwnsAudioFocus = true
     )
 

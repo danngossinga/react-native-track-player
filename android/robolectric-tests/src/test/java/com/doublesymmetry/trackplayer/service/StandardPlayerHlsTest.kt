@@ -177,6 +177,41 @@ class StandardPlayerHlsTest {
         watched.assertGivesUpAtTheStallTimeoutAndStopsLoading(stalled, givenUpBefore = 1)
     }
 
+    // Playlists and keys are a load's progress until its first segment is asked for (a slow proxy
+    // answering them must not fail a healthy track), as on the crossfade path; every load counts
+    // them again.
+
+    @Test
+    fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyStandardTrackGiveUp() {
+        val slow = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4)
+            .also { servers += it }
+        val watched = watchedStandardPlayer()
+        val startedAtMs = monotonicNowMs()
+        load(watched.player, slow)
+        awaitTrue("the track is ready") { runBlocking(playerThread) { watched.player.playbackState == Player.STATE_READY } }
+        assertTrue("the playlists took longer than the stall timeout", monotonicNowMs() - startedAtMs > STALL_TIMEOUT_MS)
+        assertEquals("no give-up", 0, watched.gaveUpAtMs.size)
+    }
+
+    @Test
+    fun slowPlaylistsCountAgainForTheNextStandardTrack() {
+        val first = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val watched = watchedStandardPlayer()
+        load(watched.player, first)
+        awaitTrue("the first track is ready") { runBlocking(playerThread) { watched.player.playbackState == Player.STATE_READY } }
+        val slow = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4)
+            .also { servers += it }
+        // KotlinAudio's load: another item, prepared.
+        runBlocking(playerThread) {
+            watched.player.setMediaItem(hlsItem(slow))
+            watched.player.prepare()
+        }
+        awaitTrue("the next track is ready") {
+            runBlocking(playerThread) { watched.player.playbackState == Player.STATE_READY && watched.player.currentMediaItem?.localConfiguration?.uri.toString() == slow.masterUrl }
+        }
+        assertEquals("no give-up", 0, watched.gaveUpAtMs.size)
+    }
+
     @Test
     fun aStalledStandardSeekGivesUpAtTheStallTimeoutAndStopsLoading() {
         // Segments from the fourth on (12 s) never come; the seek to 20 s stalls.
@@ -272,16 +307,16 @@ class StandardPlayerHlsTest {
         val context = RuntimeEnvironment.getApplication()
         val bytes = LoadedBytes()
         val http = standardHttpDataSourceFactory({ STALL_TIMEOUT_MS }).invoke { }
-        // As vendored KotlinAudio with the service's mediaTransferListener: only media requests
-        // count their bytes (playlists and keys do not), the same split as the crossfade engines.
+        // As vendored KotlinAudio with the service's transfer listeners: media bytes always,
+        // playlists and keys until the first segment request, as the crossfade engines.
         val builder = ExoPlayer.Builder(context)
             .setLooper(thread.looper)
-            .setMediaSourceFactory(CrossfadeMediaSourceFactory(playlistDataSourceFactory = http, mediaDataSourceFactory = http.countingBytes(bytes)))
+            .setMediaSourceFactory(CrossfadeMediaSourceFactory(playlistDataSourceFactory = http.countingBytes(bytes.playlists), mediaDataSourceFactory = http.countingBytes(bytes)))
         val analytics = StandardPlayerAnalytics()
         configureStandardExoPlayer(builder, context, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, analytics)
         val player = builder.build().also { players += it }
         val watched = WatchedPlayer(player)
-        val watch = StandardLoadWatch(stallTimeoutMs = { STALL_TIMEOUT_MS }, totalTimeoutMs = { PREPARE_TIMEOUT_MS })
+        val watch = StandardLoadWatch(stallTimeoutMs = { STALL_TIMEOUT_MS }, totalTimeoutMs = { PREPARE_TIMEOUT_MS }, onLoadStart = bytes::startLoad)
         // As KotlinAudioPlaybackBackend.startLoadWatch: the player's events and one timer while a
         // load is watched; a waited seek owns its loading.
         watched.driver = StandardLoadDriver(

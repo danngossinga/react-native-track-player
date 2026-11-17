@@ -44,7 +44,9 @@ internal data class StandardLoadObservation(
 internal class StandardLoadWatch(
     private val stallTimeoutMs: () -> Long,
     private val totalTimeoutMs: () -> Long,
-    private val nowMs: () -> Long = ::monotonicNowMs
+    private val nowMs: () -> Long = ::monotonicNowMs,
+    /** A load starts being watched (the progress counter's per-load reset: [LoadedBytes.startLoad]). */
+    private val onLoadStart: () -> Unit = {}
 ) {
     private var readyItem: Any? = null
     private var watchedItem: Any? = null
@@ -96,6 +98,7 @@ internal class StandardLoadWatch(
                 watchedItem = item
                 lastStallTimeoutMs = it.stallTimeoutMs
                 lastTotalTimeoutMs = it.totalTimeoutMs
+                onLoadStart()
             }
         val verdict = current.check(nowMs(), observed.readings)
         if (verdict == StallVerdict.WAIT) return null
@@ -187,14 +190,38 @@ internal class StandardLoadDriver(
 internal fun standardLoadGiveUpMessage(verdict: StallVerdict, stallTimeoutMs: Long, totalTimeoutMs: Long): String =
     "The track did not become ready (${stallVerdictReason(verdict, stallTimeoutMs, totalTimeoutMs)})."
 
-/** Counts the bytes a player downloads (a load's progress), from every request it opens. */
+/**
+ * The bytes a player downloads that count as a load's progress, as on the crossfade path: media
+ * (segments, a progressive file; this listener) always; HLS playlists and keys ([playlists]) only
+ * until the track's first segment is asked for. Before that they are the load's only progress (a
+ * slow proxy answering the playlists must not fail a healthy track); after it, the player reloads
+ * them when it falls back to another rendition, which is not progress. [startLoad] at every load.
+ */
 internal class LoadedBytes : TransferListener {
     private val count = AtomicLong(0L)
+    private val mediaRequested = java.util.concurrent.atomic.AtomicBoolean(false)
 
     val value: Long
         get() = count.get()
 
-    override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    /** A new load: its playlists are progress again until it asks for a segment. */
+    fun startLoad() {
+        mediaRequested.set(false)
+    }
+
+    /** The listener of the playlist and key requests. */
+    val playlists: TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            if (!mediaRequested.get()) count.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    }
+
+    override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+        mediaRequested.set(true)
+    }
     override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
     override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
         count.addAndGet(bytesTransferred.toLong())
@@ -202,9 +229,9 @@ internal class LoadedBytes : TransferListener {
     override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
 }
 
-/** [factory]'s sources, each counting its bytes into [bytes]. */
-internal fun DataSource.Factory.countingBytes(bytes: LoadedBytes): DataSource.Factory = DataSource.Factory {
-    createDataSource().also { it.addTransferListener(bytes) }
+/** [factory]'s sources, each telling [listener] its bytes. */
+internal fun DataSource.Factory.countingBytes(listener: TransferListener): DataSource.Factory = DataSource.Factory {
+    createDataSource().also { it.addTransferListener(listener) }
 }
 
 /** What the load watch reads of ExoPlayer [player] with its [bytes] counter. */

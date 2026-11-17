@@ -864,6 +864,11 @@ assert(
       failLoad.includes('if (report) playerEventHolder.updatePlaybackError(error)') &&
       vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
       standardHooks.includes('mediaTransferListener = analytics.loadedBytes,') &&
+      standardHooks.includes('playlistTransferListener = analytics.loadedBytes.playlists,') &&
+      vendored.includes('MediaType.HLS -> createHlsSource(mediaItem, playlistFactory, mediaFactory)') &&
+      musicService.includes('onLoadStart = { standardAnalytics[binding.player]?.loadedBytes?.startLoad() }') &&
+      ['slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyStandardTrackGiveUp', 'slowPlaylistsCountAgainForTheNextStandardTrack']
+        .every((t) => hlsTest.includes(`fun ${t}()`)) &&
       musicService.includes('totalTimeoutMs = { prepareTimeout.milliseconds }') &&
       musicService.includes('.also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }') &&
       section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)') &&

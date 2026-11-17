@@ -27,8 +27,9 @@ section 4(b)); line numbers below include that notice.
   `:27` `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
   resources are now merged into this library's namespace).
 - `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
-  (defaults keep upstream behaviour), including `mediaTransferListener` (told of the media
-  requests' bytes only: a load's progress for the host's load watch).
+  (defaults keep upstream behaviour), including `mediaTransferListener` and `playlistTransferListener`
+  (the media requests' and the playlist requests' bytes: a load's progress for the host's load
+  watch).
 - `players/BaseAudioPlayer.kt`:
   - `:1-4` the notice;
   - `:39` import of `PlayerHooks`; `:70` import of `HlsDataSourceFactory`;
@@ -44,10 +45,12 @@ section 4(b)); line numbers below include that notice.
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream;
-  - `:511-539` media requests and the rest are split: with `hooks.mediaTransferListener`, the
-    media requests (HLS segments, DASH and SmoothStreaming chunks, a progressive file) report
-    their bytes to it, playlists, manifests and keys do not (HLS through an `HlsDataSourceFactory`
-    by data type), as the crossfade engines count only media bytes;
+  - `:511-542` media requests and the rest are split: the media requests (HLS segments, DASH
+    and SmoothStreaming chunks, a progressive file) report their bytes to
+    `hooks.mediaTransferListener`, the playlists, manifests and keys to
+    `hooks.playlistTransferListener` (HLS through an `HlsDataSourceFactory` by data type): the
+    host counts playlists as progress until the first segment is asked for, as the crossfade
+    engines;
   - `:423-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error

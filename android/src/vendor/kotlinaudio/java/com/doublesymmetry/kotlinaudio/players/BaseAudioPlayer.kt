@@ -512,11 +512,14 @@ abstract class BaseAudioPlayer internal constructor(
         val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.let { listener ->
             DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
         } ?: factory
+        val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.let { listener ->
+            DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
+        } ?: factory
 
         return when (audioItem.type) {
-            MediaType.DASH -> createDashSource(mediaItem, factory, mediaFactory)
-            MediaType.HLS -> createHlsSource(mediaItem, factory, mediaFactory)
-            MediaType.SMOOTH_STREAMING -> createSsSource(mediaItem, factory, mediaFactory)
+            MediaType.DASH -> createDashSource(mediaItem, playlistFactory, mediaFactory)
+            MediaType.HLS -> createHlsSource(mediaItem, playlistFactory, mediaFactory)
+            MediaType.SMOOTH_STREAMING -> createSsSource(mediaItem, playlistFactory, mediaFactory)
             else -> createProgressiveSource(mediaItem, mediaFactory)
         }
     }

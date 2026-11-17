@@ -28,5 +28,7 @@ class PlayerHooks(
      * Told of every media request's bytes (segments, chunks, a progressive file), not of
      * playlists, manifests or keys: the host's measure of a load's progress. Null: none.
      */
-    val mediaTransferListener: TransferListener? = null
+    val mediaTransferListener: TransferListener? = null,
+    /** Told of the playlist, manifest and key requests' bytes (null: none). */
+    val playlistTransferListener: TransferListener? = null
 )
