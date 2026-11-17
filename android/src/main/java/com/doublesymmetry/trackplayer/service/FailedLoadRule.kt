@@ -35,8 +35,9 @@ internal class FailedLoadRule {
      * Failed -play/command-> Loaded/Loading (the active track, else the failed one; command: a
      * seek or stop, owner decision 2026-11-17); Failed -skipped-> Loading/Loaded(item) (the
      * player loads its own item);
-     * any -reset-> Selecting; -adopted(x)-> Loaded(x) (x null: Selecting); published, replaced and
-     * removed keep the kind and follow the item.
+     * any -reset-> Selecting; -adopted(x)-> Loaded(x) (x null: Selecting); -activating(x)->
+     * Loaded(x) when x is the active track, else Loading(x) (an idle activation: reported once it
+     * loaded); published, replaced and removed keep the kind and follow the item.
      */
     sealed class Phase {
         object Selecting : Phase() {
@@ -167,7 +168,16 @@ internal class FailedLoadRule {
         return if (reported === item) reportCurrentTrack(null) else null
     }
 
-    /** The app was told about [item] another way (a logical idle activation). */
+    /**
+     * A play, retry, skip, next or load with no active track (the logical idle) activates the
+     * player's [item]: it loads, and is reported once it loaded, as crossfade's play with no active
+     * track (never a track that fails to load); not a new queue's selection (reported at once).
+     */
+    fun activating(item: Any?) {
+        phase = following(item)
+    }
+
+    /** The app was told about [item] another way (a logical idle activation with no load watch). */
     fun published(item: Any?) {
         reported = item
         phase = if (phase is Phase.Failed) Phase.Failed(item) else following(item)

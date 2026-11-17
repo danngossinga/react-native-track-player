@@ -141,6 +141,22 @@ class QueuedAudioPlayer(
     }
 
     /**
+     * Fork: adds [items] at [atIndex] (null: at the end) as [add], without preparing the player: a
+     * stopped player (no active track, a stop, a failure) loads nothing, as the crossfade engines
+     * (upstream's [add] prepares, which loads a stopped player's current item again).
+     */
+    fun addWithoutPreparing(items: List<AudioItem>, atIndex: Int?) {
+        val mediaSources = items.map { getMediaSourceFromAudioItem(it) }
+        if (atIndex == null) {
+            queue.addAll(mediaSources)
+            exoPlayer.addMediaSources(mediaSources)
+        } else {
+            queue.addAll(atIndex, mediaSources)
+            exoPlayer.addMediaSources(atIndex, mediaSources)
+        }
+    }
+
+    /**
      * Remove an item from the queue.
      * @param index The index of the item to remove.
      */

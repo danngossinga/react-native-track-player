@@ -750,7 +750,24 @@ assert(
       // goes back to the reported track, or with none reported stops in idle
       // (StandardLoadCoordinator.leaveCancelledLoad, tested; Android's StandardBackendHlsTest
       // a*DuringASkipsLoad* and a*CancellingASkipWithNoActiveTrack* on the real player).
-      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('let hasActiveTrack = loads.beginSeek(to: position)\n        guard hasActiveTrack, !disposed, let track = player.currentItem as? Track else {') &&
+      // With no active track the seek resolves and does nothing, as crossfade's (the coordinator
+      // resolves it, tested: ...ACancelWithNoReportedTrack...).
+      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('guard loads.beginSeek(to: position, completion: completion) else { return }\n') &&
+      // After a failed load the seek plays once done, as requested before the failure
+      // (StandardLoadCoordinator.seekFinished, tested: ...ASeekOrStopAfterAFailedSkipActsOnTheActiveTrack).
+      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('if case .success = result { self?.loads.seekFinished(succeeded: true) } else { self?.loads.seekFinished(succeeded: false) }\n            completion(result)\n        }\n        guard !disposed, let track = player.currentItem as? Track else {') &&
+      backendSource.includes('    func resumePlayback() {\n        requested.request(true)\n        player.play()\n    }') &&
+      backendSource.includes('    var playbackRequested: Bool { return requested.playWhenReady }') &&
+      // With no active track a queue change loads nothing and its item change reports nothing;
+      // an idle activation is reported once its track loaded (StandardLoadCoordinator.queueChanged,
+      // itemMoved, idleActivation, tested: ...AQueueChangeWithNoActiveTrackLoadsNothing,
+      // ...AnIdleActivationIsReportedOnceItsTrackLoaded).
+      ['func add(_ tracks: [Track], at index: Int) throws {', 'func remove(at indexes: [Int]) throws {', 'func move(from: Int, to: Int) throws {', 'func replaceQueue(_ tracks: [Track]) throws {'].every((start) =>
+        section(backendSource, start, '\n    }\n').includes('loads.queueChanged()')) &&
+      section(backendSource, 'func itemMoved(', '\n    }\n').includes('let moved = loads.itemMoved((item as AnyObject?).map(ObjectIdentifier.init))') &&
+      !backendSource.includes('failedLoads.moved(') &&
+      section(backendSource, 'private func publishIdleTrackActivationIfNeeded(', '\n    }\n').includes('let now = loads.idleActivation((player.currentItem as AnyObject?).map(ObjectIdentifier.init))\n        onIdleTrackActivated(player, now && player.currentIndex >= 0 ? player.currentIndex : nil)') &&
+      !backendSource.includes('failedLoads.published(') &&
       // A skip, next, previous, load or restore loads the player's own track
       // (FailedLoadRule.skipped, LOAD-16); only a seek or stop (the coordinator's, tested) acts on
       // the active track (owner decision, 2026-11-17, LOAD-06).
@@ -821,6 +838,9 @@ assert(
         'testStandardLoadCoordinatorACancelReturnsToTheReportedTrackPausedAtItsPosition',
         'testStandardLoadCoordinatorAnUnissuedSeekThatGivesUpOnAFailedTrackLeavesThePlayToRetryIt',
         'testStandardLoadCoordinatorASeekOrStopAfterAFailedSkipActsOnTheActiveTrack',
+        'testStandardLoadCoordinatorAQueueChangeWithNoActiveTrackLoadsNothing',
+        'testStandardLoadCoordinatorAnIdleActivationIsReportedOnceItsTrackLoaded',
+        'testStandardLoadCoordinatorASeekAfterAFailedSkipPlaysOnlyAsRequestedBeforeTheFailure',
         'testStandardSeekAndLoadLimitsAreIndependent',
         'testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads',
         'testStandardCommandLoadResultIsTheCommandsResolution']
@@ -897,7 +917,7 @@ assert(
       section(standardBackend, 'func play() throws {', '\n    }\n').includes('commandLoads.failureCleared()') &&
       section(standardBackend, 'func retry() {', '\n    }\n').includes('onMain { commandLoads.failureCleared() }') &&
       section(facade, 'func loadGaveUp(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)') &&
-      section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('loads.beginSeek(to: position)') &&
+      section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('loads.beginSeek(to: position, completion: completion)') &&
       section(facade, '    func beginSeek(', '\n    }\n').includes('let cancelledWait = commandLoads.cancel()') &&
       ['func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('commandLoads.cancel()')) &&

@@ -178,7 +178,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 17)
+        XCTAssertEqual(scenarios.count, 18)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -215,6 +215,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
                 case "reset": rule.reset()
                 case "remove": XCTAssertEqual(rule.removed(identity(step["item"])), expected, at)
+                case "activate": rule.activating(identity(step["item"]))
                 case "publish": rule.published(identity(step["item"]))
                 case "adopt": rule.adopted(identity(step["item"]))
                 case "replace": rule.replaced(identity(step["item"]), with: identity(step["with"]))
@@ -1272,6 +1273,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         func checkLoad() { calls.append("check") }
         func stopLoading(log: String) {
             calls.append("stop")
+            // As the backend: the give-up's stop ends the module's request.
+            requested = false
             stoppedEmittedAtStop = coordinator?.emitsPlayerState("stopped")
         }
         func emitGiveUp(_ report: StandardGiveUpReport) {
@@ -1291,6 +1294,11 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         func requestPlayback(_ playing: Bool) {
             calls.append("request \(playing ? "play" : "pause")")
             requested = playing
+        }
+        var playbackRequested: Bool { return requested ?? false }
+        func resumePlayback() {
+            calls.append("resume")
+            requested = true
         }
         func cancelSeeks() { calls.append("cancelSeeks") }
         func jumpPaused(to item: ObjectIdentifier) -> Bool {
@@ -1483,7 +1491,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             switch command {
             case "pause": h.loads.pause()
             case "stop": h.loads.stop()
-            default: XCTAssertFalse(h.loads.beginSeek(to: 5), "no active track to seek in: the seek rejects")
+            default:
+                // Changed deliberately (crossfade's seek with no active track,
+                // AndroidPlaybackOrchestrator.seekTo; Android:
+                // aSeekCancellingASkipWithNoActiveTrackResolvesAndLoadsNothing): it rejected
+                // standard_seek_unavailable; it now resolves and does nothing.
+                var result: Result<Void, Error>?
+                XCTAssertFalse(h.loads.beginSeek(to: 5) { result = $0 }, "no active track to seek in")
+                XCTAssertNotNil(try? result?.get(), "the seek resolves")
             }
             XCTAssertEqual(h.player.calls, expected[command], command)
             XCTAssertEqual(outcomes, [.cancelled], command)
@@ -1498,6 +1513,75 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(standardFirstTrackToSelect(currentIndex: 1, count: 2), 0)
         XCTAssertNil(standardFirstTrackToSelect(currentIndex: 0, count: 2), "already on it")
         XCTAssertNil(standardFirstTrackToSelect(currentIndex: -1, count: 0), "an empty queue")
+    }
+
+    func testStandardLoadCoordinatorAQueueChangeWithNoActiveTrackLoadsNothing() {
+        // Fifth review, F1 (Android: anAdd*, aMove*, removingThePlayersTrack*, aNewQueue
+        // WithNoActiveTrack*): the idle a cancel entered lasts across queue changes, as crossfade's
+        // queue change with no active track. SwiftAudioEx loads a new queue's first item (or the
+        // next one when the current item left): the player stops at once, its state the player's
+        // (stopped); its loading is not emitted and its item change reports nothing.
+        var outcomes: [StandardCommandLoadOutcome] = []
+        let h = coordinatorWithASkipAfterAFailedFirstLoad { outcomes.append($0) }
+        h.loads.pause()
+        XCTAssertTrue(h.player.isIdle)
+        let c = NSObject()
+        let phase = h.loads.failedLoads.phase
+        // An add or a move (SwiftAudioEx stays stopped): nothing to do.
+        h.player.loadStateRawValue = "stopped"
+        h.player.calls.removeAll()
+        h.loads.queueChanged()
+        XCTAssertEqual(h.player.calls, [], "the player stays stopped")
+        // A new queue (or the player's item removed): SwiftAudioEx loads its item.
+        h.player.loadStateRawValue = "loading"
+        XCTAssertFalse(h.loads.emitsPlayerState("loading"), "no loading with no active track")
+        XCTAssertFalse(h.loads.itemMoved(ObjectIdentifier(c)), "not reported")
+        XCTAssertEqual(h.loads.failedLoads.phase, phase, "the rule does not move")
+        h.loads.queueChanged()
+        XCTAssertEqual(h.player.calls, ["stopPlayer", "idle"], "stopped at once, the state the player's")
+        XCTAssertTrue(h.loads.emitsPlayerState("stopped"))
+        XCTAssertNil(h.loads.failedLoads.reported)
+        XCTAssertFalse(h.loads.watchesLoads)
+        // With an active track, a queue change is the player's own.
+        h.player.isIdle = false
+        h.player.calls.removeAll()
+        h.loads.queueChanged()
+        XCTAssertEqual(h.player.calls, [])
+        XCTAssertTrue(h.loads.emitsPlayerState("loading"))
+    }
+
+    func testStandardLoadCoordinatorAnIdleActivationIsReportedOnceItsTrackLoaded() {
+        // Fifth review, F5 (Android: aPlayWithNoActiveTrackReportsTheFirstTrackOnceItLoaded,
+        // aNextWithNoActiveTrackWhoseTrackFailsReportsNothing): a play, retry, skip, next or load
+        // with no active track reports its track once it loaded, as crossfade's play with no active
+        // track (before: at once, then none again when it failed).
+        for loads in [true, false] {
+            var outcomes: [StandardCommandLoadOutcome] = []
+            let h = coordinatorWithASkipAfterAFailedFirstLoad { outcomes.append($0) }
+            h.loads.pause()
+            // The play: the idle ends, the player starts the first track (A).
+            h.player.isIdle = false
+            h.player.currentLoadItem = h.ia
+            h.player.calls.removeAll()
+            XCTAssertFalse(h.loads.idleActivation(h.ia), "not told now")
+            XCTAssertNil(h.loads.failedLoads.reported, "not reported before it loaded")
+            XCTAssertEqual(h.loads.failedLoads.phase, .loading(h.ia))
+            XCTAssertFalse(h.loads.itemMoved(h.ia), "its item change reports nothing")
+            if loads {
+                h.see(.ready)
+                XCTAssertEqual(h.player.calls, ["active A from none"], "reported once it loaded")
+                XCTAssertEqual(h.loads.failedLoads.reported, h.ia)
+            } else {
+                h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+                XCTAssertFalse(h.player.calls.contains { $0.hasPrefix("active") }, "a track that fails is never reported (nor none again): \(h.player.calls)")
+                XCTAssertNil(h.loads.failedLoads.reported)
+            }
+        }
+        // With no load watch nothing tells when it loaded: told at once.
+        let unwatched = StandardLoadCoordinator(player: FakeLoadPlayer(), watched: false)
+        let a = NSObject()
+        XCTAssertTrue(unwatched.idleActivation(ObjectIdentifier(a)))
+        XCTAssertEqual(unwatched.failedLoads.reported, ObjectIdentifier(a))
     }
 
     func testStandardLoadCoordinatorACancelReturnsToTheReportedTrackPausedAtItsPosition() {
@@ -1522,7 +1606,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             switch command {
             case "pause": h.loads.pause()
             case "stop": h.loads.stop()
-            default: XCTAssertTrue(h.loads.beginSeek(to: 30), "A is active: the seek acts on it")
+            default: XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") }, "A is active: the seek acts on it")
             }
             XCTAssertEqual(h.player.calls, expected[command], command)
             XCTAssertEqual(outcomes, [.cancelled], command)
@@ -1573,7 +1657,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ia))
         XCTAssertNil(h.loads.failedLoads.reported)
         h.player.calls.removeAll()
-        XCTAssertTrue(h.loads.beginSeek(to: 30))
+        XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
         XCTAssertEqual(h.player.calls, [], "none reported: the seek acts on the failed track")
         XCTAssertEqual(h.loads.failedLoads.phase, .loading(h.ia), "A retried")
         XCTAssertNil(h.loads.hostFailure, "the seek is a command: the give-up's error ended")
@@ -1607,7 +1691,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             h.player.isPlayerStopped = true
             h.player.calls.removeAll()
             if command == "seek" {
-                XCTAssertTrue(h.loads.beginSeek(to: 30))
+                XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
                 XCTAssertEqual(h.player.calls, ["request pause", "jump A paused"], "the seek goes back to A")
             } else {
                 h.loads.stop()
@@ -1638,9 +1722,52 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         n.loads.pause()
         XCTAssertEqual(n.player.currentLoadItem, n.ib, "a pause with nothing cancelled stays")
         n.player.calls.removeAll()
-        XCTAssertTrue(n.loads.beginSeek(to: 30))
+        XCTAssertTrue(n.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
         XCTAssertEqual(n.player.calls, ["request pause", "jump A paused"])
         XCTAssertEqual(n.player.currentLoadItem, n.ia)
+    }
+
+    func testStandardLoadCoordinatorASeekAfterAFailedSkipPlaysOnlyAsRequestedBeforeTheFailure() {
+        // Fifth review, F2 (Android: aSeekAfterASkipThatGaveUp..., aSeekAfterASkipThatFailedWith
+        // APlayerError..., aSeekAfterAGiveUpThenAPause..., aSeekAfterASkipThatFailedWhilePaused...):
+        // as crossfade's seek after a failed skip (its failure keeps playWhenReady), the seek goes
+        // back to A and, once done (SwiftAudioEx issues it once the item loaded), plays when
+        // playback was requested before the failure; a pause after the failure ends that request;
+        // a cancelled skip's seek stays paused (crossfade's cancelled operation).
+        for (name, requestedBefore, failure, pauseAfter, succeeded, resumes) in [
+            ("give-up, playing", true, "giveUp", false, true, true),
+            ("give-up, the seek fails", true, "giveUp", false, false, false),
+            ("give-up, paused before", false, "giveUp", false, true, false),
+            ("give-up, then a pause", true, "giveUp", true, true, false),
+            ("player error, playing", true, "error", false, true, true),
+            ("player error, paused before", false, "error", false, true, false),
+        ] {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            h.player.requested = requestedBefore
+            var outcomes: [StandardCommandLoadOutcome] = []
+            h.loads.waitForCommandLoad { outcomes.append($0) }
+            if failure == "giveUp" {
+                h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+            } else {
+                h.see(.failed)
+            }
+            XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib), name)
+            if pauseAfter { h.loads.pause() }
+            h.player.calls.removeAll()
+            XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") }, name)
+            XCTAssertEqual(h.player.calls, ["request pause", "jump A paused"], "\(name): back to A, paused until the seek is done")
+            h.loads.seekFinished(succeeded: succeeded)
+            XCTAssertEqual(h.player.calls.last == "resume", resumes, "\(name): \(h.player.calls)")
+        }
+        // A seek that cancels a waiting skip (crossfade's cancelled operation) stays paused.
+        let c = CoordinatorHarness()
+        c.skipFromAToB()
+        c.player.requested = true
+        c.loads.waitForCommandLoad { _ in }
+        XCTAssertTrue(c.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
+        c.loads.seekFinished(succeeded: true)
+        XCTAssertFalse(c.player.calls.contains("resume"), "a cancelled skip's seek stays paused")
     }
 
     func testStandardSeekAndLoadLimitsAreIndependent() {

@@ -2152,8 +2152,9 @@ final class FailedLoadRule {
     /// failed(x); any -ready-> loaded(item); loading/failed(not active) -failed-> failed(item);
     /// failed -play/command-> loaded/loading (the active track, else the failed one; command: a
     /// seek or stop, owner decision 2026-11-17); failed -skipped-> loading/loaded(item) (the
-    /// player loads its own item); any -reset-> selecting; -adopted(x)-> loaded(x) (x nil: selecting); published, replaced and
-    /// removed keep the kind and follow the item.
+    /// player loads its own item); any -reset-> selecting; -adopted(x)-> loaded(x) (x nil: selecting);
+    /// -activating(x)-> loaded(x) when x is the active track, else loading(x) (an idle activation:
+    /// reported once it loaded); published, replaced and removed keep the kind and follow the item.
     enum Phase: Equatable {
         case selecting
         case loading(ObjectIdentifier?)
@@ -2274,7 +2275,15 @@ final class FailedLoadRule {
         return reported == item ? reportTrack(nil) : nil
     }
 
-    /// The app was told about `item` another way (a logical idle activation).
+    /// A play, retry, skip, next or load with no active track (the logical idle) activates the
+    /// player's `item`: it loads, and is reported once it loaded, as crossfade's play with no
+    /// active track (never a track that fails to load); not a new queue's selection (reported at
+    /// once). Android: the same `activating`.
+    func activating(_ item: ObjectIdentifier?) {
+        phase = following(item)
+    }
+
+    /// The app was told about `item` another way (a logical idle activation with no load watch).
     func published(_ item: ObjectIdentifier?) {
         reported = item
         if case .failed = phase { phase = .failed(item) } else { phase = following(item) }
@@ -2785,6 +2794,10 @@ protocol StandardLoadPlayer: AnyObject {
     var isPlayerStopped: Bool { get }
     /// The module's playback request (`RequestedPlayback`): what an ended interruption resumes.
     func requestPlayback(_ playing: Bool)
+    /// Whether playback is requested now (`RequestedPlayback`).
+    var playbackRequested: Bool { get }
+    /// Plays, requested (SwiftAudioEx's play).
+    func resumePlayback()
     /// Ends the seeks in progress (`standard_seek_cancelled`).
     func cancelSeeks()
     /// Moves the player to `item`, paused (SwiftAudioEx's jumpToItem); false when it left the queue.
@@ -2812,6 +2825,12 @@ final class StandardLoadCoordinator {
     /// The player's loads are watched (a load watch exists): a command waits for its load.
     private let watched: Bool
     private(set) var disposed = false
+    /// Whether playback was requested when the last give-up stopped the player (it stops the
+    /// request with SwiftAudioEx); a pause or stop ends it.
+    private var playRequestedAtGiveUp = false
+    /// A seek that went back to the active track after a failed load plays once it is done, as
+    /// playback was requested (`beginSeek`, `seekFinished`).
+    private(set) var resumesAfterSeek = false
 
     init(player: StandardLoadPlayer, watched: Bool) {
         self.player = player
@@ -2832,7 +2851,42 @@ final class StandardLoadCoordinator {
     /// the give-up's ERROR state is the last state. A stop ends that error first
     /// (`StandardGiveUps.stopped`): its own `stopped` is emitted.
     func emitsPlayerState(_ stateRawValue: String) -> Bool {
-        return !(stateRawValue == "stopped" && giveUps.failure != nil)
+        // With no active track (the logical idle) the player only loads for a queue change it
+        // stopped at once (`queueChanged`): no loading for the app, as Android, which loads nothing.
+        return !(stateRawValue == "stopped" && giveUps.failure != nil) && !(stateRawValue == "loading" && (player?.isIdle ?? false))
+    }
+
+    /// The player moved to `item` (SwiftAudioEx's item change): whether to report it now
+    /// (`FailedLoadRule.moved`). With no active track (the logical idle: a queue change) nothing
+    /// is reported and the rule does not move; the command that activates a track does
+    /// (`idleActivation`), as Android, whose load watch does not look at the player in the idle.
+    func itemMoved(_ item: ObjectIdentifier?) -> Bool {
+        guard !(player?.isIdle ?? false) else { return false }
+        return failedLoads.moved(item)
+    }
+
+    /// After a queue change (add, move, remove, a new queue): with no active track (the logical
+    /// idle) the player loads nothing and stays stopped, as crossfade's queue change with no
+    /// active track and Android (SwiftAudioEx loads a new queue's first item, or the next one when
+    /// the current item left: stopped at once). Its state is the player's (stopped).
+    func queueChanged() {
+        guard let player = player, player.isIdle, player.loadStateRawValue == "loading" else { return }
+        player.stopPlayer()
+        player.enterIdle()
+    }
+
+    /// A play, retry, skip, next or load with no active track (the logical idle) activated the
+    /// player's `item`: it loads and is reported once it loaded (`FailedLoadRule.activating`), as
+    /// crossfade's play with no active track and Android, never a track that fails to load.
+    /// Returns whether to tell the app now: only with no load watch (nothing tells when it
+    /// loaded), the app told of it at once (`FailedLoadRule.published`).
+    func idleActivation(_ item: ObjectIdentifier?) -> Bool {
+        guard watched else {
+            failedLoads.published(item)
+            return true
+        }
+        failedLoads.activating(item)
+        return false
     }
 
     /// What the load watch saw (`StandardLoadObservation`), fed to `failedLoads` and
@@ -2967,6 +3021,8 @@ final class StandardLoadCoordinator {
     /// (`leaveCancelledLoad`); the player pauses, requested paused. A give-up's error stays.
     func pause() {
         guard let player = player else { return }
+        playRequestedAtGiveUp = false
+        resumesAfterSeek = false
         player.cancelSeeks()
         leaveCancelledLoad(cancelledWait: commandLoads.cancel(), position: nil)
         player.requestPlayback(false)
@@ -2979,6 +3035,8 @@ final class StandardLoadCoordinator {
     /// 2026-11-17, LOAD-06), the seeks end, and the player stops, requested paused.
     func stop() {
         guard let player = player else { return }
+        playRequestedAtGiveUp = false
+        resumesAfterSeek = false
         let ended = giveUps.stopped(playerStopped: player.isPlayerStopped)
         _ = failedLoads.command()
         let cancelledWait = commandLoads.cancel()
@@ -2993,13 +3051,38 @@ final class StandardLoadCoordinator {
     /// cancelled and does not take effect; the seek acts on the active track, also after a failed
     /// skip and while a natural advance loads (owner decision, 2026-11-17, LOAD-06; none active:
     /// the failed track, retried); the player is no longer in a give-up's error. Returns whether a
-    /// track is active to seek in (none: it rejects, nothing loads).
-    func beginSeek(to position: Double) -> Bool {
+    /// track is active to seek in; with none (the logical idle, also after a backend restore with
+    /// no active track) the seek resolves at once (`completion`) and nothing loads, as crossfade's
+    /// seek with no active track and Android.
+    func beginSeek(to position: Double, completion: (Result<Void, Error>) -> Void) -> Bool {
+        // After a failed load, the seek goes back to the active track and plays there once done
+        // when playback was requested (a failure keeps the request, as crossfade's seek after a
+        // failed skip; SwiftAudioEx issues the seek once the item loaded, so not before it).
+        var afterFailedLoad = false
+        if case .failed = failedLoads.phase { afterFailedLoad = true }
+        let playing = giveUps.failure != nil ? playRequestedAtGiveUp : (player?.playbackRequested ?? false)
         let cancelledWait = commandLoads.cancel()
         giveUps.clear()
         _ = failedLoads.command()
-        leaveCancelledLoad(cancelledWait: cancelledWait, position: position, actsOnReportedTrack: true)
-        return !(player?.isIdle ?? true)
+        let left = leaveCancelledLoad(cancelledWait: cancelledWait, position: position, actsOnReportedTrack: true)
+        if case .returnsTo = left {
+            resumesAfterSeek = afterFailedLoad && playing && !cancelledWait
+        } else {
+            resumesAfterSeek = false
+        }
+        guard !(player?.isIdle ?? true) else {
+            completion(.success(()))
+            return false
+        }
+        return true
+    }
+
+    /// The seek `beginSeek` started ended (`succeeded`): it plays when it went back to the active
+    /// track after a failed load and playback was requested (`resumesAfterSeek`).
+    func seekFinished(succeeded: Bool) {
+        guard resumesAfterSeek else { return }
+        resumesAfterSeek = false
+        if succeeded { player?.resumePlayback() }
     }
 
     /// A relative seek's target: from the position the app reads (the reported track's, also while
@@ -3015,6 +3098,7 @@ final class StandardLoadCoordinator {
     /// Android.
     func stopAfterGiveUp(log: String, report: StandardGiveUpReport) {
         guard let player = player else { return }
+        playRequestedAtGiveUp = player.playbackRequested
         player.stopLoading(log: log)
         player.emitGiveUp(report)
         failLoadedTrack()

@@ -649,7 +649,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             lastItemPosition = lastPosition
             // The track the player left: its last position, while another loads (rule 13).
             progress.left((lastItem as AnyObject?).map(ObjectIdentifier.init), position: lastPosition)
-            let moved = failedLoads.moved((item as AnyObject?).map(ObjectIdentifier.init))
+            let moved = loads.itemMoved((item as AnyObject?).map(ObjectIdentifier.init))
             // SwiftAudioEx has shown the new item on the lock screen: the reported one again.
             followNowPlaying()
             loadDriver?.poke()
@@ -694,8 +694,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private func enqueueSeek(to position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
         // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled, and
         // does not take effect: the seek acts on the active track (none: nothing to seek in).
-        let hasActiveTrack = loads.beginSeek(to: position)
-        guard hasActiveTrack, !disposed, let track = player.currentItem as? Track else {
+        // No active track (the logical idle): it resolves, nothing to seek in (crossfade's).
+        guard loads.beginSeek(to: position, completion: completion) else { return }
+        // After a failed load it plays once done, as requested (StandardLoadCoordinator.seekFinished).
+        let completion: (Result<Void, Error>) -> Void = { [weak self] result in
+            if case .success = result { self?.loads.seekFinished(succeeded: true) } else { self?.loads.seekFinished(succeeded: false) }
+            completion(result)
+        }
+        guard !disposed, let track = player.currentItem as? Track else {
             completion(.failure(seekError("standard_seek_unavailable", "No active track is available for seeking.")))
             return
         }
@@ -1135,7 +1141,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func syncQueue(_ tracks: [Track]) {}
 
     func add(_ tracks: [Track], at index: Int) throws {
-        try onMain { try player.add(items: tracks, at: index) }
+        try onMain {
+            try player.add(items: tracks, at: index)
+            loads.queueChanged()
+        }
     }
 
     func remove(at indexes: [Int]) throws {
@@ -1158,11 +1167,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             } else {
                 reportRemovedTrack(before)
             }
+            loads.queueChanged()
         }
     }
 
     func move(from: Int, to: Int) throws {
-        try onMain { try player.moveItem(fromIndex: from, toIndex: to) }
+        try onMain {
+            try player.moveItem(fromIndex: from, toIndex: to)
+            loads.queueChanged()
+        }
     }
 
     func removeUpcomingTracks() {
@@ -1185,6 +1198,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             player.clear()
             try player.add(items: tracks)
             if tracks.isEmpty { idleWithoutActiveTrack = false }
+            // With no active track a new queue has none either and loads nothing, as crossfade's
+            // setQueue with no active track (SwiftAudioEx loaded its first item: stopped).
+            loads.queueChanged()
         }
     }
 
@@ -1405,9 +1421,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     private func publishIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
         guard wasIdle else { return }
-        // The app is told of this track now (the idle activation's own event).
-        failedLoads.published((player.currentItem as AnyObject?).map(ObjectIdentifier.init))
-        onIdleTrackActivated(player, player.currentIndex >= 0 ? player.currentIndex : nil)
+        // The track loads and is reported once it loaded (StandardLoadCoordinator.idleActivation),
+        // as crossfade's play with no active track; told now only with no load watch.
+        let now = loads.idleActivation((player.currentItem as AnyObject?).map(ObjectIdentifier.init))
+        onIdleTrackActivated(player, now && player.currentIndex >= 0 ? player.currentIndex : nil)
+        followNowPlaying()
     }
 
     private func beginIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
@@ -1439,6 +1457,11 @@ extension StandardPlaybackBackend: StandardLoadPlayer {
     var isIdle: Bool { return idleWithoutActiveTrack }
     var isPlayerStopped: Bool { return player.playerState == .stopped }
     func requestPlayback(_ playing: Bool) { requested.request(playing) }
+    var playbackRequested: Bool { return requested.playWhenReady }
+    func resumePlayback() {
+        requested.request(true)
+        player.play()
+    }
     func cancelSeeks() { cancelPendingSeeks() }
     func jumpPaused(to item: ObjectIdentifier) -> Bool {
         guard let index = indexOfItem(item) else { return false }

@@ -2,6 +2,8 @@ package com.doublesymmetry.trackplayer.service
 
 import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.ForwardingPlayer
+import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.PlaybackException
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.util.FlagSet
 
@@ -16,9 +18,14 @@ import com.google.android.exoplayer2.util.FlagSet
  * (monorepo rule 13: every reader agrees with getActiveTrack). Its play-when-ready stays the
  * player's: the notification's ongoing flag (PlayerNotificationManager.getOngoing: buffering or
  * ready and play-when-ready) keeps MusicService's foreground service as the player's request is,
- * so the session shows buffering at that position while the player means to play. The media
- * session and the notification only read the player at its events, so a hold or release tells
- * them at once ([hold]). Commands pass through. Main thread.
+ * so the session shows buffering at that position while the player means to play. Held, the
+ * current media item (index, item, next and previous) is the reported track's, as the app's
+ * active track: the media session's active queue item (TimelineQueueNavigator reads the current
+ * media item index). A host give-up's error ([hostError]: a load or seek the host gave up, which
+ * stops the player with no ExoPlayer error) is the player's error, so the session shows the error
+ * state as the app does (ERROR), not none. The media session and the notification only read the
+ * player at its events, so a change of what it reports tells them at once ([hold], [refresh]).
+ * Commands pass through. Main thread.
  */
 internal class ReportedSessionPlayer(player: Player) : ForwardingPlayer(player) {
     /** The reported track's progress while held (null: the player's own values). */
@@ -26,20 +33,46 @@ internal class ReportedSessionPlayer(player: Player) : ForwardingPlayer(player) 
         private set
     private val listeners = mutableListOf<Player.Listener>()
 
+    /** The reported track's index (null: none), read live while held (a queue change moves it). */
+    var reportedIndex: () -> Int? = { null }
+
+    /** The error of a host give-up the player is in (null: none), read live (the next command ends it). */
+    var hostError: () -> PlaybackException? = { null }
+
+    /** What the session and the notification were last told: held, its index, an error. */
+    private var told: Triple<TrackProgress?, Int?, Boolean> = Triple(null, null, false)
+
     /**
-     * Holds the reported track's [progress] (null: released). A change tells the session and the
-     * notification at once (their play state and position), not at the player's next event:
-     * EVENT_IS_PLAYING_CHANGED, at which ExoPlayer 2.19.0's MediaSessionConnector invalidates its
-     * playback state and PlayerNotificationManager posts again.
+     * Holds the reported track's [progress] (null: released), then [refresh].
      */
     fun hold(progress: TrackProgress?) {
-        if (progress == held) return
         held = progress
-        val events = Player.Events(
-            FlagSet.Builder().add(Player.EVENT_IS_PLAYING_CHANGED).build()
-        )
+        refresh()
+    }
+
+    /**
+     * A change of what this player reports (held, the held index, a host error) tells the session
+     * and the notification at once, not at the player's next event (none may come: a stop or a
+     * cleared queue after a give-up): EVENT_IS_PLAYING_CHANGED, at which ExoPlayer 2.19.0's
+     * MediaSessionConnector invalidates its playback state (it reads getPlayerError) and
+     * PlayerNotificationManager posts again, with EVENT_POSITION_DISCONTINUITY when the current
+     * media item index changed (the connector then tells TimelineQueueNavigator, whose active
+     * queue item follows it).
+     */
+    fun refresh() {
+        val now = Triple(held, heldIndex(), hostError() != null)
+        if (now == told) return
+        val indexChanged = now.second != told.second
+        told = now
+        val flags = FlagSet.Builder().add(Player.EVENT_IS_PLAYING_CHANGED)
+        if (indexChanged) flags.add(Player.EVENT_POSITION_DISCONTINUITY)
+        val events = Player.Events(flags.build())
         listeners.toList().forEach { it.onEvents(this, events) }
     }
+
+    /** The reported track's index while held and in the timeline (null: the player's own). */
+    private fun heldIndex(): Int? =
+        if (held == null) null else reportedIndex()?.takeIf { it in 0 until super.getMediaItemCount() }
 
     override fun addListener(listener: Player.Listener) {
         listeners += listener
@@ -63,6 +96,25 @@ internal class ReportedSessionPlayer(player: Player) : ForwardingPlayer(player) 
     // notification metadata would then drop the held duration (NotificationManager.getDuration).
     // Held, the item is dynamic only when the reported track's duration is not known.
     override fun isCurrentMediaItemDynamic(): Boolean = held?.let { it.durationMs <= 0L } ?: super.isCurrentMediaItemDynamic()
+    override fun getCurrentMediaItemIndex(): Int = heldIndex() ?: super.getCurrentMediaItemIndex()
+    @Deprecated("Deprecated in Java")
+    @Suppress("DEPRECATION")
+    override fun getCurrentWindowIndex(): Int = heldIndex() ?: super.getCurrentWindowIndex()
+    override fun getCurrentMediaItem(): MediaItem? = heldIndex()?.let { super.getMediaItemAt(it) } ?: super.getCurrentMediaItem()
+    override fun getNextMediaItemIndex(): Int = heldIndex()?.let { neighbour(it, next = true) } ?: super.getNextMediaItemIndex()
+    override fun getPreviousMediaItemIndex(): Int = heldIndex()?.let { neighbour(it, next = false) } ?: super.getPreviousMediaItemIndex()
+    override fun hasNextMediaItem(): Boolean = heldIndex()?.let { neighbour(it, next = true) != C.INDEX_UNSET } ?: super.hasNextMediaItem()
+    override fun hasPreviousMediaItem(): Boolean = heldIndex()?.let { neighbour(it, next = false) != C.INDEX_UNSET } ?: super.hasPreviousMediaItem()
+    override fun getPlayerError(): PlaybackException? = super.getPlayerError() ?: hostError()
+
+    /** The item after or before [index] in the timeline, as ExoPlayer's own (repeat one: off). */
+    private fun neighbour(index: Int, next: Boolean): Int {
+        val timeline = super.getCurrentTimeline()
+        if (timeline.isEmpty) return C.INDEX_UNSET
+        val repeat = super.getRepeatMode().let { if (it == Player.REPEAT_MODE_ONE) Player.REPEAT_MODE_OFF else it }
+        return if (next) timeline.getNextWindowIndex(index, repeat, super.getShuffleModeEnabled())
+        else timeline.getPreviousWindowIndex(index, repeat, super.getShuffleModeEnabled())
+    }
 
     /** A duration the app reads as 0 (not known) is ExoPlayer's unset one. */
     private fun durationOf(progress: TrackProgress): Long =
