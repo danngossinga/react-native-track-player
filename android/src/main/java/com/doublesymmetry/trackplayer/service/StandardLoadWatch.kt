@@ -58,16 +58,41 @@ internal class StandardLoadWatch(
 ) {
     /**
      * A load in progress: its [item], when it began (the first time the item was seen loading,
-     * even while a seek owned it), whether its progress counter was started ([onLoadStart]; once
-     * per load) and its stall [watch] while it is watched (null while a seek owns it: once the
-     * seek ends, the load is watched again with its own total limit and a fresh stall clock).
+     * even while a seek owned it) and its [stage].
      */
     data class Load(
         val item: Any,
         val startedAtMs: Long,
-        val progressStarted: Boolean = false,
-        val watch: Watch? = null
-    )
+        val stage: Stage = Stage.Fresh
+    ) {
+        /** Its progress counter was started ([onLoadStart]; once per load). */
+        val progressStarted: Boolean
+            get() = stage != Stage.Fresh
+
+        /** Its stall watch while it is watched. */
+        val watch: Watch?
+            get() = (stage as? Stage.Watched)?.watch
+
+        /** A seek owns its loading: not watched, its progress counter kept. */
+        fun disarmed(): Load = if (stage is Stage.Watched) copy(stage = Stage.Disarmed) else this
+    }
+
+    /**
+     * Where a load stands (one explicit state; iOS: `StandardLoadWatch.Stage`, the same moves):
+     * - [Fresh]: seen loading, never watched (a seek owned it from its start): its progress
+     *   counter not started.
+     * - [Watched]: watched, with its stall [Watch]; its progress counter started.
+     * - [Disarmed]: watched before, a seek owns it now: no stall clock, its progress counter kept
+     *   (once the seek ends, it is watched again with its own total limit and a fresh stall clock).
+     * Moves: Fresh -watched-> Watched (the counter starts, [onLoadStart]); Watched -a seek owns
+     * it-> Disarmed; Disarmed -watched-> Watched (the counter goes on); Fresh and Disarmed stay
+     * when a seek owns them.
+     */
+    sealed class Stage {
+        object Fresh : Stage()
+        object Disarmed : Stage()
+        data class Watched(val watch: Watch) : Stage()
+    }
 
     /**
      * A watched load's stage (iOS: `StandardLoadWatch.Watch`, the same moves):
@@ -130,9 +155,9 @@ internal class StandardLoadWatch(
         if (observed.ownedElsewhere) {
             // A seek on an item not ready since it was loaded: its load goes on (and its total).
             if (observed.playbackState == Player.STATE_BUFFERING && ready !== item) {
-                state = State.Loading(ready, loadOf(item).copy(watch = null))
+                state = State.Loading(ready, loadOf(item).disarmed())
             } else {
-                load?.let { state = State.Loading(ready, it.copy(watch = null)) }
+                load?.let { state = State.Loading(ready, it.disarmed()) }
             }
             return null
         }
@@ -153,28 +178,30 @@ internal class StandardLoadWatch(
             return null
         }
         var current = loadOf(item)
-        if (current.watch == null) {
-            val created = StallWatch(stallTimeoutMs(), totalTimeoutMs(), startedAtMs = current.startedAtMs, lastProgressAtMs = nowMs())
-            lastStallTimeoutMs = created.stallTimeoutMs
-            lastTotalTimeoutMs = created.totalTimeoutMs
-            val starts = !current.progressStarted
-            current = current.copy(progressStarted = true, watch = Watch.Playable(created))
-            state = State.Loading(ready, current)
-            if (starts) onLoadStart()
+        val watch = when (val stage = current.stage) {
+            is Stage.Watched -> stage.watch
+            Stage.Fresh, Stage.Disarmed -> {
+                val created = StallWatch(stallTimeoutMs(), totalTimeoutMs(), startedAtMs = current.startedAtMs, lastProgressAtMs = nowMs())
+                lastStallTimeoutMs = created.stallTimeoutMs
+                lastTotalTimeoutMs = created.totalTimeoutMs
+                current = current.copy(stage = Stage.Watched(Watch.Playable(created)))
+                state = State.Loading(ready, current)
+                if (stage == Stage.Fresh) onLoadStart()
+                current.watch!!
+            }
         }
         val at = nowMs()
-        val watch = current.watch!!
         val readings = observed.readings
         val verdict = when {
             // No progress signal: only the total limit.
             readings == null -> {
-                current = current.copy(watch = Watch.Playable(watch.stall))
+                current = current.copy(stage = Stage.Watched(Watch.Playable(watch.stall)))
                 watch.stall.capVerdict(at)
             }
             watch is Watch.Playable -> {
                 // The signal appeared: a stage reached, the stall clock starts again from it.
                 watch.stall.noteProgress(at)
-                current = current.copy(watch = Watch.Item(watch.stall))
+                current = current.copy(stage = Stage.Watched(Watch.Item(watch.stall)))
                 watch.stall.check(at, readings)
             }
             else -> watch.stall.check(at, readings)

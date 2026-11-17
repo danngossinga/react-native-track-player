@@ -1633,14 +1633,43 @@ struct StandardLoadObservation {
 /// is not a load. Main thread.
 final class StandardLoadWatch {
     /// A load in progress: its item, when it began (the first time the item was seen loading, even
-    /// while a seek owned it), whether its progress was started (`startsLoad`; once per load) and
-    /// its stall watch while it is watched (nil while a seek owns it: once the seek ends, the load
-    /// is watched again with its own total limit and a fresh stall clock). As Android.
+    /// while a seek owned it) and its stage. As Android.
     struct Load: Equatable {
         let item: ObjectIdentifier
         let startedAt: TimeInterval
-        var progressStarted: Bool
-        var watch: Watch?
+        var stage: Stage = .fresh
+
+        /// Its progress was started (`startsLoad`; once per load).
+        var progressStarted: Bool { return stage != .fresh }
+
+        /// Its stall watch while it is watched.
+        var watch: Watch? {
+            if case let .watched(watch) = stage { return watch }
+            return nil
+        }
+
+        /// A seek owns its loading: not watched, its progress kept.
+        func disarmed() -> Load {
+            guard case .watched = stage else { return self }
+            var load = self
+            load.stage = .disarmed
+            return load
+        }
+    }
+
+    /// Where a load stands (one explicit state; Android: `StandardLoadWatch.Stage`, the same moves):
+    /// - `fresh`: seen loading, never watched (a seek owned it from its start): its progress not
+    ///   started.
+    /// - `watched(watch)`: watched, with its stall `Watch`; its progress started.
+    /// - `disarmed`: watched before, a seek owns it now: no stall clock, its progress kept (once
+    ///   the seek ends, it is watched again with its own total limit and a fresh stall clock).
+    /// Moves: fresh -watched-> watched (its progress starts: `startsLoad`); watched -a seek owns
+    /// it-> disarmed; disarmed -watched-> watched (its progress goes on); fresh and disarmed stay
+    /// when a seek owns them.
+    enum Stage: Equatable {
+        case fresh
+        case disarmed
+        case watched(Watch)
     }
 
     /// A watched load's stage, as crossfade's prepare (IOSCrossfadeEngine: its playable stage has
@@ -1736,12 +1765,9 @@ final class StandardLoadWatch {
         if observed.ownedElsewhere {
             // A seek on an item not ready since it was loaded: its load goes on (and its total).
             if observed.phase == .loading, ready != item {
-                var load = loadOf(item)
-                load.watch = nil
-                state = .loading(ready: ready, load: load)
-            } else if var load = load {
-                load.watch = nil
-                state = .loading(ready: ready, load: load)
+                state = .loading(ready: ready, load: loadOf(item).disarmed())
+            } else if let load = load {
+                state = .loading(ready: ready, load: load.disarmed())
             }
             return nil
         }
@@ -1761,13 +1787,13 @@ final class StandardLoadWatch {
         }
         var load = loadOf(item)
         var watch: Watch
-        if let current = load.watch {
+        switch load.stage {
+        case let .watched(current):
             watch = current
-        } else {
+        case .fresh, .disarmed:
             var created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: load.startedAt)
             created.noteProgress(at: now())
             watch = .playable(created)
-            load.progressStarted = true
             lastStallTimeoutMs = created.stallTimeoutMs
             lastTotalTimeoutMs = created.totalTimeoutMs
         }
@@ -1787,7 +1813,7 @@ final class StandardLoadWatch {
             verdict = stall.check(at: at, readings: readings)
             watch = .item(stall)
         }
-        load.watch = watch
+        load.stage = .watched(watch)
         guard verdict != .wait else {
             state = .loading(ready: ready, load: load)
             return nil
@@ -1799,7 +1825,7 @@ final class StandardLoadWatch {
     /// `item` is loading: the load in progress, or a new one from now.
     private func loadOf(_ item: ObjectIdentifier) -> Load {
         if let load = load, load.item == item { return load }
-        return Load(item: item, startedAt: now(), progressStarted: false, watch: nil)
+        return Load(item: item, startedAt: now())
     }
 
     /// When to check next, in milliseconds, while a load is watched (nil: none): at the moment the

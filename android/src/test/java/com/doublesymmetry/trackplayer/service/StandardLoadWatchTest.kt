@@ -222,6 +222,50 @@ class StandardLoadWatchTest {
     }
 
     @Test
+    fun aLoadsStageMovesBetweenFreshWatchedAndDisarmed() {
+        // One explicit stage per load (iOS: testStandardLoadWatchALoadsStageMovesBetweenFreshWatchedAndDisarmed,
+        // the same steps).
+        var starts = 0
+        val watch = StandardLoadWatch({ stall }, { 60_000L }, nowMs = { now }, onLoadStart = { starts++ })
+        fun see(item: Any, owned: Boolean, bytes: Long = 0L) =
+            watch.check(StandardLoadObservation(item, Player.STATE_BUFFERING, false, longArrayOf(bytes, 0L, 0L), ownedElsewhere = owned))
+        fun load() = (watch.state as StandardLoadWatch.State.Loading).load
+        // A seek owns A's loading from its start: a fresh load, not watched, its counter not started.
+        now = 1_000L
+        see(a, owned = true)
+        assertEquals(StandardLoadWatch.Stage.Fresh, load().stage)
+        assertEquals(1_000L, load().startedAtMs)
+        now = 2_000L
+        see(a, owned = true)
+        assertEquals("fresh while a seek owns it", StandardLoadWatch.Stage.Fresh, load().stage)
+        assertEquals(0, starts)
+        // Watched: the counter starts once, the total limit runs from the load's start.
+        now = 3_000L
+        see(a, owned = false)
+        val first = (load().stage as StandardLoadWatch.Stage.Watched).watch.stall
+        assertEquals(1, starts)
+        assertEquals(1_000L + 60_000L, first.capDeadlineMs())
+        assertEquals(3_000L + 10_000L, first.deadlineMs())
+        // A seek owns it: disarmed, and stays so.
+        now = 4_000L
+        see(a, owned = true)
+        assertEquals(StandardLoadWatch.Stage.Disarmed, load().stage)
+        now = 5_000L
+        see(a, owned = true)
+        assertEquals(StandardLoadWatch.Stage.Disarmed, load().stage)
+        assertFalse(watch.isWatching)
+        assertNull(watch.nextCheckInMs())
+        // Watched again: the counter goes on (no new start), a fresh stall clock, the same total.
+        now = 6_000L
+        see(a, owned = false, bytes = 0L)
+        val again = (load().stage as StandardLoadWatch.Stage.Watched).watch.stall
+        assertEquals(1, starts)
+        assertEquals(6_000L + 10_000L, again.deadlineMs())
+        assertEquals(1_000L + 60_000L, again.capDeadlineMs())
+        assertEquals(1_000L, load().startedAtMs)
+    }
+
+    @Test
     fun withoutAProgressSignalOnlyTheTotalLimitEndsALoadAndTheStallRuleRunsFromTheSignal() {
         // iOS: testStandardLoadBeforeItsItemExistsOnlyTheTotalLimitEndsALoadAndTheStallRuleRunsFromTheItemsCreation,
         // the same steps (ExoPlayer's loads always have readings: the moves are kept the same).

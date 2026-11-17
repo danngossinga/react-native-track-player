@@ -814,6 +814,57 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(h.watch.state, .idle(ready: nil))
     }
 
+    func testStandardLoadWatchALoadsStageMovesBetweenFreshWatchedAndDisarmed() {
+        // One explicit stage per load (Android: StandardLoadWatchTest.aLoadsStageMovesBetweenFreshWatchedAndDisarmed,
+        // the same steps; Android's onLoadStart is startsLoad here).
+        let h = LoadWatchHarness()
+        var starts = 0
+        func see(_ owned: Bool) {
+            let observed = StandardLoadObservation(item: ObjectIdentifier(h.a), phase: .loading, readings: [0], ownedElsewhere: owned)
+            if h.watch.startsLoad(observed) { starts += 1 }
+            _ = h.watch.check(observed)
+        }
+        func load() -> StandardLoadWatch.Load? {
+            if case let .loading(_, load) = h.watch.state { return load }
+            return nil
+        }
+        func stall() -> StallWatch? {
+            if case let .watched(watch)? = load()?.stage { return watch.stall }
+            return nil
+        }
+        // A seek owns A's loading from its start: a fresh load, not watched, its progress not started.
+        h.now = 1
+        see(true)
+        XCTAssertEqual(load()?.stage, .fresh)
+        XCTAssertEqual(load()?.startedAt, 1)
+        h.now = 2
+        see(true)
+        XCTAssertEqual(load()?.stage, .fresh, "fresh while a seek owns it")
+        XCTAssertEqual(starts, 0)
+        // Watched: its progress starts once, the total limit runs from the load's start.
+        h.now = 3
+        see(false)
+        XCTAssertEqual(starts, 1)
+        XCTAssertEqual(stall()?.capDeadline(), 61)
+        XCTAssertEqual(stall()?.deadline(), 13)
+        // A seek owns it: disarmed, and stays so.
+        h.now = 4
+        see(true)
+        XCTAssertEqual(load()?.stage, .disarmed)
+        h.now = 5
+        see(true)
+        XCTAssertEqual(load()?.stage, .disarmed)
+        XCTAssertFalse(h.watch.isWatching)
+        XCTAssertNil(h.watch.nextCheckInMs())
+        // Watched again: its progress goes on (no new start), a fresh stall clock, the same total.
+        h.now = 6
+        see(false)
+        XCTAssertEqual(starts, 1)
+        XCTAssertEqual(stall()?.deadline(), 16)
+        XCTAssertEqual(stall()?.capDeadline(), 61)
+        XCTAssertEqual(load()?.startedAt, 1)
+    }
+
     func testReportedNowPlayingStateIsReleasedOrHeldOnTheReportedTrack() {
         // Android: ReportedTrackTest.theNowPlayingStateIsReleasedOrHeldOnTheReportedTrack.
         let a = NSObject(), b = NSObject()
