@@ -119,6 +119,15 @@ class CrossfadeEngineHlsTest {
         assertEquals("v064", awaitFirstSegmentRendition(server))
     }
 
+    @Test
+    fun aHigherEstimateStartsAtTheHighestRenditionThatFitsAbout70PercentOfIt() {
+        // 200 kbit/s: 70 % is 140 kbit/s, so the 128 kbit/s rendition (not the lowest, not the
+        // highest) is the first one asked for.
+        val server = server(listOf("v192" to 192_000, "v064" to 64_000, "v128" to 128_000))
+        startLoading(engine(STALL_TIMEOUT_MS, initialBitrateEstimateBps = 200_000L), server)
+        assertEquals("v128", awaitFirstSegmentRendition(server))
+    }
+
     // A segment that never comes: the load fails at stallTimeoutMs (ExoPlayer's own retries do not
     // extend it), and the player stops asking for it (the abandoned request closed, no retry).
 
@@ -150,6 +159,24 @@ class CrossfadeEngineHlsTest {
             "gave up after ${gaveUpAfterMs}ms (renditions asked: ${failing.segmentRenditions()}); stallTimeoutMs is $STALL_TIMEOUT_MS",
             gaveUpAfterMs < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS
         )
+    }
+
+    @Test
+    fun aPlayerErrorDuringALoadAlsoStopsLoadingAsOnIos() {
+        // The master playlist is not a playlist: the player fails at once. As on iOS, whatever
+        // ends a load (stall, limit, player error), the engine stops and forgets the track.
+        val engine = engine(STALL_TIMEOUT_MS)
+        val broken = HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
+        val item = hlsItem(broken)
+        val error = runBlocking(engineThread) {
+            runCatching { engine.prepare(item, 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+        }.exceptionOrNull()
+        assertTrue("the load must fail, got $error", error is RejectionException)
+        assertEquals("crossfade_engine_error", (error as RejectionException).code)
+        runBlocking(engineThread) {
+            assertFalse("a track that failed is not prepared", engine.isPreparedFor(item))
+            assertEquals(Player.STATE_IDLE, engine.playbackState)
+        }
     }
 
     @Test
@@ -209,6 +236,7 @@ class CrossfadeEngineHlsTest {
         val gaveUpAtMs = monotonicNowMs()
         assertTrue("the load must fail, got $error", error is RejectionException)
         assertEquals("crossfade_prepare_timeout", (error as RejectionException).code)
+        assertEquals("Crossfade engine did not become ready (no progress for $STALL_TIMEOUT_MS ms).", error.message)
         val firstRequestAtMs = stalled.stalledRequestTimesMs.first()
         assertTrue(
             "gave up ${gaveUpAtMs - firstRequestAtMs}ms after the segment request; stallTimeoutMs is $STALL_TIMEOUT_MS",
@@ -265,13 +293,16 @@ class CrossfadeEngineHlsTest {
     ): HlsTestServer =
         HlsTestServer(renditions, segmentCount, stalledFrom, failingStatus, failingAfterMs).also { servers += it }
 
-    private fun engine(stallTimeoutMs: Long): AndroidCrossfadeEngine = runBlocking(engineThread) {
+    private fun engine(
+        stallTimeoutMs: Long,
+        initialBitrateEstimateBps: Long = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS
+    ): AndroidCrossfadeEngine = runBlocking(engineThread) {
         AndroidCrossfadeEngine(
             RuntimeEnvironment.getApplication(),
             "engineA",
             C.AUDIO_CONTENT_TYPE_MUSIC,
             /* handleAudioFocus= */ false,
-            initialBitrateEstimateBps = { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS },
+            initialBitrateEstimateBps = { initialBitrateEstimateBps },
             stallTimeoutMs = { stallTimeoutMs }
         ).also { engines += it }
     }
