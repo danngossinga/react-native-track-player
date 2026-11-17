@@ -296,9 +296,11 @@ class StandardBackendHlsTest {
         val seen = mutableListOf<Triple<Int, Boolean, Boolean>>()
         session.addListener(object : com.google.android.exoplayer2.Player.Listener {
             override fun onEvents(player: com.google.android.exoplayer2.Player, events: com.google.android.exoplayer2.Player.Events) {
-                if (events.containsAny(com.google.android.exoplayer2.Player.EVENT_IS_PLAYING_CHANGED, com.google.android.exoplayer2.Player.EVENT_POSITION_DISCONTINUITY, com.google.android.exoplayer2.Player.EVENT_TIMELINE_CHANGED)) {
-                    seen += Triple(player.currentMediaItemIndex, player.playerError != null, events.contains(com.google.android.exoplayer2.Player.EVENT_POSITION_DISCONTINUITY))
-                }
+                seen += Triple(
+                    player.currentMediaItemIndex,
+                    player.playerError != null,
+                    events.containsAny(com.google.android.exoplayer2.Player.EVENT_POSITION_DISCONTINUITY, com.google.android.exoplayer2.Player.EVENT_TIMELINE_CHANGED)
+                )
             }
         })
         val itemOfA = exo.getMediaItemAt(0)
@@ -311,7 +313,6 @@ class StandardBackendHlsTest {
         assertEquals("next after A", 1, session.nextMediaItemIndex)
         assertFalse("nothing before A", session.hasPreviousMediaItem())
         assertEquals("a connector reading at the hold sees A", 0, seen.last().first)
-        assertTrue("the hold's event tells a connector the index changed (its active queue item)", seen.last().third)
         assertEquals(PREPARE_TIMEOUT_CODE, (skip.let { awaitTrue("the skip ends", AWAIT_MS) { it() != null }; it()!!.exceptionOrNull() as RejectionException }).code)
         pump(STALL_TIMEOUT_MS)
         assertEquals(0, backed.backend.currentIndex)
@@ -330,6 +331,17 @@ class StandardBackendHlsTest {
         backed.backend.stop()
         assertNull("no error after the stop", session.playerError)
         assertTrue("told at once: ${seen.drop(beforeStop)}", seen.drop(beforeStop).any { !it.second })
+        // A skip to C (index 3) that loads: held on A while it loads, then released on C. The
+        // connector takes the active queue item only at a discontinuity or a timeline change:
+        // every change of the index it reads comes with one.
+        assertNull(command { backed.backend.skip(3) })
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals("C reported", 3, backed.backend.currentIndex)
+        assertEquals("the session's current item is C", 3, session.currentMediaItemIndex)
+        assertEquals("the last index a connector took is C", 3, seen.last().first)
+        seen.zipWithNext().forEach { (before, after) ->
+            if (before.first != after.first) assertTrue("an index change ${before.first} -> ${after.first} a connector sees: $seen", after.third)
+        }
     }
 
     @Test
@@ -1174,6 +1186,57 @@ class StandardBackendHlsTest {
         assertEquals(0, backed.backend.currentIndex)
     }
 
+    // A backend switch that restores no active track (a snapshot with none) is the same logical
+    // idle: a seek resolves and does nothing; the play reports its first track once it loaded.
+
+    @Test
+    fun aRestoreWithNoActiveTrackResolvesASeekAndReportsThePlaysTrackOnceItLoaded() {
+        val a = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val items = listOf(item(a, 1L), item(slowServer(), 2L))
+        val backed = backed(candidateQueue = items)
+        val snapshot = PlaybackBackendSnapshot.empty().copy(queueIds = items.map { it.track.queueId.toString() })
+        assertNull(command {
+            backed.backend.prepareSilently(snapshot)
+            backed.backend.restore(snapshot)
+            backed.backend.commitQueue(snapshot)
+            backed.backend.activateAfterCommit(snapshot)
+        })
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals(-1, backed.backend.currentIndex)
+        assertEquals(AudioPlayerState.IDLE, backed.backend.playbackState)
+        assertNull("no active track to seek in: nothing to do", command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
+        assertEquals(-1, backed.backend.currentIndex)
+        val returned = backed.commandReading { backed.backend.play() }
+        assertEquals("not reported before it loaded", emptyList<Int?>(), returned.reported)
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        assertEquals("A reported once it loaded", listOf<Pair<Int?, Int?>>(0 to null), backed.activeTrackChanges)
+        assertEquals(0, backed.backend.currentIndex)
+    }
+
+    // An add to a queue the player stopped on loads nothing (wider than the idle: a stop, a
+    // failure), as crossfade's queue change and SwiftAudioEx's add to a queue that has items;
+    // upstream KotlinAudio's add prepared the player, which loaded its stopped item again.
+
+    @Test
+    fun anAddAfterAStopLoadsNothing() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        backed.backend.stop()
+        pump(STALL_TIMEOUT_MS / 3)
+        val requests = playable.requests.size
+        val events = backed.events.size
+        val c = slowServer()
+        backed.backend.add(listOf(item(c, 2L)), null)
+        pump(STALL_TIMEOUT_MS * 2)
+        assertEquals("the add loads nothing", listOf(requests, 0), listOf(playable.requests.size, c.requests.size))
+        assertEquals(com.google.android.exoplayer2.Player.STATE_IDLE, backed.analytics.player!!.playbackState)
+        assertEquals("no state event", emptyList<String>(), backed.events.drop(events))
+        assertEquals(AudioPlayerState.STOPPED, backed.backend.playbackState)
+    }
+
     // A play, retry, skip, next or load with no active track (the logical idle) reports its track
     // once it loaded, as crossfade's play with no active track (before: at once, then, when its
     // load failed, no active track again). iOS: StandardLoadCoordinator.idleActivation.
@@ -1330,7 +1393,9 @@ class StandardBackendHlsTest {
         /** standardSeekTimeoutMs (the app sets it apart from prepareTimeoutMs). */
         seekTimeoutMs: Long = PREPARE_TIMEOUT_MS,
         /** prepareTimeoutMs: a load's total limit. */
-        loadTimeoutMs: Long = PREPARE_TIMEOUT_MS
+        loadTimeoutMs: Long = PREPARE_TIMEOUT_MS,
+        /** A backend switch's candidate with this queue (not authoritative until its commit). */
+        candidateQueue: List<TrackAudioItem>? = null
     ) {
         val analytics = StandardPlayerAnalytics()
         val player = QueuedAudioPlayer(
@@ -1358,7 +1423,7 @@ class StandardBackendHlsTest {
         val backend = KotlinAudioPlaybackBackend(
             player,
             Any(),
-            AndroidTrackQueue(),
+            AndroidTrackQueue().apply { candidateQueue?.let(::replaceWith) },
             PlaybackTransitionGenerationSidecar(),
             onCommitted = {},
             onActivated = {},
@@ -1384,7 +1449,7 @@ class StandardBackendHlsTest {
                 totalTimeoutMs = { loadTimeoutMs },
                 onLoadStart = analytics::startLoad
             ),
-            initiallyAuthoritative = true
+            initiallyAuthoritative = candidateQueue == null
         ).also { it.startLoadWatch(Handler(Looper.getMainLooper())) }
 
         /**
@@ -1504,8 +1569,9 @@ class StandardBackendHlsTest {
     private fun backed(
         seekStallMs: Long = STALL_TIMEOUT_MS,
         seekTimeoutMs: Long = PREPARE_TIMEOUT_MS,
-        loadTimeoutMs: Long = PREPARE_TIMEOUT_MS
-    ): Backed = Backed(seekStallMs, seekTimeoutMs, loadTimeoutMs).also { backends += it }
+        loadTimeoutMs: Long = PREPARE_TIMEOUT_MS,
+        candidateQueue: List<TrackAudioItem>? = null
+    ): Backed = Backed(seekStallMs, seekTimeoutMs, loadTimeoutMs, candidateQueue).also { backends += it }
 
     private fun item(server: HlsTestServer, queueId: Long) =
         TrackAudioItem(track = Track(queueId = queueId), type = MediaType.HLS, audioUrl = server.masterUrl)

@@ -49,9 +49,12 @@ When the track fails to load it rejects, and the previous track stays active: `c
 (no progress for `stallTimeoutMs`, or over `prepareTimeoutMs`), `crossfade_engine_error` (the player
 failed the track), or `cancelled` (a newer skip, load, seek, pause, stop or queue change took
 over). A skip a seek, pause or stop cancelled does not take effect: the player goes back to the
-active track, paused, and the seek acts there. After a skip that failed, a seek or stop acts on
-the active track too (owner decision, 2026-11-17), and a skip or `skipToNext` to the track that
-failed loads it again. A failure the promise reports is not also sent as a
+active track, paused (a cancelled operation, as crossfade's), and the seek acts there. After a
+skip that failed, a seek or stop acts on the active track too (owner decision, 2026-11-17): the
+seek then plays there when playback was requested before the failure, as crossfade's; a skip or
+`skipToNext` to the track that failed loads it again. With no active track (a cancel left none),
+a skip, `skipToNext` or `load` reports its track once it loaded, never at once, as crossfade's,
+and adding, moving or removing tracks, or a new queue, loads nothing and keeps no active track. A failure the promise reports is not also sent as a
 `PlaybackError` event. Once the track loaded, a
 failed `initialPosition` seek rejects with the seek's code (see
 [`seekTo`](./player.md#seektoseconds)), on both platforms.

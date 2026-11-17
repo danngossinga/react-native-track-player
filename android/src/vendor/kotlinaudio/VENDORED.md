@@ -86,7 +86,12 @@ with their own comments (checked against the upstream archive with `diff`).
   with a newline (upstream's file had none).
 - `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
   passed to `BaseAudioPlayer`;
-  `:219-231` `releaseSource(index)` (new): a new, unprepared source for a non-current item in place
+  `:143-157` `addWithoutPreparing(items, atIndex)` (new): adds as `add`, without preparing the
+  player. The standard backend adds with it to a queue that has items (a new queue's first track
+  still loads through `add`): a player stopped with no active track, by a stop or by a failure
+  loads nothing, as the crossfade engines and SwiftAudioEx's add (upstream's `add` prepares the
+  player, which loaded its current item again: a cancelled skip's track, a failed one);
+  `:235-247` `releaseSource(index)` (new): a new, unprepared source for a non-current item in place
   of the prepared one, which ExoPlayer releases (removed from its playlist; the item, its place
   and the current item unchanged). The standard backend calls it on the track of a skip that a
   pause or seek cancelled while it loaded: ExoPlayer keeps an item's source prepared while the

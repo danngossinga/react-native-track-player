@@ -60,7 +60,7 @@ on the backend, the same on Android and iOS:
 | ------- | ---- | ---- |
 | standard | `standard_seek_timeout` | no progress for `stallTimeoutMs`, or over `standardSeekTimeoutMs`; the player stops loading and is in an error state |
 | standard | `standard_seek_cancelled` | a newer seek, a skip, pause, stop, load or another track took over |
-| standard | `standard_seek_unavailable` | no active track, or it failed to load |
+| standard | `standard_seek_unavailable` | the track it acts on failed to load (a player error) |
 | crossfade | `crossfade_seek_timeout` | the seek made no progress, or went over its limit |
 | crossfade | `crossfade_prepare_timeout`, `crossfade_engine_error` | the track had to load again and failed |
 | crossfade | `cancelled` | a newer command took over |
@@ -68,12 +68,17 @@ on the backend, the same on Android and iOS:
 iOS alone rejects a position that is not a finite number, with `seek_failed`.
 
 A seek during a skip or load that still waits for its track cancels it (`cancelled`) and acts on
-the active track, paused. A seek (and a `stop`) acts on the active track, the one
-`getActiveTrack()` and the progress report, as crossfade's (owner decision, 2026-11-17): after a
-failed load, and on the standard backend while another track loads (a natural advance), the player
-goes back to the active track, paused, and the seek acts there (before: it acted on the track that
-failed). With no active track (the first track failed to load), the seek retries the track that
-failed; when it fails as well, the next play retries it again.
+the active track, paused (a cancelled operation, as crossfade's). A seek (and a `stop`) acts on
+the active track, the one `getActiveTrack()` and the progress report, as crossfade's (owner
+decision, 2026-11-17): after a failed load the player goes back to the active track, the seek
+acts there and then plays when playback was requested before the failure, as crossfade's seek
+after a failed skip (a pause after the failure ends that request); on the standard backend while
+another track loads (a natural advance, which the seek cancels) it goes back paused (before: it
+acted on the track that failed). With no active track the seek resolves and does nothing, as
+crossfade's (a cancel left none, or a backend switch restored none; before:
+`standard_seek_unavailable`), except after the first track failed to load: then the seek retries
+the track that failed (owner decision, 2026-11-17; crossfade does nothing there); when it fails as
+well, the next play retries it again.
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |
