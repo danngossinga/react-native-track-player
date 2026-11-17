@@ -258,27 +258,40 @@ internal class ReportedNowPlaying {
     /** Show [item] (null: the player's own item); [held]: the player's own updates are held. */
     data class Change(val item: Any?, val held: Boolean)
 
-    private var heldItem: Any? = null
-    private var heldOn: Any? = null
-    private var held = false
+    /**
+     * What is shown (one explicit state, the monorepo's state-machine form 3, moved only by
+     * [follow]; iOS: `ReportedNowPlaying.State`, same moves):
+     * - [Released]: the player's own updates go through (it is on the reported track, or none is
+     *   reported).
+     * - [Held]: [Held.item] (the reported track) is shown while the player is on [Held.on] (null:
+     *   no item); the player's own updates are held.
+     *
+     * Moves: any -(reported r, player p !== r)-> Held(r, p) (a change, unless already Held(r, p));
+     * Held -(none reported, or the player on it)-> Released (a change); Released stays.
+     * Items are compared by identity.
+     */
+    sealed class State {
+        object Released : State()
+        class Held(val item: Any, val on: Any?) : State()
+    }
+
+    var state: State = State.Released
+        private set
 
     /** Whether the player's own now-playing updates are held now. */
     val isHeld: Boolean
-        get() = held
+        get() = state is State.Held
 
     /** The reported track and the player's item now: what to show, null when nothing changes. */
     fun follow(reported: Any?, playerItem: Any?): Change? {
         if (reported != null && playerItem !== reported) {
-            if (held && heldItem === reported && heldOn === playerItem) return null
-            held = true
-            heldItem = reported
-            heldOn = playerItem
+            val current = state
+            if (current is State.Held && current.item === reported && current.on === playerItem) return null
+            state = State.Held(reported, playerItem)
             return Change(reported, held = true)
         }
-        if (!held) return null
-        held = false
-        heldItem = null
-        heldOn = null
+        if (state !is State.Held) return null
+        state = State.Released
         return Change(reported, held = false)
     }
 }

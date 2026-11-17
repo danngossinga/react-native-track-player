@@ -52,7 +52,7 @@ enum StallVerdict: Equatable {
 /// `totalTimeoutMs` in all. It is fed readings (for example the seconds of media loaded) and the
 /// time; a reading that grows from the previous one is progress. A reading that drops (a seek
 /// back) is not progress, but the next growth from there is.
-struct StallWatch {
+struct StallWatch: Equatable {
     let stallTimeoutMs: Int
     let totalTimeoutMs: Int
     private let startedAt: TimeInterval
@@ -1617,20 +1617,39 @@ struct StandardLoadObservation {
 /// `stallTimeoutMs` with no progress, or after `prepareTimeoutMs` in all. A rebuffer after ready
 /// is not a load. Main thread.
 final class StandardLoadWatch {
+    /// A load in progress: its item, when it began (the first time the item was seen loading, even
+    /// while a seek owned it), whether its progress was started (`startsLoad`; once per load) and
+    /// its stall watch while it is watched (nil while a seek owns it: once the seek ends, the load
+    /// is watched again with its own total limit and a fresh stall clock). As Android.
+    struct Load: Equatable {
+        let item: ObjectIdentifier
+        let startedAt: TimeInterval
+        var progressStarted: Bool
+        var watch: StallWatch?
+    }
+
+    /// Where the watch stands (one explicit state, the monorepo's state-machine form 3: a closed
+    /// union moved only by `check` and `reset`; Android: `StandardLoadWatch.State`, same moves).
+    ///
+    /// - `idle(ready)`: no load. `ready` is the item ready since it was loaded (nil: none): its
+    ///   buffering is a rebuffer, not a load.
+    /// - `loading(ready, load)`: `load.item` loads (it is never `ready`, which a return to it would
+    ///   find ready).
+    ///
+    /// Moves: no item or a failure -> idle(nil); owned elsewhere -> the load (if any) disarmed,
+    /// and an item loading not ready since its load -> loading (the same load, else a new one from
+    /// now); ready -> idle(item); idle phase -> idle(nil); loading the ready item -> idle(ready);
+    /// loading another -> loading (its load, watched; a new one for a new item), and a verdict
+    /// other than wait -> idle(ready); reset -> idle(nil).
+    enum State: Equatable {
+        case idle(ready: ObjectIdentifier?)
+        case loading(ready: ObjectIdentifier?, load: Load)
+    }
+
     private let stallTimeoutMs: () -> Int
     private let totalTimeoutMs: () -> Int
     private let now: () -> TimeInterval
-    private var readyItem: ObjectIdentifier?
-    /// The load in progress: its item and when it began (the first time the item was seen
-    /// loading, even while a seek owned it). A seek during the load does not end it: once the
-    /// seek ends, the load is watched again with its own total limit (a fresh stall clock). As
-    /// Android.
-    private var loadItem: ObjectIdentifier?
-    private var loadStartedAt: TimeInterval = 0
-    /// The item whose progress this load started (`startsLoad`), once per load.
-    private var progressItem: ObjectIdentifier?
-    private var watchedItem: ObjectIdentifier?
-    private var watch: StallWatch?
+    private(set) var state: State = .idle(ready: nil)
     /// The limits of the last load watched (what a give-up reports).
     private(set) var lastStallTimeoutMs = 0
     private(set) var lastTotalTimeoutMs = 0
@@ -1645,7 +1664,20 @@ final class StandardLoadWatch {
         self.now = now
     }
 
-    var isWatching: Bool { return watch != nil }
+    var isWatching: Bool { return watched != nil }
+
+    private var ready: ObjectIdentifier? {
+        switch state {
+        case let .idle(ready), let .loading(ready, _): return ready
+        }
+    }
+
+    private var load: Load? {
+        if case let .loading(_, load) = state { return load }
+        return nil
+    }
+
+    private var watched: StallWatch? { return load?.watch }
 
     /// Whether `check` would start a new load's progress with `observed` (its readings aside): an
     /// item loading, not ready since it was loaded and whose load has not started its progress
@@ -1654,86 +1686,79 @@ final class StandardLoadWatch {
     /// Android's `onLoadStart`.
     func startsLoad(_ observed: StandardLoadObservation) -> Bool {
         guard let item = observed.item, observed.phase == .loading, !observed.ownedElsewhere else { return false }
-        return readyItem != item && !(loadItem == item && progressItem == item)
+        guard ready != item else { return false }
+        if let load = load, load.item == item, load.progressStarted { return false }
+        return true
     }
 
     /// Takes one observation: the verdict that ends a load the caller must give up, else nil.
     func check(_ observed: StandardLoadObservation) -> StallVerdict? {
         guard let item = observed.item, observed.phase != .failed else {
-            readyItem = nil
-            endLoad()
+            state = .idle(ready: nil)
             return nil
         }
         if observed.ownedElsewhere {
-            disarm()
             // A seek on an item not ready since it was loaded: its load goes on (and its total).
-            if observed.phase == .loading, readyItem != item { loadOf(item) }
+            if observed.phase == .loading, ready != item {
+                var load = loadOf(item)
+                load.watch = nil
+                state = .loading(ready: ready, load: load)
+            } else if var load = load {
+                load.watch = nil
+                state = .loading(ready: ready, load: load)
+            }
             return nil
         }
         switch observed.phase {
         case .ready:
-            readyItem = item
-            endLoad()
+            state = .idle(ready: item)
             return nil
         case .idle, .failed:
-            readyItem = nil
-            endLoad()
+            state = .idle(ready: nil)
             return nil
         case .loading:
             break
         }
-        if readyItem == item {
-            endLoad()
+        if ready == item {
+            state = .idle(ready: ready)
             return nil
         }
-        loadOf(item)
-        if watch == nil || watchedItem != item {
-            var created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: loadStartedAt)
+        var load = loadOf(item)
+        if load.watch == nil {
+            var created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: load.startedAt)
             created.noteProgress(at: now())
-            watch = created
-            watchedItem = item
-            progressItem = item
+            load.watch = created
+            load.progressStarted = true
             lastStallTimeoutMs = created.stallTimeoutMs
             lastTotalTimeoutMs = created.totalTimeoutMs
         }
-        let verdict = watch!.check(at: now(), readings: observed.readings)
-        guard verdict != .wait else { return nil }
-        endLoad()
+        let verdict = load.watch!.check(at: now(), readings: observed.readings)
+        guard verdict != .wait else {
+            state = .loading(ready: ready, load: load)
+            return nil
+        }
+        state = .idle(ready: ready)
         return verdict
     }
 
     /// `item` is loading: the load in progress, or a new one from now.
-    private func loadOf(_ item: ObjectIdentifier) {
-        guard loadItem != item else { return }
-        loadItem = item
-        loadStartedAt = now()
-        progressItem = nil
+    private func loadOf(_ item: ObjectIdentifier) -> Load {
+        if let load = load, load.item == item { return load }
+        return Load(item: item, startedAt: now(), progressStarted: false, watch: nil)
     }
 
     /// When to check next, in milliseconds, while a load is watched (nil: none): at the moment the
     /// load would give up if nothing progresses, and every `standardLoadSampleIntervalMs` before
     /// it, to read the progress the player does not signal. Same rule as Android.
     func nextCheckInMs() -> Int? {
-        guard let watch = watch else { return nil }
+        guard let watch = watched else { return nil }
         let untilDeadline = max(0, Int(((watch.deadline() - now()) * 1000).rounded(.up)))
         return min(untilDeadline, standardLoadSampleIntervalMs(watch.stallTimeoutMs))
     }
 
     /// Forgets the load in progress.
     func reset() {
-        readyItem = nil
-        endLoad()
-    }
-
-    private func disarm() {
-        watch = nil
-        watchedItem = nil
-    }
-
-    private func endLoad() {
-        disarm()
-        loadItem = nil
-        progressItem = nil
+        state = .idle(ready: nil)
     }
 }
 
@@ -2050,23 +2075,37 @@ final class ReportedNowPlaying {
         let held: Bool
     }
 
-    private var heldItem: ObjectIdentifier?
-    private var heldOn: ObjectIdentifier?
-    private(set) var isHeld = false
+    /// What is shown (one explicit state, the monorepo's state-machine form 3, moved only by
+    /// `follow`; Android: `ReportedNowPlaying.State`, same moves):
+    /// - `released`: the player's own updates go through (it is on the reported track, or none
+    ///   is reported).
+    /// - `held(item, on)`: `item` (the reported track) is shown while the player is on `on` (nil:
+    ///   no item); the player's own updates are held.
+    ///
+    /// Moves: any -(reported r, player p != r)-> held(r, p) (a change, unless already held(r, p));
+    /// held -(none reported, or the player on it)-> released (a change); released stays.
+    enum State: Equatable {
+        case released
+        case held(item: ObjectIdentifier, on: ObjectIdentifier?)
+    }
+
+    private(set) var state: State = .released
+
+    var isHeld: Bool {
+        if case .held = state { return true }
+        return false
+    }
 
     /// The reported track and the player's item now: what to show, nil when nothing changes.
     func follow(reported: ObjectIdentifier?, playerItem: ObjectIdentifier?) -> Change? {
         if let reported = reported, playerItem != reported {
-            if isHeld, heldItem == reported, heldOn == playerItem { return nil }
-            isHeld = true
-            heldItem = reported
-            heldOn = playerItem
+            let next = State.held(item: reported, on: playerItem)
+            if state == next { return nil }
+            state = next
             return Change(item: reported, held: true)
         }
         guard isHeld else { return nil }
-        isHeld = false
-        heldItem = nil
-        heldOn = nil
+        state = .released
         return Change(item: reported, held: false)
     }
 }

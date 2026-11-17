@@ -55,4 +55,22 @@ class ReportedTrackTest {
         nowPlaying.follow(reported = c, playerItem = b)
         assertEquals(ReportedNowPlaying.Change(null, held = false), nowPlaying.follow(reported = null, playerItem = b))
     }
+
+    @Test
+    fun theNowPlayingStateIsReleasedOrHeldOnTheReportedTrack() {
+        // iOS: testReportedNowPlayingStateIsReleasedOrHeldOnTheReportedTrack.
+        val nowPlaying = ReportedNowPlaying()
+        fun held(): Pair<Any?, Any?>? = (nowPlaying.state as? ReportedNowPlaying.State.Held)?.let { it.item to it.on }
+        assertTrue(nowPlaying.state === ReportedNowPlaying.State.Released)
+        assertEquals("the player has no item", ReportedNowPlaying.Change(a, held = true), nowPlaying.follow(reported = a, playerItem = null))
+        assertTrue(held()!!.first === a && held()!!.second == null)
+        assertEquals(ReportedNowPlaying.Change(a, held = true), nowPlaying.follow(reported = a, playerItem = b))
+        assertTrue(held()!!.first === a && held()!!.second === b)
+        assertEquals("another reported track", ReportedNowPlaying.Change(b, held = true), nowPlaying.follow(reported = b, playerItem = a))
+        assertTrue(held()!!.first === b && held()!!.second === a)
+        assertEquals(ReportedNowPlaying.Change(b, held = false), nowPlaying.follow(reported = b, playerItem = b))
+        assertTrue(nowPlaying.state === ReportedNowPlaying.State.Released)
+        assertNull(nowPlaying.follow(reported = null, playerItem = null))
+        assertTrue(nowPlaying.state === ReportedNowPlaying.State.Released)
+    }
 }

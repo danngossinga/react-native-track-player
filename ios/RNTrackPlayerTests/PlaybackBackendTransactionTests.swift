@@ -664,6 +664,83 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(h.watch.startsLoad(observed(h.a, .loading)), "a retry after a stop")
     }
 
+    func testStandardLoadWatchStateMovesBetweenIdleAndOneLoad() {
+        // One explicit state (Android: StandardLoadWatchTest.theStateMovesBetweenIdleAndOneLoad,
+        // the same steps).
+        let h = LoadWatchHarness()
+        let ia = ObjectIdentifier(h.a), ib = ObjectIdentifier(h.b)
+        func load(_ state: StandardLoadWatch.State) -> StandardLoadWatch.Load? {
+            if case let .loading(_, load) = state { return load }
+            return nil
+        }
+        XCTAssertEqual(h.watch.state, .idle(ready: nil))
+        h.now = 1
+        _ = h.observe(h.a, .loading)
+        XCTAssertEqual(load(h.watch.state)?.item, ia)
+        XCTAssertEqual(load(h.watch.state)?.startedAt, 1)
+        XCTAssertEqual(load(h.watch.state)?.progressStarted, true)
+        XCTAssertNotNil(load(h.watch.state)?.watch)
+        // A seek owns it: the same load, disarmed.
+        h.now = 2
+        _ = h.observe(h.a, .loading, owned: true)
+        XCTAssertEqual(load(h.watch.state)?.startedAt, 1)
+        XCTAssertEqual(load(h.watch.state)?.progressStarted, true)
+        XCTAssertNil(load(h.watch.state)?.watch)
+        XCTAssertFalse(h.watch.isWatching)
+        _ = h.observe(h.a, .ready)
+        XCTAssertEqual(h.watch.state, .idle(ready: ia))
+        // B loads while A stays the item ready since its load.
+        h.now = 3
+        _ = h.observe(h.b, .loading)
+        guard case let .loading(ready, loadB) = h.watch.state else { return XCTFail("B loads") }
+        XCTAssertEqual(ready, ia)
+        XCTAssertEqual(loadB.item, ib)
+        XCTAssertEqual(loadB.startedAt, 3)
+        // Back on A buffering: a rebuffer, not a load (B's load is over).
+        XCTAssertNil(h.observe(h.a, .loading))
+        XCTAssertEqual(h.watch.state, .idle(ready: ia))
+        // A seek owning A's buffering starts no load either.
+        _ = h.observe(h.a, .loading, owned: true)
+        XCTAssertEqual(h.watch.state, .idle(ready: ia))
+        // A give-up ends the load and keeps the ready item.
+        h.now = 4
+        _ = h.observe(h.b, .loading)
+        h.now = 14
+        XCTAssertEqual(h.observe(h.b, .loading), .stalled)
+        XCTAssertEqual(h.watch.state, .idle(ready: ia))
+        XCTAssertEqual(h.watch.lastStallTimeoutMs, 10_000, "the limits of the last load stay")
+        // A failure, no item, the idle phase and reset forget the ready item.
+        _ = h.observe(h.a, .failed)
+        XCTAssertEqual(h.watch.state, .idle(ready: nil))
+        _ = h.observe(h.a, .ready)
+        _ = h.observe(nil, .loading)
+        XCTAssertEqual(h.watch.state, .idle(ready: nil))
+        _ = h.observe(h.a, .ready)
+        _ = h.observe(h.a, .idle)
+        XCTAssertEqual(h.watch.state, .idle(ready: nil))
+        _ = h.observe(h.b, .loading)
+        h.watch.reset()
+        XCTAssertEqual(h.watch.state, .idle(ready: nil))
+    }
+
+    func testReportedNowPlayingStateIsReleasedOrHeldOnTheReportedTrack() {
+        // Android: ReportedTrackTest.theNowPlayingStateIsReleasedOrHeldOnTheReportedTrack.
+        let a = NSObject(), b = NSObject()
+        let ia = ObjectIdentifier(a), ib = ObjectIdentifier(b)
+        let nowPlaying = ReportedNowPlaying()
+        XCTAssertEqual(nowPlaying.state, .released)
+        XCTAssertEqual(nowPlaying.follow(reported: ia, playerItem: nil), .init(item: ia, held: true), "the player has no item")
+        XCTAssertEqual(nowPlaying.state, .held(item: ia, on: nil))
+        XCTAssertEqual(nowPlaying.follow(reported: ia, playerItem: ib), .init(item: ia, held: true))
+        XCTAssertEqual(nowPlaying.state, .held(item: ia, on: ib))
+        XCTAssertEqual(nowPlaying.follow(reported: ib, playerItem: ia), .init(item: ib, held: true), "another reported track")
+        XCTAssertEqual(nowPlaying.state, .held(item: ib, on: ia))
+        XCTAssertEqual(nowPlaying.follow(reported: ib, playerItem: ib), .init(item: ib, held: false))
+        XCTAssertEqual(nowPlaying.state, .released)
+        XCTAssertNil(nowPlaying.follow(reported: nil, playerItem: nil))
+        XCTAssertEqual(nowPlaying.state, .released)
+    }
+
     // A standard command's wait for its track's load (the crossfade rule), with FailedLoadRule as
     // StandardPlaybackBackend feeds them; the same cases as Android's StandardCommandLoadTest.
 

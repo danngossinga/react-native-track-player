@@ -2,6 +2,9 @@ package com.doublesymmetry.trackplayer.service
 
 import com.google.android.exoplayer2.Player
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertTrue
 import org.junit.Assert.assertNull
 import org.junit.Test
 
@@ -157,5 +160,64 @@ class StandardLoadWatchTest {
         observe(b, Player.STATE_READY)
         assertNull(watch.nextCheckInMs())
         assertEquals(1L, standardLoadSampleIntervalMs(5L))
+    }
+
+    @Test
+    fun theStateMovesBetweenIdleAndOneLoad() {
+        // One explicit state (iOS: testStandardLoadWatchStateMovesBetweenIdleAndOneLoad, the same steps).
+        val starts = mutableListOf<Long>()
+        val watch = StandardLoadWatch({ stall }, { 60_000L }, nowMs = { now }, onLoadStart = { starts += now })
+        fun see(item: Any?, state: Int, owned: Boolean = false, error: Boolean = false) =
+            watch.check(StandardLoadObservation(item, state, error, longArrayOf(0L, 0L, 0L), ownedElsewhere = owned))
+        fun load() = (watch.state as? StandardLoadWatch.State.Loading)?.load
+        assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
+        now = 1_000L
+        see(a, Player.STATE_BUFFERING)
+        assertTrue(load()!!.item === a)
+        assertEquals(1_000L, load()!!.startedAtMs)
+        assertTrue(load()!!.progressStarted)
+        assertNotNull(load()!!.watch)
+        // A seek owns it: the same load, disarmed.
+        now = 2_000L
+        see(a, Player.STATE_BUFFERING, owned = true)
+        assertEquals(1_000L, load()!!.startedAtMs)
+        assertTrue(load()!!.progressStarted)
+        assertNull(load()!!.watch)
+        assertFalse(watch.isWatching)
+        see(a, Player.STATE_READY)
+        assertEquals(StandardLoadWatch.State.Idle(a), watch.state)
+        // B loads while A stays the item ready since its load.
+        now = 3_000L
+        see(b, Player.STATE_BUFFERING)
+        val loading = watch.state as StandardLoadWatch.State.Loading
+        assertTrue(loading.ready === a)
+        assertTrue(loading.load.item === b)
+        assertEquals(3_000L, loading.load.startedAtMs)
+        // Back on A buffering: a rebuffer, not a load (B's load is over).
+        assertNull(see(a, Player.STATE_BUFFERING))
+        assertEquals(StandardLoadWatch.State.Idle(a), watch.state)
+        // A seek owning A's buffering starts no load either.
+        see(a, Player.STATE_BUFFERING, owned = true)
+        assertEquals(StandardLoadWatch.State.Idle(a), watch.state)
+        // A give-up ends the load and keeps the ready item.
+        now = 4_000L
+        see(b, Player.STATE_BUFFERING)
+        now = 14_000L
+        assertEquals(StallVerdict.STALLED, see(b, Player.STATE_BUFFERING))
+        assertEquals(StandardLoadWatch.State.Idle(a), watch.state)
+        assertEquals("the limits of the last load stay", 10_000L, watch.lastStallTimeoutMs)
+        assertEquals("one progress start per load", listOf(1_000L, 3_000L, 4_000L), starts)
+        // An error, no item, the idle state and reset forget the ready item.
+        see(a, Player.STATE_BUFFERING, error = true)
+        assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
+        see(a, Player.STATE_READY)
+        see(null, Player.STATE_BUFFERING)
+        assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
+        see(a, Player.STATE_READY)
+        see(a, Player.STATE_IDLE)
+        assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
+        see(b, Player.STATE_BUFFERING)
+        watch.reset()
+        assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
     }
 }

@@ -50,18 +50,42 @@ internal class StandardLoadWatch(
     /** A load starts being watched (the progress counter's per-load reset: [StandardPlayerAnalytics.startLoad]). */
     private val onLoadStart: () -> Unit = {}
 ) {
-    private var readyItem: Any? = null
     /**
-     * The load in progress: its item and when it began (the first time the item was seen loading,
-     * even while a seek owned it). A seek during the load does not end it: once the seek ends,
-     * the load is watched again with its own total limit (a fresh stall clock).
+     * A load in progress: its [item], when it began (the first time the item was seen loading,
+     * even while a seek owned it), whether its progress counter was started ([onLoadStart]; once
+     * per load) and its stall [watch] while it is watched (null while a seek owns it: once the
+     * seek ends, the load is watched again with its own total limit and a fresh stall clock).
      */
-    private var loadItem: Any? = null
-    private var loadStartedAtMs = 0L
-    /** The item whose progress counter this load started ([onLoadStart]), once per load. */
-    private var progressItem: Any? = null
-    private var watchedItem: Any? = null
-    private var watch: StallWatch? = null
+    data class Load(
+        val item: Any,
+        val startedAtMs: Long,
+        val progressStarted: Boolean = false,
+        val watch: StallWatch? = null
+    )
+
+    /**
+     * Where the watch stands (one explicit state, the monorepo's state-machine form 3: a closed
+     * union moved only by [check] and [reset]; iOS: `StandardLoadWatch.State`, same moves).
+     *
+     * - [Idle]: no load. [Idle.ready] is the item ready since it was loaded (null: none): its
+     *   buffering is a rebuffer, not a load.
+     * - [Loading]: [Loading.load]'s item loads (never [Loading.ready], which a return to it would
+     *   find ready).
+     *
+     * Moves: no item or an error -> Idle(null); owned elsewhere -> the load (if any) disarmed, and
+     * an item buffering not ready since its load -> Loading (the same load, else a new one from
+     * now); ready or ended -> Idle(item); idle -> Idle(null); buffering the ready item ->
+     * Idle(ready); buffering another -> Loading (its load, watched; a new one for a new item), and
+     * a verdict other than wait -> Idle(ready); reset -> Idle(null).
+     */
+    sealed class State {
+        abstract val ready: Any?
+        data class Idle(override val ready: Any?) : State()
+        data class Loading(override val ready: Any?, val load: Load) : State()
+    }
+
+    var state: State = State.Idle(null)
+        private set
 
     /** The limits of the last load watched (what a give-up reports). */
     var lastStallTimeoutMs = 0L
@@ -69,67 +93,67 @@ internal class StandardLoadWatch(
     var lastTotalTimeoutMs = 0L
         private set
 
+    private val load: Load?
+        get() = (state as? State.Loading)?.load
+
     /** A load is being watched. */
     val isWatching: Boolean
-        get() = watch != null
+        get() = load?.watch != null
 
     /** Takes one observation: the verdict that ends a load the caller must give up, else null. */
     fun check(observed: StandardLoadObservation): StallVerdict? {
         val item = observed.item
         if (item == null || observed.hasError) {
-            readyItem = null
-            endLoad()
+            state = State.Idle(null)
             return null
         }
+        val ready = state.ready
         if (observed.ownedElsewhere) {
-            disarm()
             // A seek on an item not ready since it was loaded: its load goes on (and its total).
-            if (observed.playbackState == Player.STATE_BUFFERING && readyItem !== item) loadOf(item)
+            if (observed.playbackState == Player.STATE_BUFFERING && ready !== item) {
+                state = State.Loading(ready, loadOf(item).copy(watch = null))
+            } else {
+                load?.let { state = State.Loading(ready, it.copy(watch = null)) }
+            }
             return null
         }
         when (observed.playbackState) {
             Player.STATE_READY, Player.STATE_ENDED -> {
-                readyItem = item
-                endLoad()
+                state = State.Idle(item)
                 return null
             }
             Player.STATE_IDLE -> {
                 // Stopped or not prepared: whatever loads next is a new load.
-                readyItem = null
-                endLoad()
+                state = State.Idle(null)
                 return null
             }
         }
         // Buffering.
-        if (readyItem === item) {
-            endLoad()
+        if (ready === item) {
+            state = State.Idle(ready)
             return null
         }
-        loadOf(item)
-        val current = watch?.takeIf { watchedItem === item }
-            ?: StallWatch(stallTimeoutMs(), totalTimeoutMs(), startedAtMs = loadStartedAtMs, lastProgressAtMs = nowMs()).also {
-                watch = it
-                watchedItem = item
-                lastStallTimeoutMs = it.stallTimeoutMs
-                lastTotalTimeoutMs = it.totalTimeoutMs
-                if (progressItem !== item) {
-                    progressItem = item
-                    onLoadStart()
-                }
-            }
-        val verdict = current.check(nowMs(), observed.readings)
-        if (verdict == StallVerdict.WAIT) return null
-        endLoad()
+        var current = loadOf(item)
+        if (current.watch == null) {
+            val created = StallWatch(stallTimeoutMs(), totalTimeoutMs(), startedAtMs = current.startedAtMs, lastProgressAtMs = nowMs())
+            lastStallTimeoutMs = created.stallTimeoutMs
+            lastTotalTimeoutMs = created.totalTimeoutMs
+            val starts = !current.progressStarted
+            current = current.copy(progressStarted = true, watch = created)
+            state = State.Loading(ready, current)
+            if (starts) onLoadStart()
+        }
+        val verdict = current.watch!!.check(nowMs(), observed.readings)
+        if (verdict == StallVerdict.WAIT) {
+            state = State.Loading(ready, current)
+            return null
+        }
+        state = State.Idle(ready)
         return verdict
     }
 
     /** [item] is loading: the load in progress, or a new one from now. */
-    private fun loadOf(item: Any) {
-        if (loadItem === item) return
-        loadItem = item
-        loadStartedAtMs = nowMs()
-        progressItem = null
-    }
+    private fun loadOf(item: Any): Load = load?.takeIf { it.item === item } ?: Load(item, nowMs())
 
     /**
      * When to check next, in milliseconds from [nowMs], while a load is watched (null: none): at
@@ -137,26 +161,14 @@ internal class StandardLoadWatch(
      * [standardLoadSampleIntervalMs] before it, to read the progress the player does not signal.
      */
     fun nextCheckInMs(): Long? {
-        val current = watch ?: return null
+        val current = load?.watch ?: return null
         val untilDeadline = (current.deadlineMs() - nowMs()).coerceAtLeast(0L)
         return minOf(untilDeadline, standardLoadSampleIntervalMs(current.stallTimeoutMs))
     }
 
     /** Forgets the load in progress (the player is no longer this backend's to watch). */
     fun reset() {
-        readyItem = null
-        endLoad()
-    }
-
-    private fun disarm() {
-        watch = null
-        watchedItem = null
-    }
-
-    private fun endLoad() {
-        disarm()
-        loadItem = null
-        progressItem = null
+        state = State.Idle(null)
     }
 }
 
