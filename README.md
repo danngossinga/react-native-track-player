@@ -144,12 +144,18 @@ Added fork surface:
   track is never reported, the player goes back to the active track, paused
   (crossfade's cancelled operation), and the seek acts on that track (before: the
   standard backend paused or sought the loading track, which then became active;
-  a pause did not cancel the command). None of the cancelled track's media loads
-  after that; on Android's standard backend, after a seek or pause, ExoPlayer keeps
-  the cancelled track's source prepared while it is in the queue, so an HLS
-  playlist request already under way completes and the source then fetches its
-  primary media playlist (a stop releases it); on iOS SwiftAudioEx cancels the
-  asset's loading. The rejection is the report:
+  a pause did not cancel the command). With no active track (the first track's
+  load failed), the cancel stops the loading track and leaves no active track
+  (crossfade's active index -1): that track is never reported, a seek then rejects
+  with `standard_seek_unavailable`, and the next play starts the first track, as
+  crossfade's play with no active track (before: the cancelled track went on
+  loading and became active). Nothing of the cancelled track loads after that,
+  not even a playlist: Android's standard backend releases its source (ExoPlayer
+  would keep it prepared while it is in the queue, and an HLS source would fetch
+  its primary media playlist); on iOS SwiftAudioEx cancels the asset's loading.
+  `seekBy` (and the remote jump buttons, which call it) is relative to the
+  position the app reads: the active track's while another track loads (before:
+  the loading track's). The rejection is the report:
   no `PlaybackError` event for it. A load no command waits for (a natural
   advance, a play or retry after a failure) reports its failure with a
   `PlaybackError` event (`code`, `message`), after the `PlaybackState` error event
@@ -186,9 +192,13 @@ Added fork surface:
   applies from the item's creation; an iOS crossfade seek, which had no limit before, now fails on a stall or
   at this limit and the player then reports an error state), `playStartTimeoutMs` (crossfade play start, iOS and Android),
   `standardReadyTimeoutMs` (standard backend readiness) and
-  `standardSeekTimeoutMs` (standard seek, iOS and Android; on iOS, before the seek
-  is issued only this limit applies, then the buffered position is its only
-  progress signal), each
+  `standardSeekTimeoutMs` (standard seek, iOS and Android, set apart from
+  `prepareTimeoutMs`: a seek owns its track's loading, which the load limit does
+  not end meanwhile; on iOS, before the seek is issued only this limit applies,
+  then the buffered position is its only progress signal: a seek on a track whose
+  playlists never answer gives up at `stallTimeoutMs` on Android and at this limit
+  on iOS, then on both it stops loading, fails the track again and leaves the
+  player in error, and the next play loads the active track), each
   60000 by default. On iOS, a backend switch waits at most the load limit plus
   the play-start limit plus 5 s (at least 10 s); on Android it does not block a
   thread and is bounded by the load and play-start waits themselves. The play
