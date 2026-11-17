@@ -246,6 +246,19 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testTheBridgeSendsTheSameRejectionCodesAsAndroid() {
+        // Android sends every command failure's own code; iOS the same codes. Standard seeks
+        // (before: all `seek_failed` on iOS) and crossfade seeks.
+        for code in ["standard_seek_timeout", "standard_seek_cancelled", "standard_seek_unavailable", "crossfade_seek_timeout",
+                     "crossfade_prepare_timeout", "crossfade_engine_error", "cancelled", "crossfade_play_start_timeout",
+                     "crossfade_start_failed", audioFocusRefusedCode] {
+            XCTAssertEqual(bridgeRejectionCode(code, fallback: "seek_failed"), code)
+        }
+        // iOS alone checks the position is finite: the command's own code.
+        XCTAssertEqual(bridgeRejectionCode("standard_seek_invalid_position", fallback: "seek_failed"), "seek_failed")
+        XCTAssertEqual(bridgeRejectionCode(nil, fallback: "skip_failed"), "skip_failed")
+    }
+
     func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed() {
         // The crossfade rule on both platforms (Android: startTrackAt of failedLoadIndex), as the
         // standard backends' FailedLoadRule (LOAD-03): the active track when there is one, else

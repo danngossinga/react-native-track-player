@@ -97,6 +97,16 @@ Added fork surface:
   player in an error state with the same `crossfade_prepare_timeout` code; a
   stalled standard seek stops loading and leaves the player in error (its promise
   rejects with `standard_seek_timeout`).
+- `seekTo` and `seekBy` reject with codes that depend on the backend (the same
+  codes on Android and iOS): the standard backend uses `standard_seek_timeout`
+  (no progress for `stallTimeoutMs`, or over `standardSeekTimeoutMs`),
+  `standard_seek_cancelled` (a newer seek, a skip, pause, stop, load or another
+  track took over) and `standard_seek_unavailable` (no active track, or it failed
+  to load); the crossfade backend uses `crossfade_seek_timeout`,
+  `crossfade_prepare_timeout` or `crossfade_engine_error` (the track had to load
+  again and failed) and `cancelled`. iOS sent all of them as `seek_failed`
+  before; it still does for `standard_seek_invalid_position` (a position that is
+  not a finite number), which only iOS checks.
 - `skip`, `skipToNext`, `skipToPrevious` and `load` resolve once their track
   loaded and is the active one (`getActiveTrackIndex()` returns it), on both
   backends and both platforms, paused or playing; `initialPosition` is applied

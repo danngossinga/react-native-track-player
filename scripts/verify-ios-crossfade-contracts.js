@@ -513,7 +513,10 @@ assert(
     // activation, which Android does not wait for either).
     section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
     (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
-    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]') &&
+    // The codes sent as they are (sharedRejectionCodes, tested by
+    // testTheBridgeSendsTheSameRejectionCodesAsAndroid), read by every command's rejection.
+    player.includes('return bridgeRejectionCode((error as NSError).userInfo["code"] as? String, fallback: fallback)') &&
+    !player.includes('static let sharedRejectionCodes') &&
     (player.match(/reject\(self\.rejectionCode\(error, "seek_failed"\), "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
@@ -584,7 +587,7 @@ assert(
     section(player, 'public func retry(resolve:', 'public func setRepeatMode(').includes('reject(self.rejectionCode(error, "retry_failed")') &&
     standardBackend.includes('    var startingCommandPlays: Bool {\n        return onMain {\n            commandStartsPlayback(playWhenReady: publicPlayWhenReady, stateRawValue: playbackState.rawValue)') &&
     pingPongBackend.includes('    var startingCommandPlays: Bool {\n        return (try? performPlaybackBackendOnMainSync {\n            commandStartsPlayback(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)') &&
-    player.includes('"crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]') &&
+    facade.includes('    "cancelled", audioFocusRefusedCode,\n]') &&
     facade.includes('let audioFocusRefusedCode = "audio_focus_refused"') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayIsDecidedFromTheActivationAlone()') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAResumeNeedsTheSessionAndNothingElseActivatesIt()'),

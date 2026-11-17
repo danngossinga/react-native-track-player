@@ -415,12 +415,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// gives up, a crossfade whose incoming song does not start, a load that gives up or fails
     /// (both backends' skip, next, previous and load) and a command a newer one cancelled. Other
     /// failures keep the command's generic code.
-    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]
-
+    /// The error's code when Android sends the same (sharedRejectionCodes), else `fallback`.
     private func rejectionCode(_ error: Error, _ fallback: String) -> String {
-        guard let code = (error as NSError).userInfo["code"] as? String,
-              Self.sharedRejectionCodes.contains(code) else { return fallback }
-        return code
+        return bridgeRejectionCode((error as NSError).userInfo["code"] as? String, fallback: fallback)
     }
 
     private func rejectWhenNotInitialized(reject: RCTPromiseRejectBlock) -> Bool {

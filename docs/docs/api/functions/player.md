@@ -47,6 +47,20 @@ Seeks by a relative time offset in the current track.
 
 Seeks to a specified time position in the current track.
 
+The promise resolves once the player is at that position. It rejects with a code that depends
+on the backend, the same on Android and iOS:
+
+| Backend | Code | When |
+| ------- | ---- | ---- |
+| standard | `standard_seek_timeout` | no progress for `stallTimeoutMs`, or over `standardSeekTimeoutMs`; the player stops loading and is in an error state |
+| standard | `standard_seek_cancelled` | a newer seek, a skip, pause, stop, load or another track took over |
+| standard | `standard_seek_unavailable` | no active track, or it failed to load |
+| crossfade | `crossfade_seek_timeout` | the seek made no progress, or went over its limit |
+| crossfade | `crossfade_prepare_timeout`, `crossfade_engine_error` | the track had to load again and failed |
+| crossfade | `cancelled` | a newer command took over |
+
+iOS alone rejects a position that is not a finite number, with `seek_failed`.
+
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |
 | seconds | `number` | The position in seconds |

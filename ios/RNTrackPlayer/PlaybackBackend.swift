@@ -297,6 +297,25 @@ enum InterruptionStep: Equatable {
 /// The code a refused play rejects with and reports (`playback-error`), the same on Android.
 let audioFocusRefusedCode = "audio_focus_refused"
 
+/// The rejection codes the module sends to JS as they are, as Android sends every command
+/// failure's own code: play start, crossfade, load and seek failures (standard and crossfade
+/// seeks: `standard_seek_timeout`, `standard_seek_cancelled`, `standard_seek_unavailable`,
+/// `crossfade_seek_timeout`), `cancelled` and a refused audio focus. Any other error rejects with
+/// the command's own code (`seek_failed`, `skip_failed`...); `standard_seek_invalid_position` is
+/// iOS's alone (Android has no such check) and stays `seek_failed`.
+let sharedRejectionCodes: Set<String> = [
+    "crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", "crossfade_prepare_timeout",
+    "crossfade_seek_timeout", "standard_seek_timeout", "standard_seek_cancelled", "standard_seek_unavailable",
+    "cancelled", audioFocusRefusedCode,
+]
+
+/// The code a command rejects with in JS: the error's own when Android sends the same, else
+/// the command's `fallback`.
+func bridgeRejectionCode(_ code: String?, fallback: String) -> String {
+    guard let code = code, sharedRejectionCodes.contains(code) else { return fallback }
+    return code
+}
+
 func audioFocusRefusedError() -> Error {
     NSError(domain: "RNTrackPlayer.PlaybackBackend", code: 1, userInfo: [
         NSLocalizedDescriptionKey: "The system did not give the audio to this player (a call or another app holds it).",
