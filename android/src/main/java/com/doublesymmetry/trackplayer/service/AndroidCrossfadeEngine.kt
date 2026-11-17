@@ -29,6 +29,7 @@ import com.google.android.exoplayer2.upstream.DefaultDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
 import kotlinx.coroutines.delay
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
@@ -110,18 +111,33 @@ internal class AndroidCrossfadeEngine(
         crossfadeBandwidthMeter(context, estimate)
     }
     /**
-     * Media bytes this player has downloaded (segments, a progressive file): a load's progress,
-     * counted while a segment arrives. Playlists and keys are not counted: the player reloads them
-     * when it falls back to another rendition after a failed segment, which is not progress.
+     * Bytes this player has downloaded that count as a load's progress: media (segments, a
+     * progressive file) always; HLS playlists and keys only until the track's first segment is
+     * asked for. Before that they are the load's only progress (a slow proxy answering the
+     * playlists must not fail a healthy track); after it, the player reloads them when it falls
+     * back to another rendition after a failed segment, which is not progress. The total limit
+     * (prepareTimeoutMs) bounds both stages.
      */
     private val bytesLoaded = AtomicLong(0L)
+    /** Set once the current track has asked for a segment; reset at every load. */
+    private val mediaRequested = AtomicBoolean(false)
     private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)
-    /** HLS playlists and keys. */
+    /** HLS playlists and keys: progress until the first segment is asked for. */
     private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
+        .setTransferListener(object : TransferListener {
+            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+                if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())
+            }
+            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        })
     /** Media: segments and progressive files, whose bytes are progress. */
     private val mediaDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
         .setTransferListener(object : TransferListener {
-            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+                mediaRequested.set(true)
+            }
             override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
             override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
                 bytesLoaded.addAndGet(bytesTransferred.toLong())
@@ -208,6 +224,8 @@ internal class AndroidCrossfadeEngine(
         // Every track starts from the app's current estimate, not from the last track's measure.
         // A start-of-track estimate: a new value waits for the next track; the playing one keeps
         // following the measured bandwidth.
+        // A new track: its playlists are progress again until it asks for a segment.
+        mediaRequested.set(false)
         val initialEstimate = bandwidthMeter.startTrack()
         androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
         player.setMediaItem(buildMediaItem(item))

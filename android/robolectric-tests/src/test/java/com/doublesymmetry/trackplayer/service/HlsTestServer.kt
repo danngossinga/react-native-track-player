@@ -30,7 +30,9 @@ internal class HlsTestServer(
     private val failingStatus: Int? = null,
     private val failingAfterMs: Long = 0L,
     /** When set, the master playlist's body instead of the renditions (a broken playlist). */
-    private val masterBody: String? = null
+    private val masterBody: String? = null,
+    /** How long the master and each media playlist take to answer (a busy proxy or origin). */
+    private val playlistDelayMs: Long = 0L
 ) : AutoCloseable {
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
@@ -73,8 +75,14 @@ internal class HlsTestServer(
                 requests += path
                 val segment = SEGMENT_NAME.matchEntire(path.substringAfterLast('/'))?.groupValues?.get(1)?.toInt()
                 when {
-                    path == "/master.m3u8" -> respond(connection, (masterBody ?: masterPlaylist()).toByteArray(), PLAYLIST_TYPE)
-                    path.endsWith("/index.m3u8") -> respond(connection, mediaPlaylist().toByteArray(), PLAYLIST_TYPE)
+                    path == "/master.m3u8" -> {
+                        Thread.sleep(playlistDelayMs)
+                        respond(connection, (masterBody ?: masterPlaylist()).toByteArray(), PLAYLIST_TYPE)
+                    }
+                    path.endsWith("/index.m3u8") -> {
+                        Thread.sleep(playlistDelayMs)
+                        respond(connection, mediaPlaylist().toByteArray(), PLAYLIST_TYPE)
+                    }
                     segment != null && segment >= stalledFrom && failingStatus != null -> {
                         stalledRequestTimesMs += monotonicNowMs()
                         Thread.sleep(failingAfterMs)
