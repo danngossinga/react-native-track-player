@@ -412,9 +412,10 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     // MARK: - Bridged Methods
 
     /// Codes iOS rejects with as Android does (its RejectionException's code): a play start that
-    /// gives up and a crossfade whose incoming song does not start. Other failures keep the
-    /// command's generic code.
-    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", audioFocusRefusedCode]
+    /// gives up, a crossfade whose incoming song does not start, a load that gives up or fails
+    /// (both backends' skip, next, previous and load) and a command a newer one cancelled. Other
+    /// failures keep the command's generic code.
+    private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]
 
     private func rejectionCode(_ error: Error, _ fallback: String) -> String {
         guard let code = (error as NSError).userInfo["code"] as? String,
@@ -2038,6 +2039,12 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+        // A load a command (skip, next, previous, load) waits for reports its failure by the
+        // command's rejection, as the crossfade path and Android: no playback error on top of it.
+        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
+           backend.identity === source, backend.reportsPlayerErrorThroughCommand() {
+            return
+        }
         // The code and message, as Android's standard player and the crossfade path send them
         // (`error` kept for apps that read it).
         var body: [String: Any] = ["error": error?.localizedDescription as Any]

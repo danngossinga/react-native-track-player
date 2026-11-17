@@ -93,10 +93,23 @@ Added fork surface:
   example `crossfade_prepare_timeout`, and `message`) on both platforms.
   The standard backend follows the same rule on both platforms: a load (a load,
   a skip, a natural advance, a retry) whose media makes no progress for
-  `stallTimeoutMs`, or exceeds `prepareTimeoutMs`, stops loading, leaves the
-  player in an error state and emits a `PlaybackError` with the same
-  `crossfade_prepare_timeout` code; a stalled standard seek stops loading and
-  leaves the player in error (its promise rejects with `standard_seek_timeout`).
+  `stallTimeoutMs`, or exceeds `prepareTimeoutMs`, stops loading and leaves the
+  player in an error state with the same `crossfade_prepare_timeout` code; a
+  stalled standard seek stops loading and leaves the player in error (its promise
+  rejects with `standard_seek_timeout`).
+- `skip`, `skipToNext`, `skipToPrevious` and `load` resolve once their track
+  loaded and is the active one (`getActiveTrackIndex()` returns it), on both
+  backends and both platforms, paused or playing; `initialPosition` is applied
+  after that load. When the track fails to load they reject and the previous
+  track stays active: `crossfade_prepare_timeout` (a give-up),
+  `crossfade_engine_error` (a player error) or `cancelled` (a newer skip, load,
+  seek, stop or queue change took over; on the standard backend a pause does not
+  end the load, so it does not cancel the command). The rejection is the report:
+  no `PlaybackError` event for it. A load no command waits for (a natural
+  advance, a play or retry after a failure) reports its failure with a
+  `PlaybackError` event (`code`, `message`). iOS now rejects crossfade loads that
+  give up or are cancelled with these codes too (before: `skip_failed`,
+  `playback_backend_load_failed`), as Android.
 - A track becomes the active one once it loaded, on both backends and both
   platforms (iOS crossfade's rule, the chosen alignment): `PlaybackActiveTrackChanged`
   (and the deprecated `PlaybackTrackChanged`) comes then, never for a track that

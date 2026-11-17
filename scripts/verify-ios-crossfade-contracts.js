@@ -512,7 +512,7 @@ assert(
     // activation, which Android does not wait for either).
     section(orchestrator, 'private func loadIndex(', 'private func ').includes('self.reportPlaybackStartFailure(error)') &&
     (orchestrator.match(/self\.reportPlaybackStartFailure\(error\)/g) || []).length === 1 &&
-    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", audioFocusRefusedCode]') &&
+    player.includes('private static let sharedRejectionCodes: Set<String> = ["crossfade_play_start_timeout", "crossfade_engine_error", "crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]') &&
     (player.match(/reject\(self\.rejectionCode\(error, "seek_failed"\), "Unable to seek\.", error\)/g) || []).length === 2 &&
     orchestrator.includes('completion(.failure(self.makeError("crossfade_start_failed", error.localizedDescription)))') &&
     player.includes('emit(event: EventType.PlaybackError, body: ["code": code, "message": message])') &&
@@ -583,7 +583,7 @@ assert(
     section(player, 'public func retry(resolve:', 'public func setRepeatMode(').includes('reject(self.rejectionCode(error, "retry_failed")') &&
     standardBackend.includes('    var startingCommandPlays: Bool {\n        return onMain {\n            commandStartsPlayback(playWhenReady: publicPlayWhenReady, stateRawValue: playbackState.rawValue)') &&
     pingPongBackend.includes('    var startingCommandPlays: Bool {\n        return (try? performPlaybackBackendOnMainSync {\n            commandStartsPlayback(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)') &&
-    player.includes('"crossfade_start_failed", audioFocusRefusedCode]') &&
+    player.includes('"crossfade_start_failed", "crossfade_prepare_timeout", "cancelled", audioFocusRefusedCode]') &&
     facade.includes('let audioFocusRefusedCode = "audio_focus_refused"') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayIsDecidedFromTheActivationAlone()') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAResumeNeedsTheSessionAndNothingElseActivatesIt()'),
@@ -665,15 +665,16 @@ assert(
   'An iOS failed seek must report its target; the end observer must act while preloading.'
 );
 
-// The standard player's loads follow the stall rule (no command waits for them), as the crossfade
-// path and Android's standard player: a load with no progress for stallTimeoutMs (buffered media)
-// or over prepareTimeoutMs stops loading (SwiftAudioEx stop: the item leaves the AVPlayer), is in
-// error and reports crossfade_prepare_timeout as a PlaybackError; a stalled seek stops loading and
+// The standard player's loads follow the stall rule, as the crossfade path and Android's standard
+// player: a load with no progress for stallTimeoutMs (buffered media) or over prepareTimeoutMs
+// stops loading (SwiftAudioEx stop: the item leaves the AVPlayer), is in error and reports
+// crossfade_prepare_timeout as a PlaybackError (a skip or load waiting for it rejects with it
+// instead); a stalled seek stops loading and
 // leaves the player in error (its rejection is the report).
 {
   const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
   const poll = section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func followLoad(');
-  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, keptPosition: Double? = nil) {', '\n    }\n');
+  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, failsLoad: Bool, keptPosition: Double? = nil) {', '\n    }\n');
   const driver = section(facade, 'final class StandardLoadDriver {', '\n}\n');
   const gaveUp = section(player, 'func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
   const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
@@ -689,7 +690,10 @@ assert(
       facade.includes('return max(1, stallTimeoutMs / 10)') &&
       !backendSource.includes('stallCheckIntervalMs') &&
       // A failed seek keeps its target as the position.
-      backendSource.includes('report: false,\n                    keptPosition: request.position') &&
+      backendSource.includes('report: false,\n                    failsLoad: false,\n                    keptPosition: request.position') &&
+      // A load a command waits for fails the load (FailedLoadRule) but is reported by the
+      // command's rejection, not a playback error (as the crossfade path and Android).
+      section(backendSource, 'private func giveUpLoad(', '\n    }\n').includes('report: !commandLoads.waits(for: item),\n            failsLoad: true') &&
       backendSource.includes('return giveUpState?.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
       giveUp.includes('player.stop()') &&
@@ -714,7 +718,7 @@ assert(
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")') &&
       backendSource.includes('if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {\n            return indexOfItem(failedLoads.reported) ?? -1') &&
       section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func giveUpLoad(').includes('followLoad(observed)') &&
-      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, keptPosition: Double? = nil) {', '\n    }\n').includes('if report { failLoadedTrack() }') &&
+      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, failsLoad: Bool, keptPosition: Double? = nil) {', '\n    }\n').includes('if failsLoad { failLoadedTrack() }') &&
       backendSource.includes('loadActiveTrackAfterFailedLoad()\n            reloadAtKeptPosition(kept)\n            requested.request(true)\n            player.play()') &&
       // A track is reported once it loaded (deferred), both events, and the lock screen points
       // back to the active track after a failed load.
@@ -738,5 +742,35 @@ assert(
     section(engine, 'func prepare(track: Track, position: Double, completion:', 'asset.loadValuesAsynchronously(').includes('NSLocalizedDescriptionKey: crossfadeLoadTimeoutMessage(reason),'),
   'An iOS load that gives up must use the shared give-up message at every stage.'
 );
+
+// Standard skip, next, previous and load end as crossfade's and Android's (smart-music-player
+// reads the active index right after them): once the track loaded and is the active one, then
+// any initial seek, or rejected with the load's failure (crossfade_prepare_timeout,
+// crossfade_engine_error) or `cancelled`, codes JS receives as on Android; a failure a command
+// waits for is not also a playback error. The XCTest target reaches StandardCommandLoad only.
+{
+  const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  const followLoad = section(standardBackend, 'private func followLoad(', '\n    }\n');
+  assert(
+    facade.includes('let standardLoadErrorCode = "crossfade_engine_error"') &&
+      section(standardBackend, 'func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {', '\n    }\n').includes('waitForCommandLoad { [weak self] result in') &&
+      section(standardBackend, 'func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', 'func skipToNext(').includes('finishCommandLoad(') &&
+      (section(standardBackend, 'func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', 'func skipToPrevious(').match(/finishCommandLoad\(seekTo: initialTime >= 0 \? initialTime : nil, completion: completion\)/g) || []).length === 2 &&
+      section(standardBackend, 'func skipToPrevious(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', 'func play(completion:').includes('finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)') &&
+      section(standardBackend, 'private func waitForCommandLoad(', '\n    }\n').includes('completion(.failure(playbackBackendError(code: "cancelled", message: standardCommandLoadCancelledMessage)))') &&
+      followLoad.includes('commandLoads.ruleSettled(active: failedLoads.active, reported: failedLoads.reported)') &&
+      followLoad.includes('code: standardLoadErrorCode,') &&
+      section(standardBackend, 'private func giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message)') &&
+      section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('commandLoads.cancel()') &&
+      ['func stop() {', 'func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {', 'func dispose() throws {'].every((start) =>
+        section(standardBackend, start, '\n    }\n').includes('commandLoads.cancel()')) &&
+      section(player, 'func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {', '\n    }\n').includes('backend.identity === source, backend.reportsPlayerErrorThroughCommand() {') &&
+      ['testStandardCommandLoadSmartMusicPlayersSequenceEndsOnceTheTargetLoadedAndIsReported',
+        'testStandardCommandLoadASkipToTheSelectedFirstTrackEndsAtItsLoadNotAtItsSelection',
+        'testStandardCommandLoadAFailedLoadRejectsWithItsCodeAndTheCommandReportsIt',
+        'testStandardCommandLoadANewerCommandCancelsTheOlderWait'].every((t) => tests.includes(`func ${t}()`)),
+    'iOS standard skip, next, previous and load must end once their track loaded, as crossfade and Android.'
+  );
+}
 
 console.log('iOS crossfade contracts OK');

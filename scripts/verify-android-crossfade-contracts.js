@@ -440,7 +440,7 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        failedLoads.command()\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
+    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled.\n        commandLoads.cancel()\n        failedLoads.command()\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
@@ -838,10 +838,10 @@ assert(
   'The Android end monitor must also act while the next track preloads, as iOS.'
 );
 
-// The standard player's loads follow the stall rule (no command waits for them): a load that
-// makes no progress for stallTimeoutMs (media bytes and buffered media; playlists and keys are
-// not progress) or exceeds prepareTimeoutMs stops loading and reports crossfade_prepare_timeout
-// with the error state, as a crossfade advance. A stalled standard seek stops loading and leaves
+// The standard player's loads follow the stall rule: a load that makes no progress for
+// stallTimeoutMs (media bytes and buffered media; playlists and keys are not progress) or exceeds
+// prepareTimeoutMs stops loading and reports crossfade_prepare_timeout with the error state, as a
+// crossfade advance (a skip or load waiting for it rejects with it instead). A stalled standard seek stops loading and leaves
 // the player in error (its rejection is the report). Pinned behaviour: robolectric-tests
 // StandardPlayerHlsTest (real ExoPlayer).
 {
@@ -864,7 +864,9 @@ assert(
       section(standardBackend, 'fun startLoadWatch(handler: android.os.Handler) {', '\n    }\n').includes('it.listenTo(collector)') &&
       section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('loadDriver?.poke()') &&
       giveUp.includes('androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")') &&
-      giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),\n            report = true') &&
+      giveUp.includes('val message = standardLoadGiveUpMessage(verdict, stallMs, totalMs)') &&
+      // Reported as a playback error only when no command waits for the load (its rejection reports it).
+      giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),\n            report = !commandLoads.waitsFor(item)') &&
       failLoad.includes('exoPlayer.stop()') && failLoad.includes('playerState = AudioPlayerState.ERROR') &&
       failLoad.includes('if (report) playerEventHolder.updatePlaybackError(error)') &&
       vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
@@ -950,6 +952,35 @@ assert(
   assert(
     !/RejectionException\("\$name/.test(engineSource),
     'Android engine errors must not name the engine (engineA/engineB) in their message.'
+  );
+}
+
+// Standard skip, next, previous and load end as crossfade's (smart-music-player reads the active
+// index right after them): once the track loaded and is the active one, or rejected with the
+// load's failure (crossfade_prepare_timeout, crossfade_engine_error) or `cancelled`; a failure a
+// command waits for is not also a playback error. Pinned behaviour: StandardCommandLoadTest and
+// robolectric-tests StandardBackendHlsTest; MusicService's event filter has no test.
+{
+  const commandLoad = read('android/src/main/java/com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt');
+  const hls = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt');
+  const playbackErrors = section(musicService, 'ownerScope.collectWithAdmission(source.event.playbackError, admission) {', '\n        }\n');
+  assert(
+    commandLoad.includes('internal const val STANDARD_LOAD_ERROR_CODE = "crossfade_engine_error"') &&
+      ['override suspend fun load(item: TrackAudioItem) {', 'override suspend fun skip(index: Int) {',
+        'override suspend fun skipToNext() {', 'override suspend fun skipToPrevious() {'].every((start) =>
+        section(standardBackend, start, '\n    }\n').includes('awaitCommandLoad()')) &&
+      section(standardBackend, 'private suspend fun awaitCommandLoad() {', '\n    }\n').includes('throw RejectionException(STANDARD_COMMAND_LOAD_CANCELLED_MESSAGE, "cancelled")') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('commandLoads.ruleSettled(failedLoads.active, failedLoads.reported)') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
+      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message)') &&
+      ['override fun stop() {\n        commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        commandLoads.cancel()',
+        'override fun clearQueue() {\n        commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
+      playbackErrors.includes('if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission') &&
+      read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt",') &&
+      ['aSkipAfterSettingTheQueueResolvesOnceTheTargetLoadedAndIsTheActiveTrack', 'aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded',
+        'aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded', 'aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive',
+        'aNewerSkipCancelsTheWaitOfTheOlderOne'].every((t) => hls.includes(`fun ${t}()`)),
+    'Android standard skip, next, previous and load must end once their track loaded, as crossfade.'
   );
 }
 

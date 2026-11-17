@@ -24,6 +24,7 @@ val engineSources = listOf(
     "com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt",
     "com/doublesymmetry/trackplayer/service/StallWatch.kt",
     "com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt",
+    "com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt",
     "com/doublesymmetry/trackplayer/service/StandardLoadWatch.kt",
     "com/doublesymmetry/trackplayer/model/TrackAudioItem.kt",
     "com/doublesymmetry/trackplayer/utils/RejectionException.kt"

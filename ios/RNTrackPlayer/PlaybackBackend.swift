@@ -1890,3 +1890,110 @@ func indexToPlayAfterFailedLoad(currentIndex: Int, failedIndex: Int?, count: Int
 func standardSeekEndStopsLoading(didFinish: Bool, sameTrack: Bool, isLatest: Bool) -> Bool {
     return !didFinish && sameTrack && isLatest
 }
+
+/// The code a standard command rejects with when the player fails its track's load, as a
+/// crossfade load whose engine fails (both platforms).
+let standardLoadErrorCode = "crossfade_engine_error"
+/// The message of a standard load that failed with no message of its own (Android: the same).
+let standardLoadFailedMessage = "The track failed to load."
+/// The message of a standard command's wait that a newer command ended (Android: the same).
+let standardCommandLoadCancelledMessage = "A newer command replaced this one before its track loaded."
+
+/// How a standard command's wait for its track's load ended.
+enum StandardCommandLoadOutcome: Equatable {
+    case loaded
+    case failed(code: String, message: String)
+    case cancelled
+}
+
+/// The standard player's commands that load a track (skip, next, previous, load) end as the
+/// crossfade path's do: once the track loaded and is the active one (`FailedLoadRule`), or with
+/// the load's failure, rejected with its code (a give-up: `crossfade_prepare_timeout`; a player
+/// error: `crossfade_engine_error`). A newer command that loads, seeks or stops ends the older
+/// wait with `cancelled`. A failure a command waits for is reported by its rejection only, not
+/// also as a playback error (a load no command waits for, a natural advance, reports a playback
+/// error). Same rule on Android (StandardCommandLoad.kt). Items are compared by identity. Main.
+final class StandardCommandLoad {
+    /// One command's wait for `target`'s load.
+    final class Wait {
+        let target: ObjectIdentifier
+        fileprivate let settle: (StandardCommandLoadOutcome) -> Void
+
+        fileprivate init(target: ObjectIdentifier, settle: @escaping (StandardCommandLoadOutcome) -> Void) {
+            self.target = target
+            self.settle = settle
+        }
+    }
+
+    private var wait: Wait?
+    /// The item whose failure a command's rejection reported (no playback error for it).
+    private var failureReportedByCommand: ObjectIdentifier?
+
+    /// A command waits for a load.
+    var isWaiting: Bool { return wait != nil }
+
+    /// A command waits for `target`'s load: settled at once when `target` is already the loaded
+    /// track the app was told of (`FailedLoadRule`'s `active` and `reported`), else by
+    /// `ruleSettled`, `failed` or `cancel`. An older wait ends cancelled. Returns the wait, nil
+    /// when settled at once.
+    @discardableResult
+    func begin(
+        target: ObjectIdentifier,
+        active: ObjectIdentifier?,
+        reported: ObjectIdentifier?,
+        settle: @escaping (StandardCommandLoadOutcome) -> Void
+    ) -> Wait? {
+        cancel()
+        failureReportedByCommand = nil
+        if active == target && reported == target {
+            settle(.loaded)
+            return nil
+        }
+        let created = Wait(target: target, settle: settle)
+        wait = created
+        return created
+    }
+
+    /// `FailedLoadRule` after a ready item: the wait for the track that loaded ends once it is
+    /// the active track and the app was told of it (a new queue's first track was reported at its
+    /// selection: it ends at its load all the same).
+    func ruleSettled(active: ObjectIdentifier?, reported: ObjectIdentifier?) {
+        guard let current = wait, let active = active, active == reported, current.target == active else { return }
+        wait = nil
+        current.settle(.loaded)
+    }
+
+    /// Whether a command waits for `item`'s load (its failure is then that command's to report).
+    func waits(for item: ObjectIdentifier?) -> Bool {
+        return item != nil && wait?.target == item
+    }
+
+    /// `item`'s load failed: its wait ends rejected with `code`. Returns whether one waited.
+    @discardableResult
+    func failed(_ item: ObjectIdentifier?, code: String, message: String) -> Bool {
+        guard let current = wait, current.target == item else { return false }
+        wait = nil
+        failureReportedByCommand = item
+        current.settle(.failed(code: code, message: message))
+        return true
+    }
+
+    /// A newer command that loads, seeks or stops: the wait in progress ends cancelled.
+    func cancel() {
+        guard let current = wait else { return }
+        wait = nil
+        current.settle(.cancelled)
+    }
+
+    /// Whether the player's error on `item` is a command's to report (by its rejection): one
+    /// waits for its load, or rejected with its failure.
+    func reportsFailure(of item: ObjectIdentifier?) -> Bool {
+        guard let item = item else { return false }
+        return wait?.target == item || failureReportedByCommand == item
+    }
+
+    /// The player is no longer in that error (a new load): its later errors are reported again.
+    func failureCleared() {
+        failureReportedByCommand = nil
+    }
+}

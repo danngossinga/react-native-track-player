@@ -367,6 +367,106 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(h.observe(h.a, .loading), .stalled)
     }
 
+    // A standard command's wait for its track's load (the crossfade rule), with FailedLoadRule as
+    // StandardPlaybackBackend feeds them; the same cases as Android's StandardCommandLoadTest.
+
+    func testStandardCommandLoadSmartMusicPlayersSequenceEndsOnceTheTargetLoadedAndIsReported() {
+        let h = CommandLoadHarness()
+        // setQueue: the first track is selected (reported at once), then skip(2).
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        h.command(h.third)
+        _ = h.rule.moved(h.third)
+        XCTAssertEqual(h.outcomes, [], "the skip waits while its track loads")
+        XCTAssertEqual(h.rule.reported, h.first, "the previous track is still the one the app has")
+        h.ready()
+        XCTAssertEqual(h.outcomes, [.loaded])
+        XCTAssertEqual(h.rule.reported, h.third, "the target is the active track when the skip ends")
+        // Previous: skip back to the second track.
+        h.outcomes.removeAll()
+        h.command(h.second)
+        _ = h.rule.moved(h.second)
+        XCTAssertEqual(h.outcomes, [])
+        h.ready()
+        XCTAssertEqual(h.outcomes, [.loaded])
+        XCTAssertEqual(h.rule.reported, h.second)
+    }
+
+    func testStandardCommandLoadASkipToTheSelectedFirstTrackEndsAtItsLoadNotAtItsSelection() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        XCTAssertEqual(h.rule.reported, h.first, "selected and reported at once")
+        h.command(h.first)
+        XCTAssertEqual(h.outcomes, [], "reported but not loaded: the skip waits")
+        h.ready()
+        XCTAssertEqual(h.outcomes, [.loaded])
+    }
+
+    func testStandardCommandLoadASkipToTheTrackAlreadyLoadedAndReportedEndsAtOnce() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        _ = h.rule.ready()
+        XCTAssertNil(h.loads.begin(target: h.first, active: h.rule.active, reported: h.rule.reported) { h.outcomes.append($0) })
+        XCTAssertEqual(h.outcomes, [.loaded])
+        XCTAssertFalse(h.loads.isWaiting)
+    }
+
+    func testStandardCommandLoadAnotherTrackReadyDoesNotEndTheWait() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        _ = h.rule.ready()
+        h.command(h.second)
+        // The player still showed the first track ready (its move not yet seen).
+        h.ready()
+        XCTAssertEqual(h.outcomes, [])
+        XCTAssertTrue(h.loads.isWaiting)
+    }
+
+    func testStandardCommandLoadAFailedLoadRejectsWithItsCodeAndTheCommandReportsIt() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        _ = h.rule.ready()
+        h.command(h.second)
+        _ = h.rule.moved(h.second)
+        XCTAssertTrue(h.loads.waits(for: h.second))
+        XCTAssertTrue(h.loads.reportsFailure(of: h.second))
+        XCTAssertFalse(h.loads.failed(h.first, code: standardPrepareTimeoutCode, message: "x"), "another track's failure is not this command's")
+        _ = h.rule.failed()
+        XCTAssertTrue(h.loads.failed(h.second, code: standardPrepareTimeoutCode, message: "The track did not become ready."))
+        XCTAssertEqual(h.outcomes, [.failed(code: standardPrepareTimeoutCode, message: "The track did not become ready.")])
+        XCTAssertEqual(h.rule.reported, h.first, "the previous track stays active")
+        // Its player error is the rejection's, not a playback error, until the player leaves it.
+        XCTAssertTrue(h.loads.reportsFailure(of: h.second))
+        XCTAssertFalse(h.loads.reportsFailure(of: h.first))
+        h.loads.failureCleared()
+        XCTAssertFalse(h.loads.reportsFailure(of: h.second))
+    }
+
+    func testStandardCommandLoadANewerCommandCancelsTheOlderWait() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        _ = h.rule.ready()
+        var older: [StandardCommandLoadOutcome] = []
+        _ = h.rule.command()
+        h.loads.begin(target: h.second, active: h.rule.active, reported: h.rule.reported) { older.append($0) }
+        h.command(h.third)
+        XCTAssertEqual(older, [.cancelled])
+        _ = h.rule.moved(h.third)
+        h.loads.cancel()
+        XCTAssertEqual(h.outcomes, [.cancelled])
+        XCTAssertEqual(older.count, 1, "settled once")
+    }
+
+    func testStandardCommandLoadCodesAreTheCrossfadePaths() {
+        XCTAssertEqual(standardPrepareTimeoutCode, "crossfade_prepare_timeout")
+        XCTAssertEqual(standardLoadErrorCode, "crossfade_engine_error")
+    }
+
     func testStandardLoadWithNoItemOrAnotherOwnerNothingIsWatched() {
         let h = LoadWatchHarness()
         XCTAssertNil(h.observe(h.a, .loading))
@@ -2530,6 +2630,29 @@ private enum FakeError: Error {
     case restore
     case cancelled
     case secretDisposalDetail
+}
+
+/// FailedLoadRule and StandardCommandLoad as StandardPlaybackBackend feeds them.
+private final class CommandLoadHarness {
+    private let items = [NSObject(), NSObject(), NSObject()]
+    var first: ObjectIdentifier { return ObjectIdentifier(items[0]) }
+    var second: ObjectIdentifier { return ObjectIdentifier(items[1]) }
+    var third: ObjectIdentifier { return ObjectIdentifier(items[2]) }
+    let rule = FailedLoadRule()
+    let loads = StandardCommandLoad()
+    var outcomes: [StandardCommandLoadOutcome] = []
+
+    /// A command moved the player to `item` and waits for its load, as the backend does.
+    func command(_ item: ObjectIdentifier) {
+        _ = rule.command()
+        loads.begin(target: item, active: rule.active, reported: rule.reported) { [unowned self] in self.outcomes.append($0) }
+    }
+
+    /// The player's item became ready, as the backend's followLoad.
+    func ready() {
+        _ = rule.ready()
+        loads.ruleSettled(active: rule.active, reported: rule.reported)
+    }
 }
 
 private final class TransactionBarrier {

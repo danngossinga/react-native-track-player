@@ -107,24 +107,112 @@ class StandardBackendHlsTest {
         command { backed.backend.play() }
         awaitTrue("the first track plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
         assertEquals("the first track was reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
-        // The fan taps an uncached track while the first one plays.
+        // The fan taps an uncached track while the first one plays: the skip waits for its load
+        // and, as a crossfade skip, rejects with the give-up (the rejection is the report: no
+        // playback error event on top of it).
         backed.loadStartedAtMs = monotonicNowMs()
-        command { backed.backend.skip(1) }
+        var indexAtRejection: Int? = null
+        val error = command {
+            try {
+                backed.backend.skip(1)
+            } finally {
+                indexAtRejection = backed.backend.currentIndex
+            }
+        } as RejectionException
+        assertEquals(PREPARE_TIMEOUT_CODE, error.code)
+        assertTrue("${error.message}", error.message!!.startsWith("The track did not become ready (no progress for $STALL_TIMEOUT_MS ms"))
+        assertEquals("the active track when the skip rejected", 0, indexAtRejection)
         backed.assertGivesUpAtTheStallTimeoutAndStopsLoading(stalled)
         backed.assertStaysInError(PREPARE_TIMEOUT_CODE)
-        // The error the app sees (the backend's and KotlinAudio's playback-error event): the
-        // host's code as is, not android-crossfade_prepare_timeout.
+        // The error the app reads (the backend's): the host's code as is, not
+        // android-crossfade_prepare_timeout.
         assertEquals(PREPARE_TIMEOUT_CODE, backed.backend.playbackError?.code)
-        val emitted = backed.player.event.playbackError.replayCache.single()
-        assertEquals(PREPARE_TIMEOUT_CODE, emitted.code)
-        assertEquals(PREPARE_TIMEOUT_CODE, standardPlaybackErrorCode(emitted))
-        assertTrue("${emitted.message}", emitted.message!!.startsWith("The track did not become ready (no progress for $STALL_TIMEOUT_MS ms"))
+        assertEquals(PREPARE_TIMEOUT_CODE, standardPlaybackErrorCode(backed.player.playbackError!!))
+        assertTrue("no playback error event", backed.player.event.playbackError.replayCache.isEmpty())
         // FailedLoadRule: the previous track is active again, and the failed one never reported.
         assertEquals("the active track", 0, backed.backend.currentIndex)
         assertEquals("the load failure names the active track", listOf<Int?>(0), backed.loadFailures)
         assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
         // The player itself is on the failed track, stopped there.
         assertEquals(1, backed.player.currentIndex)
+    }
+
+    // Skip, next, previous and load end as crossfade's: once the track loaded and is the active
+    // one, or with the load's failure. Smart-music-player's sequence: set the queue, skip to the
+    // selected track, then read the active index (paused: the load still happens).
+
+    @Test
+    fun aSkipAfterSettingTheQueueResolvesOnceTheTargetLoadedAndIsTheActiveTrack() {
+        val backed = backed()
+        backed.backend.replaceQueue(listOf(item(slowServer(), 1L), item(slowServer(), 2L), item(slowServer(), 3L)))
+        val returned = backed.commandReading { backed.backend.skip(2) }
+        assertEquals("the active track when skip returned", 2, returned.index)
+        assertEquals("the player was ready when skip returned", com.google.android.exoplayer2.Player.STATE_READY, returned.exoState)
+        assertEquals("reported before skip returned", 2, returned.reported.last())
+        // Previous and next, as the music player's own previous and next.
+        assertEquals("the active track when previous returned", 1, backed.commandReading { backed.backend.skipToPrevious() }.index)
+        val next = backed.commandReading { backed.backend.skipToNext() }
+        assertEquals("the active track when next returned", 2, next.index)
+        assertEquals(com.google.android.exoplayer2.Player.STATE_READY, next.exoState)
+        assertTrue(backed.gaveUpAtMs.isEmpty())
+    }
+
+    @Test
+    fun aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded() {
+        val backed = backed()
+        backed.backend.replaceQueue(listOf(item(slowServer(), 1L), item(slowServer(), 2L)))
+        // The new queue's first track is selected at once; the skip still waits for its load.
+        val returned = backed.commandReading { backed.backend.skip(0) }
+        assertEquals(0, returned.index)
+        assertEquals("the player was ready when skip returned", com.google.android.exoplayer2.Player.STATE_READY, returned.exoState)
+    }
+
+    @Test
+    fun aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded() {
+        val backed = backed()
+        val returned = backed.commandReading { backed.backend.load(item(slowServer(), 1L)) }
+        assertEquals(0, returned.index)
+        assertEquals("the player was ready when load returned", com.google.android.exoplayer2.Player.STATE_READY, returned.exoState)
+    }
+
+    @Test
+    fun aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val broken = HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(broken, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("the first track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        var indexAtRejection: Int? = null
+        val error = command {
+            try {
+                backed.backend.skip(1)
+            } finally {
+                indexAtRejection = backed.backend.currentIndex
+            }
+        } as RejectionException
+        assertEquals("crossfade_engine_error", error.code)
+        assertEquals(0, indexAtRejection)
+        // The rejection is the report: the player's own error event is not the app's.
+        assertTrue("the command reports the player's error", backed.backend.reportsPlayerErrorThroughCommand())
+        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    @Test
+    fun aNewerSkipCancelsTheWaitOfTheOlderOne() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(stalled, 2L), item(slowServer(), 3L)))
+        command { backed.backend.play() }
+        awaitTrue("the first track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        val older = launchCommand { backed.backend.skip(1) }
+        awaitTrue("the stalled track loads") { stalled.stalledRequestTimesMs.isNotEmpty() }
+        assertNull("the older skip still waits", older())
+        val newer = backed.commandReading { backed.backend.skip(2) }
+        assertEquals(2, newer.index)
+        assertEquals("cancelled", (older()!!.exceptionOrNull() as RejectionException).code)
+        assertTrue("no give-up", backed.gaveUpAtMs.isEmpty())
     }
 
     @Test
@@ -322,6 +410,20 @@ class StandardBackendHlsTest {
         }
 
         /** A message sent now runs on the playback thread after the stop just issued. */
+        /** What a command left when it returned (or threw), read at that moment. */
+        inner class Returned(val index: Int, val exoState: Int, val reported: List<Int?>)
+
+        /** Runs a command that must succeed; what it left when it returned. */
+        fun commandReading(block: suspend () -> Unit): Returned {
+            var returned: Returned? = null
+            val error = command {
+                block()
+                returned = Returned(backend.currentIndex, analytics.player!!.playbackState, activeTrackChanges.map { it.first })
+            }
+            assertNull("the command failed: $error", error)
+            return returned!!
+        }
+
         fun markStopProcessed() {
             (analytics.player as ExoPlayer).createMessage { _, _ -> stopProcessedAtMs += android.os.SystemClock.elapsedRealtime() }.send()
         }
@@ -390,6 +492,17 @@ class StandardBackendHlsTest {
         awaitTrue("the command ends", AWAIT_MS) { result != null }
         return result!!.exceptionOrNull()
     }
+
+    /** Starts a backend command on the main thread; its result once it ended (null before). */
+    private fun launchCommand(block: suspend () -> Unit): () -> Result<Unit>? {
+        var result: Result<Unit>? = null
+        CoroutineScope(Dispatchers.Main.immediate).launch { result = runCatching { block() } }
+        return { result }
+    }
+
+    /** A track whose segments each take a while (well under stallTimeoutMs): its load is seen. */
+    private fun slowServer(): HlsTestServer =
+        HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, segmentDelayMs = STALL_TIMEOUT_MS / 3).also { servers += it }
 
     /** Runs the main thread's messages (the player's events, the watch's timer) for [ms]. */
     private fun pump(ms: Long) {

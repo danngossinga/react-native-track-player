@@ -1596,6 +1596,10 @@ class MusicService : HeadlessJsTaskService() {
         ownerScope.collectWithAdmission(source.event.playbackError, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
             if (useOrchestratedCrossfade()) return@collectWithAdmission
+            // A load a command (skip, next, previous, load) waits for reports its failure by the
+            // command's rejection, as the crossfade path: no playback error on top of it.
+            val standard = playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend
+            if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission
             emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
         }
     }

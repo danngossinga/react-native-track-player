@@ -191,6 +191,8 @@ internal class KotlinAudioPlaybackBackend(
     /** The position of the track the player left at its last item change (the event's lastPosition). */
     private var lastItemPositionMs = 0L
     private var loadDriver: StandardLoadDriver? = null
+    /** Skip, next, previous and load end once their track loaded, or with its failure (crossfade's rule). */
+    private val commandLoads = StandardCommandLoad()
 
     /** A new queue (replaced, cleared, emptied): its first track is a new selection. */
     private fun forgetReportedTrack() {
@@ -398,6 +400,8 @@ internal class KotlinAudioPlaybackBackend(
         player.pause()
     }
     override suspend fun seekTo(positionMs: Long) {
+        // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled.
+        commandLoads.cancel()
         failedLoads.command()
         try {
             // As a crossfade seek that gives up: the player stops loading and is in error.
@@ -463,17 +467,60 @@ internal class KotlinAudioPlaybackBackend(
             if (!sawPlayerError) {
                 sawPlayerError = true
                 failLoadedTrack()
+                // A command waiting for this load rejects with the player's error, as a crossfade
+                // load that fails (crossfade_engine_error).
+                commandLoads.failed(
+                    item,
+                    STANDARD_LOAD_ERROR_CODE,
+                    analytics()?.player?.playerError?.message ?: STANDARD_LOAD_FAILED_MESSAGE
+                )
             }
             return
         }
+        if (sawPlayerError) commandLoads.failureCleared()
         sawPlayerError = false
         if (observed.ownedElsewhere) return
         if (observed.playbackState == com.google.android.exoplayer2.Player.STATE_READY ||
             observed.playbackState == com.google.android.exoplayer2.Player.STATE_ENDED
         ) {
             failedLoads.ready()?.let(::report)
+            commandLoads.ruleSettled(failedLoads.active, failedLoads.reported)
         }
     }
+
+    /**
+     * Waits for the load a command started (skip, next, previous, load) on the player's current
+     * item, as the crossfade path: returns once it loaded and is the active track; throws the
+     * load's failure (crossfade_prepare_timeout, crossfade_engine_error), or `cancelled` when a
+     * newer command replaced it. Without a load watch (tests), returns at once.
+     */
+    private suspend fun awaitCommandLoad() {
+        val driver = loadDriver ?: return
+        val target = player.currentItem ?: return
+        if (disposed || playerReleased) return
+        val outcome = kotlinx.coroutines.CompletableDeferred<StandardCommandLoad.Outcome>()
+        val wait = commandLoads.begin(target, failedLoads.active, failedLoads.reported) { outcome.complete(it) } ?: return
+        // The load is looked at now (the player's events of the command may have come first).
+        driver.poke()
+        val result = try {
+            outcome.await()
+        } catch (error: kotlinx.coroutines.CancellationException) {
+            commandLoads.drop(wait)
+            throw error
+        }
+        when (result) {
+            StandardCommandLoad.Outcome.Loaded -> Unit
+            is StandardCommandLoad.Outcome.Failed -> throw RejectionException(result.message, result.code)
+            StandardCommandLoad.Outcome.Cancelled ->
+                throw RejectionException(STANDARD_COMMAND_LOAD_CANCELLED_MESSAGE, "cancelled")
+        }
+    }
+
+    /**
+     * Whether the player's current error is a command's to report (its rejection): no playback
+     * error event for it, as the crossfade path (MusicService).
+     */
+    fun reportsPlayerErrorThroughCommand(): Boolean = commandLoads.reportsFailureOf(player.currentItem)
 
     /** A load failed: the previous track stays active (none when there was none), as iOS. */
     private fun failLoadedTrack() {
@@ -510,11 +557,16 @@ internal class KotlinAudioPlaybackBackend(
         val totalMs = loadWatch?.lastTotalTimeoutMs ?: 0L
         val reason = stallVerdictReason(verdict, stallMs, totalMs)
         androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")
+        val item = player.currentItem
+        val message = standardLoadGiveUpMessage(verdict, stallMs, totalMs)
+        // A load a command waits for is reported by its rejection; one no command waits for (a
+        // natural advance, a play) as a playback error, as the crossfade path.
         player.failLoad(
-            PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),
-            report = true
+            PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),
+            report = !commandLoads.waitsFor(item)
         )
         failLoadedTrack()
+        commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message)
     }
 
     /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
@@ -546,6 +598,7 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun dispose() {
         if (disposed) return
         disposed = true
+        commandLoads.cancel()
         loadDriver?.stop()
         isAuthoritative = false
         if (!playerReleased) player.stop()
@@ -571,6 +624,7 @@ internal class KotlinAudioPlaybackBackend(
     override fun remove(indexes: List<Int>) {
         val before = player.items.toList()
         player.remove(indexes)
+        cancelCommandLoadOfRemovedTrack()
         if (player.items.isEmpty()) forgetReportedTrack() else reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
@@ -580,6 +634,7 @@ internal class KotlinAudioPlaybackBackend(
         if (!logicalPlaybackState.hasLogicalActiveItem(player.currentIndex)) return
         val before = player.items.toList()
         player.removeUpcomingItems()
+        cancelCommandLoadOfRemovedTrack()
         reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
@@ -589,6 +644,7 @@ internal class KotlinAudioPlaybackBackend(
         if (!logicalPlaybackState.hasLogicalActiveItem(player.currentIndex)) return
         val before = player.items.toList()
         player.removePreviousItems()
+        cancelCommandLoadOfRemovedTrack()
         reportRemovedTrack(before)
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
@@ -602,7 +658,13 @@ internal class KotlinAudioPlaybackBackend(
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
 
+    /** The track a command waits for left the queue: its wait ends cancelled. */
+    private fun cancelCommandLoadOfRemovedTrack() {
+        if (commandLoads.isWaiting && player.items.none { commandLoads.waitsFor(it) }) commandLoads.cancel()
+    }
+
     override fun replaceQueue(items: List<TrackAudioItem>) {
+        commandLoads.cancel()
         forgetReportedTrack()
         player.clear()
         player.add(items)
@@ -611,6 +673,7 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun clearQueue() {
+        commandLoads.cancel()
         forgetReportedTrack()
         player.clear()
         logicalPlaybackState.onQueueCleared()
@@ -618,6 +681,7 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override suspend fun load(item: TrackAudioItem) {
+        commandLoads.cancel()
         failedLoads.command()
         seekGate.cancel("load")
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
@@ -625,19 +689,27 @@ internal class KotlinAudioPlaybackBackend(
             player.load(item)
             queueStore.replaceWith(player.items.map { it as TrackAudioItem })
         }
+        awaitCommandLoad()
     }
 
     override suspend fun skip(index: Int) {
         if (index !in player.items.indices) {
             throw IndexOutOfBoundsException("The track index is out of bounds: $index")
         }
+        commandLoads.cancel()
         seekGate.cancel("skip")
         failedLoads.command()
         runActivatingOperation(
             publishLogicalActivation = index == player.currentIndex
         ) { _ -> player.jumpToItem(index) }
+        awaitCommandLoad()
     }
     override suspend fun skipToNext() {
+        commandLoads.cancel()
+        moveToNext()
+        awaitCommandLoad()
+    }
+    private suspend fun moveToNext() {
         seekGate.cancel("skip")
         // After a failed load, next is relative to the active (previous) track, as iOS.
         // While a track loads or after it failed, next is relative to the active one, as iOS.
@@ -663,6 +735,11 @@ internal class KotlinAudioPlaybackBackend(
     }
     override suspend fun skipToPrevious() {
         if (logicalPlaybackState.shouldIgnorePrevious()) return
+        commandLoads.cancel()
+        moveToPrevious()
+        awaitCommandLoad()
+    }
+    private fun moveToPrevious() {
         seekGate.cancel("skip")
         if (failedLoads.isPending(player.currentItem)) {
             val active = reportedIndex()
@@ -684,6 +761,7 @@ internal class KotlinAudioPlaybackBackend(
         }
     }
     override fun stop() {
+        commandLoads.cancel()
         failedLoads.command()
         seekGate.cancel("stop")
         player.stop()

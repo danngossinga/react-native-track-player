@@ -34,12 +34,21 @@ Clears the current queue and adds the supplied tracks to the now empty queue.
 
 Replaces the current track with the supplied track or creates a track when the queue is empty.
 
+Resolves once the track loaded and is the active one, or rejects when it fails to load, as [`skip`](#skipindex-initialposition).
+
 | Param  | Type              | Description |
 |--------|-------------------|-------------|
 | track | `Track`            | The [Track](../objects/track.md) object that will be loaded |
 
 ## `skip(index, initialPosition)`
 Skips to a track in the queue.
+
+The promise resolves once the track loaded and is the active one (`getActiveTrackIndex()` returns
+it), on both backends and both platforms, even while paused; then `initialPosition` is applied.
+When the track fails to load it rejects, and the previous track stays active: `crossfade_prepare_timeout`
+(no progress for `stallTimeoutMs`, or over `prepareTimeoutMs`), `crossfade_engine_error` (the player
+failed the track), or `cancelled` (a newer skip, load, seek, stop or queue change took over). A
+failure the promise reports is not also sent as a `PlaybackError` event.
 
 **Returns:** `Promise<void>`
 
@@ -51,6 +60,8 @@ Skips to a track in the queue.
 ## `skipToNext(initialPosition)`
 Skips to the next track in the queue.
 
+Resolves and rejects as [`skip`](#skipindex-initialposition).
+
 **Returns:** `Promise<void>`
 
 | Param  | Type     | Description     |
@@ -59,6 +70,8 @@ Skips to the next track in the queue.
 
 ## `skipToPrevious(initialPosition)`
 Skips to the previous track in the queue.
+
+Resolves and rejects as [`skip`](#skipindex-initialposition).
 
 **Returns:** `Promise<void>`
 
