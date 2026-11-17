@@ -104,6 +104,25 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertNil(PlaybackAdvanceFailure(.failure(cancelled)))
     }
 
+    func testAnAdvanceWhosePlayStartGaveUpIsReportedOnceByThePlayStart() {
+        // The next track loaded but did not start: loadIndex's autoplay failure reported it (the
+        // player is paused, not in error), so the advance reports nothing more. A load that
+        // failed (the player in error) is the advance's to report.
+        let playStart = NSError(domain: "RNTP-Crossfade", code: 4, userInfo: [
+            NSLocalizedDescriptionKey: "Crossfade engine did not start playing.",
+            "code": "crossfade_play_start_timeout"
+        ])
+        XCTAssertNil(PlaybackAdvanceFailure(.failure(playStart), playerInError: false))
+        let stall = NSError(domain: "RNTP-Crossfade", code: 5, userInfo: [
+            NSLocalizedDescriptionKey: "Crossfade engine did not become ready (no progress for 10000ms).",
+            "code": "crossfade_prepare_timeout"
+        ])
+        XCTAssertEqual(
+            PlaybackAdvanceFailure(.failure(stall), playerInError: true),
+            PlaybackAdvanceFailure(code: "crossfade_prepare_timeout", message: "Crossfade engine did not become ready (no progress for 10000ms).")
+        )
+    }
+
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.
 
     func testStallWatchKeepsASlowButProgressingLoadPastTheStallTimeout() {

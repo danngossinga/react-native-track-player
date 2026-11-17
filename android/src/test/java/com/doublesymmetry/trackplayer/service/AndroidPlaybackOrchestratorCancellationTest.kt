@@ -592,6 +592,32 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aNaturalAdvanceWhosePlayStartStallsReportsOnePlaybackError() = runTest {
+        // The next track loads but does not start: the play start's give-up reports it (paused,
+        // as after a failed play), and the advance must not report it a second time.
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            engineA.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 120_000L, nowMs = { currentTime })
+            engineB.simulatedStart = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 120_000L, nowMs = { currentTime })
+            engineA.ended = true
+            advanceTimeBy(30_000L)
+            runCurrent()
+            assertEquals(listOf("crossfade_play_start_timeout"), delegate.playbackErrors.map { it.first })
+            assertEquals(AudioPlayerState.PAUSED, delegate.playbackStates.last())
+            assertFalse(orchestrator.playWhenReady)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aStalledSkipLeavesThePlayerInErrorAsOnIos() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")

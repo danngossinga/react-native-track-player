@@ -117,6 +117,14 @@ struct PlaybackAdvanceFailure: Equatable {
         guard code != "cancelled" else { return nil }
         self.init(code: code, message: nsError.localizedDescription)
     }
+
+    /// The advance's own report: only a load that failed, which leaves the player in error. A
+    /// play start that gave up (the player paused) was reported by the play start itself, as
+    /// after any play, so it is not reported twice. Same rule as Android's advanceToNextTrack.
+    init?(_ result: Result<Void, Error>, playerInError: Bool) {
+        guard playerInError else { return nil }
+        self.init(result)
+    }
 }
 
 /// The code of an advance failure whose error names none (a player error), as on Android.

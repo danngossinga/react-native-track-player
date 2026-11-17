@@ -608,7 +608,7 @@ assert(
   const observeEnd = section(orchestrator, 'private func observeEnd() {', 'private func stabilizeCancelledOperation() {');
   const delegateImpl = section(player, 'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure) {', '\n    }\n');
   assert(
-    observeEnd.includes('guard let self = self, let failure = PlaybackAdvanceFailure(result) else { return }') &&
+    observeEnd.includes('guard let self = self,\n                          let failure = PlaybackAdvanceFailure(result, playerInError: self.state == .error) else { return }') &&
       observeEnd.includes('self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)') &&
       !observeEnd.includes('{ _ in }') &&
       delegateImpl.includes('isAuthoritative(.pingPong, identity: orchestrator)') &&

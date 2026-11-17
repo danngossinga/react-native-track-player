@@ -1286,7 +1286,9 @@ internal class AndroidPlaybackOrchestrator private constructor(
             androidXfadeLog("natural advance cancelled index=$nextIndex")
         } catch (error: RejectionException) {
             androidXfadeLog("advance failed toIndex=$nextIndex error=${error.code}")
-            delegate.onPlaybackError(error.code, error.message)
+            // A load that failed left the player in error: reported here. A play start that gave
+            // up (paused) was already reported by awaitPlaybackStart, as after any play.
+            if (state == AndroidPlaybackOrchestratorState.ERROR) delegate.onPlaybackError(error.code, error.message)
         } finally {
             operationController.finish(ticket)
         }

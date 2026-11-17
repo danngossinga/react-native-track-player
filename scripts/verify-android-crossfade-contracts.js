@@ -737,7 +737,8 @@ assert(
       monitor.includes('advanceToNextTrack(nextIndex, endedPosition)') &&
       !monitor.includes('startTrackAt(') &&
       advance.includes('val ticket = beginOperation()') &&
-      advance.includes('delegate.onPlaybackError(error.code, error.message)') &&
+      advance.includes('if (state == AndroidPlaybackOrchestratorState.ERROR) delegate.onPlaybackError(error.code, error.message)') &&
+      read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aNaturalAdvanceWhosePlayStartStallsReportsOnePlaybackError()') &&
       advance.includes('operationController.finish(ticket)') &&
       musicService.includes('override fun onPlaybackError(code: String, message: String?) {') &&
       musicService.includes('emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {\n                        putString("code", code)'),

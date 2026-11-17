@@ -1792,7 +1792,8 @@ final class IOSPlaybackOrchestrator {
                 // The load leaves the player in error when it fails; the app learns why from a
                 // playback error, as from a failed skip's rejection.
                 skip(to: next, initialTime: 0) { [weak self] result in
-                    guard let self = self, let failure = PlaybackAdvanceFailure(result) else { return }
+                    guard let self = self,
+                          let failure = PlaybackAdvanceFailure(result, playerInError: self.state == .error) else { return }
                     IOSPlaybackLog.log("advance failed toIndex=\(next) error=\(failure.code)")
                     self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)
                 }
