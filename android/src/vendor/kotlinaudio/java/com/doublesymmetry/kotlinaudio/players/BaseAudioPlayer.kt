@@ -508,11 +508,12 @@ abstract class BaseAudioPlayer internal constructor(
             }
         }
 
-        // Fork: media requests (not playlists, manifests or keys) report their bytes to the host.
-        val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.let { listener ->
+        // Fork: this item's media requests (not playlists, manifests or keys) report their bytes
+        // to the host, through listeners of this item.
+        val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(audioItem)?.let { listener ->
             DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
         } ?: factory
-        val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.let { listener ->
+        val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(audioItem)?.let { listener ->
             DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
         } ?: factory
 

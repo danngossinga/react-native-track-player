@@ -472,7 +472,8 @@ assert(
 const buildGradle = read('android/build.gradle');
 const vendoredBase = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
 const standardConfig = section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt'), 'internal fun configureStandardExoPlayer(', '\n}\n');
-const standardHooks = section(musicService, 'private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(', '/**');
+// The service's hooks are a shared function (the Robolectric tests build the player with it too).
+const standardHooks = section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal fun standardPlayerHooks(', '\n)\n');
 assert(
   !buildGradle.includes("com.github.doublesymmetry:kotlinaudio") &&
     buildGradle.includes("java.srcDirs += 'src/vendor/kotlinaudio/java'") &&
@@ -481,9 +482,9 @@ assert(
     read('android/src/vendor/kotlinaudio/VENDORED.md').includes('bf71120704bfe4be2311cf86fc1e2ee1c3c702b7') &&
     vendoredBase.includes('hooks.configureExoPlayer(this)\n            }\n            .build()') &&
     vendoredBase.includes('val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)') &&
-    musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(analytics))') &&
+    musicService.includes('QueuedAudioPlayer(\n                this@MusicService, playerConfig, bufferConfig, cacheConfig,\n                standardPlayerHooks(this@MusicService, analytics, { initialBitrateEstimate.bitsPerSecond }, { stallTimeout.milliseconds })\n            )') &&
     // Start-low per track: each media period's own media loads (not its manifest, not another's).
-    standardHooks.includes('configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)') &&
+    standardHooks.includes('configureStandardExoPlayer(builder, context, initialBitrateEstimateBps, analytics)') &&
     standardConfig.includes('val startLow = StandardStartLow(\n        initialBitrateEstimateBps,') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('    val meter: BandwidthMeter = newMeter(unmeasuredBps)\n    val selectionFactory = StartLowTrackSelectionFactory(initialBitrateEstimateBps, loads, unmeasuredBps, adaptive)') &&
     standardConfig.includes('newMeter = { bps -> DefaultBandwidthMeter.Builder(context).setInitialBitrateEstimate(bps).build() }') &&
@@ -524,7 +525,7 @@ assert(
     !/positionToleranceMs: Long = \d/.test(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt')) &&
     standardHooks.includes('configureExoPlayer = { builder ->') &&
     true &&
-    standardHooks.includes('httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds })') &&
+    standardHooks.includes('httpDataSourceFactory = standardHttpDataSourceFactory(stallTimeoutMs),') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('StartLowBandwidthMeter(\n            bandwidthMeter,\n            initialBitrateEstimateBps(),') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelectionTest.kt').includes('fun everyTrackSelectionReadsTheCurrentSetting()') &&
     read('android/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeHttpTimeoutsTest.kt').includes('fun theStandardPlayersRequestsKeepKotlinAudiosConfigurationAndFollowTheCurrentStallTimeout()'),
@@ -867,10 +868,16 @@ assert(
       failLoad.includes('exoPlayer.stop()') && failLoad.includes('playerState = AudioPlayerState.ERROR') &&
       failLoad.includes('if (report) playerEventHolder.updatePlaybackError(error)') &&
       vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
-      standardHooks.includes('mediaTransferListener = analytics.loadedBytes,') &&
-      standardHooks.includes('playlistTransferListener = analytics.loadedBytes.playlists,') &&
+      // Each item's own listeners: progress belongs to the load of the item that loads.
+      standardHooks.includes('mediaTransferListener = { item -> analytics.loadedBytes.media(item) },') &&
+      standardHooks.includes('playlistTransferListener = { item -> analytics.loadedBytes.playlists(item) },') &&
+      vendored.includes('val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(audioItem)?.let { listener ->') &&
+      vendored.includes('val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(audioItem)?.let { listener ->') &&
+      watchSource.includes('private fun loadOf(item: Any): Load? = current.get()?.takeIf { it.item === item }') &&
+      ['thePreviousTracksSegmentRequestDoesNotEndTheNextLoadsPlaylistProgress', 'thePreviousTracksBytesAreNotTheNextLoadsProgress']
+        .every((t) => read('android/src/test/java/com/doublesymmetry/trackplayer/service/LoadedBytesTest.kt').includes(`fun ${t}()`)) &&
       vendored.includes('MediaType.HLS -> createHlsSource(mediaItem, playlistFactory, mediaFactory)') &&
-      musicService.includes('onLoadStart = { standardAnalytics[binding.player]?.loadedBytes?.startLoad() }') &&
+      musicService.includes('onLoadStart = { item -> standardAnalytics[binding.player]?.loadedBytes?.startLoad(item) }') &&
       ['slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyStandardTrackGiveUp', 'slowPlaylistsCountAgainForTheNextStandardTrack']
         .every((t) => hlsTest.includes(`fun ${t}()`)) &&
       musicService.includes('totalTimeoutMs = { prepareTimeout.milliseconds }') &&

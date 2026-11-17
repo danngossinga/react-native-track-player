@@ -28,13 +28,13 @@ section 4(b)); line numbers below include that notice.
   resources are now merged into this library's namespace).
 - `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
   (defaults keep upstream behaviour), including `mediaTransferListener` and `playlistTransferListener`
-  (the media requests' and the playlist requests' bytes: a load's progress for the host's load
-  watch).
+  (made for each item when its source is built: that item's media requests' and playlist requests'
+  bytes, its load's progress for the host's load watch).
 - `players/BaseAudioPlayer.kt`:
   - `:1-4` the notice;
   - `:39` import of `PlayerHooks`; `:70` import of `HlsDataSourceFactory`;
-  - `:91-92` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
-  - `:113-114` audio focus (DJE-204/205): with `hooks.hostOwnsAudioFocus`, the player never
+  - `:92-93` constructor parameter `hooks: PlayerHooks = PlayerHooks()`;
+  - `:114-115` audio focus (DJE-204/205): with `hooks.hostOwnsAudioFocus`, the player never
     requests (upstream: when it becomes READY, even while paused) nor abandons the focus, so it
     neither ducks nor emits its own focus event. The host holds one focus for both backends,
     requested at the user's play and at an interruption's resume, and applies one interruption
@@ -45,12 +45,13 @@ section 4(b)); line numbers below include that notice.
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream;
-  - `:511-542` media requests and the rest are split: the media requests (HLS segments, DASH
-    and SmoothStreaming chunks, a progressive file) report their bytes to
-    `hooks.mediaTransferListener`, the playlists, manifests and keys to
-    `hooks.playlistTransferListener` (HLS through an `HlsDataSourceFactory` by data type): the
-    host counts playlists as progress until the first segment is asked for, as the crossfade
-    engines;
+  - `:511-543` media requests and the rest are split: the media requests (HLS segments, DASH
+    and SmoothStreaming chunks, a progressive file) report their bytes to the listener
+    `hooks.mediaTransferListener` makes for the item, the playlists, manifests and keys to the one
+    `hooks.playlistTransferListener` makes (HLS through an `HlsDataSourceFactory` by data type):
+    the host counts playlists as progress until the first segment is asked for, as the crossfade
+    engines, and only the requests of the item that loads (a previous item's request still in
+    flight is not the next load's progress);
   - `:423-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error

@@ -367,6 +367,29 @@ internal class StandardPlayerAnalytics(
     }
 }
 
+/**
+ * What the standard player (vendored KotlinAudio) takes from the app's settings, as the crossfade
+ * players do: every track starts from the current [initialBitrateEstimateBps], and every HTTP
+ * request's connect and read timeouts follow the current [stallTimeoutMs]. MusicService builds
+ * every standard player with it (and the Robolectric tests, the same way).
+ */
+internal fun standardPlayerHooks(
+    context: android.content.Context,
+    analytics: StandardPlayerAnalytics,
+    initialBitrateEstimateBps: () -> Long,
+    stallTimeoutMs: () -> Long
+) = com.doublesymmetry.kotlinaudio.models.PlayerHooks(
+    configureExoPlayer = { builder ->
+        configureStandardExoPlayer(builder, context, initialBitrateEstimateBps, analytics)
+    },
+    httpDataSourceFactory = standardHttpDataSourceFactory(stallTimeoutMs),
+    // A load's progress, as on the crossfade path: media bytes always, playlists and keys until
+    // the track's first segment is asked for; each item's own requests, for its own load.
+    mediaTransferListener = { item -> analytics.loadedBytes.media(item) },
+    playlistTransferListener = { item -> analytics.loadedBytes.playlists(item) },
+    hostOwnsAudioFocus = true
+)
+
 internal class PlaybackOperationCancelledException(
     val reason: String
 ) : CancellationException("Playback operation was cancelled by $reason.")

@@ -343,10 +343,22 @@ class StandardPlayerHlsTest {
         val bytes = LoadedBytes()
         val http = standardHttpDataSourceFactory({ STALL_TIMEOUT_MS }).invoke { }
         // As vendored KotlinAudio with the service's transfer listeners: media bytes always,
-        // playlists and keys until the first segment request, as the crossfade engines.
+        // playlists and keys until the first segment request, as the crossfade engines; each
+        // item's own listeners, made when its source is built.
+        val sources = object : com.google.android.exoplayer2.source.MediaSource.Factory {
+            private val shared = CrossfadeMediaSourceFactory(playlistDataSourceFactory = http, mediaDataSourceFactory = http)
+            override fun setDrmSessionManagerProvider(provider: com.google.android.exoplayer2.drm.DrmSessionManagerProvider) = this
+            override fun setLoadErrorHandlingPolicy(policy: com.google.android.exoplayer2.upstream.LoadErrorHandlingPolicy) = this
+            override fun getSupportedTypes(): IntArray = shared.supportedTypes
+            override fun createMediaSource(mediaItem: MediaItem) =
+                CrossfadeMediaSourceFactory(
+                    playlistDataSourceFactory = http.countingBytes(bytes.playlists(mediaItem)),
+                    mediaDataSourceFactory = http.countingBytes(bytes.media(mediaItem))
+                ).createMediaSource(mediaItem)
+        }
         val builder = ExoPlayer.Builder(context)
             .setLooper(thread.looper)
-            .setMediaSourceFactory(CrossfadeMediaSourceFactory(playlistDataSourceFactory = http.countingBytes(bytes.playlists), mediaDataSourceFactory = http.countingBytes(bytes)))
+            .setMediaSourceFactory(sources)
         val analytics = StandardPlayerAnalytics()
         configureStandardExoPlayer(builder, context, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, analytics)
         val player = builder.build().also { players += it }

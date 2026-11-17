@@ -25,10 +25,11 @@ class PlayerHooks(
      */
     val hostOwnsAudioFocus: Boolean = false,
     /**
-     * Told of every media request's bytes (segments, chunks, a progressive file), not of
-     * playlists, manifests or keys: the host's measure of a load's progress. Null: none.
+     * The listener of an item's media requests (segments, chunks, a progressive file), not of its
+     * playlists, manifests or keys, made when the item's source is built: the host's measure of
+     * that item's load progress. Null: none.
      */
-    val mediaTransferListener: TransferListener? = null,
-    /** Told of the playlist, manifest and key requests' bytes (null: none). */
-    val playlistTransferListener: TransferListener? = null
+    val mediaTransferListener: ((AudioItem) -> TransferListener)? = null,
+    /** The listener of an item's playlist, manifest and key requests (null: none). */
+    val playlistTransferListener: ((AudioItem) -> TransferListener)? = null
 )

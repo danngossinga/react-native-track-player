@@ -534,7 +534,7 @@ class MusicService : HeadlessJsTaskService() {
                     loadWatch = StandardLoadWatch(
                         stallTimeoutMs = { stallTimeout.milliseconds },
                         totalTimeoutMs = { prepareTimeout.milliseconds },
-                        onLoadStart = { standardAnalytics[binding.player]?.loadedBytes?.startLoad() }
+                        onLoadStart = { item -> standardAnalytics[binding.player]?.loadedBytes?.startLoad(item) }
                     ),
                     initiallyAuthoritative = initiallyAuthoritative
                 ).also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }
@@ -640,7 +640,10 @@ class MusicService : HeadlessJsTaskService() {
 
         standardPlayerFactory = {
             val analytics = StandardPlayerAnalytics()
-            QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(analytics))
+            QueuedAudioPlayer(
+                this@MusicService, playerConfig, bufferConfig, cacheConfig,
+                standardPlayerHooks(this@MusicService, analytics, { initialBitrateEstimate.bitsPerSecond }, { stallTimeout.milliseconds })
+            )
                 .also { standardAnalytics[it] = analytics }
         }
         orchestratorAudioContentType = playerConfig.audioContentType.toExoAudioContentType()
@@ -666,23 +669,6 @@ class MusicService : HeadlessJsTaskService() {
             diagnosticScope = scope
         )
     }
-
-    /**
-     * What the standard player (vendored KotlinAudio) takes from the app's settings, as the
-     * crossfade players do: every track starts from the current `initialBitrateEstimateBps`, and
-     * every HTTP request's connect and read timeouts follow the current `stallTimeoutMs`.
-     */
-    private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(
-        configureExoPlayer = { builder ->
-            configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)
-        },
-        httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
-        // A load's progress, as on the crossfade path: media bytes always, playlists and keys
-        // until the track's first segment is asked for.
-        mediaTransferListener = analytics.loadedBytes,
-        playlistTransferListener = analytics.loadedBytes.playlists,
-        hostOwnsAudioFocus = true
-    )
 
     /**
      * Runs one interruption event on the active backend: reads whether it plays, then pauses or

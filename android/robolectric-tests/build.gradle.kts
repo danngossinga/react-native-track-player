@@ -1,8 +1,10 @@
 // JVM tests that run the crossfade engine's real ExoPlayer (Robolectric) against a local HTTP
 // server: the renditions it asks for and how long a stalled load takes to give up. A separate
 // build (Gradle 8.7, AGP 8), so the library's own build and the example app need no new
-// dependency. It compiles the engine's sources from ../src/main/java with small stubs for the
-// React Native and KotlinAudio types they name (stubs/).
+// dependency. It compiles the engine's sources from ../src/main/java and the vendored KotlinAudio
+// (../src/vendor/kotlinaudio, the standard player, with its resources), with small stubs (stubs/)
+// for the React Native types they name and for KotlinAudio's media session, artwork and log
+// libraries, which this machine's offline Gradle 8 cache lacks (not under test).
 //
 //   cd android/robolectric-tests && JAVA_HOME=$(/usr/libexec/java_home -v 17) ./gradlew testDebugUnitTest
 plugins {
@@ -13,6 +15,10 @@ plugins {
 /** The library sources under test: the crossfade engine, the standard player's configuration, and what they use. */
 val engineSources = listOf(
     "com/doublesymmetry/trackplayer/service/AndroidCrossfadeEngine.kt",
+    "com/doublesymmetry/trackplayer/service/AndroidTrackQueue.kt",
+    "com/doublesymmetry/trackplayer/service/FailedLoadRule.kt",
+    "com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt",
+    "com/doublesymmetry/trackplayer/service/PlaybackBackend.kt",
     "com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt",
     "com/doublesymmetry/trackplayer/service/PerTrackBandwidthMeter.kt",
     "com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt",
@@ -25,11 +31,14 @@ val engineSources = listOf(
 
 val librarySources = tasks.register<Sync>("librarySources") {
     from("${rootProject.projectDir}/../src/main/java") { include(engineSources) }
+    // Vendored KotlinAudio as the library builds it (its standard player: QueuedAudioPlayer).
+    from("${rootProject.projectDir}/../src/vendor/kotlinaudio/java")
     into(layout.buildDirectory.dir("library-src"))
 }
 
 android {
-    namespace = "com.doublesymmetry.trackplayer.robolectrictests"
+    // The library's namespace: vendored KotlinAudio names its resources' R there.
+    namespace = "com.doublesymmetry.trackplayer"
     compileSdk = 35
 
     defaultConfig {
@@ -48,6 +57,7 @@ android {
     sourceSets {
         getByName("main") {
             java.setSrcDirs(listOf(layout.buildDirectory.dir("library-src").get().asFile, "stubs"))
+            res.setSrcDirs(listOf("${rootProject.projectDir}/../src/vendor/kotlinaudio/res"))
         }
     }
 

@@ -4,7 +4,9 @@ import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.TransferListener
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The code a load that gives up reports, on both backends and both platforms (the crossfade
@@ -45,8 +47,8 @@ internal class StandardLoadWatch(
     private val stallTimeoutMs: () -> Long,
     private val totalTimeoutMs: () -> Long,
     private val nowMs: () -> Long = ::monotonicNowMs,
-    /** A load starts being watched (the progress counter's per-load reset: [LoadedBytes.startLoad]). */
-    private val onLoadStart: () -> Unit = {}
+    /** A load of the item starts being watched (the progress counter's per-load reset: [LoadedBytes.startLoad]). */
+    private val onLoadStart: (item: Any) -> Unit = {}
 ) {
     private var readyItem: Any? = null
     private var watchedItem: Any? = null
@@ -98,7 +100,7 @@ internal class StandardLoadWatch(
                 watchedItem = item
                 lastStallTimeoutMs = it.stallTimeoutMs
                 lastTotalTimeoutMs = it.totalTimeoutMs
-                onLoadStart()
+                onLoadStart(item)
             }
         val verdict = current.check(nowMs(), observed.readings)
         if (verdict == StallVerdict.WAIT) return null
@@ -192,41 +194,58 @@ internal fun standardLoadGiveUpMessage(verdict: StallVerdict, stallTimeoutMs: Lo
 
 /**
  * The bytes a player downloads that count as a load's progress, as on the crossfade path: media
- * (segments, a progressive file; this listener) always; HLS playlists and keys ([playlists]) only
+ * (segments, a progressive file; [media]) always; HLS playlists and keys ([playlists]) only
  * until the track's first segment is asked for. Before that they are the load's only progress (a
  * slow proxy answering the playlists must not fail a healthy track); after it, the player reloads
- * them when it falls back to another rendition, which is not progress. [startLoad] at every load.
+ * them when it falls back to another rendition, which is not progress.
+ *
+ * Progress belongs to one load: [startLoad] names the item that loads, and each item's sources
+ * report through that item's own listeners ([media], [playlists]: the player makes them when it
+ * builds the item's source). A transfer of another item (the previous track's request still in
+ * flight on a loader thread when the next one starts) is not this load's progress and does not
+ * end its playlists' count.
  */
-internal class LoadedBytes : TransferListener {
+internal class LoadedBytes {
+    private class Load(val item: Any) {
+        val mediaRequested = AtomicBoolean(false)
+    }
+
     private val count = AtomicLong(0L)
-    private val mediaRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+    private val current = AtomicReference<Load?>(null)
 
     val value: Long
         get() = count.get()
 
-    /** A new load: its playlists are progress again until it asks for a segment. */
-    fun startLoad() {
-        mediaRequested.set(false)
+    /** A new load of [item]: its playlists are progress again until it asks for a segment. */
+    fun startLoad(item: Any) {
+        current.set(Load(item))
     }
 
-    /** The listener of the playlist and key requests. */
-    val playlists: TransferListener = object : TransferListener {
-        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    /** The load in progress, when it is [item]'s. */
+    private fun loadOf(item: Any): Load? = current.get()?.takeIf { it.item === item }
+
+    /** The listener of [item]'s media requests. */
+    fun media(item: Any): TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+            loadOf(item)?.mediaRequested?.set(true)
+        }
         override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
         override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-            if (!mediaRequested.get()) count.addAndGet(bytesTransferred.toLong())
+            if (loadOf(item) != null) count.addAndGet(bytesTransferred.toLong())
         }
         override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
     }
 
-    override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-        mediaRequested.set(true)
+    /** The listener of [item]'s playlist and key requests. */
+    fun playlists(item: Any): TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            val load = loadOf(item) ?: return
+            if (!load.mediaRequested.get()) count.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
     }
-    override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-    override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-        count.addAndGet(bytesTransferred.toLong())
-    }
-    override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
 }
 
 /** [factory]'s sources, each telling [listener] its bytes. */
