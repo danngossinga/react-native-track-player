@@ -74,14 +74,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testAStalledAdvanceIsReportedWithItsCodeAndMessage() {
         let stall = NSError(domain: "RNTP-Crossfade", code: 5, userInfo: [
-            NSLocalizedDescriptionKey: "Crossfade engine did not become ready (no progress for 10000ms).",
+            NSLocalizedDescriptionKey: "Crossfade engine did not become ready (no progress for 10000 ms).",
             "code": "crossfade_prepare_timeout"
         ])
         XCTAssertEqual(
             PlaybackAdvanceFailure(.failure(stall)),
             PlaybackAdvanceFailure(
                 code: "crossfade_prepare_timeout",
-                message: "Crossfade engine did not become ready (no progress for 10000ms)."
+                message: "Crossfade engine did not become ready (no progress for 10000 ms)."
             )
         )
     }
@@ -293,8 +293,35 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(standardLoadPhase(stateRawValue: "stopped", bufferedPosition: 4), .idle)
         XCTAssertEqual(standardLoadPhase(stateRawValue: "idle", bufferedPosition: 0), .idle)
         XCTAssertEqual(standardLoadPhase(stateRawValue: "failed", bufferedPosition: 0), .failed)
-        XCTAssertEqual(standardLoadGiveUpMessage(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000), "The track did not become ready (no progress for 10000ms).")
+        XCTAssertEqual(standardLoadGiveUpMessage(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000), "The track did not become ready (no progress for 10000 ms).")
+        XCTAssertEqual(standardLoadGiveUpMessage(.capExceeded, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000), "The track did not become ready (over the 60000 ms limit).")
         XCTAssertEqual(standardPrepareTimeoutCode, "crossfade_prepare_timeout")
+    }
+
+    func testAGiveUpIsWordedAsOnAndroidWithoutEngineNames() {
+        // Same text as Android (StallWatchTest.aGiveUpIsWordedAsOnIosWithoutEngineNames).
+        XCTAssertEqual(
+            crossfadeLoadTimeoutMessage(StallVerdict.stalled.reason(stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)),
+            "Crossfade engine did not become ready (no progress for 10000 ms)."
+        )
+        XCTAssertEqual(
+            crossfadeLoadTimeoutMessage(StallVerdict.capExceeded.reason(stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)),
+            "Crossfade engine did not become ready (over the 60000 ms limit)."
+        )
+        XCTAssertEqual(
+            crossfadeSeekTimeoutMessage(StallVerdict.stalled.reason(stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)),
+            "Crossfade engine seek did not finish (no progress for 10000 ms)."
+        )
+    }
+
+    func testAFailedLoadStopsLoadingBeforeItCompletesAndASuccessDoesNot() {
+        var events: [String] = []
+        settleCrossfadeLoad(.failure(NSError(domain: "AVFoundationErrorDomain", code: -11800)),
+                            stopLoading: { events.append("stop") }, complete: { _ in events.append("complete") })
+        XCTAssertEqual(events, ["stop", "complete"])
+        events.removeAll()
+        settleCrossfadeLoad(.success(()), stopLoading: { events.append("stop") }, complete: { _ in events.append("complete") })
+        XCTAssertEqual(events, ["complete"])
     }
 
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.

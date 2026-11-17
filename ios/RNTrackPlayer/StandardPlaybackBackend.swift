@@ -417,9 +417,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
         followLoad(observed)
         if let verdict = watch.check(observed) {
-            let reason = verdict == .stalled
-                ? "no progress for \(watch.lastStallTimeoutMs) ms"
-                : "over the \(watch.lastTotalTimeoutMs) ms limit"
+            let reason = verdict.reason(stallTimeoutMs: watch.lastStallTimeoutMs, totalTimeoutMs: watch.lastTotalTimeoutMs)
             giveUp(
                 log: "load \(reason)",
                 failure: IOSPlaybackErrorSnapshot(

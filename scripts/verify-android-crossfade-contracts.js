@@ -617,7 +617,7 @@ assert(
     standardBackend.includes('        override val positionMs: Long get() = player.position\n') &&
     // The engine's play start: a player error fails at once (crossfade_engine_error), a reset
     // during the wait cancels it, and a give-up leaves the engine failed.
-    engineAwaitPlaying.includes('            if (player.playerError != null) {\n                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED\n                throw RejectionException(player.playerError?.message ?: "$name failed to play.", "crossfade_engine_error")\n            }\n            player.isPlaying') &&
+    engineAwaitPlaying.includes('            if (player.playerError != null) {\n                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED\n                throw RejectionException(player.playerError?.message ?: "Crossfade engine failed to play.", "crossfade_engine_error")\n            }\n            player.isPlaying') &&
     engineAwaitPlaying.includes('        ticket?.ensureActive()\n        if (operationGeneration != generation) throw PlaybackOperationCancelledException("engine_reset")\n        if (verdict != null) {') &&
     engineAwaitPlaying.includes('            player.playWhenReady = false\n            player.pause()\n            state = AndroidCrossfadeEngineState.FAILED\n'),
   'Android seventh-review pins must stay in place.'
@@ -879,6 +879,23 @@ assert(
       (standardBackend.match(/failedLoads\.command\(\)\?\.let \{ reportCorrection\(it, null\) \}/g) || []).length === 8 &&
       !/failedLoads\.command\(\)\n/.test(standardBackend),
     'The Android standard player must keep the previous track active after a failed load, as iOS.'
+  );
+}
+
+// A give-up says the same as on iOS, with no engine names; both platforms' tests pin the text.
+{
+  const androidTest = read('android/src/test/java/com/doublesymmetry/trackplayer/service/StallWatchTest.kt');
+  const iosTest = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  for (const text of [
+    'Crossfade engine did not become ready (no progress for 10000 ms).',
+    'Crossfade engine did not become ready (over the 60000 ms limit).',
+    'Crossfade engine seek did not finish (no progress for 10000 ms).'
+  ]) {
+    assert(androidTest.includes(`"${text}"`) && iosTest.includes(`"${text}"`), `Both platforms must pin the give-up text: ${text}`);
+  }
+  assert(
+    !/RejectionException\("\$name/.test(engineSource),
+    'Android engine errors must not name the engine (engineA/engineB) in their message.'
   );
 }
 

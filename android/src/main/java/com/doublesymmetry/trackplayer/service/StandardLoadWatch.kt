@@ -123,11 +123,12 @@ internal suspend fun StandardLoadWatch.supervise(
     }
 }
 
-/** The message of a load that gave up, as the crossfade engines word theirs. */
+/**
+ * The message of a standard load that gave up: the crossfade load's words without the engine
+ * ("The track did not become ready (no progress for N ms)."), the same text on iOS.
+ */
 internal fun standardLoadGiveUpMessage(verdict: StallVerdict, stallTimeoutMs: Long, totalTimeoutMs: Long): String =
-    "The track did not become ready (" +
-        (if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${totalTimeoutMs}ms limit") +
-        ")."
+    "The track did not become ready (${stallVerdictReason(verdict, stallTimeoutMs, totalTimeoutMs)})."
 
 /** Counts the bytes a player downloads (a load's progress), from every request it opens. */
 internal class LoadedBytes : TransferListener {

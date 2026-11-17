@@ -87,4 +87,10 @@ class StandardLoadWatchTest {
         assertEquals("crossfade_prepare_timeout", standardPlaybackErrorCode(host))
         assertEquals("android-io-network-connection-failed", standardPlaybackErrorCode(exo))
     }
+
+    @Test
+    fun aGiveUpSaysTheSameAsOnIos() {
+        assertEquals("The track did not become ready (no progress for 10000 ms).", standardLoadGiveUpMessage(StallVerdict.STALLED, 10_000L, 60_000L))
+        assertEquals("The track did not become ready (over the 60000 ms limit).", standardLoadGiveUpMessage(StallVerdict.CAP_EXCEEDED, 10_000L, 60_000L))
+    }
 }

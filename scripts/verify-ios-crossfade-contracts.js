@@ -285,7 +285,7 @@ assert(
     engineSeek.includes('readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
     // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
-    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            completion(result)') &&
+    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)') &&
     engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            completion?(result)') &&
     waitForPlaying.includes('if let playWait = playWait { self.endWait(playWait) }\n            playWait = nil\n            completion(result)') &&
     startWait.includes('if let self = self, let driver = driver { self.endWait(driver) }\n            onGiveUp(verdict, watch)') &&
@@ -628,7 +628,9 @@ assert(
     engine.includes('private func abandonLoad() {') &&
       section(engine, 'private func abandonLoad() {', '\n    }\n').includes('stopLoading(player)') &&
       section(facade, 'func stopLoading(_ player: ItemLoadingPlayer) {', '\n}\n').includes('player.replaceCurrentItem(with: nil)') &&
-      prepare.includes('self.abandonLoad()') &&
+      prepare.includes('settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)') &&
+      section(facade, 'func settleCrossfadeLoad(', '\n}\n').includes('if case .failure = result { stopLoading() }') &&
+      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('pendingAsset?.cancelLoading()') &&
       prepare.includes('"code": "crossfade_prepare_timeout"') &&
       seek.includes('self.abandonLoad()') &&
       seek.includes('"code": "crossfade_seek_timeout"'),

@@ -453,7 +453,7 @@ internal class KotlinAudioPlaybackBackend(
     private fun giveUpLoad(verdict: StallVerdict) {
         val stallMs = loadWatch?.lastStallTimeoutMs ?: 0L
         val totalMs = loadWatch?.lastTotalTimeoutMs ?: 0L
-        val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallMs}ms" else "over the ${totalMs}ms limit"
+        val reason = stallVerdictReason(verdict, stallMs, totalMs)
         androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")
         player.failLoad(
             PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),
