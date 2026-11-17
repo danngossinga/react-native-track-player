@@ -2,6 +2,7 @@ package com.doublesymmetry.kotlinaudio.models
 
 import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.MediaItem
+import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
@@ -32,5 +33,11 @@ class PlayerHooks(
      */
     val mediaTransferListener: ((MediaItem) -> TransferListener)? = null,
     /** The listener of a source's playlist, manifest and key requests (null: none). */
-    val playlistTransferListener: ((MediaItem) -> TransferListener)? = null
+    val playlistTransferListener: ((MediaItem) -> TransferListener)? = null,
+    /**
+     * The player the media session and the notification read, made from KotlinAudio's own (its
+     * ExoPlayer, or the forwarding player that intercepts their commands): the host may wrap it
+     * (for example to show another track's position while one loads). Default: as is.
+     */
+    val sessionPlayer: (Player) -> Player = { it }
 )

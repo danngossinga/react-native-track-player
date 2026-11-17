@@ -11,7 +11,8 @@ import com.google.android.exoplayer2.Player
 
 // Stand-ins for ExoPlayer's media session extension (2.19.0), which vendored KotlinAudio names:
 // not in this machine's offline Gradle 8 cache. The media session is not under test here; same
-// shapes, no behaviour.
+// shapes, no behaviour, except that it keeps the player it was given (the real one reads it), so a
+// test can check which player the media session reads.
 
 class MediaSessionConnector(@Suppress("UNUSED_PARAMETER") mediaSession: MediaSessionCompat) {
     interface CommandReceiver {
@@ -34,7 +35,13 @@ class MediaSessionConnector(@Suppress("UNUSED_PARAMETER") mediaSession: MediaSes
         fun getMetadata(player: Player): MediaMetadataCompat
     }
 
-    fun setPlayer(player: Player?) = Unit
+    /** The player the media session reads (stub only: the real class keeps it privately). */
+    var player: Player? = null
+        private set
+
+    fun setPlayer(player: Player?) {
+        this.player = player
+    }
     fun setQueueNavigator(queueNavigator: QueueNavigator?) = Unit
     fun setMetadataDeduplicationEnabled(enabled: Boolean) = Unit
     fun invalidateMediaSessionQueue() = Unit

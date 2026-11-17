@@ -200,10 +200,10 @@ Added fork surface:
   progress events give the active track's last position, duration and buffered
   position (not the loading track's), and the lock screen (iOS) and the
   notification (Android) keep showing the active track; they switch when the new
-  track is reported. On iOS the lock screen also shows the active track's last
-  position, not moving; Android's media session still reads its position from the
-  player (the loading track's) while the notification shows the active track's
-  title and artwork.
+  track is reported. The lock screen (iOS) and the media session and notification
+  (Android) also show the active track's last position, duration and buffered
+  position, not playing (before, Android's media session and notification read the
+  loading track's position, duration and playing state from the player).
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek, and the standard
   backend's load; on iOS the stage before the asset is playable has no progress

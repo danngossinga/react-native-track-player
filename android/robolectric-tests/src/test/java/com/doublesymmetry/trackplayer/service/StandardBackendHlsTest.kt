@@ -203,6 +203,75 @@ class StandardBackendHlsTest {
     }
 
     @Test
+    fun whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack() {
+        // Rule 13 (N1), as iOS's lock screen (the reported track at its last position, rate 0):
+        // while C loads, the player the media session and the notification read (KotlinAudio's
+        // sessionPlayer, given to both) reports A's last position, duration and buffered
+        // position, not playing; once C is reported, the player's own values again.
+        val backed = backed()
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(slowServer(), 3L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val session = backed.player.sessionPlayer
+        val exo = backed.analytics.player!!
+        // The one both read: the notification's player and the media session's.
+        assertSame("the notification reads it", session, privateField(backed.player.notificationManager, "player"))
+        val connector = privateField(backed.player, "mediaSessionConnector") as com.google.android.exoplayer2.ext.mediasession.MediaSessionConnector
+        assertSame("the media session reads it", session, connector.player)
+        assertTrue("A plays, read as is", session.isPlaying && session.playWhenReady)
+        val durationOfA = backed.backend.durationMs
+        val skip = launchCommand { backed.backend.skip(2) }
+        awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
+        val positionOfA = backed.backend.positionMs
+        var sawLoading = false
+        val deadline = monotonicNowMs() + AWAIT_MS
+        while (skip() == null) {
+            if (monotonicNowMs() >= deadline) fail("timed out waiting for the skip to C to end")
+            shadowOf(Looper.getMainLooper()).idle()
+            if (skip() != null) break
+            if (exo.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING && backed.player.currentIndex == 2) {
+                sawLoading = true
+                assertEquals("the session's position is A's last", positionOfA, session.currentPosition)
+                assertEquals(positionOfA, session.contentPosition)
+                assertEquals("the session's duration is A's", durationOfA, session.duration)
+                assertTrue("the session's buffered position is A's", session.bufferedPosition >= positionOfA)
+                assertFalse("the session is not playing", session.isPlaying)
+                assertFalse("the session does not play when ready", session.playWhenReady)
+                assertTrue("the player itself goes on to play C", exo.playWhenReady)
+            }
+            Thread.sleep(CLOCK_TICK_MS)
+        }
+        assertTrue("C's load was seen", sawLoading)
+        assertTrue(skip()!!.isSuccess)
+        awaitTrue("C plays") { exo.isPlaying }
+        assertTrue("C's own: playing", session.isPlaying && session.playWhenReady)
+        assertEquals("C's own duration", exo.duration, session.duration)
+        assertEquals("C's own position", exo.currentPosition, session.currentPosition)
+    }
+
+    @Test
+    fun theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases() {
+        // The media session and the notification read the player at its events: a hold or a
+        // release is one (play state and position), not left to the player's next event.
+        val backed = backed()
+        val session = backed.player.sessionPlayer as ReportedSessionPlayer
+        val reads = mutableListOf<Pair<Long, Boolean>>()
+        session.addListener(object : com.google.android.exoplayer2.Player.Listener {
+            override fun onEvents(player: com.google.android.exoplayer2.Player, events: com.google.android.exoplayer2.Player.Events) {
+                if (events.contains(com.google.android.exoplayer2.Player.EVENT_IS_PLAYING_CHANGED)) reads += player.currentPosition to player.isPlaying
+            }
+        })
+        session.hold(TrackProgress(42_000L, 180_000L, 50_000L))
+        assertEquals(listOf(42_000L to false), reads)
+        session.hold(TrackProgress(42_000L, 180_000L, 50_000L))
+        assertEquals("the same hold tells nothing", 1, reads.size)
+        session.hold(null)
+        assertEquals(listOf(42_000L to false, backed.analytics.player!!.currentPosition to false), reads)
+        assertNull(session.held)
+    }
+
+    @Test
     fun aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded() {
         val backed = backed()
         backed.backend.replaceQueue(listOf(item(slowServer(), 1L), item(slowServer(), 2L)))
@@ -1126,6 +1195,20 @@ class StandardBackendHlsTest {
 
     private fun item(server: HlsTestServer, queueId: Long) =
         TrackAudioItem(track = Track(queueId = queueId), type = MediaType.HLS, audioUrl = server.masterUrl)
+
+    /** [owner]'s private field [name] (declared by its class or a superclass). */
+    private fun privateField(owner: Any, name: String): Any? {
+        var type: Class<*>? = owner.javaClass
+        while (type != null) {
+            type.declaredFields.firstOrNull { it.name == name }?.let { field ->
+                field.isAccessible = true
+                return field.get(owner)
+            }
+            type = type.superclass
+        }
+        fail("no field $name in ${owner.javaClass}")
+        return null
+    }
 
     /** Runs a backend command on the main thread (the service's), to its end; its error, if any. */
     private fun command(block: suspend () -> Unit): Throwable? {

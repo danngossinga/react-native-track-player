@@ -230,6 +230,8 @@ internal class KotlinAudioPlaybackBackend(
     private fun forgetReportedTrack() {
         failedLoads.reset()
         observedItem = null
+        // No reported track: the notification and the media session read the player again.
+        followNowPlaying()
     }
 
     private fun indexOfItem(item: Any?): Int? =
@@ -536,10 +538,17 @@ internal class KotlinAudioPlaybackBackend(
             }
     }
 
-    /** The notification shows the reported track ([ReportedNowPlaying]); only the authoritative backend's. */
+    /**
+     * The notification shows the reported track ([ReportedNowPlaying]); only the authoritative
+     * backend's. While held, the media session and the notification also read the reported
+     * track's progress, not playing ([ReportedSessionPlayer], rule 13; iOS: the lock screen at its
+     * last position, rate 0), set before the notification is told to show it.
+     */
     private fun followNowPlaying() {
         if (!isAuthoritative || disposed || playerReleased) return
-        nowPlaying.follow(failedLoads.reported, player.currentItem)?.let { onNowPlaying(indexOfItem(it.item), it.held) }
+        val change = nowPlaying.follow(failedLoads.reported, player.currentItem)
+        analytics()?.sessionPlayer?.hold(if (nowPlaying.isHeld) reportedProgress() else null)
+        change?.let { onNowPlaying(indexOfItem(it.item), it.held) }
     }
 
     /** Feeds [failedLoads]: the player's item changes, when it is ready, and a player error. */

@@ -22,6 +22,7 @@ val engineSources = listOf(
     "com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt",
     "com/doublesymmetry/trackplayer/service/PerTrackBandwidthMeter.kt",
     "com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt",
+    "com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt",
     "com/doublesymmetry/trackplayer/service/SharedFlowAdmission.kt",
     "com/doublesymmetry/trackplayer/service/StallWatch.kt",
     "com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt",

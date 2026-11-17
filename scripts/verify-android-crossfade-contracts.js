@@ -1053,6 +1053,32 @@ assert(
   );
 }
 
+// Rule 13 (N1, as iOS's lock screen): while a standard track loads, the media session and the
+// notification read the reported track's position, duration and buffered position, not playing
+// (ReportedSessionPlayer, held by the backend; StandardBackendHlsTest.whileATrackLoadsTheMedia
+// SessionAndTheNotificationReadTheReportedTrack on the real player, with the instance both read).
+// What the tests cannot reach: the real MediaSessionConnector (a stub in the Robolectric build)
+// invalidates its playback state, and PlayerNotificationManager re-posts, at these two events
+// (ExoPlayer 2.19.0's MediaSessionConnector.ComponentListener.onEvents, read with javap).
+{
+  const sessionPlayer = read('android/src/main/java/com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt');
+  const vendored = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
+  assert(
+    sessionPlayer.includes('FlagSet.Builder().addAll(Player.EVENT_PLAY_WHEN_READY_CHANGED, Player.EVENT_IS_PLAYING_CHANGED).build()') &&
+      sessionPlayer.includes('listeners.toList().forEach { it.onEvents(this, events) }') &&
+      standardHooks.includes('sessionPlayer = { player -> ReportedSessionPlayer(player).also { analytics.sessionPlayer = it } }') &&
+      musicService.includes('standardPlayerHooks(this@MusicService, analytics, { initialBitrateEstimate.bitsPerSecond }, { stallTimeout.milliseconds })') &&
+      vendored.includes('sessionPlayer = hooks.sessionPlayer(playerToUse)\n\n        notificationManager = NotificationManager(\n            context,\n            sessionPlayer,') &&
+      vendored.includes('mediaSessionConnector.setPlayer(sessionPlayer)') &&
+      vendored.includes('notificationManager.getMediaMetadataCompat()') &&
+      section(standardBackend, 'private fun followNowPlaying() {', '\n    }\n').includes('analytics()?.sessionPlayer?.hold(if (nowPlaying.isHeld) reportedProgress() else null)\n        change?.let { onNowPlaying(indexOfItem(it.item), it.held) }') &&
+      read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt",') &&
+      ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases']
+        .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)),
+    'The Android media session and notification must read the reported track while another loads, as iOS\'s lock screen.'
+  );
+}
+
 // The engine gives ExoPlayer each load's own media source; a media item would go through
 // ExoPlayer's default factory (no progress listener, no per-request HTTP timeouts).
 assert(

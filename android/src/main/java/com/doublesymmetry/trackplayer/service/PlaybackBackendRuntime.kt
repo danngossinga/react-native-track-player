@@ -403,6 +403,8 @@ internal class StandardPlayerAnalytics(
     val transitions = AutoTransitionCounter()
     /** The bytes the player downloads (its HTTP sources count them): a load's progress. */
     val loadedBytes = LoadedBytes()
+    /** What the player's media session and notification read (set when the player is built). */
+    var sessionPlayer: ReportedSessionPlayer? = null
 
     /** A load starts: the progress of the item ExoPlayer loads now (its sources' MediaItem). */
     fun startLoad() {
@@ -422,8 +424,9 @@ internal class StandardPlayerAnalytics(
 /**
  * What the standard player (vendored KotlinAudio) takes from the app's settings, as the crossfade
  * players do: every track starts from the current [initialBitrateEstimateBps], and every HTTP
- * request's connect and read timeouts follow the current [stallTimeoutMs]. MusicService builds
- * every standard player with it (and the Robolectric tests, the same way).
+ * request's connect and read timeouts follow the current [stallTimeoutMs]; its media session and
+ * notification read [StandardPlayerAnalytics.sessionPlayer]. MusicService builds every standard
+ * player with it (and the Robolectric tests, the same way).
  */
 internal fun standardPlayerHooks(
     context: android.content.Context,
@@ -439,7 +442,10 @@ internal fun standardPlayerHooks(
     // the track's first segment is asked for; each item's own requests, for its own load.
     mediaTransferListener = { item -> analytics.loadedBytes.media(item) },
     playlistTransferListener = { item -> analytics.loadedBytes.playlists(item) },
-    hostOwnsAudioFocus = true
+    hostOwnsAudioFocus = true,
+    // The media session and the notification read the reported track while another one loads
+    // (the backend holds it: ReportedSessionPlayer), as iOS's lock screen.
+    sessionPlayer = { player -> ReportedSessionPlayer(player).also { analytics.sessionPlayer = it } }
 )
 
 internal class PlaybackOperationCancelledException(

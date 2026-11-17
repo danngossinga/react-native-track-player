@@ -100,6 +100,12 @@ abstract class BaseAudioPlayer internal constructor(
 
     val notificationManager: NotificationManager
 
+    /**
+     * Fork: the player the media session and the notification read ([PlayerHooks.sessionPlayer]
+     * of upstream's: the ExoPlayer, or the forwarding player that intercepts their commands).
+     */
+    val sessionPlayer: Player
+
     open val playerOptions: PlayerOptions = DefaultPlayerOptions()
 
     open val currentItem: AudioItem?
@@ -246,10 +252,12 @@ abstract class BaseAudioPlayer internal constructor(
 
         val playerToUse =
             if (playerConfig.interceptPlayerActionsTriggeredExternally) createForwardingPlayer() else exoPlayer
+        // Fork: the host may wrap it (PlayerHooks.sessionPlayer).
+        sessionPlayer = hooks.sessionPlayer(playerToUse)
 
         notificationManager = NotificationManager(
             context,
-            playerToUse,
+            sessionPlayer,
             mediaSession,
             mediaSessionConnector,
             notificationEventHolder,
@@ -274,7 +282,7 @@ abstract class BaseAudioPlayer internal constructor(
                 )
                 .build();
             exoPlayer.setAudioAttributes(audioAttributes, playerConfig.handleAudioFocus);
-            mediaSessionConnector.setPlayer(playerToUse)
+            mediaSessionConnector.setPlayer(sessionPlayer)
             mediaSessionConnector.setMediaMetadataProvider {
                 notificationManager.getMediaMetadataCompat()
             }
