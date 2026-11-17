@@ -589,4 +589,12 @@ assert(
   );
 }
 
+// The engine gives ExoPlayer each load's own media source; a media item would go through
+// ExoPlayer's default factory (no progress listener, no per-request HTTP timeouts).
+assert(
+  !/\.(setMediaItem|setMediaItems|addMediaItem|addMediaItems)\(/.test(engineSource) &&
+    (engineSource.match(/player\.setMediaSource\(/g) || []).length === 1,
+  'The Android crossfade engine must load tracks only with setMediaSource(its per-load source), never a media item.'
+);
+
 console.log('Android crossfade contracts OK');

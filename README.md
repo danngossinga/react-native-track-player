@@ -78,10 +78,12 @@ Added fork surface:
   not progress). On iOS the stage that loads the playlists (before the asset is
   playable) has no progress signal, so only `prepareTimeoutMs` ends it; after
   it, progress is buffered media and the item's transferred bytes, which
-  AVFoundation does not split between playlists and media. On Android a
-  crossfade load therefore gives up after `stallTimeoutMs` (10 s by default)
-  with no progress, counted once its playlists are in and its first segment has
-  been requested, and stops the player's background retries. Emulator check at
+  AVFoundation does not split between playlists and media. On Android the
+  no-progress countdown of a crossfade load runs from the start of the load:
+  until its first segment is requested, playlist and key bytes reset it; after
+  that only media bytes (and buffered media) do. When it reaches
+  `stallTimeoutMs` (10 s by default) the load gives up and stops the player's
+  background retries. Emulator check at
   commit 1cbac20 (before playlists counted until the first segment): a load
   whose segment never came gave up 10.0–10.4 s after it started; a longer wait
   seen by the app came from its own calls.
