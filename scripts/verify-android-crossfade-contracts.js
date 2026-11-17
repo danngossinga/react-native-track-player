@@ -483,7 +483,9 @@ assert(
       abandon.includes('load abandoned ($why)') &&
       prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation, "load ${error.code}: ${error.message}")\n            throw error') &&
       section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "load $reason")') &&
-      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")'),
+      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")') &&
+      seekBody.includes('player.playerError?.let { error ->') &&
+      seekBody.includes('abandonLoad(generation, "seek ${error.code}: ${error.message}")'),
     'An Android engine that gives up on a load or seek must stop the player and forget the track.'
   );
 }
