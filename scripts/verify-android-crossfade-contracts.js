@@ -451,4 +451,60 @@ assert(
   'WholeNumberSetting.value must stay @Volatile: loading threads read it at every HTTP request.'
 );
 
+// An uncached adaptive track starts at its lowest rendition: the crossfade players' track
+// selector lets audio renditions with unknown channel counts or sample rates (an HLS master
+// playlist names neither) adapt from the bandwidth estimate. Pinned behaviour:
+// android/robolectric-tests CrossfadeEngineHlsTest.anUncachedTrack...
+{
+  const builder = section(engineSource, 'val player: ExoPlayer = ExoPlayer.Builder(context)', '.build()');
+  const parameters = section(engineSource, 'internal fun crossfadeTrackSelectorParameters(', '.build()');
+  assert(
+    builder.includes('.setTrackSelector(crossfadeTrackSelector(context))') &&
+      builder.includes('.setBandwidthMeter(bandwidthMeter)') &&
+      parameters.includes('.setAllowAudioMixedChannelCountAdaptiveness(true)') &&
+      parameters.includes('.setAllowAudioMixedSampleRateAdaptiveness(true)') &&
+      read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt')
+        .includes('fun anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionHighestListedFirst()'),
+    'Android crossfade players must select adaptively among audio renditions (lowest first at a low estimate).'
+  );
+}
+
+// A load or seek an engine gives up on stops loading (no background retries) and forgets the
+// track, as iOS removes the item.
+{
+  const abandon = section(engineSource, 'private fun abandonLoad(generation: Long) {', '\n    }\n');
+  const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+  const seekBody = section(engineSource, 'override suspend fun seekTo(', 'override fun setVolume(');
+  assert(
+    abandon.includes('if (operationGeneration != generation) return') &&
+      abandon.includes('player.stop()') &&
+      abandon.includes('preparedItem = null') &&
+      abandon.includes('preparedTrackKey = null') &&
+      prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation)\n            throw error') &&
+      section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation)') &&
+      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation)'),
+    'An Android engine that gives up on a load or seek must stop the player and forget the track.'
+  );
+}
+
+// A track that fails to load leaves the player in error (as iOS); the load started when a track
+// ends reports its failure as a playback-error (no command waits for it), as iOS.
+{
+  const startTrack = section(orchestrator, 'private suspend fun startTrackAt(', 'private suspend fun ensureActivePrepared(');
+  const monitor = section(orchestrator, 'private suspend fun monitorActiveEngine() {', 'private suspend fun advanceToNextTrack(');
+  const advance = section(orchestrator, 'private suspend fun advanceToNextTrack(', 'private fun cancelCrossfade(');
+  assert(
+    startTrack.includes('} catch (error: RejectionException) {') &&
+      section(startTrack, '} catch (error: RejectionException) {', 'throw error').includes('setState(AndroidPlaybackOrchestratorState.ERROR)') &&
+      monitor.includes('advanceToNextTrack(nextIndex, endedPosition)') &&
+      !monitor.includes('startTrackAt(') &&
+      advance.includes('val ticket = operationController.begin()') &&
+      advance.includes('delegate.onPlaybackError(error.code, error.message)') &&
+      advance.includes('operationController.finish(ticket)') &&
+      musicService.includes('override fun onPlaybackError(code: String, message: String?) {') &&
+      musicService.includes('emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {\n                        putString("code", code)'),
+    'A failed Android natural advance must leave the player in error and emit playback-error.'
+  );
+}
+
 console.log('Android crossfade contracts OK');

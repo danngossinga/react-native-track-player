@@ -199,13 +199,17 @@ final class IOSCrossfadeEngine {
             self.itemStatusObservation = nil
             loadItem?.cancelPendingSeeks()
             self.player.cancelPendingPrerolls()
+            self.abandonLoad()
             self.state = .failed
             settle(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: loadItem == nil
-                    ? "Crossfade engine did not become playable (\(reason))."
-                    : "Crossfade engine did not become ready (\(reason))."]
+                userInfo: [
+                    NSLocalizedDescriptionKey: loadItem == nil
+                        ? "Crossfade engine did not become playable (\(reason))."
+                        : "Crossfade engine did not become ready (\(reason)).",
+                    "code": "crossfade_prepare_timeout"
+                ]
             )))
         }
         loadWait = wait
@@ -298,11 +302,15 @@ final class IOSCrossfadeEngine {
                 // The player goes to an error state: audio must not resume by itself when the
                 // data arrives later, as after a failed play start.
                 self.player.pause()
+                self.abandonLoad()
                 self.state = .failed
                 finish(.failure(NSError(
                     domain: "RNTP-Crossfade",
                     code: 3,
-                    userInfo: [NSLocalizedDescriptionKey: "Crossfade engine seek did not finish (\(reason))."]
+                    userInfo: [
+                        NSLocalizedDescriptionKey: "Crossfade engine seek did not finish (\(reason)).",
+                        "code": "crossfade_seek_timeout"
+                    ]
                 )))
             }
         }
@@ -352,6 +360,14 @@ final class IOSCrossfadeEngine {
         player.pause()
         player.seek(to: .zero)
         state = .idle
+    }
+
+    /// Ends a load or seek the engine gave up on: the item leaves the player, so AVPlayer stops
+    /// requesting its media (it would otherwise keep the stalled request going in the background);
+    /// the next play loads the track again. As Android's engine.
+    private func abandonLoad() {
+        IOSPlaybackLog.log("\(name) load abandoned")
+        player.replaceCurrentItem(with: nil)
     }
 
     func reset() {

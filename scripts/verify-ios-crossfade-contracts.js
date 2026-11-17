@@ -456,4 +456,36 @@ assert(
   assert(unwatched === 1, 'Only the load\'s own seek may pass watched: false in ios/RNTrackPlayer (found ' + unwatched + ').');
 }
 
+// The load started when a track ends reports its failure as a playback-error (no command waits
+// for it), with the same fields as Android's orchestrator.
+{
+  const observeEnd = section(orchestrator, 'private func observeEnd() {', 'private func stabilizeCancelledOperation() {');
+  const delegateImpl = section(player, 'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure) {', '\n    }\n');
+  assert(
+    observeEnd.includes('guard let self = self, let failure = PlaybackAdvanceFailure(result) else { return }') &&
+      observeEnd.includes('self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)') &&
+      !observeEnd.includes('{ _ in }') &&
+      delegateImpl.includes('isAuthoritative(.pingPong, identity: orchestrator)') &&
+      delegateImpl.includes('emit(event: EventType.PlaybackError, body: ["code": failure.code, "message": failure.message])') &&
+      facade.includes('struct PlaybackAdvanceFailure: Equatable {'),
+    'A failed iOS natural advance must emit playback-error with its code and message.'
+  );
+}
+
+// A load or seek an engine gives up on stops loading (the item leaves the player), as Android's
+// engine stops its player.
+{
+  const prepare = section(engine, 'func prepare(track: Track, position: Double, completion:', 'asset.loadValuesAsynchronously(');
+  const seek = section(engine, 'func seek(to position: Double, watched: Bool = true,', 'player.seek(to: time,');
+  assert(
+    engine.includes('private func abandonLoad() {') &&
+      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('player.replaceCurrentItem(with: nil)') &&
+      prepare.includes('self.abandonLoad()') &&
+      prepare.includes('"code": "crossfade_prepare_timeout"') &&
+      seek.includes('self.abandonLoad()') &&
+      seek.includes('"code": "crossfade_seek_timeout"'),
+    'An iOS engine that gives up on a load or seek must remove the item (stop loading) and name the code.'
+  );
+}
+
 console.log('iOS crossfade contracts OK');

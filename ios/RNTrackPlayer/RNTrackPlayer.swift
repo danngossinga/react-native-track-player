@@ -1944,6 +1944,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         updateNowPlayingForOrchestrator()
     }
 
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure) {
+        guard playbackBackendAuthority.isAuthoritative(.pingPong, identity: orchestrator),
+              orchestrator === playbackOrchestrator else { return }
+        // Same event and fields as Android's orchestrator.
+        emit(event: EventType.PlaybackError, body: ["code": failure.code, "message": failure.message])
+    }
+
     func playbackOrchestrator(
         _ orchestrator: IOSPlaybackOrchestrator,
         didChangeActiveTrack index: Int?,
