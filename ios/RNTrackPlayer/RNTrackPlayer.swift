@@ -146,17 +146,28 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
             guard let self = self else { return }
             self.handleAudioPlayerCommonMetadataReceived(source: source, metadata: metadata)
         }
+        // Its failed state, then its error (StandardFailureOrder, tested): SwiftAudioEx delivers
+        // the failure first, from another queue.
+        let failureOrder = StandardFailureOrder<Error?>()
         source.event.stateChange.addListener(self) { [weak self, weak source, token] state in
             guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerStateChange(source: source, state: state)
+            failureOrder.stateDelivered(
+                failed: state == .failed,
+                emit: { self.handleAudioPlayerStateChange(source: source, state: state) },
+                emitFailure: { self.handleAudioPlayerFailed(source: source, error: $0) }
+            )
         }
         source.event.fail.addListener(self) { [weak self, weak source, token] error in
             guard token.acceptsDelivery else { return }
             guard let source = source else { return }
             guard let self = self else { return }
-            self.handleAudioPlayerFailed(source: source, error: error)
+            failureOrder.failureDelivered(
+                error,
+                playerFailed: { source.playerState == .failed },
+                emitFailure: { self.handleAudioPlayerFailed(source: source, error: $0) }
+            )
         }
         source.event.currentItem.addListener(self) { [weak self, weak source, token] data in
             guard token.acceptsDelivery else { return }

@@ -908,6 +908,25 @@ assert(
   );
 }
 
+// A standard player error reaches JS as its error state, then the playback error (as Android and
+// the crossfade path): both SwiftAudioEx deliveries pass through one StandardFailureOrder
+// (tested), the failure reading the player's state as it arrives.
+{
+  const events = section(player, 'private func configurePlayerEvents(_ source: QueuedAudioPlayer) {', 'source.event.currentItem.addListener(self)');
+  const failureTests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  assert(
+    events.includes('let failureOrder = StandardFailureOrder<Error?>()') &&
+      events.includes('failureOrder.stateDelivered(\n                failed: state == .failed,\n                emit: { self.handleAudioPlayerStateChange(source: source, state: state) },\n                emitFailure: { self.handleAudioPlayerFailed(source: source, error: $0) }') &&
+      events.includes('failureOrder.failureDelivered(\n                error,\n                playerFailed: { source.playerState == .failed },\n                emitFailure: { self.handleAudioPlayerFailed(source: source, error: $0) }') &&
+      !events.includes('self.handleAudioPlayerFailed(source: source, error: error)') &&
+      !events.includes('self.handleAudioPlayerStateChange(source: source, state: state)\n        }') &&
+      ['testStandardFailureOrderEmitsAFailureAfterTheFailedStateItWaitsFor',
+        'testStandardFailureOrderEmitsAtOnceWhenNoFailedStateIsComing',
+        'testStandardFailureOrderKeepsTheOrderAcrossQueues'].every((t) => failureTests.includes(`func ${t}()`)),
+    'iOS standard player errors must reach JS after their error state (StandardFailureOrder).'
+  );
+}
+
 // The standard seek and backend-switch waits sample every stallTimeoutMs / 10 (as the load watch
 // and Android) and look at every player event between; no fixed poll. The crossfade engine keeps
 // stallCheckIntervalMs (out of scope).

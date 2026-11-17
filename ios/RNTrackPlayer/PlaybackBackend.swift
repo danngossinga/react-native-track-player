@@ -684,6 +684,78 @@ final class LockedValue<Value> {
     }
 }
 
+/// The order in which a standard player's failure reaches JS: its error state, then the playback
+/// error, as Android (KotlinAudio's onPlayerError and failLoad) and the crossfade path.
+/// SwiftAudioEx reports a failure at once on its `fail` event, while it sets its failed state on
+/// its state queue and emits it on another event queue, so the error came first. One player's
+/// state and failure deliveries pass through this, one at a time (its lock): a failure waits for
+/// the failed state when that state is still to come (the player is failed, the last state
+/// delivered is not), and is emitted right after it.
+///
+/// One explicit state (form 3): `notFailed` (the last state delivered is not failed), `failed`
+/// (it is), `waiting(failures)` (failures waiting for the failed state). Moves: a failed state ->
+/// failed, emitting the waiting failures after it; another state -> notFailed, except while
+/// waiting (an older state still delivered first: keeps waiting); a failure while failed, or
+/// while the player is not failed (no failed state is coming: SwiftAudioEx's failed-to-play-to-end)
+/// -> emitted at once; else -> waiting (appended).
+final class StandardFailureOrder<Failure> {
+    enum State {
+        case notFailed
+        case failed
+        case waiting([Failure])
+    }
+
+    private let lock = NSLock()
+    private var stored: State = .notFailed
+
+    var state: State {
+        lock.lock()
+        defer { lock.unlock() }
+        return stored
+    }
+
+    /// A state delivered: `emit` emits it (or the backend holds it back), then the failures
+    /// waiting for a failed state are emitted (`emitFailure`), in that order.
+    func stateDelivered(failed: Bool, emit: () -> Void, emitFailure: (Failure) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        emit()
+        if failed {
+            if case let .waiting(failures) = stored {
+                stored = .failed
+                failures.forEach(emitFailure)
+            } else {
+                stored = .failed
+            }
+        } else if case .waiting = stored {
+            return
+        } else {
+            stored = .notFailed
+        }
+    }
+
+    /// A failure delivered: emitted at once (`emitFailure`) unless the failed state is still to
+    /// come (`playerFailed`: the player's state is failed now, read here).
+    func failureDelivered(_ failure: Failure, playerFailed: () -> Bool, emitFailure: (Failure) -> Void) {
+        lock.lock()
+        defer { lock.unlock() }
+        switch stored {
+        case .failed:
+            emitFailure(failure)
+        case let .waiting(failures):
+            stored = .waiting(failures + [failure])
+        case .notFailed:
+            if playerFailed() {
+                stored = .waiting([failure])
+            } else {
+                emitFailure(failure)
+            }
+        }
+    }
+}
+
+extension StandardFailureOrder.State: Equatable where Failure: Equatable {}
+
 /// Drives one wait on a callback queue: every `intervalMs` it reads the progress and asks its
 /// `StallWatch`; it reschedules itself while the verdict is `.wait` and calls `onGiveUp` once
 /// otherwise. `readings` returning nil means the wait has no progress signal yet (an asset not

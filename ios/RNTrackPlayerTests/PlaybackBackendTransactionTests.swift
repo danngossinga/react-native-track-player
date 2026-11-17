@@ -944,6 +944,88 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(h.watch.state, .idle(ready: nil))
     }
 
+    // A standard player error reaches JS as its error state, then the playback error (Android's
+    // onPlayerError, failLoad and the crossfade path). SwiftAudioEx reports the failure at once
+    // but its failed state later, from other queues.
+
+    func testStandardFailureOrderEmitsAFailureAfterTheFailedStateItWaitsFor() {
+        let order = StandardFailureOrder<String>()
+        var emitted: [String] = []
+        func state(_ name: String) {
+            order.stateDelivered(failed: name == "failed", emit: { emitted.append("state:\(name)") }, emitFailure: { emitted.append("error:\($0)") })
+        }
+        func failure(_ name: String, playerFailed: Bool) {
+            order.failureDelivered(name, playerFailed: { playerFailed }, emitFailure: { emitted.append("error:\($0)") })
+        }
+        XCTAssertEqual(order.state, .notFailed)
+        state("loading")
+        // The failure first (its state still on SwiftAudioEx's queues): it waits for it, behind
+        // an older state still delivered first.
+        failure("e1", playerFailed: true)
+        XCTAssertEqual(order.state, .waiting(["e1"]))
+        state("loading")
+        XCTAssertEqual(order.state, .waiting(["e1"]), "an older state does not release it")
+        state("failed")
+        XCTAssertEqual(emitted, ["state:loading", "state:loading", "state:failed", "error:e1"])
+        XCTAssertEqual(order.state, .failed)
+        // In the failed state (SwiftAudioEx emits no state for the same state again): at once.
+        failure("e2", playerFailed: true)
+        XCTAssertEqual(emitted.last, "error:e2")
+        // The state first: the failure follows it at once.
+        state("loading")
+        XCTAssertEqual(order.state, .notFailed)
+        state("failed")
+        failure("e3", playerFailed: true)
+        XCTAssertEqual(Array(emitted.suffix(3)), ["state:loading", "state:failed", "error:e3"])
+        // Two failures before the state: both after it, in order.
+        state("loading")
+        failure("e4", playerFailed: true)
+        failure("e5", playerFailed: true)
+        XCTAssertEqual(order.state, .waiting(["e4", "e5"]))
+        state("failed")
+        XCTAssertEqual(Array(emitted.suffix(3)), ["state:failed", "error:e4", "error:e5"])
+    }
+
+    func testStandardFailureOrderEmitsAtOnceWhenNoFailedStateIsComing() {
+        // SwiftAudioEx's failed-to-play-to-end failure leaves its state as it is: no failed state
+        // follows, the failure is emitted at once.
+        let order = StandardFailureOrder<String>()
+        var emitted: [String] = []
+        order.stateDelivered(failed: false, emit: { emitted.append("state:playing") }, emitFailure: { emitted.append("error:\($0)") })
+        order.failureDelivered("e", playerFailed: { false }, emitFailure: { emitted.append("error:\($0)") })
+        XCTAssertEqual(emitted, ["state:playing", "error:e"])
+        XCTAssertEqual(order.state, .notFailed)
+        // A failed state the backend holds back (a give-up emitted its own error state) still
+        // releases the failure waiting for it.
+        order.failureDelivered("held", playerFailed: { true }, emitFailure: { emitted.append("error:\($0)") })
+        order.stateDelivered(failed: true, emit: {}, emitFailure: { emitted.append("error:\($0)") })
+        XCTAssertEqual(emitted.last, "error:held")
+    }
+
+    func testStandardFailureOrderKeepsTheOrderAcrossQueues() {
+        // As SwiftAudioEx delivers them: the state and the failure on two queues, racing. The
+        // failure reads the player failed (the state is set before it is reported).
+        for _ in 0..<500 {
+            let order = StandardFailureOrder<String>()
+            let emitted = LockedValue<[String]>([])
+            let stateQueue = DispatchQueue(label: "state"), failQueue = DispatchQueue(label: "fail")
+            let done = DispatchGroup()
+            done.enter()
+            stateQueue.async {
+                order.stateDelivered(failed: false, emit: { emitted.value.append("state:loading") }, emitFailure: { emitted.value.append("error:\($0)") })
+                order.stateDelivered(failed: true, emit: { emitted.value.append("state:failed") }, emitFailure: { emitted.value.append("error:\($0)") })
+                done.leave()
+            }
+            done.enter()
+            failQueue.async {
+                order.failureDelivered("e", playerFailed: { true }, emitFailure: { emitted.value.append("error:\($0)") })
+                done.leave()
+            }
+            done.wait()
+            XCTAssertEqual(emitted.value, ["state:loading", "state:failed", "error:e"])
+        }
+    }
+
     func testStandardLoadWatchALoadsStageMovesBetweenFreshWatchedAndDisarmed() {
         // One explicit stage per load (Android: StandardLoadWatchTest.aLoadsStageMovesBetweenFreshWatchedAndDisarmed,
         // the same steps; Android's onLoadStart is startsLoad here).
