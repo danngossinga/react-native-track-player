@@ -2015,7 +2015,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
               let index = activeIndex, source.items.indices.contains(index),
               let track = source.items[index] as? Track else { return }
-        Metadata.update(for: source, with: track.toObject())
+        // Through `direct`: the player's own writes are held while it is on the failed track, and
+        // a dropped write would still cancel the active track's artwork download (Metadata's task).
+        Metadata.update(for: source, with: track.toObject(), through: (source.nowPlayingInfoController as? StandardNowPlayingInfoController)?.direct)
     }
 
     /// The lock screen shows the standard player's reported track (ReportedNowPlaying, rule 13),

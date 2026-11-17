@@ -35,7 +35,8 @@ Retries the current track when it stopped playing due to a playback error.
 
 ## `seekBy(offset)`
 
-Seeks by a relative time offset in the current track.
+Seeks by a relative time offset in the current track. It resolves and rejects as
+[`seekTo`](#seektoseconds).
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |

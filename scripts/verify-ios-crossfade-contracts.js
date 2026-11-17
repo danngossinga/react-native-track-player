@@ -765,7 +765,7 @@ assert(
       player.includes('!backend.itemMoved(item, lastItem: lastItem, lastPosition: lastPosition ?? 0) {') &&
       player.includes('func handleStandardActiveTrackChanged(source: QueuedAudioPlayer, index: Int?, lastTrack: Track?, lastIndex: Int?, lastPosition: Double) {') &&
       section(player, 'private func emitStandardActiveTrackChanged(', '\n    }\n').includes('emit(event: EventType.PlaybackTrackChanged, body: b)') &&
-      section(player, 'func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {', '\n    }\n').includes('Metadata.update(for: source, with: track.toObject())') &&
+      section(player, 'func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {', '\n    }\n').includes('Metadata.update(for: source, with: track.toObject(), through: (source.nowPlayingInfoController as? StandardNowPlayingInfoController)?.direct)') &&
       // The crossfade play after a failed first load retries the track that failed (Android too).
       section(orchestrator, '        case .error:', '        }\n        refreshNowPlaying()').includes('indexToPlayAfterFailedLoad(') &&
       read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()') &&
