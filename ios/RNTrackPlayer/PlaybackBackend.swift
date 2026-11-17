@@ -2197,10 +2197,45 @@ func indexToPlayAfterFailedLoad(currentIndex: Int, failedIndex: Int?, count: Int
 
 /// Whether a standard native seek that ended stops loading: one that ended unfinished on its
 /// own track and was the latest (no newer seek replaced it: AVPlayer ends a replaced seek
-/// unfinished, which is not a failure), as `settleCrossfadeSeek` on the crossfade path. A seek
-/// that gives up (`standard_seek_timeout`) stops loading too; a player failure has stopped it.
-func standardSeekEndStopsLoading(didFinish: Bool, sameTrack: Bool, isLatest: Bool) -> Bool {
-    return !didFinish && sameTrack && isLatest
+/// unfinished, which is not a failure), as `settleCrossfadeSeek` on the crossfade path, on an
+/// item AVPlayer can seek in (`standardSeekEndCompletes`: on one it cannot, an unfinished seek
+/// completes where the player is). A seek that gives up (`standard_seek_timeout`) stops loading
+/// too; a player failure has stopped it.
+func standardSeekEndStopsLoading(didFinish: Bool, sameTrack: Bool, isLatest: Bool, seekable: Bool) -> Bool {
+    return !didFinish && seekable && sameTrack && isLatest
+}
+
+/// Whether a standard native seek that ended resolves: one that finished on its own track, or
+/// one AVPlayer ended unfinished on an item it cannot seek in (no seekable range: a stream with
+/// no length, as a raw ADTS radio stream; AVPlayer then seeks only within the data it loaded and
+/// otherwise stays where it is, measured with AVFoundation on macOS). Such a seek completes where
+/// the player is, as Android's completes where ExoPlayer lands (its start) on an item ExoPlayer
+/// cannot seek in. Any other unfinished end rejects (`standard_seek_cancelled`).
+func standardSeekEndCompletes(didFinish: Bool, sameTrack: Bool, seekable: Bool) -> Bool {
+    return sameTrack && (didFinish || !seekable)
+}
+
+/// What a standard seek reads of SwiftAudioEx's AVPlayerItem (`standardPlayerItem`).
+struct StandardSeekItem: Equatable {
+    /// The item is ready to play: SwiftAudioEx then seeks AVPlayer at once, which always calls
+    /// back (without an item it defers the seek and may never call back).
+    let ready: Bool
+    /// AVPlayer can seek in the item (it has a seekable range); true when the item cannot be
+    /// read (no item yet, another SwiftAudioEx layout): the seek's usual rules apply.
+    let seekable: Bool
+}
+
+func standardSeekItem(_ lookup: StandardPlayerItemLookup) -> StandardSeekItem {
+    guard case let .item(item?) = lookup else { return StandardSeekItem(ready: false, seekable: true) }
+    return StandardSeekItem(ready: item.status == .readyToPlay, seekable: !item.seekableTimeRanges.isEmpty)
+}
+
+/// Whether a queued standard seek is issued now: once its item has a duration, or, for one with
+/// none (a stream with no length: SwiftAudioEx's duration is 0 for it, for good), once its item
+/// is ready to play. Before, such a seek waited for a duration that never came and rejected at
+/// `standardSeekTimeoutMs`.
+func standardSeekCanBeIssued(duration: Double, item: StandardSeekItem) -> Bool {
+    return duration > 0 || item.ready
 }
 
 /// The code a standard command rejects with when the player fails its track's load, as a
@@ -2588,10 +2623,11 @@ final class StandardLoadCoordinator {
     }
 
     /// A native seek ended: one that ended unfinished on its track and was the latest stops
-    /// loading (`standardSeekEndStopsLoading`); one a newer seek replaced does not.
-    func nativeSeekEnded(didFinish: Bool, track: ObjectIdentifier, isLatest: Bool, keptPosition: Double) {
+    /// loading (`standardSeekEndStopsLoading`); one a newer seek replaced, or one on an item
+    /// AVPlayer cannot seek in (`seekable` false: it completes where the player is), does not.
+    func nativeSeekEnded(didFinish: Bool, track: ObjectIdentifier, isLatest: Bool, seekable: Bool, keptPosition: Double) {
         guard !disposed,
-              standardSeekEndStopsLoading(didFinish: didFinish, sameTrack: player?.currentLoadItem == track, isLatest: isLatest) else { return }
+              standardSeekEndStopsLoading(didFinish: didFinish, sameTrack: player?.currentLoadItem == track, isLatest: isLatest, seekable: seekable) else { return }
         giveUps.seekGaveUp(
             IOSPlaybackErrorSnapshot(message: "The native seek was interrupted.", code: "standard_seek_cancelled"),
             keptPosition: keptPosition

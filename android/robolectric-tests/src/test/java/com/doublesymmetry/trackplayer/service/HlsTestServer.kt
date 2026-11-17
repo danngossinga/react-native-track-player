@@ -18,7 +18,8 @@ import java.util.concurrent.Executors
  * [stalledFrom], and for the others nothing at all: the request is accepted and never answered,
  * like a stalled CDN, until the client closes it; or, with [failingStatus], an HTTP error after
  * [failingAfterMs] (a CDN that fails, which makes the player fall back to another rendition).
- * It records every request and every stalled request the client closed, in order.
+ * It records every request and every stalled request the client closed, in order. It also serves
+ * [streamUrl]: a raw ADTS stream (as an internet radio's), not HLS.
  */
 internal class HlsTestServer(
     /** The renditions, in master playlist order: (name, BANDWIDTH in bits per second). */
@@ -76,6 +77,14 @@ internal class HlsTestServer(
     val port: Int
         get() = socket.localPort
 
+    /**
+     * A raw ADTS stream of one segment's audio ([SEGMENT_SECONDS] s), sent with no Content-Length
+     * and ended by closing the connection: ExoPlayer cannot seek in it (no length, so no
+     * constant-bitrate seeking; its window is not seekable).
+     */
+    val streamUrl: String
+        get() = "http://127.0.0.1:${socket.localPort}$STREAM_PATH"
+
     init {
         pool.execute {
             while (!socket.isClosed) {
@@ -103,6 +112,16 @@ internal class HlsTestServer(
                 }
                 val segment = SEGMENT_NAME.matchEntire(path.substringAfterLast('/'))?.groupValues?.get(1)?.toInt()
                 when {
+                    path == STREAM_PATH -> {
+                        val head = "HTTP/1.1 200 OK\r\nContent-Type: audio/aac\r\nConnection: close\r\n\r\n"
+                        connection.getOutputStream().apply {
+                            write(head.toByteArray())
+                            write(adtsSegment(0))
+                            flush()
+                        }
+                        runCatching { connection.close() }
+                        return
+                    }
                     path == "/master.m3u8" -> {
                         Thread.sleep(playlistDelayMs)
                         respond(connection, (masterBody ?: masterPlaylist()).toByteArray(), PLAYLIST_TYPE)
@@ -220,6 +239,7 @@ internal class HlsTestServer(
         const val SEGMENT_SECONDS = 4
         private const val PLAYLIST_TYPE = "application/vnd.apple.mpegurl"
         private val SEGMENT_NAME = Regex("segment-(\\d+)\\.aac")
+        private const val STREAM_PATH = "/stream.aac"
         private const val SAMPLE_RATE = 44_100
         private const val SAMPLES_PER_FRAME = 1_024
         private const val FRAME_PAYLOAD_BYTES = 32

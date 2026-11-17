@@ -118,7 +118,13 @@ internal data class StandardSeekObservation(
     /** The playback speed: how far the position may have moved past the target since the seek. */
     val rate: Float = 1f,
     /** The player's automatic transitions so far (a track played to its end, repeat-one too). */
-    val autoTransitions: Long = 0L
+    val autoTransitions: Long = 0L,
+    /**
+     * The player can seek in the track (ExoPlayer's window is seekable). When it cannot (a
+     * stream with no length or index, as a raw ADTS radio stream), ExoPlayer lands a seek where
+     * it can (the start) and completes it there: so does the standard seek, once loaded.
+     */
+    val seekable: Boolean = true
 )
 
 /**
@@ -232,7 +238,8 @@ internal class StandardSeekGate(
                         observed.state != AudioPlayerState.BUFFERING &&
                         // Not loaded (stopped, never prepared): not at the target yet.
                         observed.state != AudioPlayerState.IDLE &&
-                        standardSeekIsAtTarget(observed.positionMs, target, playedMs.toLong(), sinceLastMs.toLong()))
+                        // A track the player cannot seek in: where the player landed.
+                        (!observed.seekable || standardSeekIsAtTarget(observed.positionMs, target, playedMs.toLong(), sinceLastMs.toLong())))
             }
         } catch (cancelled: PlaybackOperationCancelledException) {
             throw RejectionException("Playback changed before the native seek completed (${cancelled.reason}).", "standard_seek_cancelled")
@@ -286,6 +293,12 @@ internal interface ExoSeekState {
     val hasError: Boolean
     /** Playing now (ready and asked to play): the position moves past the target. */
     val isPlaying: Boolean
+    /**
+     * ExoPlayer can seek in its current item (`isCurrentMediaItemSeekable`). Before its source
+     * loaded (a placeholder window) it says no, but the player is not ready then: the seek reads
+     * it only once loaded.
+     */
+    val isSeekable: Boolean
 }
 
 /** [ExoSeekState] of the captured ExoPlayer ([StandardPlayerAnalytics]; idle until there is one). */
@@ -299,6 +312,8 @@ internal class CapturedExoSeekState(private val captured: () -> com.google.andro
         get() = player?.playerError != null
     override val isPlaying: Boolean
         get() = player?.isPlaying == true
+    override val isSeekable: Boolean
+        get() = player?.isCurrentMediaItemSeekable ?: true
 }
 
 /** What a seek wait reads of [StandardSeekPlayer]. */
@@ -317,7 +332,8 @@ internal fun StandardSeekPlayer.seekObservation() = StandardSeekObservation(
     durationMs = durationMs.coerceAtLeast(0L),
     item = currentItem,
     rate = rate,
-    autoTransitions = autoTransitions
+    autoTransitions = autoTransitions,
+    seekable = exo.isSeekable
 )
 
 /**

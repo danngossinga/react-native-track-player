@@ -115,6 +115,16 @@ Added fork surface:
   again and failed) and `cancelled`. iOS sent all of them as `seek_failed`
   before; it still does for `standard_seek_invalid_position` (a position that is
   not a finite number), which only iOS checks.
+- A standard seek in a track the player cannot seek in (a stream with no length
+  or index, such as a raw ADTS radio stream: ExoPlayer's window is not seekable,
+  AVPlayer's item has no seekable range) resolves where the player lands, on both
+  platforms (before: Android waited for the target and failed with
+  `standard_seek_timeout` after `stallTimeoutMs`, leaving the player in error;
+  iOS never issued it, as such a stream has no duration, and rejected it at
+  `standardSeekTimeoutMs`). Where it lands differs: ExoPlayer goes back to the
+  start of the track; iOS issues the seek once the item is ready, and AVPlayer
+  seeks within the data it has loaded or stays where it is (measured with
+  AVFoundation on macOS, not on an iOS device).
 - `skip`, `skipToNext`, `skipToPrevious` and `load` resolve once their track
   loaded and is the active one (`getActiveTrackIndex()` returns it), on both
   backends and both platforms, paused or playing; `initialPosition` is applied
@@ -126,7 +136,12 @@ Added fork surface:
   track is never reported, the player goes back to the active track, paused
   (crossfade's cancelled operation), and the seek acts on that track (before: the
   standard backend paused or sought the loading track, which then became active;
-  a pause did not cancel the command). The rejection is the report:
+  a pause did not cancel the command). None of the cancelled track's media loads
+  after that; on Android's standard backend, after a seek or pause, ExoPlayer keeps
+  the cancelled track's source prepared while it is in the queue, so an HLS
+  playlist request already under way completes and the source then fetches its
+  primary media playlist (a stop releases it); on iOS SwiftAudioEx cancels the
+  asset's loading. The rejection is the report:
   no `PlaybackError` event for it. A load no command waits for (a natural
   advance, a play or retry after a failure) reports its failure with a
   `PlaybackError` event (`code`, `message`), after the `PlaybackState` error event

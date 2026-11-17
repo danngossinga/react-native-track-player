@@ -314,10 +314,36 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testAStandardSeekThatEndsUnfinishedStopsLoadingUnlessANewerOneReplacedIt() {
         // As settleCrossfadeSeek: the latest seek that fails stops loading; a replaced one does not.
-        XCTAssertTrue(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: true))
-        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: false))
-        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: false, isLatest: true))
-        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: true, sameTrack: true, isLatest: true))
+        XCTAssertTrue(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: true, seekable: true))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: false, seekable: true))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: false, isLatest: true, seekable: true))
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: true, sameTrack: true, isLatest: true, seekable: true))
+        // On an item AVPlayer cannot seek in, it completes where the player is: no stop.
+        XCTAssertFalse(standardSeekEndStopsLoading(didFinish: false, sameTrack: true, isLatest: true, seekable: false))
+    }
+
+    func testAStandardSeekOnAnItemAVPlayerCannotSeekInCompletesWhereThePlayerIs() {
+        // A stream with no length (a raw ADTS radio stream): no seekable range, and SwiftAudioEx's
+        // duration stays 0. Android: ExoPlayer lands such a seek at the start and completes it.
+        // Issued once the item is ready (before: it waited for a duration, then timed out).
+        XCTAssertFalse(standardSeekCanBeIssued(duration: 0, item: StandardSeekItem(ready: false, seekable: true)))
+        XCTAssertTrue(standardSeekCanBeIssued(duration: 0, item: StandardSeekItem(ready: true, seekable: false)))
+        XCTAssertTrue(standardSeekCanBeIssued(duration: 30, item: StandardSeekItem(ready: false, seekable: true)))
+        // AVPlayer ends it unfinished when the target is past the data it loaded, and stays: it
+        // completes there. Finished (within the loaded data): done at the target.
+        XCTAssertTrue(standardSeekEndCompletes(didFinish: false, sameTrack: true, seekable: false))
+        XCTAssertTrue(standardSeekEndCompletes(didFinish: true, sameTrack: true, seekable: false))
+        XCTAssertTrue(standardSeekEndCompletes(didFinish: true, sameTrack: true, seekable: true))
+        // Unfinished on an item AVPlayer can seek in, or on another track: interrupted.
+        XCTAssertFalse(standardSeekEndCompletes(didFinish: false, sameTrack: true, seekable: true))
+        XCTAssertFalse(standardSeekEndCompletes(didFinish: true, sameTrack: false, seekable: false))
+        XCTAssertFalse(standardSeekEndCompletes(didFinish: false, sameTrack: false, seekable: false))
+        // The item as the seek reads it: none, or another layout, keeps the usual rules.
+        XCTAssertEqual(standardSeekItem(.unavailable), StandardSeekItem(ready: false, seekable: true))
+        XCTAssertEqual(standardSeekItem(.item(nil)), StandardSeekItem(ready: false, seekable: true))
+        let loading = AVPlayerItem(url: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("absent.aac"))
+        XCTAssertFalse(standardSeekItem(.item(loading)).ready, "not ready before it loaded")
+        XCTAssertFalse(standardSeekItem(.item(loading)).seekable, "an item with no seekable range")
     }
 
     func testAFailedStandardSeekKeepsItsTargetAsThePosition() {
@@ -1092,16 +1118,18 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let n = CoordinatorHarness()
         n.loads.failedLoads.adopted(n.ia)
         n.player.currentLoadItem = n.ia
-        n.loads.nativeSeekEnded(didFinish: true, track: n.ia, isLatest: true, keptPosition: 5)
-        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: false, keptPosition: 5)
-        n.loads.nativeSeekEnded(didFinish: false, track: n.ib, isLatest: true, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: true, track: n.ia, isLatest: true, seekable: true, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: false, seekable: true, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ib, isLatest: true, seekable: true, keptPosition: 5)
+        // On an item AVPlayer cannot seek in: it completed where the player is.
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: true, seekable: false, keptPosition: 5)
         XCTAssertEqual(n.player.calls, [])
-        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: true, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: true, seekable: true, keptPosition: 5)
         XCTAssertEqual(n.player.calls, ["stop", "gaveUp standard_seek_cancelled playbackError=false", "nowPlaying"])
         let d = CoordinatorHarness()
         d.player.currentLoadItem = d.ia
         d.loads.dispose()
-        d.loads.nativeSeekEnded(didFinish: false, track: d.ia, isLatest: true, keptPosition: 5)
+        d.loads.nativeSeekEnded(didFinish: false, track: d.ia, isLatest: true, seekable: true, keptPosition: 5)
         XCTAssertEqual(d.player.calls, [], "disposed: no give-up")
     }
 

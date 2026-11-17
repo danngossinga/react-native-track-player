@@ -362,6 +362,28 @@ class PlaybackBackendRuntimePrimitivesTest {
     }
 
     @Test
+    fun aSeekInATrackThePlayerCannotSeekInCompletesWhereThePlayerLandsOnceLoaded() = runTest {
+        // ExoPlayer lands a seek in a track it cannot seek in at the start, and completes it.
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 1_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
+        val item = Any()
+        var reads = 0
+        val started = currentTime
+        gate.await(20_000L, item) {
+            reads += 1
+            // Loading (masked by the seek) first, then ready where it landed.
+            if (reads < 3) StandardSeekObservation(AudioPlayerState.BUFFERING, 20_000L, reads * 100L, item = item, seekable = false)
+            else StandardSeekObservation(AudioPlayerState.READY, 0L, 4_000L, item = item, seekable = false)
+        }
+        assertEquals("done at the first ready reading", 3, reads)
+        assertEquals(200L, currentTime - started)
+        // A track it can seek in, ready short of the target: not done (it gives up at the stall).
+        val seekable = runCatching {
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 0L, 4_000L, item = item) }
+        }
+        assertEquals("standard_seek_timeout", (seekable.exceptionOrNull() as RejectionException).code)
+    }
+
+    @Test
     fun aStandardSeekFailsAtOnceOnAPlayerError() = runTest {
         val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
         val item = Any()
@@ -580,6 +602,7 @@ class PlaybackBackendRuntimePrimitivesTest {
             override val hasError: Boolean get() = exoError
             override val isPlaying: Boolean
                 get() = playWhenReady && effectiveState == com.google.android.exoplayer2.Player.STATE_READY
+            override val isSeekable: Boolean = true
         }
 
         override val positionMs: Long

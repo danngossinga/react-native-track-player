@@ -784,8 +784,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // This is the native item's duration, not Track metadata. Without
             // an AVPlayerItem, SwiftAudioEx stores a deferred seek and may never
             // call back (for example after a 404). Check and issue on main so a
-            // queue replacement cannot run between them.
-            guard player.duration > 0 else {
+            // queue replacement cannot run between them. A stream with no length has
+            // no duration for good: issued once its item is ready to play.
+            guard standardSeekCanBeIssued(duration: player.duration, item: standardSeekItem(standardPlayerItem(of: player))) else {
                 // Looked at again at the player's next event (state, duration: seekEventListener)
                 // or after stallTimeoutMs / 10, whichever comes first: no fixed poll.
                 let poll = DispatchWorkItem { [weak self] in self?.pumpSeeks() }
@@ -815,10 +816,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         let wasIssued = issuedSeek === request
         if wasIssued { issuedSeek = nil }
         let sameTrack = (player.currentItem as? Track) === request.track
+        // On an item AVPlayer cannot seek in, an unfinished seek completes where the player is
+        // (Android: where ExoPlayer lands).
+        let seekable = standardSeekItem(standardPlayerItem(of: player)).seekable
         // A seek that fails for any reason stops loading (as the crossfade path); one a newer
         // seek replaced does not.
-        loads.nativeSeekEnded(didFinish: didFinish, track: ObjectIdentifier(request.track), isLatest: wasIssued && pendingSeeks.isEmpty, keptPosition: request.position)
-        request.finish(didFinish && sameTrack && !disposed
+        loads.nativeSeekEnded(didFinish: didFinish, track: ObjectIdentifier(request.track), isLatest: wasIssued && pendingSeeks.isEmpty, seekable: seekable, keptPosition: request.position)
+        request.finish(standardSeekEndCompletes(didFinish: didFinish, sameTrack: sameTrack, seekable: seekable) && !disposed
             ? .success(())
             : .failure(seekError("standard_seek_cancelled", "The native seek was interrupted.")))
         pumpSeeks()

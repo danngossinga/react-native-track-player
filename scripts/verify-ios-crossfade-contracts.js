@@ -818,7 +818,12 @@ assert(
       section(orchestrator, '        case .error:', '        }\n        refreshNowPlaying()').includes('indexToPlayAfterFailedLoad(') &&
       read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()') &&
       section(backendSource, 'private func cancelPendingSeeks() {', '\n    }\n').includes('pokeLoadWatchAfterSeek()') &&
-      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('loads.nativeSeekEnded(didFinish: didFinish, track: ObjectIdentifier(request.track), isLatest: wasIssued && pendingSeeks.isEmpty, keptPosition: request.position)') &&
+      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('loads.nativeSeekEnded(didFinish: didFinish, track: ObjectIdentifier(request.track), isLatest: wasIssued && pendingSeeks.isEmpty, seekable: seekable, keptPosition: request.position)') &&
+      // A seek on an item AVPlayer cannot seek in completes where the player is (Android: where
+      // ExoPlayer lands), and one on a stream with no duration is issued once its item is ready.
+      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('let seekable = standardSeekItem(standardPlayerItem(of: player)).seekable') &&
+      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('request.finish(standardSeekEndCompletes(didFinish: didFinish, sameTrack: sameTrack, seekable: seekable) && !disposed') &&
+      section(backendSource, 'private func pumpSeeks() {', '\n    }\n').includes('guard standardSeekCanBeIssued(duration: player.duration, item: standardSeekItem(standardPlayerItem(of: player))) else {') &&
       section(backendSource, 'func remove(at indexes: [Int]) throws {', '\n    }\n').includes('reportRemovedTrack(before)'),
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );

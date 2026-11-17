@@ -372,6 +372,30 @@ class StandardBackendHlsTest {
         assertTrue(backed.player.position >= LOADABLE_TARGET_MS)
     }
 
+    // A track ExoPlayer cannot seek in (a raw ADTS stream with no length, as an internet radio's):
+    // ExoPlayer lands its seek at the start and completes it there; the standard seek completes
+    // where the player landed too (iOS: at AVPlayer's own seek completion), instead of waiting
+    // for a target the player never reaches and giving up.
+
+    @Test
+    fun aSeekInATrackThePlayerCannotSeekInCompletesWhereThePlayerLands() {
+        val server = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(TrackAudioItem(track = Track(queueId = 1L), type = MediaType.DEFAULT, audioUrl = server.streamUrl)))
+        command { backed.backend.play() }
+        awaitTrue("the stream plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        // Paused: the stream does not reach its end while the seek waits.
+        backed.backend.pause()
+        assertFalse("ExoPlayer cannot seek in the stream", backed.analytics.player!!.isCurrentMediaItemSeekable)
+        val error = command { backed.backend.seekTo(STREAM_SEEK_TARGET_MS) }
+        assertNull("the seek completes: $error", error)
+        assertTrue("where ExoPlayer landed (the start): ${backed.player.position} ms", backed.player.position < PLAYED_MS)
+        pump(STALL_TIMEOUT_MS)
+        assertTrue("no give-up", backed.gaveUpAtMs.isEmpty())
+        assertNull(backed.backend.playbackError)
+        assertEquals(AudioPlayerState.READY, backed.backend.playbackState)
+    }
+
     @Test
     fun clearingTheQueueAfterAGiveUpEndsTheError() {
         val stalled = server(LADDER)
@@ -858,6 +882,8 @@ class StandardBackendHlsTest {
         const val SEEK_TARGET_MS = 20_000L
         /** In the second segment, which arrives. */
         const val LOADABLE_TARGET_MS = 5_000L
+        /** Within [HlsTestServer.streamUrl]'s audio, past where the stream was paused. */
+        const val STREAM_SEEK_TARGET_MS = 3_000L
         /** How far a playing track moved on between SMP's position read and its skip. */
         const val CAPTURE_LAG_MS = 300L
         /** Time for the watch's sampling and the threads around a give-up. */
