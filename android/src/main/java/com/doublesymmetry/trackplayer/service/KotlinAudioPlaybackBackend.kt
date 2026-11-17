@@ -449,10 +449,11 @@ internal class KotlinAudioPlaybackBackend(
     }
     override suspend fun seekTo(positionMs: Long) {
         // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled, and
-        // does not take effect: the seek acts on the active track.
+        // does not take effect: the seek acts on the active track, also after a failed skip and
+        // while a natural advance loads (owner decision, 2026-11-17, LOAD-06).
         val cancelledWait = commandLoads.cancel()
         failedLoads.command()
-        leaveCancelledLoad(cancelledWait, positionMs)
+        leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)
         // No active track (none reported when the cancel stopped the load, or a logical idle):
         // nothing to seek in; the player's own item does not load.
         if (logicalPlaybackState.isIdle) {
@@ -650,8 +651,8 @@ internal class KotlinAudioPlaybackBackend(
      * - None reported: the player stops (which releases every source: nothing of the cancelled
      *   track loads any more) and has no active track (logical idle, crossfade's active index -1).
      */
-    private fun leaveCancelledLoad(cancelledWait: Boolean, positionMs: Long?) {
-        when (val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported)) {
+    private fun leaveCancelledLoad(cancelledWait: Boolean, positionMs: Long?, actsOnReportedTrack: Boolean = false) {
+        when (val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported, actsOnReportedTrack)) {
             StandardCancelledLoad.Stays -> Unit
             is StandardCancelledLoad.ReturnsTo -> {
                 val index = indexOfItem(left.item) ?: return
@@ -700,7 +701,16 @@ internal class KotlinAudioPlaybackBackend(
         // seek loads the track again, as after a stop (iOS: hostFailure cleared, item reloaded).
         override val kotlinAudioState: AudioPlayerState
             get() = player.playerState.let {
-                if (it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true) AudioPlayerState.STOPPED else it
+                when {
+                    it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true -> AudioPlayerState.STOPPED
+                    // An ExoPlayer error ExoPlayer no longer has (prepared again: a seek that went
+                    // back to the active track after a failed skip): KotlinAudio's state follows a
+                    // message later.
+                    it == AudioPlayerState.ERROR && analytics()?.player?.let { exo ->
+                        exo.playerError == null && exo.playbackState != com.google.android.exoplayer2.Player.STATE_IDLE
+                    } == true -> AudioPlayerState.BUFFERING
+                    else -> it
+                }
             }
         override val exo: ExoSeekState = CapturedExoSeekState { analytics()?.player }
         override val positionMs: Long get() = player.position
@@ -809,7 +819,7 @@ internal class KotlinAudioPlaybackBackend(
 
     override suspend fun load(item: TrackAudioItem) {
         commandLoads.cancel()
-        failedLoads.command()
+        failedLoads.skipped()
         seekGate.cancel("load")
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
@@ -825,7 +835,7 @@ internal class KotlinAudioPlaybackBackend(
         }
         commandLoads.cancel()
         seekGate.cancel("skip")
-        failedLoads.command()
+        failedLoads.skipped()
         runActivatingOperation(
             publishLogicalActivation = index == player.currentIndex
         ) { _ -> player.jumpToItem(index) }
@@ -842,7 +852,7 @@ internal class KotlinAudioPlaybackBackend(
         // While a track loads or after it failed, next is relative to the active one, as iOS.
         if (failedLoads.isPending(player.currentItem)) {
             val active = reportedIndex()
-            failedLoads.command()
+            failedLoads.skipped()
             if (active >= 0 && active + 1 < player.items.size) {
                 player.jumpToItem(active + 1)
                 return
@@ -870,7 +880,7 @@ internal class KotlinAudioPlaybackBackend(
         seekGate.cancel("skip")
         if (failedLoads.isPending(player.currentItem)) {
             val active = reportedIndex()
-            failedLoads.command()
+            failedLoads.skipped()
             if (active - 1 >= 0) {
                 player.jumpToItem(active - 1)
                 return
@@ -894,8 +904,9 @@ internal class KotlinAudioPlaybackBackend(
         val cancelledWait = commandLoads.cancel()
         failedLoads.command()
         seekGate.cancel("stop")
-        // As crossfade's stop: a skip or load still waiting does not take effect.
-        leaveCancelledLoad(cancelledWait, positionMs = null)
+        // As crossfade's stop: a skip or load still waiting does not take effect, and after a
+        // failed skip the player stops on the active track (owner decision, 2026-11-17, LOAD-06).
+        leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)
         player.stop()
     }
     override fun setVolume(value: Float) { player.volume = value }

@@ -442,10 +442,15 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('        val cancelledWait = commandLoads.cancel()\n        failedLoads.command()\n        leaveCancelledLoad(cancelledWait, positionMs)\n') &&
+    standardBackend.includes('        val cancelledWait = commandLoads.cancel()\n        failedLoads.command()\n        leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n') &&
+    // A skip, next, previous or load loads the player's own track (FailedLoadRule.skipped,
+    // LOAD-16); a seek or stop acts on the active track (owner decision, 2026-11-17, LOAD-06;
+    // StandardBackendHlsTest.aSeekAfterASkipThatGaveUp..., aStopAfterASkipThatGaveUp...).
+    (standardBackend.match(/failedLoads\.skipped\(\)/g) || []).length === 4 &&
+    (standardBackend.match(/failedLoads\.command\(\)/g) || []).length === 2 &&
     // With no active track (a cancel with none reported stopped the load): the seek rejects, the
     // player's own item does not load (StandardBackendHlsTest.aSeekCancellingASkipWithNoActiveTrack...).
-    section(standardBackend, 'leaveCancelledLoad(cancelledWait, positionMs)\n', 'seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->').includes('if (logicalPlaybackState.isIdle) {\n            seekGate.cancel("seek")\n            throw RejectionException("No active track is available for seeking.", STANDARD_SEEK_UNAVAILABLE_CODE)') &&
+    section(standardBackend, 'leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n', 'seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->').includes('if (logicalPlaybackState.isIdle) {\n            seekGate.cancel("seek")\n            throw RejectionException("No active track is available for seeking.", STANDARD_SEEK_UNAVAILABLE_CODE)') &&
     // A seek that gives up, or finds its track failed to load, leaves that track failed: the next
     // play loads the active track (FailedLoadRule; StandardBackendHlsTest's seek-after-failed-skip tests).
     standardBackend.includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)\n                // Its track failed (again): the next play loads the active track, as after a failed\n                // load (FailedLoadRule.failed changes nothing on the loaded track).\n                failLoadedTrack()') &&
@@ -454,8 +459,8 @@ assert(
     // releasing the cancelled track's source, or with none reported stops in idle (crossfade's
     // cancelled operation; standardCancelledLoad).
     standardBackend.includes('leaveCancelledLoad(commandLoads.cancel(), positionMs = null)\n        player.pause()') &&
-    standardBackend.includes('leaveCancelledLoad(cancelledWait, positionMs = null)\n        player.stop()') &&
-    standardBackend.includes('when (val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported)) {') &&
+    standardBackend.includes('leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)\n        player.stop()') &&
+    standardBackend.includes('when (val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported, actsOnReportedTrack)) {') &&
     standardBackend.includes('                player.jumpToItem(index, playWhenReady = false)\n                player.seek(position, TimeUnit.MILLISECONDS)\n                // Its source is released') &&
     standardBackend.includes('                player.releaseSource(cancelled)\n') &&
     standardBackend.includes('            StandardCancelledLoad.StopsInIdle -> {\n                player.stop()\n                logicalPlaybackState.enterIdle(player.items.size)') &&
@@ -912,7 +917,7 @@ assert(
       // change that follows the stop does not turn it into PAUSED; a seek loads the track again.
       vendored.includes('if (!player.playWhenReady && playerState != AudioPlayerState.STOPPED && !isHostFailure()) {') &&
       vendored.includes('playerState == AudioPlayerState.ERROR && playbackError?.fromHost == true') &&
-      standardBackend.includes('if (it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true) AudioPlayerState.STOPPED else it') &&
+      standardBackend.includes('it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true -> AudioPlayerState.STOPPED') &&
       vendored.includes('exoPlayer.clearMediaItems()\n        // Fork: a host give-up\'s error ends with the queue (no item, no error).\n        if (isHostFailure()) playerState = AudioPlayerState.IDLE') &&
       // The real vendored player and backend against a stalled server.
       read('android/robolectric-tests/build.gradle.kts').includes('from("${rootProject.projectDir}/../src/vendor/kotlinaudio/java")') &&
@@ -946,7 +951,7 @@ assert(
 {
   const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
   assert(
-    fixture.scenarios.length === 15 &&
+    fixture.scenarios.length === 17 &&
       // One explicit state (FailedLoadRule.Phase and PlayerError): the backend keeps no flag of its own.
       read('android/src/main/java/com/doublesymmetry/trackplayer/service/FailedLoadRule.kt').includes('sealed class Phase {') &&
       !standardBackend.includes('sawPlayerError') &&
@@ -1017,8 +1022,11 @@ assert(
         'aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded', 'aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive',
         'aNewerSkipCancelsTheWaitOfTheOlderOne', 'aStopOrANewQueueEndsAWaitingSkipCancelled',
         'aGiveUpThatNoCommandWaitsForIsReportedAfterARejectedSkip',
-        'aSeekThatGivesUpOnTheTrackASkipFailedToLoadLeavesThePlayToThePreviousTrack',
-        'aSeekOnTheTrackThatFailedWithAPlayerErrorLeavesThePlayToThePreviousTrack',
+        'aSeekAfterASkipThatGaveUpActsOnThePreviousTrackAndThePlayPlaysIt',
+        'aStopAfterASkipThatGaveUpStopsOnThePreviousTrackAndThePlayReloadsIt',
+        'aSeekAfterASkipThatFailedWithAPlayerErrorActsOnThePreviousTrack',
+        'aNextToTheTrackThatFailedLoadsItAgainAndReportsIt',
+        'aSeekOnATrackWhosePlaylistsNeverAnswerGivesUpAtTheStallTimeoutAndLeavesThePlayToRetryIt',
         'aSeekDuringASkipsLoadCancelsTheSkipAndActsOnTheActiveTrack',
         'aPauseDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack',
         'aStopDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack',

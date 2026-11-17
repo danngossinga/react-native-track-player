@@ -733,9 +733,10 @@ assert(
       // A failed seek keeps its target as the position, with no playback error.
       section(backendSource, 'let wait = StallWaitDriver(', 'request.wait = wait').includes('self.loads.seekTimedOut(issued: request.issued, track: ObjectIdentifier(request.track), message: message, keptPosition: request.position)') &&
       // Every give-up, a seek's too, fails its track (FailedLoadRule.failed: none for the loaded
-      // track): a seek after a failed skip that gives up leaves the play to the previous track
-      // (Android: StandardBackendHlsTest.aSeekThatGivesUpOnTheTrackASkipFailedToLoadLeavesThePlayToThePreviousTrack;
-      // the rule: LOAD-14).
+      // track): after a failed skip a seek acts on the active track, which a give-up leaves
+      // loaded (owner decision, 2026-11-17; Android:
+      // StandardBackendHlsTest.aSeekAfterASkipThatGaveUpActsOnThePreviousTrackAndThePlayPlaysIt;
+      // the rule: LOAD-06, LOAD-14).
       !backendSource.includes('failsLoad') &&
       backendSource.includes('func emitGiveUp(_ report: StandardGiveUpReport) { onLoadGaveUp(player, report) }') &&
       // A seek that finds its track failed to load leaves it failed (Android: the same).
@@ -750,6 +751,12 @@ assert(
       // (StandardLoadCoordinator.leaveCancelledLoad, tested; Android's StandardBackendHlsTest
       // a*DuringASkipsLoad* and a*CancellingASkipWithNoActiveTrack* on the real player).
       section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('let hasActiveTrack = loads.beginSeek(to: position)\n        guard hasActiveTrack, !disposed, let track = player.currentItem as? Track else {') &&
+      // A skip, next, previous, load or restore loads the player's own track
+      // (FailedLoadRule.skipped, LOAD-16); only a seek or stop (the coordinator's, tested) acts on
+      // the active track (owner decision, 2026-11-17, LOAD-06).
+      (backendSource.match(/failedLoads\.skipped\(\)/g) || []).length === 7 &&
+      !backendSource.includes('failedLoads.command()') &&
+      section(backendSource, '    func skip(to index: Int, initialTime: Double,', '                let sameIndex = player.currentIndex == index').includes('            clearHostFailure()\n            failedLoads.skipped()') &&
       backendSource.includes('    func jumpPaused(to item: ObjectIdentifier) -> Bool {\n        guard let index = indexOfItem(item) else { return false }\n        try? player.jumpToItem(atIndex: index, playWhenReady: false)\n        return true') &&
       backendSource.includes('    func seekPlayer(to position: Double) { player.seek(to: position) }') &&
       backendSource.includes('    var isIdle: Bool { return idleWithoutActiveTrack }') &&
@@ -812,7 +819,8 @@ assert(
         'testStandardLoadCoordinatorAPlayerFailureFailsTheLoadOnceAndRejectsTheWaitWithItsError',
         'testStandardLoadCoordinatorACancelWithNoReportedTrackStopsTheLoadInIdleAndNeverReportsIt',
         'testStandardLoadCoordinatorACancelReturnsToTheReportedTrackPausedAtItsPosition',
-        'testStandardLoadCoordinatorAnUnissuedSeekThatGivesUpOnAFailedSkipsTrackLeavesThePlayToA',
+        'testStandardLoadCoordinatorAnUnissuedSeekThatGivesUpOnAFailedTrackLeavesThePlayToRetryIt',
+        'testStandardLoadCoordinatorASeekOrStopAfterAFailedSkipActsOnTheActiveTrack',
         'testStandardSeekAndLoadLimitsAreIndependent',
         'testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads',
         'testStandardCommandLoadResultIsTheCommandsResolution']

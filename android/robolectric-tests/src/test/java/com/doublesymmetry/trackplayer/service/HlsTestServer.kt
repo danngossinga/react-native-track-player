@@ -49,6 +49,10 @@ internal class HlsTestServer(
     private val trickleFrom: Int = -1,
     private val trickleGapMs: Long = 0L
 ) : AutoCloseable {
+    /** Once set, the segments that stalled ([stalledFrom]) are served (a CDN that recovered). */
+    @Volatile
+    var recovered = false
+
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
     private val pool = Executors.newCachedThreadPool()
@@ -134,12 +138,12 @@ internal class HlsTestServer(
                         Thread.sleep(keyDelayMs)
                         respond(connection, KEY, "application/octet-stream")
                     }
-                    segment != null && segment >= stalledFrom && failingStatus != null -> {
+                    segment != null && segment >= stalledFrom && failingStatus != null && !recovered -> {
                         stalledRequestTimesMs += monotonicNowMs()
                         Thread.sleep(failingAfterMs)
                         respond(connection, ByteArray(0), "audio/aac", status = "$failingStatus Failing")
                     }
-                    segment != null && segment >= stalledFrom -> {
+                    segment != null && segment >= stalledFrom && !recovered -> {
                         stallUntilClosed(connection)
                         return
                     }

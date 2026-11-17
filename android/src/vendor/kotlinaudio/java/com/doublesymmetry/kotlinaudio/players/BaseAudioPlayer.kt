@@ -763,7 +763,9 @@ abstract class BaseAudioPlayer internal constructor(
                     }
                     Player.EVENT_MEDIA_ITEM_TRANSITION -> {
                         playbackError = null
-                        if (currentItem != null) {
+                        // Fork: a stop issued after the item changed (the host's stop on the track
+                        // it went back to), its ExoPlayer still idle, stays stopped.
+                        if (currentItem != null && !(playerState == AudioPlayerState.STOPPED && player.playbackState == Player.STATE_IDLE)) {
                             playerState = AudioPlayerState.LOADING
                             if (isPlaying) {
                                 playerState = AudioPlayerState.READY

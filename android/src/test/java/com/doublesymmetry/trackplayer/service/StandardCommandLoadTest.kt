@@ -21,7 +21,7 @@ class StandardCommandLoadTest {
 
     /** A command moved the player to [item] and waits for its load, as the backend does. */
     private fun command(item: Any, into: MutableList<StandardCommandLoad.Outcome> = outcomes) {
-        rule.command()
+        rule.skipped()
         loads.begin(item, rule.active, rule.reported) { into += it }
     }
 
@@ -164,10 +164,17 @@ class StandardCommandLoadTest {
         rule.moved(first)
         assertEquals(FailedLoadRule.Phase.Loaded(first), rule.phase)
         assertNull("nothing reported, nothing to reload", rule.play())
-        // No wait cancelled (after a failed load too, LOAD-06): the player's own track.
+        // No wait cancelled: a pause stays; a seek or stop on a track other than the reported one
+        // (a failed skip, a natural advance loading) goes back to it (changed deliberately: owner
+        // decision, 2026-11-17, LOAD-06), and with none reported acts on the player's own track
+        // (the failed first track, retried).
         assertFalse("none waits any more", loads.cancel())
         assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = second, reported = first))
         assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = second, reported = null))
+        val seekBack = standardCancelledLoad(cancelledWait = false, playerItem = second, reported = first, actsOnReportedTrack = true)
+        assertTrue("a seek or stop goes back to A: $seekBack", seekBack is StandardCancelledLoad.ReturnsTo && seekBack.item === first)
+        assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = second, reported = null, actsOnReportedTrack = true))
+        assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = false, playerItem = first, reported = first, actsOnReportedTrack = true))
         // Already on the reported track: it stays.
         assertSame(StandardCancelledLoad.Stays, standardCancelledLoad(cancelledWait = true, playerItem = first, reported = first))
         // None reported (the first load failed): the cancelled load stops, no active track (as

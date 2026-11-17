@@ -25,13 +25,16 @@ internal class FailedLoadRule {
      *   once. No item.
      * - [Loading]: the player is on [item] (null: none), which has not loaded since it moved there.
      * - [Loaded]: [item] loaded: it is the active track ([active] === item).
-     * - [Failed]: [item]'s load failed (a give-up, a player error); the next play loads the active
-     *   track again, else retries [item]. A move keeps it failed (the player's own item changes).
+     * - [Failed]: [item]'s load failed (a give-up, a player error); the next play, seek or stop
+     *   acts on the active track again, else retries [item]. A move keeps it failed (the player's
+     *   own item changes).
      *
      * Moves: Selecting -moved(x)-> Loading(x) (reported at once; x null: stays); Loading/Loaded
      * -moved(x)-> Loaded(x) when x is the active track, else Loading(x); Failed -moved(x)->
      * Failed(x); any -ready-> Loaded(item); Loading/Failed(not active) -failed-> Failed(item);
-     * Failed -play/command-> Loaded/Loading (play: the active track, else the failed one);
+     * Failed -play/command-> Loaded/Loading (the active track, else the failed one; command: a
+     * seek or stop, owner decision 2026-11-17); Failed -skipped-> Loading/Loaded(item) (the
+     * player loads its own item);
      * any -reset-> Selecting; -adopted(x)-> Loaded(x) (x null: Selecting); published, replaced and
      * removed keep the kind and follow the item.
      */
@@ -127,10 +130,23 @@ internal class FailedLoadRule {
         return target
     }
 
-    /** Another command acts on the player's own track: reported once it loads (no report now). */
+    /**
+     * A seek or a stop acts on the active track, as crossfade's (owner decision, 2026-11-17: the
+     * one the app reads, getActiveTrack and its position): after a failed load the player goes
+     * back to the active track (the backend moves it there), else, with none, retries the failed
+     * one. Reported once it loads (no report now).
+     */
     fun command(): Report? {
-        (phase as? Phase.Failed)?.let { phase = following(it.item) }
+        (phase as? Phase.Failed)?.let { phase = following(active ?: it.item) }
         return null
+    }
+
+    /**
+     * A skip, next, previous or load: the player loads its own item, a failed one it stays on
+     * again (a skip to the track that failed); a move to another item follows ([moved]).
+     */
+    fun skipped() {
+        (phase as? Phase.Failed)?.let { phase = following(it.item) }
     }
 
     /** The queue was replaced or cleared: its first track is a new selection. */

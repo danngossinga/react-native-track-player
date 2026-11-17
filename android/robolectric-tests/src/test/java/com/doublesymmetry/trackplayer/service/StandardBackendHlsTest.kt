@@ -469,12 +469,14 @@ class StandardBackendHlsTest {
     }
 
     // Smart-music-player's rollback after a skip that failed (skipWithRollback, then
-    // restorePlaybackIntent): it seeks to the position it captured, then plays. The seek acts on
-    // the player's own track (LOAD-06) and fails there too: that track failed again, so the play
-    // loads the previous track, as after the skip's own failure (FailedLoadRule.play).
+    // restorePlaybackIntent): it seeks to the position it captured, then plays. Owner decision,
+    // 2026-11-17 (LOAD-06 flipped, changed deliberately; it acted on the player's own, failed
+    // track before): the seek acts on the active track, the one the app reads (getActiveTrack
+    // and its position), as crossfade's: the player goes back to A, paused, at the seek's target;
+    // the play plays A from there. iOS: StandardLoadCoordinator.beginSeek, stop.
 
     @Test
-    fun aSeekThatGivesUpOnTheTrackASkipFailedToLoadLeavesThePlayToThePreviousTrack() {
+    fun aSeekAfterASkipThatGaveUpActsOnThePreviousTrackAndThePlayPlaysIt() {
         val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
         val stalled = server(LADDER)
         val backed = backed()
@@ -485,30 +487,88 @@ class StandardBackendHlsTest {
         val captured = backed.backend.positionMs - CAPTURE_LAG_MS
         assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
         assertEquals(0, backed.backend.currentIndex)
-        assertEquals("standard_seek_timeout", (command { backed.backend.seekTo(captured) } as RejectionException).code)
-        // LOAD-06 (an owner decision pending): the seek acts on the player's own track.
-        assertEquals("the track the seek acted on", 1, backed.player.currentIndex)
+        assertEquals(1, backed.player.currentIndex)
+        assertNull("the seek acts on A, which loads", command { backed.backend.seekTo(captured) })
+        // Changed deliberately (owner decision, 2026-11-17): 1 (the failed track) -> 0.
+        assertEquals("the track the seek acted on", 0, backed.player.currentIndex)
         assertEquals("the active track after the seek", 0, backed.backend.currentIndex)
+        assertTrue("at the seek's target: ${backed.player.position}", backed.player.position >= captured)
+        assertFalse("paused, as a crossfade operation that went back", backed.backend.playWhenReady)
+        assertNull("the give-up's error ended", backed.backend.playbackError)
         val playableRequests = playable.requests.size
         assertNull(command { backed.backend.play() })
-        awaitTrue("the play loads A again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        awaitTrue("A plays") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
         pump(STALL_TIMEOUT_MS * 2)
         assertEquals(0, backed.player.currentIndex)
         assertEquals(0, backed.backend.currentIndex)
         assertEquals(AudioPlayerState.PLAYING, backed.backend.playbackState)
-        assertTrue("A loaded again", playable.requests.size > playableRequests)
+        assertTrue("from the seek's target: ${backed.player.position}", backed.player.position >= captured)
+        assertTrue("A loaded", playable.requests.size >= playableRequests)
         assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
     }
 
-    // The same with a track whose playlists never answer (no item, nothing loaded): the seek on
-    // it is never at its target and gives up by its own limits, whichever ends first
-    // (stallTimeoutMs, or standardSeekTimeoutMs set apart from prepareTimeoutMs, shorter or longer):
-    // it stops the track's load, fails it again, and the player is in error, reported by the
-    // seek's rejection only (no playback error, then or once prepareTimeoutMs passed); the play
-    // loads A. iOS: StandardLoadCoordinator.seekTimedOut (the same, the seek issued or not).
+    @Test
+    fun aStopAfterASkipThatGaveUpStopsOnThePreviousTrackAndThePlayReloadsIt() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(stalled, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+        val positionOfA = backed.backend.positionMs
+        backed.backend.stop()
+        assertEquals("the stop goes back to A", 0, backed.player.currentIndex)
+        pump(STALL_TIMEOUT_MS)
+        // Every reader agrees with the stop (rule 13; iOS: stopped): the state the app was told last.
+        assertEquals(AudioPlayerState.STOPPED, backed.backend.playbackState)
+        assertEquals("state:STOPPED", backed.events.last { it.startsWith("state:") })
+        assertEquals(0, backed.backend.currentIndex)
+        val playableRequests = playable.requests.size
+        assertNull(command { backed.backend.play() })
+        awaitTrue("the play reloads A") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        assertTrue("A loaded again", playable.requests.size > playableRequests)
+        assertTrue("from A's last position (${backed.player.position} ms, left at $positionOfA ms)", backed.player.position >= positionOfA)
+        pump(STALL_TIMEOUT_MS)
+        assertEquals(0, backed.player.currentIndex)
+        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    // A skip or next to the track that failed, which the player is still on (no move: ExoPlayer
+    // stays on its item), loads it again and ends once it loaded and is reported (FailedLoadRule
+    // .skipped, LOAD-16); a seek or stop goes back to the active track instead (command).
 
     @Test
-    fun aSeekOnATrackWhosePlaylistsNeverAnswerGivesUpAtTheStallTimeoutAndLeavesThePlayToA() {
+    fun aNextToTheTrackThatFailedLoadsItAgainAndReportsIt() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val flaky = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(flaky, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skipToNext() } as RejectionException).code)
+        assertEquals(1, backed.player.currentIndex)
+        assertEquals(0, backed.backend.currentIndex)
+        flaky.recovered = true
+        // Next from the active track A: B again, the player's own item (no move).
+        val returned = backed.commandReading { backed.backend.skipToNext() }
+        assertEquals("the active track when next returned", 1, returned.index)
+        assertEquals("the player was ready when next returned", com.google.android.exoplayer2.Player.STATE_READY, returned.exoState)
+        assertEquals("B reported once it loaded", listOf<Int?>(0, 1), returned.reported)
+    }
+
+    // A seek that acts on a track that failed to load (none active: the failed first track,
+    // retried) and whose playlists never answer (no item, nothing loaded): the seek is never at
+    // its target and gives up by its own limits, whichever ends first (stallTimeoutMs, or
+    // standardSeekTimeoutMs set apart from prepareTimeoutMs, shorter or longer): it stops the
+    // track's load, fails it again, and the player is in error, reported by the seek's rejection
+    // only (no playback error, then or once prepareTimeoutMs passed); the play retries it.
+    // Changed deliberately (owner decision, 2026-11-17): after a failed skip the seek acts on the
+    // active track (above), so these run on a failed first track. iOS:
+    // StandardLoadCoordinator.seekTimedOut (the same, the seek issued or not).
+
+    @Test
+    fun aSeekOnATrackWhosePlaylistsNeverAnswerGivesUpAtTheStallTimeoutAndLeavesThePlayToRetryIt() {
         assertASeekOnATrackWhosePlaylistsNeverAnswerGivesUp(backed(), "The native seek made no progress for $STALL_TIMEOUT_MS ms.")
     }
 
@@ -523,9 +583,9 @@ class StandardBackendHlsTest {
 
     @Test
     fun aSeekWithALimitLongerThanTheLoadsGivesUpByItsOwnAndTheLoadLimitAddsNothing() {
-        // The load's total limit (shorter than the seek's limits, and than stallTimeoutMs: the skip
-        // gives up by it) ends neither the seek, which owns the track's loading, nor, later, the
-        // track the seek gave up on.
+        // The load's total limit (shorter than the seek's limits, and than stallTimeoutMs: the
+        // first load gives up by it) ends neither the seek, which owns the track's loading, nor,
+        // later, the track the seek gave up on.
         assertASeekOnATrackWhosePlaylistsNeverAnswerGivesUp(
             backed(seekTimeoutMs = PREPARE_TIMEOUT_MS, loadTimeoutMs = STALL_TIMEOUT_MS * 2 / 3),
             "The native seek made no progress for $STALL_TIMEOUT_MS ms."
@@ -533,34 +593,32 @@ class StandardBackendHlsTest {
     }
 
     private fun assertASeekOnATrackWhosePlaylistsNeverAnswerGivesUp(backed: Backed, message: String) {
-        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
         val silent = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = 600_000L).also { servers += it }
-        backed.backend.add(listOf(item(playable, 1L), item(silent, 2L)))
+        backed.backend.add(listOf(item(silent, 1L)))
         command { backed.backend.play() }
-        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
-        val captured = backed.backend.positionMs - CAPTURE_LAG_MS
-        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
-        assertEquals(0, backed.backend.currentIndex)
+        awaitTrue("the first load gives up", AWAIT_MS) { backed.gaveUpAtMs.isNotEmpty() }
+        assertEquals("none active", -1, backed.backend.currentIndex)
         val beforeSeek = backed.events.size
-        val seekError = command { backed.backend.seekTo(captured) } as? RejectionException
+        val seekError = command { backed.backend.seekTo(LOADABLE_TARGET_MS) } as? RejectionException
         assertEquals("standard_seek_timeout", seekError?.code)
         assertEquals(message, seekError?.message)
-        assertEquals("the track the seek acted on (LOAD-06)", 1, backed.player.currentIndex)
+        assertEquals("the track the seek acted on (none active: the failed one)", 0, backed.player.currentIndex)
         // Its load stopped, in error with the seek's failure until the next command.
         backed.assertStaysInError("standard_seek_timeout")
         assertEquals(com.google.android.exoplayer2.Player.STATE_IDLE, backed.analytics.player!!.playbackState)
         pump(STALL_TIMEOUT_MS * 3)
         val emitted = backed.events.drop(beforeSeek).filter { it == "state:ERROR" || it.startsWith("error:") }
         assertEquals("one error state, no playback error", listOf("state:ERROR"), emitted)
-        assertEquals(0, backed.backend.currentIndex)
+        assertEquals(-1, backed.backend.currentIndex)
+        val requests = silent.requests.size
         assertNull(command { backed.backend.play() })
-        awaitTrue("the play loads A again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
-        assertEquals(0, backed.backend.currentIndex)
-        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+        awaitTrue("the play retries it") { silent.requests.size > requests }
+        assertEquals(0, backed.player.currentIndex)
+        assertEquals("never reported but at its selection", listOf<Int?>(0, null), backed.activeTrackChanges.map { it.first })
     }
 
     @Test
-    fun aSeekOnTheTrackThatFailedWithAPlayerErrorLeavesThePlayToThePreviousTrack() {
+    fun aSeekAfterASkipThatFailedWithAPlayerErrorActsOnThePreviousTrack() {
         val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
         val broken = HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
         val backed = backed()
@@ -569,10 +627,14 @@ class StandardBackendHlsTest {
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
         val captured = backed.backend.positionMs - CAPTURE_LAG_MS
         assertEquals(STANDARD_LOAD_ERROR_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
-        assertEquals(STANDARD_SEEK_UNAVAILABLE_CODE, (command { backed.backend.seekTo(captured) } as RejectionException).code)
-        assertEquals("the track the seek acted on", 1, backed.player.currentIndex)
+        // Changed deliberately (owner decision, 2026-11-17): the seek rejected
+        // standard_seek_unavailable on the failed track (1); it now acts on A (0) and succeeds.
+        assertNull("the seek acts on A", command { backed.backend.seekTo(captured) })
+        assertEquals("the track the seek acted on", 0, backed.player.currentIndex)
+        assertTrue("at the seek's target: ${backed.player.position}", backed.player.position >= captured)
+        assertFalse("paused", backed.backend.playWhenReady)
         assertNull(command { backed.backend.play() })
-        awaitTrue("the play loads A again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        awaitTrue("A plays") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
         assertEquals(0, backed.backend.currentIndex)
         assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
     }

@@ -182,10 +182,16 @@ Added fork surface:
   failed to load (a give-up or a player error). While a track loads, and after its
   load failed, the previous track is the active one (none when there was none);
   the next play loads it again or, when there was none, retries the track that
-  failed. A seek after a failed load acts on the track that failed (the player's
-  own track); when that seek fails too (it gives up, or finds the track failed),
-  the track is still the one that failed, and the next play loads the previous
-  track (before: on the standard backend that play retried the failed track). The standard backend reports a new queue's first track at once (it is
+  failed. A seek or stop acts on the active track, the one the app reads
+  (`getActiveTrack` and its position), as crossfade's (owner decision,
+  2026-11-17): after a failed load, and on the standard backend while another
+  track loads (a natural advance), the player goes back to the active track,
+  paused; the seek acts there, a stop stops there, and the next play plays it
+  (before: the seek acted on the track that failed and, when it failed too, the
+  next play loaded the previous track). With no active track (the first load
+  failed), a seek retries the track that failed; when it fails again, the next
+  play retries that track. A skip or next to the track that failed loads it
+  again. The standard backend reports a new queue's first track at once (it is
   selected when the queue is set). After a failed load the lock screen and the
   notification show the active track again. A failed seek keeps its target as the
   position on both backends and platforms.
@@ -211,7 +217,8 @@ Added fork surface:
   then the buffered position is its only progress signal: a seek on a track whose
   playlists never answer gives up at `stallTimeoutMs` on Android and at this limit
   on iOS, then on both it stops loading, fails the track again and leaves the
-  player in error, and the next play loads the active track), each
+  player in error, and the next play loads the active track, or retries that
+  track when none is active), each
   60000 by default. On iOS, a backend switch waits at most the load limit plus
   the play-start limit plus 5 s (at least 10 s); on Android it does not block a
   thread and is bounded by the load and play-start waits themselves. The play

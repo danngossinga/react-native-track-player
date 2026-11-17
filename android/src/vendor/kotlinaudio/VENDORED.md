@@ -58,13 +58,18 @@ with their own comments (checked against the upstream archive with `diff`).
     path does: the player stops loading at once and goes to the error state with the host's error
     (reported as a playback error for a load no command waits for, after the error state, as the
     crossfade path and iOS: state, then error);
-  - `:437-439` `isHostFailure()` (new) and `:775-777` in `onEvents`: the play-when-ready change
+  - `:437-439` `isHostFailure()` (new) and `:777-779` in `onEvents`: the play-when-ready change
     ExoPlayer reports a message after `failLoad`'s stop no longer turns that error into PAUSED
     (upstream: any pause while not stopped); the player stays in the host's error until the next
     command (iOS: `hostFailure`). A pause after an ExoPlayer error is upstream as-is;
   - `:444-445` in `clear()`: clearing the queue ends a host give-up's error (IDLE: no item, no
     error), as iOS's `clearQueue` clears `hostFailure`;
-  - `:798-801` in `onPlayerError`: ExoPlayer's own error emits the error state, then the
+  - `:766-768` in `onEvents` (owner decision, 2026-11-17: a seek or stop after a failed skip acts
+    on the active track): the item change ExoPlayer reports a message after the host's jump back
+    to the active track no longer turns a stop issued meanwhile (ExoPlayer still idle) into
+    LOADING (upstream: any item change with an item), which ExoPlayer's idle state then made
+    IDLE; the player stays stopped, as the stop's own event and iOS say;
+  - `:800-803` in `onPlayerError`: ExoPlayer's own error emits the error state, then the
     playback error (upstream emitted the playback error first, then set the state), as
     `failLoad`, the crossfade path and iOS: state, then error.
 - `models/PlaybackError.kt`: `:1-4` the notice; `:9` a comma after `message`; `:10-11` `fromHost` (new, default false): the

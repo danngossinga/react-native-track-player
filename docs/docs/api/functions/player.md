@@ -68,8 +68,12 @@ on the backend, the same on Android and iOS:
 iOS alone rejects a position that is not a finite number, with `seek_failed`.
 
 A seek during a skip or load that still waits for its track cancels it (`cancelled`) and acts on
-the active track, paused. After a failed load, a seek acts on the track that failed; when that
-seek fails as well, the next play loads the active track again.
+the active track, paused. A seek (and a `stop`) acts on the active track, the one
+`getActiveTrack()` and the progress report, as crossfade's (owner decision, 2026-11-17): after a
+failed load, and on the standard backend while another track loads (a natural advance), the player
+goes back to the active track, paused, and the seek acts there (before: it acted on the track that
+failed). With no active track (the first track failed to load), the seek retries the track that
+failed; when it fails as well, the next play retries it again.
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |

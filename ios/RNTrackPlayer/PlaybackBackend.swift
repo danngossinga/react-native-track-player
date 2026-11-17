@@ -2144,14 +2144,15 @@ final class FailedLoadRule {
     ///   at once. No item.
     /// - `loading(item)`: the player is on `item` (nil: none), not loaded since it moved there.
     /// - `loaded(item)`: `item` loaded: it is the active track (`active == item`).
-    /// - `failed(item)`: `item`'s load failed (a give-up, a player error); the next play loads the
-    ///   active track again, else retries `item`. A move keeps it failed.
+    /// - `failed(item)`: `item`'s load failed (a give-up, a player error); the next play, seek or
+    ///   stop acts on the active track again, else retries `item`. A move keeps it failed.
     ///
     /// Moves: selecting -moved(x)-> loading(x) (reported at once; x nil: stays); loading/loaded
     /// -moved(x)-> loaded(x) when x is the active track, else loading(x); failed -moved(x)->
     /// failed(x); any -ready-> loaded(item); loading/failed(not active) -failed-> failed(item);
-    /// failed -play/command-> loaded/loading (play: the active track, else the failed one); any
-    /// -reset-> selecting; -adopted(x)-> loaded(x) (x nil: selecting); published, replaced and
+    /// failed -play/command-> loaded/loading (the active track, else the failed one; command: a
+    /// seek or stop, owner decision 2026-11-17); failed -skipped-> loading/loaded(item) (the
+    /// player loads its own item); any -reset-> selecting; -adopted(x)-> loaded(x) (x nil: selecting); published, replaced and
     /// removed keep the kind and follow the item.
     enum Phase: Equatable {
         case selecting
@@ -2241,10 +2242,20 @@ final class FailedLoadRule {
         return target
     }
 
-    /// Another command acts on the player's own track: reported once it loads (no report now).
+    /// A seek or a stop acts on the active track, as crossfade's (owner decision, 2026-11-17: the
+    /// one the app reads, getActiveTrack and its position): after a failed load the player goes
+    /// back to the active track (the backend moves it there), else, with none, retries the failed
+    /// one. Reported once it loads (no report now).
     func command() -> Report? {
-        if case let .failed(failed) = phase { phase = following(failed) }
+        if case let .failed(failed) = phase { phase = following(active ?? failed) }
         return nil
+    }
+
+    /// A skip, next, previous or load (and a backend restore): the player loads its own item, a
+    /// failed one it stays on again (a skip to the track that failed); a move to another item
+    /// follows (`moved`).
+    func skipped() {
+        if case let .failed(failed) = phase { phase = following(failed) }
     }
 
     /// The queue was replaced or cleared: its first track is a new selection.
@@ -2587,14 +2598,16 @@ final class StandardCommandLoad {
     }
 }
 
-/// Where a seek, pause or stop leaves the player when it cancelled a command's wait
+/// Where a seek, pause or stop leaves the player when a load is pending, as crossfade's operation
+/// cancelled while it loads: the cancelled command does not take effect, and its track is never
+/// reported. A seek or stop (`actsOnReportedTrack`) acts on the reported track whenever the player
+/// is on another one (a skip or load waiting, a natural advance loading, a skip that failed: owner
+/// decision, 2026-11-17, LOAD-06); a pause only when it cancelled a command's wait
 /// (`StandardCommandLoad.cancel` returned true: a skip, next, previous or load whose track was
-/// still loading), as crossfade's operation cancelled while it loads: the cancelled command does
-/// not take effect, and its track is never reported. Android: the same rule
-/// (`standardCancelledLoad`, `StandardCancelledLoad`).
+/// still loading). Android: the same rule (`standardCancelledLoad`, `StandardCancelledLoad`).
 enum StandardCancelledLoad: Equatable {
-    /// No wait cancelled (after a failed load too: LOAD-06, a command acts on the player's own
-    /// track), or the player is on the reported track: it stays.
+    /// Nothing pending, or the player is on the reported track (none reported: a seek retries the
+    /// failed track): it stays.
     case stays
     /// The player goes back to the reported track, paused (the seek acts there).
     case returnsTo(ObjectIdentifier)
@@ -2605,11 +2618,13 @@ enum StandardCancelledLoad: Equatable {
     case stopsInIdle
 }
 
-/// What a cancel leaves (`StandardCancelledLoad`); `reported`: the track the app was told is active.
-func standardCancelledLoad(cancelledWait: Bool, playerItem: ObjectIdentifier?, reported: ObjectIdentifier?) -> StandardCancelledLoad {
-    guard cancelledWait else { return .stays }
-    guard let reported = reported else { return .stopsInIdle }
-    return reported == playerItem ? .stays : .returnsTo(reported)
+/// What a seek, pause or stop leaves (`StandardCancelledLoad`); `cancelledWait`: it cancelled a
+/// command's wait; `reported`: the track the app was told is active; `actsOnReportedTrack`: a
+/// seek or stop (owner decision, 2026-11-17), not a pause.
+func standardCancelledLoad(cancelledWait: Bool, playerItem: ObjectIdentifier?, reported: ObjectIdentifier?, actsOnReportedTrack: Bool = false) -> StandardCancelledLoad {
+    guard let reported = reported else { return cancelledWait ? .stopsInIdle : .stays }
+    if reported == playerItem { return .stays }
+    return cancelledWait || actsOnReportedTrack ? .returnsTo(reported) : .stays
 }
 
 /// The track a play, load or retry from the logical idle (no active track) selects first: the
@@ -2920,14 +2935,16 @@ final class StandardLoadCoordinator {
     var watchesLoads: Bool { return !disposed && giveUps.failure == nil && !(player?.isIdle ?? true) }
 
     /// A seek, pause or stop that cancelled (`cancelledWait`) a command's wait while its track
-    /// loads leaves it (`standardCancelledLoad`): back to the reported track, paused, at `position`
+    /// loads, or a seek or stop (`actsOnReportedTrack`) while the player is on a track other than
+    /// the reported one (owner decision, 2026-11-17), leaves it (`standardCancelledLoad`): back to
+    /// the reported track, paused, at `position`
     /// (nil: where the player left that track, read before the move); or, with none reported, the
     /// cancelled load stops and no track is active. Both pause: an ended interruption does not
     /// resume (`requestPlayback(false)`). As Android (KotlinAudioPlaybackBackend.leaveCancelledLoad).
     @discardableResult
-    func leaveCancelledLoad(cancelledWait: Bool, position: Double?) -> StandardCancelledLoad {
+    func leaveCancelledLoad(cancelledWait: Bool, position: Double?, actsOnReportedTrack: Bool = false) -> StandardCancelledLoad {
         guard let player = player else { return .stays }
-        let left = standardCancelledLoad(cancelledWait: cancelledWait, playerItem: player.currentLoadItem, reported: failedLoads.reported)
+        let left = standardCancelledLoad(cancelledWait: cancelledWait, playerItem: player.currentLoadItem, reported: failedLoads.reported, actsOnReportedTrack: actsOnReportedTrack)
         switch left {
         case .stays:
             break
@@ -2958,28 +2975,30 @@ final class StandardLoadCoordinator {
 
     /// A stop, as Android's: it ends a give-up's error (the app is told the player stopped,
     /// `StandardGiveUps.stopped`), a skip or load still waiting ends cancelled and does not take
-    /// effect, the seeks end, and the player stops, requested paused.
+    /// effect, after a failed skip the player stops on the active track (owner decision,
+    /// 2026-11-17, LOAD-06), the seeks end, and the player stops, requested paused.
     func stop() {
         guard let player = player else { return }
         let ended = giveUps.stopped(playerStopped: player.isPlayerStopped)
         _ = failedLoads.command()
         let cancelledWait = commandLoads.cancel()
         player.cancelSeeks()
-        leaveCancelledLoad(cancelledWait: cancelledWait, position: nil)
+        leaveCancelledLoad(cancelledWait: cancelledWait, position: nil, actsOnReportedTrack: true)
         player.requestPlayback(false)
         player.stopPlayer()
         if let ended = ended { player.emitGiveUp(ended) }
     }
 
     /// A seek's start, as a crossfade seek, a newer command: a skip or load still waiting ends
-    /// cancelled and does not take effect (the seek acts on the active track); the player is no
-    /// longer in a give-up's error; a failed track is the player's own again (LOAD-06). Returns
-    /// whether a track is active to seek in (none: it rejects, nothing loads).
+    /// cancelled and does not take effect; the seek acts on the active track, also after a failed
+    /// skip and while a natural advance loads (owner decision, 2026-11-17, LOAD-06; none active:
+    /// the failed track, retried); the player is no longer in a give-up's error. Returns whether a
+    /// track is active to seek in (none: it rejects, nothing loads).
     func beginSeek(to position: Double) -> Bool {
         let cancelledWait = commandLoads.cancel()
         giveUps.clear()
         _ = failedLoads.command()
-        leaveCancelledLoad(cancelledWait: cancelledWait, position: position)
+        leaveCancelledLoad(cancelledWait: cancelledWait, position: position, actsOnReportedTrack: true)
         return !(player?.isIdle ?? true)
     }
 

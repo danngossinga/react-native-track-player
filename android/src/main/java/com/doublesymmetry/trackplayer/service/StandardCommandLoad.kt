@@ -120,13 +120,16 @@ internal class StandardCommandLoad {
 }
 
 /**
- * Where a seek, pause or stop leaves the player when it cancelled a command's wait
- * ([StandardCommandLoad.cancel] returned true: a skip, next, previous or load whose track was
- * still loading), as crossfade's operation cancelled while it loads: the cancelled command does
- * not take effect, and its track is never reported. iOS: the same rule (`standardCancelledLoad`).
+ * Where a seek, pause or stop leaves the player when a load is pending, as crossfade's operation
+ * cancelled while it loads: the cancelled command does not take effect, and its track is never
+ * reported. A seek or stop ([actsOnReportedTrack]) acts on the reported track whenever the player
+ * is on another one (a skip or load waiting, a natural advance loading, a skip that failed: owner
+ * decision, 2026-11-17, LOAD-06); a pause only when it cancelled a command's wait
+ * ([StandardCommandLoad.cancel] returned true: a skip, next, previous or load whose track was still
+ * loading). iOS: the same rule (`standardCancelledLoad`).
  */
 internal sealed class StandardCancelledLoad {
-    /** No wait cancelled (after a failed load too: LOAD-06, a command acts on the player's own track), or the player is on the reported track: it stays. */
+    /** Nothing pending, or the player is on the reported track (none reported: a seek retries the failed track): it stays. */
     object Stays : StandardCancelledLoad()
 
     /** The player goes back to the reported track [item], paused (the seek acts there). */
@@ -141,12 +144,21 @@ internal sealed class StandardCancelledLoad {
     object StopsInIdle : StandardCancelledLoad()
 }
 
-/** What a cancel leaves ([StandardCancelledLoad]); [reported]: the track the app was told is active. */
-internal fun standardCancelledLoad(cancelledWait: Boolean, playerItem: Any?, reported: Any?): StandardCancelledLoad = when {
-    !cancelledWait -> StandardCancelledLoad.Stays
-    reported == null -> StandardCancelledLoad.StopsInIdle
+/**
+ * What a seek, pause or stop leaves ([StandardCancelledLoad]); [cancelledWait]: it cancelled a
+ * command's wait; [reported]: the track the app was told is active; [actsOnReportedTrack]: a seek
+ * or stop (owner decision, 2026-11-17), not a pause.
+ */
+internal fun standardCancelledLoad(
+    cancelledWait: Boolean,
+    playerItem: Any?,
+    reported: Any?,
+    actsOnReportedTrack: Boolean = false
+): StandardCancelledLoad = when {
+    reported == null -> if (cancelledWait) StandardCancelledLoad.StopsInIdle else StandardCancelledLoad.Stays
     reported === playerItem -> StandardCancelledLoad.Stays
-    else -> StandardCancelledLoad.ReturnsTo(reported)
+    cancelledWait || actsOnReportedTrack -> StandardCancelledLoad.ReturnsTo(reported)
+    else -> StandardCancelledLoad.Stays
 }
 
 /**

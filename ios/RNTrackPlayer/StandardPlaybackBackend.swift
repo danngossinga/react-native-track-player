@@ -935,7 +935,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
         try onMain {
             clearHostFailure()
-            _ = failedLoads.command()
+            failedLoads.skipped()
             cancelPendingSeeks()
             transitionGenerationSidecar.restore(snapshot.transitionGeneration)
             let queue = isAuthoritative ? queueState.authoritative : queueState.pending
@@ -1202,7 +1202,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {
         onMain {
             clearHostFailure()
-            _ = failedLoads.command()
+            failedLoads.skipped()
             commandLoads.cancel()
             cancelPendingSeeks()
             let wasIdle = idleWithoutActiveTrack
@@ -1221,7 +1221,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
             clearHostFailure()
-            _ = failedLoads.command()
+            failedLoads.skipped()
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             do {
@@ -1274,10 +1274,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             // After a failed load, next is relative to the active (previous) track, as Android.
             if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active + 1 < player.items.count {
-                _ = failedLoads.command()
+                failedLoads.skipped()
                 try? player.jumpToItem(atIndex: active + 1, playWhenReady: player.playWhenReady)
             } else {
-                _ = failedLoads.command()
+                failedLoads.skipped()
                 player.next()
             }
             finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
@@ -1297,10 +1297,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             cancelPendingSeeks()
             clearHostFailure()
             if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active - 1 >= 0 {
-                _ = failedLoads.command()
+                failedLoads.skipped()
                 try? player.jumpToItem(atIndex: active - 1, playWhenReady: player.playWhenReady)
             } else {
-                _ = failedLoads.command()
+                failedLoads.skipped()
                 player.previous()
             }
             finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
