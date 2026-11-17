@@ -1,5 +1,7 @@
 package com.doublesymmetry.trackplayer.service
 
+import com.google.android.exoplayer2.Player
+
 /** The message of a standard command's wait that a newer command ended (iOS: the same). */
 internal const val STANDARD_COMMAND_LOAD_CANCELLED_MESSAGE = "A newer command replaced this one before its track loaded."
 
@@ -71,12 +73,16 @@ internal class StandardCommandLoad {
     /** Whether a command waits for [item]'s load (its failure is then that command's to report). */
     fun waitsFor(item: Any?): Boolean = item != null && wait?.target === item
 
-    /** [item]'s load failed: its wait ends rejected with [code]. Returns whether one waited. */
-    fun failed(item: Any?, code: String, message: String): Boolean {
+    /**
+     * [item]'s load failed: its wait ends rejected with [code]. [reportedByPlayer]: the player
+     * also sends this failure as its own error event (a player error, not a give-up, whose report
+     * the backend decides at once), which the rejection replaces. Returns whether one waited.
+     */
+    fun failed(item: Any?, code: String, message: String, reportedByPlayer: Boolean): Boolean {
         val current = wait ?: return false
         if (current.target !== item) return false
         wait = null
-        failureReportedByCommand = item
+        if (reportedByPlayer) failureReportedByCommand = item
         current.settle(Outcome.Failed(code, message))
         return true
     }
@@ -100,8 +106,19 @@ internal class StandardCommandLoad {
     fun reportsFailureOf(item: Any?): Boolean =
         item != null && (wait?.target === item || failureReportedByCommand === item)
 
-    /** The player is no longer in that error (a new load): its later errors are reported again. */
+    /**
+     * The player is no longer in that error, or a command loads again (play, retry): its later
+     * errors are reported again.
+     */
     fun failureCleared() {
         failureReportedByCommand = null
     }
 }
+
+/**
+ * Whether a command's wait must start its track's load: the track is not the loaded one and the
+ * player is not loading (stopped by a give-up, or failed: [Player.STATE_IDLE]). Else nothing would
+ * end the wait. iOS: the same rule (`standardCommandLoadMustStart`).
+ */
+internal fun standardCommandLoadMustStart(targetLoaded: Boolean, exoState: Int): Boolean =
+    !targetLoaded && exoState == Player.STATE_IDLE

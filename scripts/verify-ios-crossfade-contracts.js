@@ -760,7 +760,11 @@ assert(
       section(standardBackend, 'private func waitForCommandLoad(', '\n    }\n').includes('completion(.failure(playbackBackendError(code: "cancelled", message: standardCommandLoadCancelledMessage)))') &&
       followLoad.includes('commandLoads.ruleSettled(active: failedLoads.active, reported: failedLoads.reported)') &&
       followLoad.includes('code: standardLoadErrorCode,') &&
-      section(standardBackend, 'private func giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message)') &&
+      followLoad.includes('reportedByPlayer: true') &&
+      section(standardBackend, 'private func waitForCommandLoad(', '\n    }\n').includes('if wait != nil, standardCommandLoadMustStart(targetLoaded: false, stateRawValue: player.playerState.rawValue) {\n            player.reload(startFromCurrentTime: false)') &&
+      section(standardBackend, 'func play() throws {', '\n    }\n').includes('commandLoads.failureCleared()') &&
+      section(standardBackend, 'func retry() {', '\n    }\n').includes('onMain { commandLoads.failureCleared() }') &&
+      section(standardBackend, 'private func giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)') &&
       section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('commandLoads.cancel()') &&
       ['func stop() {', 'func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {', 'func dispose() throws {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('commandLoads.cancel()')) &&
@@ -768,7 +772,9 @@ assert(
       ['testStandardCommandLoadSmartMusicPlayersSequenceEndsOnceTheTargetLoadedAndIsReported',
         'testStandardCommandLoadASkipToTheSelectedFirstTrackEndsAtItsLoadNotAtItsSelection',
         'testStandardCommandLoadAFailedLoadRejectsWithItsCodeAndTheCommandReportsIt',
-        'testStandardCommandLoadANewerCommandCancelsTheOlderWait'].every((t) => tests.includes(`func ${t}()`)),
+        'testStandardCommandLoadANewerCommandCancelsTheOlderWait',
+        'testStandardCommandLoadAGiveUpTheCommandRejectedWithLeavesTheTracksLaterFailuresReported',
+        'testStandardCommandLoadAWaitStartsItsTracksLoadOnlyWhenThePlayerStandsStill'].every((t) => tests.includes(`func ${t}()`)),
     'iOS standard skip, next, previous and load must end once their track loaded, as crossfade and Android.'
   );
 }

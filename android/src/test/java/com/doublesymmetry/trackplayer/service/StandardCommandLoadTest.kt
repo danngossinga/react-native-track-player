@@ -94,11 +94,11 @@ class StandardCommandLoadTest {
         rule.moved(second)
         assertTrue(loads.waitsFor(second))
         assertTrue(loads.reportsFailureOf(second))
-        assertFalse("another track's failure is not this command's", loads.failed(first, PREPARE_TIMEOUT_CODE, "x"))
+        assertFalse("another track's failure is not this command's", loads.failed(first, STANDARD_LOAD_ERROR_CODE, "x", reportedByPlayer = true))
         rule.failed()
-        assertTrue(loads.failed(second, PREPARE_TIMEOUT_CODE, "The track did not become ready."))
+        assertTrue(loads.failed(second, STANDARD_LOAD_ERROR_CODE, "Source error", reportedByPlayer = true))
         assertEquals(
-            listOf<StandardCommandLoad.Outcome>(StandardCommandLoad.Outcome.Failed(PREPARE_TIMEOUT_CODE, "The track did not become ready.")),
+            listOf<StandardCommandLoad.Outcome>(StandardCommandLoad.Outcome.Failed(STANDARD_LOAD_ERROR_CODE, "Source error")),
             outcomes
         )
         assertEquals("the previous track stays active", first, rule.reported)
@@ -107,6 +107,28 @@ class StandardCommandLoadTest {
         assertFalse(loads.reportsFailureOf(first))
         loads.failureCleared()
         assertFalse(loads.reportsFailureOf(second))
+    }
+
+    @Test
+    fun aGiveUpTheCommandRejectedWithLeavesTheTracksLaterFailuresReported() {
+        rule.reset()
+        rule.moved(first)
+        command(first)
+        assertTrue(loads.failed(first, PREPARE_TIMEOUT_CODE, "The track did not become ready.", reportedByPlayer = false))
+        assertEquals(
+            listOf<StandardCommandLoad.Outcome>(StandardCommandLoad.Outcome.Failed(PREPARE_TIMEOUT_CODE, "The track did not become ready.")),
+            outcomes
+        )
+        // A play retries it and it gives up again, with no command waiting: a playback error.
+        assertFalse(loads.reportsFailureOf(first))
+    }
+
+    @Test
+    fun aWaitStartsItsTracksLoadOnlyWhenThePlayerStandsStill() {
+        assertTrue(standardCommandLoadMustStart(targetLoaded = false, exoState = com.google.android.exoplayer2.Player.STATE_IDLE))
+        assertFalse(standardCommandLoadMustStart(targetLoaded = false, exoState = com.google.android.exoplayer2.Player.STATE_BUFFERING))
+        assertFalse(standardCommandLoadMustStart(targetLoaded = false, exoState = com.google.android.exoplayer2.Player.STATE_READY))
+        assertFalse(standardCommandLoadMustStart(targetLoaded = true, exoState = com.google.android.exoplayer2.Player.STATE_IDLE))
     }
 
     @Test

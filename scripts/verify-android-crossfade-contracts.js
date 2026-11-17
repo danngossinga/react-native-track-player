@@ -970,16 +970,20 @@ assert(
         'override suspend fun skipToNext() {', 'override suspend fun skipToPrevious() {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('awaitCommandLoad()')) &&
       section(standardBackend, 'private suspend fun awaitCommandLoad() {', '\n    }\n').includes('throw RejectionException(STANDARD_COMMAND_LOAD_CANCELLED_MESSAGE, "cancelled")') &&
+      section(standardBackend, 'private suspend fun awaitCommandLoad() {', '\n    }\n').includes('if (standardCommandLoadMustStart(targetLoaded = false, exoState = analytics()?.player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE)) {\n            player.prepare()') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('reportedByPlayer = true') &&
+      ['override suspend fun play() {', 'override suspend fun retry() {'].every((start) => section(standardBackend, start, '\n    }\n').includes('commandLoads.failureCleared()')) &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('commandLoads.ruleSettled(failedLoads.active, failedLoads.reported)') &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
-      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message)') &&
+      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)') &&
       ['override fun stop() {\n        commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        commandLoads.cancel()',
         'override fun clearQueue() {\n        commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
       playbackErrors.includes('if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt",') &&
       ['aSkipAfterSettingTheQueueResolvesOnceTheTargetLoadedAndIsTheActiveTrack', 'aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded',
         'aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded', 'aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive',
-        'aNewerSkipCancelsTheWaitOfTheOlderOne'].every((t) => hls.includes(`fun ${t}()`)),
+        'aNewerSkipCancelsTheWaitOfTheOlderOne', 'aStopOrANewQueueEndsAWaitingSkipCancelled',
+        'aGiveUpThatNoCommandWaitsForIsReportedAfterARejectedSkip'].every((t) => hls.includes(`fun ${t}()`)),
     'Android standard skip, next, previous and load must end once their track loaded, as crossfade.'
   );
 }

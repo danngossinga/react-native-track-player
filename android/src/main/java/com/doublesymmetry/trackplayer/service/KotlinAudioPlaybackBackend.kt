@@ -388,6 +388,8 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override suspend fun play() {
+        // A new load: a failure of it no command waits for is reported again.
+        commandLoads.failureCleared()
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             loadActiveTrackAfterFailedLoad()
@@ -472,7 +474,8 @@ internal class KotlinAudioPlaybackBackend(
                 commandLoads.failed(
                     item,
                     STANDARD_LOAD_ERROR_CODE,
-                    analytics()?.player?.playerError?.message ?: STANDARD_LOAD_FAILED_MESSAGE
+                    analytics()?.player?.playerError?.message ?: STANDARD_LOAD_FAILED_MESSAGE,
+                    reportedByPlayer = true
                 )
             }
             return
@@ -500,6 +503,10 @@ internal class KotlinAudioPlaybackBackend(
         if (disposed || playerReleased) return
         val outcome = kotlinx.coroutines.CompletableDeferred<StandardCommandLoad.Outcome>()
         val wait = commandLoads.begin(target, failedLoads.active, failedLoads.reported) { outcome.complete(it) } ?: return
+        // Its track must load: after a give-up or a player error on it, the player stands still.
+        if (standardCommandLoadMustStart(targetLoaded = false, exoState = analytics()?.player?.playbackState ?: com.google.android.exoplayer2.Player.STATE_IDLE)) {
+            player.prepare()
+        }
         // The load is looked at now (the player's events of the command may have come first).
         driver.poke()
         val result = try {
@@ -566,7 +573,7 @@ internal class KotlinAudioPlaybackBackend(
             report = !commandLoads.waitsFor(item)
         )
         failLoadedTrack()
-        commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message)
+        commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)
     }
 
     /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
@@ -754,6 +761,7 @@ internal class KotlinAudioPlaybackBackend(
     // A waited seek with the same limits, as on iOS (it ends a seek in progress, as any seek).
     override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, player.position + offsetMs))
     override suspend fun retry() {
+        commandLoads.failureCleared()
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             loadActiveTrackAfterFailedLoad()

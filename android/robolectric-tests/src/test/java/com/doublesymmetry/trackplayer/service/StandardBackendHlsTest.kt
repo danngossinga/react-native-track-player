@@ -18,6 +18,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
@@ -196,6 +197,44 @@ class StandardBackendHlsTest {
         // The rejection is the report: the player's own error event is not the app's.
         assertTrue("the command reports the player's error", backed.backend.reportsPlayerErrorThroughCommand())
         assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    @Test
+    fun aStopOrANewQueueEndsAWaitingSkipCancelled() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(stalled, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("the first track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        val stopped = launchCommand { backed.backend.skip(1) }
+        awaitTrue("the stalled track loads") { stalled.stalledRequestTimesMs.isNotEmpty() }
+        backed.backend.stop()
+        awaitTrue("the skip ends") { stopped() != null }
+        assertEquals("cancelled", (stopped()!!.exceptionOrNull() as RejectionException).code)
+        val requests = stalled.stalledRequestTimesMs.size
+        val replaced = launchCommand { backed.backend.skip(1) }
+        awaitTrue("the stalled track loads again") { stalled.stalledRequestTimesMs.size > requests }
+        backed.backend.replaceQueue(listOf(item(playable, 3L)))
+        awaitTrue("the skip ends") { replaced() != null }
+        assertEquals("cancelled", (replaced()!!.exceptionOrNull() as RejectionException).code)
+        assertTrue("no give-up", backed.gaveUpAtMs.isEmpty())
+    }
+
+    @Test
+    fun aGiveUpThatNoCommandWaitsForIsReportedAfterARejectedSkip() {
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.replaceQueue(listOf(item(stalled, 1L)))
+        // The skip to the selected first track waits for its load, which gives up: the
+        // rejection is the report.
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(0) } as RejectionException).code)
+        assertTrue("no playback error event", backed.player.event.playbackError.replayCache.isEmpty())
+        // A play retries the track that failed (none is active); nobody waits: a playback error.
+        command { backed.backend.play() }
+        awaitTrue("a second give-up", AWAIT_MS) { backed.gaveUpAtMs.size == 2 }
+        assertEquals(PREPARE_TIMEOUT_CODE, backed.player.event.playbackError.replayCache.single().code)
+        assertFalse("the app is told", backed.backend.reportsPlayerErrorThroughCommand())
     }
 
     @Test

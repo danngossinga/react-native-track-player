@@ -434,16 +434,37 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         _ = h.rule.moved(h.second)
         XCTAssertTrue(h.loads.waits(for: h.second))
         XCTAssertTrue(h.loads.reportsFailure(of: h.second))
-        XCTAssertFalse(h.loads.failed(h.first, code: standardPrepareTimeoutCode, message: "x"), "another track's failure is not this command's")
+        XCTAssertFalse(h.loads.failed(h.first, code: standardLoadErrorCode, message: "x", reportedByPlayer: true), "another track's failure is not this command's")
         _ = h.rule.failed()
-        XCTAssertTrue(h.loads.failed(h.second, code: standardPrepareTimeoutCode, message: "The track did not become ready."))
-        XCTAssertEqual(h.outcomes, [.failed(code: standardPrepareTimeoutCode, message: "The track did not become ready.")])
+        XCTAssertTrue(h.loads.failed(h.second, code: standardLoadErrorCode, message: "Source error", reportedByPlayer: true))
+        XCTAssertEqual(h.outcomes, [.failed(code: standardLoadErrorCode, message: "Source error")])
         XCTAssertEqual(h.rule.reported, h.first, "the previous track stays active")
         // Its player error is the rejection's, not a playback error, until the player leaves it.
         XCTAssertTrue(h.loads.reportsFailure(of: h.second))
         XCTAssertFalse(h.loads.reportsFailure(of: h.first))
         h.loads.failureCleared()
         XCTAssertFalse(h.loads.reportsFailure(of: h.second))
+    }
+
+    func testStandardCommandLoadAGiveUpTheCommandRejectedWithLeavesTheTracksLaterFailuresReported() {
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        h.command(h.first)
+        XCTAssertTrue(h.loads.failed(h.first, code: standardPrepareTimeoutCode, message: "The track did not become ready.", reportedByPlayer: false))
+        XCTAssertEqual(h.outcomes, [.failed(code: standardPrepareTimeoutCode, message: "The track did not become ready.")])
+        // A play retries it and it gives up again, with no command waiting: a playback error.
+        XCTAssertFalse(h.loads.reportsFailure(of: h.first))
+    }
+
+    func testStandardCommandLoadAWaitStartsItsTracksLoadOnlyWhenThePlayerStandsStill() {
+        for state in ["stopped", "failed", "idle"] {
+            XCTAssertTrue(standardCommandLoadMustStart(targetLoaded: false, stateRawValue: state), state)
+        }
+        for state in ["loading", "buffering", "ready", "playing", "paused"] {
+            XCTAssertFalse(standardCommandLoadMustStart(targetLoaded: false, stateRawValue: state), state)
+        }
+        XCTAssertFalse(standardCommandLoadMustStart(targetLoaded: true, stateRawValue: "stopped"))
     }
 
     func testStandardCommandLoadANewerCommandCancelsTheOlderWait() {

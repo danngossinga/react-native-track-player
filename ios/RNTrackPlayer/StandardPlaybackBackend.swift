@@ -446,7 +446,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             report: !commandLoads.waits(for: item),
             failsLoad: true
         )
-        commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message)
+        commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)
     }
 
     /// Feeds `failedLoads`: when the item is ready, and a player failure.
@@ -461,7 +461,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 commandLoads.failed(
                     observed.item,
                     code: standardLoadErrorCode,
-                    message: player.playbackError?.localizedDescription ?? standardLoadFailedMessage
+                    message: player.playbackError?.localizedDescription ?? standardLoadFailedMessage,
+                    reportedByPlayer: true
                 )
             }
             return
@@ -486,7 +487,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             completion(.success(()))
             return
         }
-        commandLoads.begin(target: target, active: failedLoads.active, reported: failedLoads.reported) { outcome in
+        let wait = commandLoads.begin(target: target, active: failedLoads.active, reported: failedLoads.reported) { outcome in
             switch outcome {
             case .loaded:
                 completion(.success(()))
@@ -495,6 +496,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             case .cancelled:
                 completion(.failure(playbackBackendError(code: "cancelled", message: standardCommandLoadCancelledMessage)))
             }
+        }
+        // Its track must load: after a give-up or a player error on it (a skip to the same
+        // track does not jump), the player stands still.
+        if wait != nil, standardCommandLoadMustStart(targetLoaded: false, stateRawValue: player.playerState.rawValue) {
+            player.reload(startFromCurrentTime: false)
         }
         // The load is looked at now (the player's events of the command may have come first).
         driver.poke()
@@ -995,6 +1001,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func play() throws {
         onMain {
+            // A new load: a failure of it no command waits for is reported again.
+            commandLoads.failureCleared()
             let kept = clearHostFailure()
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
@@ -1236,6 +1244,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
             let kept = clearHostFailure()
+            if value { commandLoads.failureCleared() }
             if !value { cancelPendingSeeks() }
             let wasIdle = value && idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
@@ -1264,6 +1273,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func setVolume(_ value: Float) { player.volume = value }
     func setRate(_ value: Float) { player.rate = value }
     func retry() {
+        onMain { commandLoads.failureCleared() }
         let kept = clearHostFailure()
         let wasIdle = idleWithoutActiveTrack
         beginIdleTrackActivationIfNeeded(wasIdle)
