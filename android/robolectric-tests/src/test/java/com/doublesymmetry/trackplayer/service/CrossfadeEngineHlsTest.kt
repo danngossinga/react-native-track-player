@@ -182,6 +182,27 @@ class CrossfadeEngineHlsTest {
     }
 
     @Test
+    fun slowPlaylistsCountAgainForTheNextTrackOnTheSameEngine() {
+        // The previous track asked for segments; the next one's playlists are progress again.
+        val engine = engine(STALL_TIMEOUT_MS)
+        val first = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        runBlocking(engineThread) {
+            engine.prepare(hlsItem(first), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS)
+        }
+        val slow = HlsTestServer(
+            LADDER,
+            segmentCount = 8,
+            stalledFrom = 8,
+            playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4
+        ).also { servers += it }
+        val result = runBlocking(engineThread) {
+            engine.reset()
+            runCatching { engine.prepare(hlsItem(slow), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+        }
+        assertTrue("the next healthy track loads, got $result", result.isSuccess)
+    }
+
+    @Test
     fun aPlayerErrorDuringALoadAlsoStopsLoadingAsOnIos() {
         // The master playlist is not a playlist: the player fails at once. As on iOS, whatever
         // ends a load (stall, limit, player error), the engine stops and forgets the track.
