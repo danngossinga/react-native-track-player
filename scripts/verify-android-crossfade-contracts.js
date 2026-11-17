@@ -470,6 +470,7 @@ assert(
 // HTTP timeouts as the crossfade players.
 const buildGradle = read('android/build.gradle');
 const vendoredBase = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
+const standardConfig = section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt'), 'internal fun configureStandardExoPlayer(', '\n}\n');
 const standardHooks = section(musicService, 'private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(', '/**');
 assert(
   !buildGradle.includes("com.github.doublesymmetry:kotlinaudio") &&
@@ -481,12 +482,20 @@ assert(
     vendoredBase.includes('val tempFactory = hooks.httpDataSourceFactory?.invoke(configureHttp)') &&
     musicService.includes('QueuedAudioPlayer(this@MusicService, playerConfig, bufferConfig, cacheConfig, standardPlayerHooks(analytics))') &&
     // Start-low per track: each media period's own media loads (not its manifest, not another's).
-    standardHooks.includes('val startLow = StandardStartLow(\n                { initialBitrateEstimate.bitsPerSecond },') &&
+    standardHooks.includes('configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)') &&
+    standardConfig.includes('val startLow = StandardStartLow(\n        initialBitrateEstimateBps,') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('    val meter: BandwidthMeter = newMeter(unmeasuredBps)\n    val selectionFactory = StartLowTrackSelectionFactory(initialBitrateEstimateBps, loads, unmeasuredBps, adaptive)') &&
-    standardHooks.includes('newMeter = { bps -> DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(bps).build() }') &&
+    standardConfig.includes('newMeter = { bps -> DefaultBandwidthMeter.Builder(context).setInitialBitrateEstimate(bps).build() }') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('return if (hasMeasured && estimate != unmeasuredEstimateBps) estimate else initialEstimateBps') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('loads.retainPeriodsOf(eventTime.timeline)') &&
-    standardHooks.includes('builder.setBandwidthMeter(startLow.meter)\n            builder.setTrackSelector(DefaultTrackSelector(this@MusicService, startLow.selectionFactory))\n            analytics.addListener(startLow.loadListener)\n            builder.setAnalyticsCollector(analytics)') &&
+    standardConfig.includes('    builder.setBandwidthMeter(startLow.meter)\n') &&
+    // HLS audio renditions adapt (the crossfade players' parameters, shared), lowest first at the
+    // default estimate. Pinned behaviour: android/robolectric-tests StandardPlayerHlsTest.
+    standardConfig.includes('        DefaultTrackSelector(\n            context,\n            crossfadeTrackSelectorParameters(DefaultTrackSelector.Parameters.Builder(context)),\n            startLow.selectionFactory\n        )') &&
+    standardConfig.includes('    analytics.addListener(startLow.loadListener)\n    builder.setAnalyticsCollector(analytics)') &&
+    read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt",') &&
+    ['fun theStandardPlayerAsksForTheFirstSegmentAtTheLowestRenditionHighestListedFirst()', 'fun theNextTrackPreparedAheadAlsoAsksForItsFirstSegmentAtTheLowestRendition()']
+      .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardPlayerHlsTest.kt').includes(t)) &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('        super.setPlayer(player, looper)\n        this.player = player') &&
     musicService.includes('                        standardAnalytics.remove(disposed)') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt').includes('hasOwnMeasurement = { loads.hasMeasured(mediaPeriodId) }') &&

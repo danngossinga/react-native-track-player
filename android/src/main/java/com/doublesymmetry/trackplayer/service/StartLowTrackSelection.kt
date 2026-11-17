@@ -1,7 +1,9 @@
 package com.doublesymmetry.trackplayer.service
 
+import android.content.Context
 import android.os.Handler
 import com.google.android.exoplayer2.C
+import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.analytics.AnalyticsListener
 import com.google.android.exoplayer2.source.LoadEventInfo
 import com.google.android.exoplayer2.source.MediaLoadData
@@ -9,8 +11,10 @@ import java.util.Collections
 import com.google.android.exoplayer2.Timeline
 import com.google.android.exoplayer2.source.MediaSource
 import com.google.android.exoplayer2.trackselection.AdaptiveTrackSelection
+import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.google.android.exoplayer2.trackselection.ExoTrackSelection
 import com.google.android.exoplayer2.upstream.BandwidthMeter
+import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import com.google.android.exoplayer2.upstream.TransferListener
 
 /**
@@ -158,4 +162,37 @@ internal class StartLowBandwidthMeter(
 
     override fun removeEventListener(eventListener: BandwidthMeter.EventListener) =
         measured.removeEventListener(eventListener)
+}
+
+/**
+ * What the standard player's ExoPlayer is built with (vendored KotlinAudio's
+ * `PlayerHooks.configureExoPlayer`): a meter that reports the app's `initialBitrateEstimateBps`
+ * until it has really measured (its own thresholds), not a country default; each track's own
+ * media loads (not its playlist, not another track's); the crossfade players' selector
+ * parameters, so the first segment of a track is requested at the rendition the estimate fits;
+ * ExoPlayer's own state for seeks ([analytics]).
+ */
+internal fun configureStandardExoPlayer(
+    builder: ExoPlayer.Builder,
+    context: Context,
+    initialBitrateEstimateBps: () -> Long,
+    analytics: StandardPlayerAnalytics
+) {
+    val startLow = StandardStartLow(
+        initialBitrateEstimateBps,
+        newMeter = { bps -> DefaultBandwidthMeter.Builder(context).setInitialBitrateEstimate(bps).build() }
+    )
+    builder.setBandwidthMeter(startLow.meter)
+    // The crossfade players' parameters (shared): HLS audio renditions, whose channel count and
+    // sample rate the master playlist does not give, adapt from the estimate instead of a fixed
+    // choice of the highest one.
+    builder.setTrackSelector(
+        DefaultTrackSelector(
+            context,
+            crossfadeTrackSelectorParameters(DefaultTrackSelector.Parameters.Builder(context)),
+            startLow.selectionFactory
+        )
+    )
+    analytics.addListener(startLow.loadListener)
+    builder.setAnalyticsCollector(analytics)
 }

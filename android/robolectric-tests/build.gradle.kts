@@ -10,13 +10,14 @@ plugins {
     kotlin("android") version "1.9.24"
 }
 
-/** The library sources under test: the crossfade engine and what it uses. */
+/** The library sources under test: the crossfade engine, the standard player's configuration, and what they use. */
 val engineSources = listOf(
     "com/doublesymmetry/trackplayer/service/AndroidCrossfadeEngine.kt",
     "com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt",
     "com/doublesymmetry/trackplayer/service/PerTrackBandwidthMeter.kt",
     "com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt",
     "com/doublesymmetry/trackplayer/service/StallWatch.kt",
+    "com/doublesymmetry/trackplayer/service/StartLowTrackSelection.kt",
     "com/doublesymmetry/trackplayer/model/TrackAudioItem.kt",
     "com/doublesymmetry/trackplayer/utils/RejectionException.kt"
 )

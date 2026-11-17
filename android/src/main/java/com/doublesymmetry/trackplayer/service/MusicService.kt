@@ -7,7 +7,6 @@ import android.content.pm.ServiceInfo
 import android.net.Uri
 import android.os.Binder
 import com.doublesymmetry.trackplayer.utils.RejectionException
-import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import androidx.media.AudioAttributesCompat
 import android.os.Build
 import android.os.Bundle
@@ -20,7 +19,6 @@ import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.doublesymmetry.kotlinaudio.models.*
 import com.doublesymmetry.kotlinaudio.models.NotificationButton.*
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
-import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.doublesymmetry.trackplayer.R as TrackPlayerR
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toMilliseconds
 import com.doublesymmetry.trackplayer.extensions.NumberExt.Companion.toSeconds
@@ -656,17 +654,7 @@ class MusicService : HeadlessJsTaskService() {
      */
     private fun standardPlayerHooks(analytics: StandardPlayerAnalytics) = PlayerHooks(
         configureExoPlayer = { builder ->
-            // A meter that reports the app's setting until it has really measured (its own
-            // thresholds), not a country default; each track's own media loads (not its
-            // playlist, not another track's); ExoPlayer's own state for seeks.
-            val startLow = StandardStartLow(
-                { initialBitrateEstimate.bitsPerSecond },
-                newMeter = { bps -> DefaultBandwidthMeter.Builder(this@MusicService).setInitialBitrateEstimate(bps).build() }
-            )
-            builder.setBandwidthMeter(startLow.meter)
-            builder.setTrackSelector(DefaultTrackSelector(this@MusicService, startLow.selectionFactory))
-            analytics.addListener(startLow.loadListener)
-            builder.setAnalyticsCollector(analytics)
+            configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
         hostOwnsAudioFocus = true
