@@ -560,6 +560,36 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testStandardLoadASeekDuringALoadKeepsTheLoadsTotalLimitAndStartsItsProgressOnce() {
+        // As Android: the load began at 0; a seek owned it from 5 s to 56 s. Watched again, its
+        // total limit still counts from 0 (60 s), with a fresh stall clock from the seek's end.
+        let h = LoadWatchHarness()
+        func see(_ item: NSObject, owned: Bool = false) -> (starts: Bool, verdict: StallVerdict?) {
+            let observed = StandardLoadObservation(item: ObjectIdentifier(item), phase: .loading, readings: [0], ownedElsewhere: owned)
+            return (h.watch.startsLoad(observed), h.watch.check(observed))
+        }
+        XCTAssertTrue(see(h.b).starts)
+        h.now = 5
+        XCTAssertNil(see(h.b, owned: true).verdict)
+        h.now = 56
+        let after = see(h.b)
+        XCTAssertFalse(after.starts, "the progress starts once per load")
+        XCTAssertNil(after.verdict)
+        h.now = 59.999
+        XCTAssertNil(see(h.b).verdict)
+        h.now = 60
+        XCTAssertEqual(see(h.b).verdict, .capExceeded)
+        // A load first seen while a seek owns it began then (its total counts from 70 s).
+        h.now = 70
+        XCTAssertNil(see(h.a, owned: true).verdict)
+        h.now = 125
+        let watched = see(h.a)
+        XCTAssertTrue(watched.starts, "its progress starts once watched")
+        XCTAssertNil(watched.verdict)
+        h.now = 130
+        XCTAssertEqual(see(h.a).verdict, .capExceeded)
+    }
+
     func testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching() {
         let h = LoadWatchHarness()
         func observed(_ item: NSObject?, _ phase: StandardLoadPhase, owned: Bool = false) -> StandardLoadObservation {

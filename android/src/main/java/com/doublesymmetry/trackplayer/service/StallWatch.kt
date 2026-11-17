@@ -19,9 +19,11 @@ internal enum class StallVerdict {
 internal class StallWatch(
     val stallTimeoutMs: Long,
     val totalTimeoutMs: Long,
-    private val startedAtMs: Long
+    private val startedAtMs: Long,
+    /** The stall clock's start: [startedAtMs] unless the wait goes on from an earlier start (a load after a seek). */
+    lastProgressAtMs: Long = startedAtMs
 ) {
-    private var lastProgressAtMs = startedAtMs
+    private var lastProgressAtMs = lastProgressAtMs
     private var previous: LongArray? = null
 
     /** Takes the current readings. The first ones only set the baseline. */

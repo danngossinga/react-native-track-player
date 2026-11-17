@@ -1602,6 +1602,14 @@ final class StandardLoadWatch {
     private let totalTimeoutMs: () -> Int
     private let now: () -> TimeInterval
     private var readyItem: ObjectIdentifier?
+    /// The load in progress: its item and when it began (the first time the item was seen
+    /// loading, even while a seek owned it). A seek during the load does not end it: once the
+    /// seek ends, the load is watched again with its own total limit (a fresh stall clock). As
+    /// Android.
+    private var loadItem: ObjectIdentifier?
+    private var loadStartedAt: TimeInterval = 0
+    /// The item whose progress this load started (`startsLoad`), once per load.
+    private var progressItem: ObjectIdentifier?
     private var watchedItem: ObjectIdentifier?
     private var watch: StallWatch?
     /// The limits of the last load watched (what a give-up reports).
@@ -1620,53 +1628,67 @@ final class StandardLoadWatch {
 
     var isWatching: Bool { return watch != nil }
 
-    /// Whether `check` would start watching a new load with `observed` (its readings aside): an
-    /// item loading, not ready since it was loaded and not the one watched, with no other owner.
-    /// The caller starts that load's progress (`StandardLoadBytes.startLoad`) before reading it,
-    /// as Android's `onLoadStart`.
+    /// Whether `check` would start a new load's progress with `observed` (its readings aside): an
+    /// item loading, not ready since it was loaded and whose load has not started its progress
+    /// yet, with no other owner (a load watched again after a seek goes on counting). The caller
+    /// starts that load's progress (`StandardLoadBytes.startLoad`) before reading it, as
+    /// Android's `onLoadStart`.
     func startsLoad(_ observed: StandardLoadObservation) -> Bool {
         guard let item = observed.item, observed.phase == .loading, !observed.ownedElsewhere else { return false }
-        return readyItem != item && (watch == nil || watchedItem != item)
+        return readyItem != item && !(loadItem == item && progressItem == item)
     }
 
     /// Takes one observation: the verdict that ends a load the caller must give up, else nil.
     func check(_ observed: StandardLoadObservation) -> StallVerdict? {
         guard let item = observed.item, observed.phase != .failed else {
             readyItem = nil
-            disarm()
+            endLoad()
             return nil
         }
         if observed.ownedElsewhere {
             disarm()
+            // A seek on an item not ready since it was loaded: its load goes on (and its total).
+            if observed.phase == .loading, readyItem != item { loadOf(item) }
             return nil
         }
         switch observed.phase {
         case .ready:
             readyItem = item
-            disarm()
+            endLoad()
             return nil
         case .idle, .failed:
             readyItem = nil
-            disarm()
+            endLoad()
             return nil
         case .loading:
             break
         }
         if readyItem == item {
-            disarm()
+            endLoad()
             return nil
         }
+        loadOf(item)
         if watch == nil || watchedItem != item {
-            let created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: now())
+            var created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: loadStartedAt)
+            created.noteProgress(at: now())
             watch = created
             watchedItem = item
+            progressItem = item
             lastStallTimeoutMs = created.stallTimeoutMs
             lastTotalTimeoutMs = created.totalTimeoutMs
         }
         let verdict = watch!.check(at: now(), readings: observed.readings)
         guard verdict != .wait else { return nil }
-        disarm()
+        endLoad()
         return verdict
+    }
+
+    /// `item` is loading: the load in progress, or a new one from now.
+    private func loadOf(_ item: ObjectIdentifier) {
+        guard loadItem != item else { return }
+        loadItem = item
+        loadStartedAt = now()
+        progressItem = nil
     }
 
     /// When to check next, in milliseconds, while a load is watched (nil: none): at the moment the
@@ -1681,12 +1703,18 @@ final class StandardLoadWatch {
     /// Forgets the load in progress.
     func reset() {
         readyItem = nil
-        disarm()
+        endLoad()
     }
 
     private func disarm() {
         watch = nil
         watchedItem = nil
+    }
+
+    private func endLoad() {
+        disarm()
+        loadItem = nil
+        progressItem = nil
     }
 }
 

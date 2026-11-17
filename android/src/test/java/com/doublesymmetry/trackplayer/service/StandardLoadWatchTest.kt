@@ -114,6 +114,34 @@ class StandardLoadWatchTest {
     }
 
     @Test
+    fun aSeekDuringALoadKeepsTheLoadsTotalLimitAndStartsItsProgressOnce() {
+        // As iOS: the load began at 0; a seek owned it from 5 s to 56 s. Watched again, its total
+        // limit still counts from 0 (60 s), with a fresh stall clock from the seek's end.
+        var starts = 0
+        val counted = StandardLoadWatch({ stall }, { 60_000L }, nowMs = { now }, onLoadStart = { starts += 1 })
+        fun see(state: Int, owned: Boolean = false) =
+            counted.check(StandardLoadObservation(b, state, false, longArrayOf(0L, 0L, 0L), ownedElsewhere = owned))
+        assertNull(see(Player.STATE_BUFFERING))
+        now = 5_000L
+        assertNull(see(Player.STATE_BUFFERING, owned = true))
+        now = 56_000L
+        assertNull(see(Player.STATE_BUFFERING))
+        assertEquals("the progress counter starts once per load", 1, starts)
+        now = 59_999L
+        assertNull(see(Player.STATE_BUFFERING))
+        now = 60_000L
+        assertEquals(StallVerdict.CAP_EXCEEDED, see(Player.STATE_BUFFERING))
+        // A load first seen while a seek owns it began then (its total counts from 70 s).
+        now = 70_000L
+        assertNull(counted.check(StandardLoadObservation(a, Player.STATE_BUFFERING, false, longArrayOf(0L, 0L, 0L), ownedElsewhere = true)))
+        now = 125_000L
+        assertNull(counted.check(StandardLoadObservation(a, Player.STATE_BUFFERING, false, longArrayOf(0L, 0L, 0L))))
+        now = 130_000L
+        assertEquals(StallVerdict.CAP_EXCEEDED, counted.check(StandardLoadObservation(a, Player.STATE_BUFFERING, false, longArrayOf(0L, 0L, 0L))))
+        assertEquals(2, starts)
+    }
+
+    @Test
     fun theNextCheckIsAtTheGiveUpOrATenthOfTheStallTimeoutAndNoneWithoutALoad() {
         assertNull(watch.nextCheckInMs())
         observe(a, Player.STATE_BUFFERING)
