@@ -388,7 +388,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.reset()
             standbyEngine.reset()
             setState(AndroidPlaybackOrchestratorState.LOADING)
-            activeEngine.prepare(item, 0L, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+            prepareActiveOrFail(item, 0L, ticket)
             ticket.ensureActive()
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
@@ -909,15 +909,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
         delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
-        try {
-            activeEngine.prepare(queue[index], positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
-        } catch (error: RejectionException) {
-            // As iOS's load: a track that fails to load (a stall, a player error) leaves the player
-            // in an error state, not loading forever. A newer command that took over says otherwise.
-            ticket?.ensureActive()
-            setState(AndroidPlaybackOrchestratorState.ERROR)
-            throw error
-        }
+        prepareActiveOrFail(queue[index], positionMs, ticket)
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
@@ -939,8 +931,24 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (activeEngine.isPreparedFor(item)) return
         setState(AndroidPlaybackOrchestratorState.LOADING)
-        activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        prepareActiveOrFail(item, positionMs, ticket)
         ticket?.ensureActive()
+    }
+
+    /**
+     * Loads [item] on the active engine. As iOS's load: a track that fails to load (a stall, the
+     * total limit, a player error) leaves the player in an error state, not loading forever,
+     * whichever command started the load (skip, play, seek, load, an advance). A newer command
+     * that took over says otherwise.
+     */
+    private suspend fun prepareActiveOrFail(item: TrackAudioItem, positionMs: Long, ticket: PlaybackOperationTicket?) {
+        try {
+            activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            ticket?.ensureActive()
+            setState(AndroidPlaybackOrchestratorState.ERROR)
+            throw error
+        }
     }
 
     private suspend fun prepareStandby(

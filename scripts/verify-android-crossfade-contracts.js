@@ -263,8 +263,9 @@ assert(
 // never a number.
 assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6 &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 6 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 4 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 4 &&
+    (orchestrator.match(/prepareActiveOrFail\(/g) || []).length === 4 &&
     orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
   'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
 );
@@ -494,8 +495,10 @@ assert(
   const monitor = section(orchestrator, 'private suspend fun monitorActiveEngine() {', 'private suspend fun advanceToNextTrack(');
   const advance = section(orchestrator, 'private suspend fun advanceToNextTrack(', 'private fun cancelCrossfade(');
   assert(
-    startTrack.includes('} catch (error: RejectionException) {') &&
-      section(startTrack, '} catch (error: RejectionException) {', 'throw error').includes('setState(AndroidPlaybackOrchestratorState.ERROR)') &&
+    startTrack.includes('prepareActiveOrFail(queue[index], positionMs, ticket)') &&
+      section(orchestrator, 'private suspend fun ensureActivePrepared(', 'private suspend fun prepareStandby(').includes('prepareActiveOrFail(item, positionMs, ticket)') &&
+      section(orchestrator, 'suspend fun load(item: TrackAudioItem)', 'fun setNowPlayingOverride(').includes('prepareActiveOrFail(item, 0L, ticket)') &&
+      section(orchestrator, 'private suspend fun prepareActiveOrFail(', 'private suspend fun prepareStandby(').includes('} catch (error: RejectionException) {\n            ticket?.ensureActive()\n            setState(AndroidPlaybackOrchestratorState.ERROR)\n            throw error') &&
       monitor.includes('advanceToNextTrack(nextIndex, endedPosition)') &&
       !monitor.includes('startTrackAt(') &&
       advance.includes('val ticket = operationController.begin()') &&
