@@ -352,7 +352,8 @@ assert(
     musicService.includes('readinessGate = StandardPlaybackReadinessGate(\n                        timeoutMs = { standardReadyTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds },\n                        positionToleranceMs = { backendSwitchPositionTolerance.milliseconds }\n                    ),') &&
     runtimeSource.includes('private val timeoutMs: () -> Long,') &&
     runtimeSource.includes('private val stallTimeoutMs: () -> Long,') &&
-    gateAwait.includes('stallTimeoutMs = stallTimeoutMs(),') &&
+    gateAwait.includes('val stallMs = stallTimeoutMs()') &&
+    gateAwait.includes('stallTimeoutMs = stallMs,') &&
     gateAwait.includes('totalTimeoutMs = timeoutMs(),') &&
     gateAwait.includes('readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }') &&
     !gateAwait.includes('withTimeoutOrNull') &&
@@ -449,9 +450,14 @@ assert(
       'seekGate.cancel("load")\n        runActivatingOperation('].every((s) => standardBackend.includes(s)) &&
     // seekBy is a waited seek with the same limits, as on iOS.
     standardBackend.includes('override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, player.position + offsetMs))') &&
-    // At the target: no fixed tolerance (what playback played since the seek, plus one poll).
+    // At the target: no fixed tolerance and not the sampling period (what playback played since
+    // the seek and since the last reading).
     !section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal interface StandardSeekPlayer {').includes('positionToleranceMs') &&
-    section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('isAtSeekTarget(observed.positionMs, target, playedMs.toLong())') &&
+    section(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt'), 'internal class StandardSeekGate(', 'internal class PlaybackOperationCancelledException').includes('standardSeekIsAtTarget(observed.positionMs, target, playedMs.toLong(), sinceLastMs.toLong())') &&
+    // The seek and readiness waits sample every stallTimeoutMs / 10 and wake at every player event.
+    (read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').match(/pollIntervalMs \?: standardLoadSampleIntervalMs\(stallMs\)/g) || []).length === 2 &&
+    !/pollIntervalMs: Long = \d/.test(read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt')) &&
+    section(standardBackend, 'fun startLoadWatch(handler: android.os.Handler) {', 'val watch = loadWatch ?: return').includes('seekGate.poke()\n                readinessGate.poke()') &&
     standardBackend.includes('override val rate: Float get() = player.playbackSpeed') &&
     // A play after the queue ended starts the current track from 0, as on iOS.
     section(orchestrator, 'private suspend fun playFromStill() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(').includes('if (state == AndroidPlaybackOrchestratorState.ENDED) {') &&

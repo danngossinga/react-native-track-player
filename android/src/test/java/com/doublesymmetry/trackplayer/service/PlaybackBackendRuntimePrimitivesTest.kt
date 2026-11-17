@@ -418,6 +418,71 @@ class PlaybackBackendRuntimePrimitivesTest {
     }
 
     @Test
+    fun aStandardSeekReadsThePlayerEveryTenthOfTheStallTimeoutAndAtEveryEvent() = runTest {
+        // No fixed poll: between the player's events the seek samples the player every
+        // stallTimeoutMs / 10 (as the load watch, and iOS); an event (poke) looks at once.
+        val gate = StandardSeekGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
+        val item = Any()
+        var reads = 0
+        var ready = false
+        val started = currentTime
+        val wait = async {
+            gate.await(20_000L, item) {
+                reads += 1
+                StandardSeekObservation(if (ready) AudioPlayerState.READY else AudioPlayerState.BUFFERING, 20_000L, reads * 100L, item = item)
+            }
+        }
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals("one reading at the start and one a second", 6, reads)
+        advanceTimeBy(300L)
+        ready = true
+        gate.poke()
+        runCurrent()
+        assertTrue("the player's event ended the seek", wait.isCompleted)
+        assertEquals(5_300L, currentTime - started)
+    }
+
+    @Test
+    fun aStandardSeekIsNeverDoneBeforeItsTargetWhateverTheSamplingPeriod() = runTest {
+        // Sampled every 200 ms (stallTimeoutMs / 10), ready 150 ms before the target: not this
+        // seek's position (the sampling period is no tolerance).
+        val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, nowMs = { currentTime })
+        val item = Any()
+        val early = runCatching {
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_850L, 30_000L, item = item) }
+        }
+        assertEquals("standard_seek_timeout", (early.exceptionOrNull() as RejectionException).code)
+        assertTrue(standardSeekIsAtTarget(20_000L, 20_000L, playedMs = 0L, sinceLastMs = 0L))
+        assertFalse(standardSeekIsAtTarget(19_999L, 20_000L, playedMs = 500L, sinceLastMs = 200L))
+        assertTrue(standardSeekIsAtTarget(20_700L, 20_000L, playedMs = 500L, sinceLastMs = 200L))
+        assertFalse(standardSeekIsAtTarget(20_701L, 20_000L, playedMs = 500L, sinceLastMs = 200L))
+    }
+
+    @Test
+    fun aStandardBackendSwitchReadsThePlayerEveryTenthOfTheStallTimeoutAndAtEveryEvent() = runTest {
+        val gate = StandardPlaybackReadinessGate(timeoutMs = { 60_000L }, stallTimeoutMs = { 10_000L }, nowMs = { currentTime })
+        var reads = 0
+        var ready = false
+        val started = currentTime
+        val wait = async {
+            gate.await(expectedIndex = 0, expectedPositionMs = 0L) {
+                reads += 1
+                StandardPlaybackReadinessObservation(if (ready) AudioPlayerState.READY else AudioPlayerState.BUFFERING, 0, 0L, reads * 100L)
+            }
+        }
+        advanceTimeBy(5_000L)
+        runCurrent()
+        assertEquals("one reading at the start and one a second", 6, reads)
+        advanceTimeBy(300L)
+        ready = true
+        gate.poke()
+        runCurrent()
+        assertTrue("the player's event ended the wait", wait.isCompleted)
+        assertEquals(5_300L, currentTime - started)
+    }
+
+    @Test
     fun aSeekIsAtItsTargetWithinWhatPlaybackCouldHaveMovedNotAFixedTolerance() = runTest {
         val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
         val item = Any()
@@ -732,13 +797,19 @@ class PlaybackBackendRuntimePrimitivesTest {
     }
 
     @Test
-    fun aPositionReadJustBeforeTheTargetIsAtTheTarget() = runTest {
-        // A position read between two polls may lag the target by up to one poll.
+    fun aPositionBeforeTheTargetIsNotAtItAndAtTheTargetIsDoneAtOnce() = runTest {
+        // Deliberately changed: the sampling period is no tolerance any more (it is stallTimeoutMs
+        // / 10 for the app): a position before the target is not at it, even by less than one
+        // poll; at the target it is done at once.
         val gate = StandardSeekGate(timeoutMs = { 2_000L }, stallTimeoutMs = { 2_000L }, pollIntervalMs = 100L, nowMs = { currentTime })
         val item = Any()
         val started = currentTime
-        gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_950L, 25_000L, item = item) }
+        gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 20_000L, 25_000L, item = item) }
         assertEquals(0L, currentTime - started)
+        val lagging = runCatching {
+            gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_950L, 25_000L, item = item) }
+        }
+        assertEquals("standard_seek_timeout", (lagging.exceptionOrNull() as RejectionException).code)
         // More than one poll before it: not there yet.
         val early = runCatching {
             gate.await(20_000L, item) { StandardSeekObservation(AudioPlayerState.READY, 19_850L, 25_000L, item = item) }

@@ -21,7 +21,8 @@ enum StandardPlaybackReadinessGate {
         positionToleranceMs: Int,
         observe: () -> StandardPlaybackReadinessObservation,
         now: () -> TimeInterval = { ProcessInfo.processInfo.systemUptime },
-        waitForNextPoll: () -> Void = { Thread.sleep(forTimeInterval: 0.01) }
+        /// Until the next reading: the next player event, or a tenth of the stall timeout.
+        waitForNextPoll: () -> Void
     ) throws {
         var watch = StallWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: timeoutMs, startedAt: now())
         while true {
@@ -69,6 +70,19 @@ private func waitForStandardPlaybackActivation(
             message: "Standard playback readiness cannot wait on the main thread."
         )
     }
+    // The wait looks at every player event (state, duration, seek) and, between them, every
+    // stallTimeoutMs / 10 (as the load watch and Android): no fixed poll.
+    let wake = DispatchSemaphore(value: 0)
+    let listener = NSObject()
+    player.event.stateChange.addListener(listener) { _ in wake.signal() }
+    player.event.updateDuration.addListener(listener) { _ in wake.signal() }
+    player.event.seek.addListener(listener) { _ in wake.signal() }
+    defer {
+        player.event.stateChange.removeListener(listener)
+        player.event.updateDuration.removeListener(listener)
+        player.event.seek.removeListener(listener)
+    }
+    let sampleMs = standardLoadSampleIntervalMs(stallTimeoutMs)
     try StandardPlaybackReadinessGate.wait(
         expectedIndex: expectedIndex,
         expectedPosition: snapshot.position,
@@ -82,7 +96,8 @@ private func waitForStandardPlaybackActivation(
                 position: player.currentTime,
                 buffered: player.bufferedPosition
             )
-        }
+        },
+        waitForNextPoll: { _ = wake.wait(timeout: .now() + .milliseconds(sampleMs)) }
     )
 }
 
@@ -307,6 +322,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     // SwiftAudioEx retains the listener during asynchronous removal. Use a
     // separate identity so deinit never passes its dying self to that closure.
     private let seekListener = NSObject()
+    /// The player's state and duration events, for a seek waiting for its item to load.
+    private let seekEventListener = NSObject()
     private(set) var queueReloadCount = 0
 
     init(
@@ -376,6 +393,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 self?.didCompleteNativeSeek(position: event.seconds, didFinish: event.didFinish)
             }
         }
+        // A seek waiting for its item to load is issued at the player's next event.
+        player.event.stateChange.addListener(seekEventListener) { [weak self] _ in
+            DispatchQueue.main.async { self?.pumpSeeksWaitingForTheItem() }
+        }
+        player.event.updateDuration.addListener(seekEventListener) { [weak self] _ in
+            DispatchQueue.main.async { self?.pumpSeeksWaitingForTheItem() }
+        }
         if let watch = loadWatch {
             // The player's events drive the watch; one timer only while a load is watched.
             loadDriver = StandardLoadDriver(
@@ -404,6 +428,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         player.event.stateChange.removeListener(stateListener)
         seekReadinessPoll?.cancel()
         player.event.seek.removeListener(seekListener)
+        player.event.stateChange.removeListener(seekEventListener)
+        player.event.updateDuration.removeListener(seekEventListener)
     }
 
     private func onMain<Value>(_ operation: () throws -> Value) rethrows -> Value {
@@ -657,9 +683,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         // fails when the player's buffered position does not grow for stallTimeoutMs. That
         // position (the end of the last loaded range) is the only signal SwiftAudioEx exposes:
         // a seek far from the loaded range shows no growth until its first data arrives.
+        let stallMs = stallTimeoutMs()
+        // Its progress is sampled every stallTimeoutMs / 10 (as the load watch and Android); the
+        // seek itself ends at its native callback (event-driven).
         let wait = StallWaitDriver(
-            stallTimeoutMs: stallTimeoutMs(),
+            stallTimeoutMs: stallMs,
             totalTimeoutMs: seekTimeoutMs(),
+            intervalMs: standardLoadSampleIntervalMs(stallMs),
             readings: { [weak self, weak request] in
                 guard let self = self, let request = request, request.issued else { return nil }
                 return [self.player.bufferedPosition]
@@ -730,9 +760,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // call back (for example after a 404). Check and issue on main so a
             // queue replacement cannot run between them.
             guard player.duration > 0 else {
+                // Looked at again at the player's next event (state, duration: seekEventListener)
+                // or after stallTimeoutMs / 10, whichever comes first: no fixed poll.
                 let poll = DispatchWorkItem { [weak self] in self?.pumpSeeks() }
                 seekReadinessPoll = poll
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.02, execute: poll)
+                DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(standardLoadSampleIntervalMs(stallTimeoutMs())), execute: poll)
                 return
             }
             pendingSeeks.removeFirst()
@@ -743,6 +775,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             player.seek(to: request.position)
             return
         }
+    }
+
+    /// A player event while a seek waits for its item to load (pumpSeeks' poll is set): look now.
+    private func pumpSeeksWaitingForTheItem() {
+        guard seekReadinessPoll != nil else { return }
+        pumpSeeks()
     }
 
     private func didCompleteNativeSeek(position: Double, didFinish: Bool) {

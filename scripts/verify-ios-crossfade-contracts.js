@@ -414,7 +414,8 @@ assert(
     player.includes('private let standardSeekTimeout = TimeoutSetting(optionKey: "standardSeekTimeoutMs", defaultMs: standardSeekTimeoutDefaultMs)') &&
     player.includes('readinessTimeoutMs: { [weak self] in self?.standardReadyTimeout.milliseconds ?? standardReadyTimeoutDefaultMs }') &&
     player.includes('seekTimeoutMs: { [weak self] in self?.standardSeekTimeout.milliseconds ?? standardSeekTimeoutDefaultMs }') &&
-    standardBackend2.includes('let wait = StallWaitDriver(\n            stallTimeoutMs: stallTimeoutMs(),\n            totalTimeoutMs: seekTimeoutMs(),') &&
+    standardBackend2.includes('let stallMs = stallTimeoutMs()') &&
+    standardBackend2.includes('let wait = StallWaitDriver(\n            stallTimeoutMs: stallMs,\n            totalTimeoutMs: seekTimeoutMs(),') &&
     standardBackend2.includes('guard let self = self, let request = request, request.issued else { return nil }') &&
     standardBackend2.includes('return [self.player.bufferedPosition]') &&
     standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
@@ -812,6 +813,25 @@ assert(
         'testStandardCommandLoadAGiveUpTheCommandRejectedWithLeavesTheTracksLaterFailuresReported',
         'testStandardCommandLoadAWaitStartsItsTracksLoadOnlyWhenThePlayerStandsStill'].every((t) => tests.includes(`func ${t}()`)),
     'iOS standard skip, next, previous and load must end once their track loaded, as crossfade and Android.'
+  );
+}
+
+// The standard seek and backend-switch waits sample every stallTimeoutMs / 10 (as the load watch
+// and Android) and look at every player event between; no fixed poll. The crossfade engine keeps
+// stallCheckIntervalMs (out of scope).
+{
+  assert(
+    section(standardBackend, 'private func enqueueSeek(', 'request.wait = wait').includes('intervalMs: standardLoadSampleIntervalMs(stallMs),') &&
+      section(standardBackend, 'private func pumpSeeks() {', '\n    }\n').includes('DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(standardLoadSampleIntervalMs(stallTimeoutMs())), execute: poll)') &&
+      !standardBackend.includes('asyncAfter(deadline: .now() + 0.02') &&
+      !standardBackend.includes('Thread.sleep(forTimeInterval:') &&
+      standardBackend.includes('player.event.updateDuration.addListener(seekEventListener) { [weak self] _ in\n            DispatchQueue.main.async { self?.pumpSeeksWaitingForTheItem() }') &&
+      standardBackend.includes('player.event.stateChange.addListener(seekEventListener) { [weak self] _ in\n            DispatchQueue.main.async { self?.pumpSeeksWaitingForTheItem() }') &&
+      section(standardBackend, 'private func waitForStandardPlaybackActivation(', '\n}\n').includes('let sampleMs = standardLoadSampleIntervalMs(stallTimeoutMs)') &&
+      section(standardBackend, 'private func waitForStandardPlaybackActivation(', '\n}\n').includes('waitForNextPoll: { _ = wake.wait(timeout: .now() + .milliseconds(sampleMs)) }') &&
+      ['player.event.stateChange.addListener(listener) { _ in wake.signal() }', 'player.event.updateDuration.addListener(listener) { _ in wake.signal() }', 'player.event.seek.addListener(listener) { _ in wake.signal() }']
+        .every((line) => section(standardBackend, 'private func waitForStandardPlaybackActivation(', '\n}\n').includes(line)),
+    'iOS standard seek and readiness waits must sample every stallTimeoutMs / 10 and wake at player events, as Android.'
   );
 }
 

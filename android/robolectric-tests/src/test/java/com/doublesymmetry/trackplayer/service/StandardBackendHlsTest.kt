@@ -315,6 +315,22 @@ class StandardBackendHlsTest {
     }
 
     @Test
+    fun aSeekEndsAtThePlayersEventNotAtItsNextSample() {
+        // The seek samples the player every stallTimeoutMs / 10 (2 s here); the player's own
+        // events (the backend's analytics listener) end it once it is at its target.
+        val server = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val backed = backed(seekStallMs = 20_000L)
+        backed.backend.add(listOf(item(server, 1L)))
+        command { backed.backend.play() }
+        awaitTrue("the track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        val started = monotonicNowMs()
+        assertNull(command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
+        val tookMs = monotonicNowMs() - started
+        assertTrue("the seek took $tookMs ms; it samples every 2000 ms", tookMs < 1_000L)
+        assertTrue(backed.player.position >= LOADABLE_TARGET_MS)
+    }
+
+    @Test
     fun clearingTheQueueAfterAGiveUpEndsTheError() {
         val stalled = server(LADDER)
         val backed = backed()
@@ -385,7 +401,7 @@ class StandardBackendHlsTest {
     }
 
     /** The standard backend and its player, as MusicService.createPlaybackBackend builds them. */
-    private inner class Backed {
+    private inner class Backed(seekStallMs: Long = STALL_TIMEOUT_MS) {
         val analytics = StandardPlayerAnalytics()
         val player = QueuedAudioPlayer(
             RuntimeEnvironment.getApplication(),
@@ -417,7 +433,7 @@ class StandardBackendHlsTest {
             onActivated = {},
             onDisposed = {},
             readinessGate = StandardPlaybackReadinessGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS }),
-            seekGate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS }),
+            seekGate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { seekStallMs }),
             analytics = { analytics },
             onActiveTrackChanged = { index, lastIndex, _, _ -> activeTrackChanges += index to lastIndex },
             onLoadFailed = { activeIndex ->
@@ -519,7 +535,7 @@ class StandardBackendHlsTest {
         }
     }
 
-    private fun backed(): Backed = Backed().also { backends += it }
+    private fun backed(seekStallMs: Long = STALL_TIMEOUT_MS): Backed = Backed(seekStallMs).also { backends += it }
 
     private fun item(server: HlsTestServer, queueId: Long) =
         TrackAudioItem(track = Track(queueId = queueId), type = MediaType.HLS, audioUrl = server.masterUrl)

@@ -6,7 +6,8 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.channels.ReceiveChannel
 import kotlinx.coroutines.selects.onTimeout
 import kotlinx.coroutines.selects.select
 
@@ -43,14 +44,26 @@ internal class StandardPlaybackReadinessGate(
      */
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
-    private val pollIntervalMs: Long = 25L,
+    /**
+     * How often the wait reads the player between its events ([poke]); null (the app): a tenth
+     * of the stall timeout ([standardLoadSampleIntervalMs], as the load watch). Tests pass theirs.
+     */
+    private val pollIntervalMs: Long? = null,
     /** The app's `backendSwitchPositionToleranceMs`, read at every wait. */
     private val positionToleranceMs: () -> Long = { DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS },
     /** A monotonic clock in milliseconds (tests pass their virtual time). */
     private val nowMs: () -> Long = ::monotonicNowMs
 ) {
     init {
-        require(pollIntervalMs > 0L)
+        require(pollIntervalMs == null || pollIntervalMs > 0L)
+    }
+
+    /** The player's events: a wait in progress looks again at once. */
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+
+    /** A player event (state, item, position): the wait reads the player now. */
+    fun poke() {
+        wake.trySend(Unit)
     }
 
     suspend fun await(
@@ -60,12 +73,13 @@ internal class StandardPlaybackReadinessGate(
     ) {
         var current: StandardPlaybackReadinessObservation? = null
         val toleranceMs = positionToleranceMs()
+        val stallMs = stallTimeoutMs()
         val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs(),
+            stallTimeoutMs = stallMs,
             totalTimeoutMs = timeoutMs(),
-            pollIntervalMs = pollIntervalMs,
+            pollIntervalMs = pollIntervalMs ?: standardLoadSampleIntervalMs(stallMs),
             nowMs = nowMs,
-            pause = { delay(it) },
+            pause = { delayOrWake(it, wake) },
             readings = { longArrayOf(current?.bufferedPositionMs ?: 0L) }
         ) {
             val observed = observe().also { current = it }
@@ -142,19 +156,22 @@ internal const val STANDARD_SEEK_TIMEOUT_CODE = "standard_seek_timeout"
 internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
-    private val pollIntervalMs: Long = 25L,
+    /**
+     * How often the wait reads the player between its events ([poke]); null (the app): a tenth
+     * of the stall timeout ([standardLoadSampleIntervalMs], as the load watch). Tests pass theirs.
+     * Only a sampling period: the at-target check does not depend on it.
+     */
+    private val pollIntervalMs: Long? = null,
     private val nowMs: () -> Long = ::monotonicNowMs
 ) {
     private var current: PlaybackOperationTicket? = null
 
-    /**
-     * At the target: no fixed tolerance. The position may be past the target by as much as
-     * playback has played since the seek ([playedMs]), plus one poll; it may be before it by one
-     * poll (a position read between two polls).
-     */
-    private fun isAtSeekTarget(positionMs: Long, targetMs: Long, playedMs: Long): Boolean {
-        val slackMs = pollIntervalMs
-        return positionMs >= targetMs - slackMs && positionMs <= targetMs + playedMs + slackMs
+    /** The player's events: a wait in progress looks again at once. */
+    private val wake = Channel<Unit>(Channel.CONFLATED)
+
+    /** A player event (state, position, item): the seek in progress reads the player now. */
+    fun poke() {
+        wake.trySend(Unit)
     }
 
     /** A seek is being waited for (it owns the player's loading until it ends). */
@@ -178,15 +195,16 @@ internal class StandardSeekGate(
         // the observed rate.
         var playedMs = 0.0
         var lastCheckAt = nowMs()
+        val stallMs = stallTimeoutMs()
         var transitionsAtStart: Long? = null
         var latest: StandardSeekObservation? = null
         val verdict = try {
             awaitWhileProgressing(
-                stallTimeoutMs = stallTimeoutMs(),
+                stallTimeoutMs = stallMs,
                 totalTimeoutMs = timeoutMs(),
-                pollIntervalMs = pollIntervalMs,
+                pollIntervalMs = pollIntervalMs ?: standardLoadSampleIntervalMs(stallMs),
                 nowMs = nowMs,
-                pause = { ticket.delayOrThrow(it) },
+                pause = { ticket.delayOrThrow(it, wake) },
                 readings = { longArrayOf(latest?.bufferedPositionMs ?: 0L) }
             ) {
                 ticket.ensureActive()
@@ -196,9 +214,10 @@ internal class StandardSeekGate(
                 val startTransitions = transitionsAtStart ?: observed.autoTransitions.also { transitionsAtStart = it }
                 if (observed.autoTransitions > startTransitions) return@awaitWhileProgressing true
                 val checkedAt = nowMs()
-                if (observed.state == AudioPlayerState.PLAYING) {
-                    playedMs += (checkedAt - lastCheckAt).coerceAtLeast(0L) * observed.rate.coerceAtLeast(0f).toDouble()
-                }
+                // What may have played since the last reading (playback may have run between two
+                // readings even when it is paused now): the position may be that much further on.
+                val sinceLastMs = (checkedAt - lastCheckAt).coerceAtLeast(0L) * observed.rate.coerceAtLeast(0f).toDouble()
+                if (observed.state == AudioPlayerState.PLAYING) playedMs += sinceLastMs
                 lastCheckAt = checkedAt
                 if (observed.item !== item) throw PlaybackOperationCancelledException("item_changed")
                 if (observed.state == AudioPlayerState.ERROR) {
@@ -210,7 +229,7 @@ internal class StandardSeekGate(
                         observed.state != AudioPlayerState.BUFFERING &&
                         // Not loaded (stopped, never prepared): not at the target yet.
                         observed.state != AudioPlayerState.IDLE &&
-                        isAtSeekTarget(observed.positionMs, target, playedMs.toLong()))
+                        standardSeekIsAtTarget(observed.positionMs, target, playedMs.toLong(), sinceLastMs.toLong()))
             }
         } catch (cancelled: PlaybackOperationCancelledException) {
             throw RejectionException("Playback changed before the native seek completed (${cancelled.reason}).", "standard_seek_cancelled")
@@ -226,6 +245,15 @@ internal class StandardSeekGate(
         }
     }
 }
+
+/**
+ * At a standard seek's target: no fixed tolerance, and not the sampling period. Not before the
+ * target (the player reports it as its position once the seek is issued); past it by at most
+ * what playback has played since the seek ([playedMs]) and what may have played since the last
+ * reading ([sinceLastMs]: playback may have run then).
+ */
+internal fun standardSeekIsAtTarget(positionMs: Long, targetMs: Long, playedMs: Long, sinceLastMs: Long): Boolean =
+    positionMs >= targetMs && positionMs <= targetMs + playedMs + sinceLastMs
 
 /**
  * The standard player as a seek sees it. Its state is ExoPlayer's own: prepare and seekTo mask it
@@ -426,15 +454,26 @@ internal class PlaybackOperationTicket internal constructor(
         cancellationReason.get()?.let { throw PlaybackOperationCancelledException(it) }
     }
 
+    /** Waits [durationMs], or less when [wake] gets an event; throws once cancelled. */
     @OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
-    suspend fun delayOrThrow(durationMs: Long) {
+    suspend fun delayOrThrow(durationMs: Long, wake: ReceiveChannel<Unit>? = null) {
         select<Unit> {
             onTimeout(durationMs.coerceAtLeast(0L)) { }
             cancellation.onAwait { throw PlaybackOperationCancelledException(it) }
+            wake?.onReceive { }
         }
         ensureActive()
     }
 
+}
+
+/** Waits [durationMs], or less when [wake] gets an event (a player event wakes a wait). */
+@OptIn(kotlinx.coroutines.ExperimentalCoroutinesApi::class)
+internal suspend fun delayOrWake(durationMs: Long, wake: ReceiveChannel<Unit>) {
+    select<Unit> {
+        onTimeout(durationMs.coerceAtLeast(0L)) { }
+        wake.onReceive { }
+    }
 }
 
 internal class PlaybackOperationController {

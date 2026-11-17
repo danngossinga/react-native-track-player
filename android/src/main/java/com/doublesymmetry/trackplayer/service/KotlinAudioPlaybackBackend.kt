@@ -425,9 +425,18 @@ internal class KotlinAudioPlaybackBackend(
      * reports the error, as a crossfade advance that fails.
      */
     fun startLoadWatch(handler: android.os.Handler) {
-        val watch = loadWatch ?: return
         val collector = analytics() ?: return
         collector.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
+            // The seek and readiness waits look at every player event (they only sample the
+            // player between events, every stallTimeoutMs / 10).
+            override fun onEvents(
+                player: com.google.android.exoplayer2.Player,
+                events: com.google.android.exoplayer2.analytics.AnalyticsListener.Events
+            ) {
+                seekGate.poke()
+                readinessGate.poke()
+            }
+
             override fun onPositionDiscontinuity(
                 eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
                 oldPosition: com.google.android.exoplayer2.Player.PositionInfo,
@@ -437,6 +446,7 @@ internal class KotlinAudioPlaybackBackend(
                 if (oldPosition.mediaItemIndex != newPosition.mediaItemIndex) lastItemPositionMs = oldPosition.positionMs
             }
         })
+        val watch = loadWatch ?: return
         loadDriver = StandardLoadDriver(watch, handler, ::observeLoad, ::giveUpLoad).also {
             it.listenTo(collector)
             it.poke()
