@@ -3057,6 +3057,11 @@ enum StandardPlayerItemLookup {
 /// item from its creation, which AVFoundation fills the access log of before its first
 /// `AVPlayerItemNewAccessLogEntry` notification. `.unavailable` with another layout (a SwiftAudioEx
 /// update): the load then binds its item from that notification (`StandardLoadBytes.loggedItem`).
+/// Reading this private layout is an owner decision (2026-11-17), accepted with the podspec pinned
+/// to exactly SwiftAudioEx 1.1.0 (`s.dependency "SwiftAudioEx", "1.1.0"`). Guards:
+/// scripts/verify-swiftaudioex-layout.sh runs this function against a real 1.1.0 QueuedAudioPlayer
+/// (Mac Catalyst, where the 1.1.0 sources are); testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper
+/// against the layout's fake (CI); verify-ios-crossfade-contracts.js pins the podspec.
 func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {
     var mirror: Mirror? = Mirror(reflecting: player)
     while let current = mirror {

@@ -91,7 +91,20 @@ Added fork surface:
   new rendition's segments downloaded again) are not progress (before, every
   access-log byte and any growth of the buffered position counted, so each
   switch restarted the countdown). Android counts every media byte, so there
-  bytes downloaded again at a switch count; iOS is stricter on that point.
+  bytes downloaded again at a switch count; iOS is stricter on that point. The
+  iOS standard backend reads the item's access log from SwiftAudioEx's AVPlayer
+  item, which SwiftAudioEx 1.1.0 keeps private (`AudioPlayer.wrapper` →
+  `AVPlayerWrapper.avPlayer`): it is read by reflection (`standardPlayerItem`),
+  an owner decision (2026-11-17) that holds only with the podspec pinned to
+  exactly SwiftAudioEx 1.1.0 (`s.dependency "SwiftAudioEx", "1.1.0"`; the iOS
+  contract script fails on another pin). With another layout the load binds its
+  item from AVFoundation's first access-log notification instead. Before changing
+  the pin, run `scripts/verify-swiftaudioex-layout.sh`: it builds the real
+  SwiftAudioEx sources (from the CocoaPods cache, or `SWIFTAUDIOEX_SOURCES`) with
+  `PlaybackBackend.swift` for Mac Catalyst and checks that `standardPlayerItem`
+  reads a real `QueuedAudioPlayer`'s item (without the sources it prints SKIPPED;
+  CI runs only the XCTest on a fake of that layout, as the test target cannot
+  build SwiftAudioEx).
   (Before, the iOS standard backend also applied `stallTimeoutMs` from the
   start of the load, so a playlist slower than it failed the track.) Remaining gap: on iOS an HLS
   segment counts only once it has completely arrived. AVFoundation updates neither

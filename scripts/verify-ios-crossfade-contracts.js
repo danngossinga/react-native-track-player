@@ -988,4 +988,22 @@ assert(
   );
 }
 
+// Owner decision, 2026-11-17: the standard load's byte progress reads SwiftAudioEx 1.1.0's
+// private layout (AudioPlayer.wrapper -> AVPlayerWrapper.avPlayer) by reflection, accepted only
+// with SwiftAudioEx pinned to exactly 1.1.0 (CocoaPods: a bare version is an exact one). The real
+// layout is checked by scripts/verify-swiftaudioex-layout.sh (where the 1.1.0 sources are), its
+// fake by testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper.
+{
+  const pins = podspec.split('\n').filter((line) => /^\s*s\.dependency\s+"SwiftAudioEx"/.test(line));
+  assert(
+    pins.length === 1 && pins[0].trim() === 's.dependency "SwiftAudioEx", "1.1.0"' &&
+      section(facade, 'func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {', '\n}\n').includes('$0.label == "wrapper"') &&
+      section(facade, 'func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {', '\n}\n').includes('$0.label == "avPlayer"') &&
+      facade.includes('/// Reading this private layout is an owner decision (2026-11-17), accepted with the podspec pinned') &&
+      read('scripts/verify-swiftaudioex-layout.sh').includes('"$root/ios/RNTrackPlayer/PlaybackBackend.swift" "$root/scripts/swiftaudioex-layout-guard/main.swift"') &&
+      read('scripts/swiftaudioex-layout-guard/main.swift').includes('let player = QueuedAudioPlayer()'),
+    'iOS must pin SwiftAudioEx to exactly 1.1.0 while it reads its private layout (owner decision, 2026-11-17).'
+  );
+}
+
 console.log('iOS crossfade contracts OK');
