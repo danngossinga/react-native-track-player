@@ -179,7 +179,9 @@ class StandardBackendHlsTest {
         val positionOfA = backed.backend.positionMs
         assertTrue("A's last position, $positionOfA ms", positionOfA >= PLAYED_MS)
         var sawLoading = false
+        val deadline = monotonicNowMs() + AWAIT_MS
         while (skip() == null) {
+            if (monotonicNowMs() >= deadline) fail("timed out waiting for the skip to C to end")
             shadowOf(Looper.getMainLooper()).idle()
             if (skip() != null) break
             if (backed.analytics.player?.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING && backed.player.currentIndex == 2) {
