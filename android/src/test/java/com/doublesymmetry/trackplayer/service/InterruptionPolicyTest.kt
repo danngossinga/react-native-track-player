@@ -10,33 +10,8 @@ import java.io.File
 class InterruptionPolicyTest {
     private fun scenarios(): List<Map<String, Any?>> {
         // The JSON the iOS XCTests read too.
-        var dir: File? = File("").absoluteFile
-        while (dir != null && !File(dir, "scripts/fixtures/interruption-scenarios.json").exists()) dir = dir.parentFile
-        val text = File(checkNotNull(dir) { "scenarios not found" }, "scripts/fixtures/interruption-scenarios.json").readText()
         @Suppress("UNCHECKED_CAST")
-        return parse(text)["scenarios"] as List<Map<String, Any?>>
-    }
-
-    // org.json is a stub in JVM tests: a small parser for this file's JSON.
-    private fun parse(text: String): Map<String, Any?> {
-        var i = 0
-        fun ws() { while (i < text.length && text[i].isWhitespace()) i++ }
-        fun value(): Any? {
-            ws()
-            return when (text[i]) {
-                '{' -> { i++; val m = linkedMapOf<String, Any?>(); ws(); if (text[i] == '}') { i++; return m }
-                    while (true) { ws(); val k = value() as String; ws(); i++; m[k] = value(); ws(); if (text[i++] == '}') break }; m }
-                '[' -> { i++; val l = mutableListOf<Any?>(); ws(); if (text[i] == ']') { i++; return l }
-                    while (true) { l += value(); ws(); if (text[i++] == ']') break }; l }
-                '"' -> { i++; val sb = StringBuilder(); while (text[i] != '"') { if (text[i] == '\\') i++; sb.append(text[i++]) }; i++; sb.toString() }
-                't' -> { i += 4; true }
-                'f' -> { i += 5; false }
-                'n' -> { i += 4; null }
-                else -> { val s = i; while (i < text.length && (text[i].isDigit() || text[i] == '-' || text[i] == '.')) i++; text.substring(s, i).toDouble() }
-            }
-        }
-        @Suppress("UNCHECKED_CAST")
-        return value() as Map<String, Any?>
+        return readSharedFixture("scripts/fixtures/interruption-scenarios.json")["scenarios"] as List<Map<String, Any?>>
     }
 
     @Test

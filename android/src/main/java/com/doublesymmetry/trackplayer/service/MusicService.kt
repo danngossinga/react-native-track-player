@@ -517,6 +517,14 @@ class MusicService : HeadlessJsTaskService() {
                         activateStandardPlayerBinding(binding, canonicalPlaybackState).join()
                     },
                     // The stall rule on the standard player's loads (stallTimeoutMs, prepareTimeoutMs).
+                    onFailedLoadReverted = { index, failedIndex ->
+                        // The failed track does not stay the active one (iOS): the app and the
+                        // notification follow the previous one again.
+                        if (isActivePlayer(binding.player, binding.identity)) {
+                            emitPlaybackTrackChangedEvents(index, failedIndex, 0.0)
+                            index?.let(::updateNotificationMetadataForIndex)
+                        }
+                    },
                     loadWatch = StandardLoadWatch(
                         stallTimeoutMs = { stallTimeout.milliseconds },
                         totalTimeoutMs = { prepareTimeout.milliseconds }

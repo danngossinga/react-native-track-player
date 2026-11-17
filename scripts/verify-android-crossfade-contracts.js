@@ -228,7 +228,7 @@ assert(
 );
 assert(
   standardBackend.includes('private val logicalPlaybackState = KotlinAudioLogicalPlaybackStateSidecar()') &&
-    standardBackend.includes('override val currentIndex: Int\n        get() = logicalPlaybackState.currentIndex(player.currentIndex)') &&
+    standardBackend.includes('override val currentIndex: Int\n        get() = if (failedLoads.isReverted) activeIndexAfterFailedLoad() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
     standardBackend.includes('selectFirstPhysicalItemIfNeeded()') &&
     standardBackend.includes('if (logicalPlaybackState.shouldIgnorePrevious()) return') &&
     mediaSessionInstrumentation.includes('testRestoredIdlePlayPublishesCanonicalFirstTrack') &&
@@ -439,7 +439,7 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        try {\n            seekGate.seek(seekPlayer, positionMs)') &&
+    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        failedLoads.command()\n        try {\n            seekGate.seek(seekPlayer, positionMs)') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
@@ -856,6 +856,25 @@ assert(
         .every((t) => hlsTest.includes(`fun ${t}()`)) &&
       hlsTest.includes('gaveUpAt - loadAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS'),
     'The Android standard player must give up a load with no progress at stallTimeoutMs, as crossfade.'
+  );
+}
+
+// The standard player follows the same failed-load rule (FailedLoadRule, shared scenarios in
+// scripts/fixtures/failed-load-scenarios.json, run by the JVM tests and the XCTests): after a
+// failed load (a give-up or a player error) the previous track is active again and reported, and
+// play or retry reloads it.
+{
+  const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
+  assert(
+    fixture.scenarios.length === 5 &&
+      read('android/src/test/java/com/doublesymmetry/trackplayer/service/FailedLoadRuleTest.kt').includes('readSharedFixture("scripts/fixtures/failed-load-scenarios.json")') &&
+      standardBackend.includes('get() = if (failedLoads.isReverted) activeIndexAfterFailedLoad() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
+      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('revertFailedLoad()') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('revertFailedLoad()') &&
+      section(standardBackend, 'override suspend fun play() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.play()') &&
+      section(standardBackend, 'override suspend fun retry() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.prepare()') &&
+      musicService.includes('emitPlaybackTrackChangedEvents(index, failedIndex, 0.0)\n                            index?.let(::updateNotificationMetadataForIndex)'),
+    'The Android standard player must keep the previous track active after a failed load, as iOS.'
   );
 }
 

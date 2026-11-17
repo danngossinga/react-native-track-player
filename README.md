@@ -77,6 +77,19 @@ Added fork surface:
   the track that follows an ended one fails to load (no command waits for it),
   the crossfade backend reports it with a `PlaybackError` event (`code`, for
   example `crossfade_prepare_timeout`, and `message`) on both platforms.
+  The standard backend follows the same rule on both platforms: a load (a load,
+  a skip, a natural advance, a retry) whose media makes no progress for
+  `stallTimeoutMs`, or exceeds `prepareTimeoutMs`, stops loading, leaves the
+  player in an error state and emits a `PlaybackError` with the same
+  `crossfade_prepare_timeout` code; a stalled standard seek stops loading and
+  leaves the player in error (its promise rejects with `standard_seek_timeout`).
+- When a track's load fails (a give-up or a player error), the previous track
+  stays the active one, on both backends and both platforms (iOS crossfade's rule,
+  the chosen alignment): the crossfade backend reports the new track only once it
+  loaded; the standard backend, which reports it when it moves to it, reports an
+  active-track change back to the previous track (`lastIndex` the failed one).
+  The next play loads that previous track. A first load that fails leaves no
+  active track.
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends

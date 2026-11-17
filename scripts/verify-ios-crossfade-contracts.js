@@ -694,4 +694,18 @@ assert(
   );
 }
 
+// The standard player follows the shared failed-load rule (FailedLoadRule; Android the same).
+{
+  const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
+  assert(
+    read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")') &&
+      backendSource.includes('if failedLoads.isReverted { return indexOfItem(failedLoads.active) ?? -1 }') &&
+      section(backendSource, 'private func pollLoads() {', 'private func giveUp(').includes('followLoad(observed)') &&
+      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n').includes('if report { revertFailedLoad() }') &&
+      backendSource.includes('loadActiveTrackAfterFailedLoad()\n            requested.request(true)\n            player.play()') &&
+      player.includes('func handleStandardFailedLoadReverted(source: QueuedAudioPlayer, index: Int?, failedIndex: Int) {'),
+    'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
+  );
+}
+
 console.log('iOS crossfade contracts OK');

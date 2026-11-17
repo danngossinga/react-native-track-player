@@ -171,6 +171,37 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertNil(player.currentItem, "the player keeps no item, so it requests nothing more")
     }
 
+    func testFailedLoadRuleFollowsTheSharedScenarios() throws {
+        let url = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
+        let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
+        let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
+        XCTAssertEqual(scenarios.count, 5)
+        for scenario in scenarios {
+            let id = scenario["id"] as? String ?? "?"
+            var items: [String: NSObject] = [:]
+            func identity(_ name: Any?) -> ObjectIdentifier? {
+                guard let name = name as? String else { return nil }
+                let item = items[name] ?? NSObject()
+                items[name] = item
+                return ObjectIdentifier(item)
+            }
+            let rule = FailedLoadRule()
+            for (index, step) in try XCTUnwrap(scenario["steps"] as? [[String: Any]]).enumerated() {
+                let at = "\(id) step \(index)"
+                switch step["event"] as? String ?? "" {
+                case "load": rule.loaded(identity(step["item"]))
+                case "ready": rule.ready()
+                case "fail": XCTAssertEqual(rule.failed()?.to, identity(step["revert"]), at)
+                case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
+                default: XCTFail("unknown event in \(at)")
+                }
+                XCTAssertEqual(rule.active, identity(step["active"]), at)
+            }
+        }
+    }
+
     // The standard player's load watch (same rules as Android's StandardLoadWatchTest).
 
     private final class LoadWatchHarness {

@@ -1607,3 +1607,56 @@ func standardLoadGiveUpMessage(_ verdict: StallVerdict, stallTimeoutMs: Int, tot
         (verdict == .stalled ? "no progress for \(stallTimeoutMs)ms" : "over the \(totalTimeoutMs)ms limit") +
         ")."
 }
+
+/// Which track is active around a load, as the crossfade loadIndex decides it (chosen alignment
+/// for both backends and both platforms; Android: `FailedLoadRule`, same rules): a track becomes
+/// the active one once it loaded (ready); when its load fails (a give-up, a player error) the
+/// previous track stays active (none when there was none), and the next play loads that previous
+/// track. Items are compared by identity. Shared scenarios:
+/// scripts/fixtures/failed-load-scenarios.json.
+///
+/// The standard player moves to an item before it loads (and reports it then); this rule tells it
+/// what to report back when that load fails (`failed`) and what a play reloads (`play`).
+final class FailedLoadRule {
+    /// What a failed load reports: the track active again (nil: none).
+    struct Revert: Equatable {
+        let to: ObjectIdentifier?
+    }
+
+    private var current: ObjectIdentifier?
+    private(set) var active: ObjectIdentifier?
+    /// A failed load was reverted and no command has acted since: `active` is what to report.
+    private(set) var isReverted = false
+
+    /// The player moved to `item` (a load, a skip, a natural advance).
+    func loaded(_ item: ObjectIdentifier?) {
+        current = item
+    }
+
+    /// The current item is ready (plays or has media): it is the active track.
+    func ready() {
+        active = current
+        isReverted = false
+    }
+
+    /// The current item's load failed: the revert to report, or nil when it was the active one.
+    func failed() -> Revert? {
+        guard current != active else { return nil }
+        isReverted = true
+        return Revert(to: active)
+    }
+
+    /// A play: the item to load first (the active one after a revert), or nil to play the current.
+    func play() -> ObjectIdentifier? {
+        guard isReverted else { return nil }
+        isReverted = false
+        guard let target = active else { return nil }
+        current = target
+        return target
+    }
+
+    /// Another command acted on the player: it reports its own item again.
+    func command() {
+        isReverted = false
+    }
+}
