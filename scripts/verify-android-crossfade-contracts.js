@@ -918,7 +918,12 @@ assert(
 {
   const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
   assert(
-    fixture.scenarios.length === 9 &&
+    fixture.scenarios.length === 13 &&
+      // One explicit state (FailedLoadRule.Phase and PlayerError): the backend keeps no flag of its own.
+      read('android/src/main/java/com/doublesymmetry/trackplayer/service/FailedLoadRule.kt').includes('sealed class Phase {') &&
+      !standardBackend.includes('sawPlayerError') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('if (failedLoads.playerErrorSeen()) {\n                failLoadedTrack()') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('if (failedLoads.playerErrorGone()) commandLoads.failureCleared()') &&
       section(standardBackend, 'override fun remove(indexes: List<Int>) {', '\n    }\n').includes('reportRemovedTrack(before)') &&
       read('android/src/test/java/com/doublesymmetry/trackplayer/service/FailedLoadRuleTest.kt').includes('readSharedFixture("scripts/fixtures/failed-load-scenarios.json")') &&
       standardBackend.includes('get() = if (failedLoads.isPending(player.currentItem)) reportedIndex() else logicalPlaybackState.currentIndex(player.currentIndex)') &&

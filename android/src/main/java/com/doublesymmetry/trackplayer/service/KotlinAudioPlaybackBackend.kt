@@ -186,7 +186,6 @@ internal class KotlinAudioPlaybackBackend(
      * previous one is the active track.
      */
     private val failedLoads = FailedLoadRule()
-    private var sawPlayerError = false
     private var observedItem: Any? = null
     /** The position of the track the player left at its last item change (the event's lastPosition). */
     private var lastItemPositionMs = 0L
@@ -466,8 +465,7 @@ internal class KotlinAudioPlaybackBackend(
             if (failedLoads.moved(item)) report(FailedLoadRule.Report(item, from))
         }
         if (observed.hasError) {
-            if (!sawPlayerError) {
-                sawPlayerError = true
+            if (failedLoads.playerErrorSeen()) {
                 failLoadedTrack()
                 // A command waiting for this load rejects with the player's error, as a crossfade
                 // load that fails (crossfade_engine_error).
@@ -480,8 +478,7 @@ internal class KotlinAudioPlaybackBackend(
             }
             return
         }
-        if (sawPlayerError) commandLoads.failureCleared()
-        sawPlayerError = false
+        if (failedLoads.playerErrorGone()) commandLoads.failureCleared()
         if (observed.ownedElsewhere) return
         if (observed.playbackState == com.google.android.exoplayer2.Player.STATE_READY ||
             observed.playbackState == com.google.android.exoplayer2.Player.STATE_ENDED

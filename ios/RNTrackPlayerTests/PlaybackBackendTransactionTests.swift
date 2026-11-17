@@ -177,7 +177,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 9)
+        XCTAssertEqual(scenarios.count, 13)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -186,6 +186,17 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 let item = items[name] ?? NSObject()
                 items[name] = item
                 return ObjectIdentifier(item)
+            }
+            func name(_ item: ObjectIdentifier?) -> String {
+                return items.first { ObjectIdentifier($0.value) == item }?.key ?? "none"
+            }
+            func phaseName(_ phase: FailedLoadRule.Phase) -> String {
+                switch phase {
+                case .selecting: return "selecting"
+                case let .loading(item): return "loading \(name(item))"
+                case let .loaded(item): return "loaded \(name(item))"
+                case let .failed(item): return "failed \(name(item))"
+                }
             }
             let rule = FailedLoadRule()
             for (index, step) in try XCTUnwrap(scenario["steps"] as? [[String: Any]]).enumerated() {
@@ -202,8 +213,19 @@ final class PlaybackBackendTransactionTests: XCTestCase {
                 case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
                 case "reset": rule.reset()
                 case "remove": XCTAssertEqual(rule.removed(identity(step["item"])), expected, at)
+                case "publish": rule.published(identity(step["item"]))
+                case "adopt": rule.adopted(identity(step["item"]))
+                case "replace": rule.replaced(identity(step["item"]), with: identity(step["with"]))
+                case "error":
+                    // As the backends: the first error while the player has one fails the load.
+                    let isNew = rule.playerErrorSeen()
+                    XCTAssertEqual(isNew, step["new"] as? Bool, "\(at) new")
+                    XCTAssertEqual(isNew ? rule.failed() : nil, expected, at)
+                case "recover": XCTAssertEqual(rule.playerErrorGone(), step["cleared"] as? Bool, "\(at) cleared")
                 default: XCTFail("unknown event in \(at)")
                 }
+                XCTAssertEqual(phaseName(rule.phase), step["phase"] as? String, "\(at) phase")
+                XCTAssertEqual(rule.playerError == .reported ? "reported" : "none", step["playerError"] as? String, "\(at) playerError")
                 XCTAssertEqual(rule.active, identity(step["active"]), "\(at) active")
                 XCTAssertEqual(rule.reported, identity(step["reported"]), "\(at) reported")
             }

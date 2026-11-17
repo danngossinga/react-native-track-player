@@ -1767,61 +1767,121 @@ final class FailedLoadRule {
         let from: ObjectIdentifier?
     }
 
-    private var current: ObjectIdentifier?
-    private var reverted = false
-    private var selectionPending = true
+    /// Where the player's own item stands (one explicit state, the monorepo's state-machine form
+    /// 3: a closed union moved only by this class's events; Android: `FailedLoadRule.Phase`).
+    ///
+    /// - `selecting`: a new queue (or none); the player's first move is its selection, reported
+    ///   at once. No item.
+    /// - `loading(item)`: the player is on `item` (nil: none), not loaded since it moved there.
+    /// - `loaded(item)`: `item` loaded: it is the active track (`active == item`).
+    /// - `failed(item)`: `item`'s load failed (a give-up, a player error); the next play loads the
+    ///   active track again, else retries `item`. A move keeps it failed.
+    ///
+    /// Moves: selecting -moved(x)-> loading(x) (reported at once; x nil: stays); loading/loaded
+    /// -moved(x)-> loaded(x) when x is the active track, else loading(x); failed -moved(x)->
+    /// failed(x); any -ready-> loaded(item); loading/failed(not active) -failed-> failed(item);
+    /// failed -play/command-> loaded/loading (play: the active track, else the failed one); any
+    /// -reset-> selecting; -adopted(x)-> loaded(x) (x nil: selecting); published, replaced and
+    /// removed keep the kind and follow the item.
+    enum Phase: Equatable {
+        case selecting
+        case loading(ObjectIdentifier?)
+        case loaded(ObjectIdentifier?)
+        case failed(ObjectIdentifier?)
+    }
+
+    /// The player's error, as the load sees it: `none`, or `reported` once a player error failed
+    /// the load, until the player has no error any more (an edge: one failure per error, which
+    /// outlives the moves, commands and a new queue that come while the player still has it).
+    enum PlayerError: Equatable {
+        case none
+        case reported
+    }
+
+    private(set) var phase: Phase = .selecting
+    private(set) var playerError: PlayerError = .none
     /// The active track: the last one that loaded.
     private(set) var active: ObjectIdentifier?
     /// The track the app was last told is active (nil: none).
     private(set) var reported: ObjectIdentifier?
 
+    /// The player's item (nil: none, or a new queue's selection not made yet).
+    private var current: ObjectIdentifier? {
+        switch phase {
+        case .selecting: return nil
+        case let .loading(item), let .loaded(item), let .failed(item): return item
+        }
+    }
+
+    /// The player is on `item`, not failed: loaded when it is the active track.
+    private func following(_ item: ObjectIdentifier?) -> Phase {
+        return item == active ? .loaded(item) : .loading(item)
+    }
+
+    /// The same kind of phase on `item` (a failed one stays failed).
+    private func onItem(_ item: ObjectIdentifier?) -> Phase {
+        switch phase {
+        case .selecting: return .selecting
+        case .failed: return .failed(item)
+        case .loading, .loaded: return following(item)
+        }
+    }
+
     /// The player moved to `item`: whether to report it now (else once it loaded).
     func moved(_ item: ObjectIdentifier?) -> Bool {
-        current = item
-        if item == reported || !selectionPending { return false }
-        selectionPending = false
-        reported = item
-        return true
+        if phase == .selecting {
+            // Nothing is reported in a new queue: a move to no item is no selection.
+            if item == reported { return false }
+            reported = item
+            phase = following(item)
+            return true
+        }
+        phase = onItem(item)
+        return false
     }
 
     /// The current item is ready: it is the active track, reported when the app was not told.
     func ready() -> Report? {
-        active = current
-        reverted = false
-        selectionPending = false
-        return reportTrack(current)
+        let item = current
+        active = item
+        phase = .loaded(item)
+        return reportTrack(item)
     }
 
     /// The current item's load failed: the previous track stays active; a report only when the
     /// failed track had been reported (a selected first track): back to the active one.
     func failed() -> Report? {
-        guard current != active else { return nil }
-        reverted = true
+        let item: ObjectIdentifier?
+        switch phase {
+        case let .loading(loading): item = loading
+        case let .failed(failed):
+            guard failed != active else { return nil }
+            item = failed
+        case .selecting, .loaded: return nil
+        }
+        phase = .failed(item)
         return reportTrack(active)
     }
 
     /// A play: the item to load first (the active one, else the failed one), or nil to play the current.
     func play() -> ObjectIdentifier? {
-        guard reverted else { return nil }
-        reverted = false
-        let target = active ?? current
-        current = target
+        guard case let .failed(failed) = phase else { return nil }
+        let target = active ?? failed
+        phase = following(target)
         return target
     }
 
     /// Another command acts on the player's own track: reported once it loads (no report now).
     func command() -> Report? {
-        reverted = false
+        if case let .failed(failed) = phase { phase = following(failed) }
         return nil
     }
 
     /// The queue was replaced or cleared: its first track is a new selection.
     func reset() {
-        current = nil
+        phase = .selecting
         active = nil
         reported = nil
-        reverted = false
-        selectionPending = true
     }
 
     /// `item` left the queue: when it was the reported (or active) track, there is none any more,
@@ -1829,36 +1889,49 @@ final class FailedLoadRule {
     func removed(_ item: ObjectIdentifier?) -> Report? {
         guard let item = item else { return nil }
         if active == item { active = nil }
-        if current == item { current = nil }
+        phase = onItem(current == item ? nil : current)
         return reported == item ? reportTrack(nil) : nil
     }
 
     /// The app was told about `item` another way (a logical idle activation).
     func published(_ item: ObjectIdentifier?) {
-        current = item
         reported = item
-        selectionPending = false
+        if case .failed = phase { phase = .failed(item) } else { phase = following(item) }
     }
 
     /// The player is on `item`, loaded and known to the app (a backend switch restored it).
     func adopted(_ item: ObjectIdentifier?) {
-        current = item
         active = item
         reported = item
-        reverted = false
-        selectionPending = item == nil
+        phase = item == nil ? .selecting : .loaded(item)
     }
 
-    /// `old` was replaced by `new` for the same track (new metadata): it keeps its place.
+    /// `old` was replaced by `new` for the same track (new metadata): it keeps its place. (The
+    /// iOS backends update a Track's metadata in place, same identity: kept for the shared rule.)
     func replaced(_ old: ObjectIdentifier?, with new: ObjectIdentifier?) {
-        if current == old { current = new }
         if active == old { active = new }
         if reported == old { reported = new }
+        let item = current
+        phase = onItem(item == old ? new : item)
     }
 
     /// The player is on an item other than the one reported: report `reported`'s index instead.
     func isPending(_ item: ObjectIdentifier?) -> Bool {
         return item != reported
+    }
+
+    /// The player reports a failure: true the first time (the caller fails the load), false while it lasts.
+    func playerErrorSeen() -> Bool {
+        if playerError == .reported { return false }
+        playerError = .reported
+        return true
+    }
+
+    /// The player has no failure: true when one had failed the load (it is over now).
+    func playerErrorGone() -> Bool {
+        let had = playerError == .reported
+        playerError = .none
+        return had
     }
 
     private func reportTrack(_ to: ObjectIdentifier?) -> Report? {

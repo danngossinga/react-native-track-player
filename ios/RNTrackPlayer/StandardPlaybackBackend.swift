@@ -297,7 +297,6 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let failedLoads = FailedLoadRule()
     /// Skip, next, previous and load end once their track loaded, or with its failure (crossfade's rule).
     private let commandLoads = StandardCommandLoad()
-    private var sawPlayerFailure = false
     /// The position of the track the player left at its last item change (lastPosition).
     private var lastItemPosition: Double = 0
     /// Reports a change of the active track: the player, its index (nil: none), the track the app
@@ -474,8 +473,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private func followLoad(_ observed: StandardLoadObservation) {
         guard observed.item != nil else { return }
         if observed.phase == .failed {
-            if !sawPlayerFailure {
-                sawPlayerFailure = true
+            if failedLoads.playerErrorSeen() {
                 failLoadedTrack()
                 // A command waiting for this load rejects with the player's error, as a crossfade
                 // load that fails (crossfade_engine_error).
@@ -488,8 +486,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             return
         }
-        if sawPlayerFailure { commandLoads.failureCleared() }
-        sawPlayerFailure = false
+        if failedLoads.playerErrorGone() { commandLoads.failureCleared() }
         if observed.ownedElsewhere { return }
         if observed.phase == .ready {
             if let change = failedLoads.ready() { report(change) }

@@ -748,6 +748,11 @@ assert(
   assert(
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")') &&
       backendSource.includes('if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {\n            return indexOfItem(failedLoads.reported) ?? -1') &&
+      // One explicit state (FailedLoadRule.Phase and PlayerError): the backend keeps no flag of its own.
+      read('ios/RNTrackPlayer/PlaybackBackend.swift').includes('    enum Phase: Equatable {\n        case selecting') &&
+      !backendSource.includes('sawPlayerFailure') &&
+      backendSource.includes('if failedLoads.playerErrorSeen() {\n                failLoadedTrack()') &&
+      backendSource.includes('if failedLoads.playerErrorGone() { commandLoads.failureCleared() }') &&
       section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func giveUpLoad(').includes('followLoad(observed)') &&
       section(backendSource, 'private func stopAfterGiveUp(log: String, report: StandardGiveUpReport, failsLoad: Bool) {', '\n    }\n').includes('if failsLoad { failLoadedTrack() }') &&
       backendSource.includes('loadActiveTrackAfterFailedLoad()\n            reloadAtKeptPosition(kept)\n            requested.request(true)\n            player.play()') &&

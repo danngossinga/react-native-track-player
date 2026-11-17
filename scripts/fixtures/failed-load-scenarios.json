@@ -1,5 +1,5 @@
 {
-  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule); both crossfade orchestrators follow the same rule. Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded, and only then is it reported (active-track change, deprecated track-changed event, lock screen); while it loads and after its load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the failed track is never reported as active. The next play loads the previous track again or, when there was none, retries the track that failed. Items are named. Events: 'load' the player moves to an item ('report': whether the move is reported at once: only the first item of a new queue, which a standard player selects when the queue is set, before any load); 'ready' the item is ready (playing or with media); 'fail' its load fails; 'play' the next play ('reload': the item it loads first, null: it plays the current one); 'command' another command (a seek, a stop) on the player's own track; 'reset' the queue replaced or cleared; 'remove' an item removed from the queue. After each step, 'active' is the track that loaded last and 'reported' the track the app was last told (null: none). 'report' on ready, fail and command is the change reported then, 'to' (null: no track) from 'from'; no 'report' key: none.",
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule); both crossfade orchestrators follow the same rule. Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded, and only then is it reported (active-track change, deprecated track-changed event, lock screen); while it loads and after its load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the failed track is never reported as active. The next play loads the previous track again or, when there was none, retries the track that failed. Items are named. Events: 'load' the player moves to an item ('report': whether the move is reported at once: only the first item of a new queue, which a standard player selects when the queue is set, before any load); 'ready' the item is ready (playing or with media); 'fail' its load fails; 'play' the next play ('reload': the item it loads first, null: it plays the current one); 'command' another command (a seek, a stop) on the player's own track; 'reset' the queue replaced or cleared; 'remove' an item removed from the queue; 'publish' the app told of an item another way (a logical idle activation); 'adopt' a backend switch restored an item, loaded and known to the app (null: none); 'replace' new metadata for the same track ('item' replaced by 'with'); 'error' the player reports an error ('new': whether it fails the load now: only the first time while it lasts; then 'report' as for fail); 'recover' the player has no error ('cleared': whether one had failed the load). After each step, 'active' is the track that loaded last and 'reported' the track the app was last told (null: none). 'report' on ready, fail and command is the change reported then, 'to' (null: no track) from 'from'; no 'report' key: none. 'phase' is the rule's one explicit state (FailedLoadRule.Phase): 'selecting' (a new queue: the first move is reported at once), 'loading X' (the player is on X, not loaded since it moved there), 'loaded X' (X loaded and is the active track), 'failed X' (X's load failed: the next play loads the active track, else X); 'none' for no item. 'playerError' is 'reported' from a player error that failed the load until the player has none.",
   "scenarios": [
     {
       "id": "LOAD-01 a skip whose load fails is never reported; play reloads the previous track",
@@ -8,11 +8,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -20,17 +24,23 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "play",
           "reload": "A",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -38,11 +48,15 @@
           "event": "load",
           "item": "A",
           "report": false,
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         }
@@ -55,11 +69,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -67,6 +85,8 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -76,6 +96,8 @@
             "to": "B",
             "from": "A"
           },
+          "phase": "loaded B",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         }
@@ -88,6 +110,8 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
@@ -97,12 +121,16 @@
             "to": null,
             "from": "A"
           },
+          "phase": "failed A",
+          "playerError": "none",
           "active": null,
           "reported": null
         },
         {
           "event": "play",
           "reload": "A",
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": null
         },
@@ -112,6 +140,8 @@
             "to": "A",
             "from": null
           },
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         }
@@ -124,22 +154,30 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "fail",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "play",
           "reload": null,
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         }
@@ -152,11 +190,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -164,17 +206,23 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "play",
           "reload": "A",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -182,22 +230,30 @@
           "event": "load",
           "item": "A",
           "report": false,
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "fail",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "play",
           "reload": null,
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         }
@@ -210,11 +266,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -222,16 +282,22 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "command",
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -241,6 +307,8 @@
             "to": "B",
             "from": "A"
           },
+          "phase": "loaded B",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         }
@@ -253,16 +321,22 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
         {
           "event": "reset",
+          "phase": "selecting",
+          "playerError": "none",
           "active": null,
           "reported": null
         },
@@ -270,11 +344,15 @@
           "event": "load",
           "item": "C",
           "report": true,
+          "phase": "loading C",
+          "playerError": "none",
           "active": null,
           "reported": "C"
         },
         {
           "event": "ready",
+          "phase": "loaded C",
+          "playerError": "none",
           "active": "C",
           "reported": "C"
         }
@@ -287,11 +365,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -299,6 +381,8 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -308,6 +392,8 @@
             "to": "B",
             "from": "A"
           },
+          "phase": "loaded B",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         },
@@ -315,17 +401,23 @@
           "event": "load",
           "item": "C",
           "report": false,
+          "phase": "loading C",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         },
         {
           "event": "fail",
+          "phase": "failed C",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         },
         {
           "event": "play",
           "reload": "B",
+          "phase": "loaded B",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
         }
@@ -338,11 +430,15 @@
           "event": "load",
           "item": "A",
           "report": true,
+          "phase": "loading A",
+          "playerError": "none",
           "active": null,
           "reported": "A"
         },
         {
           "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
           "active": "A",
           "reported": "A"
         },
@@ -353,6 +449,8 @@
             "to": null,
             "from": "A"
           },
+          "phase": "loaded none",
+          "playerError": "none",
           "active": null,
           "reported": null
         },
@@ -360,6 +458,8 @@
           "event": "load",
           "item": "B",
           "report": false,
+          "phase": "loading B",
+          "playerError": "none",
           "active": null,
           "reported": null
         },
@@ -369,8 +469,397 @@
             "to": "B",
             "from": null
           },
+          "phase": "loaded B",
+          "playerError": "none",
           "active": "B",
           "reported": "B"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-10 an idle activation tells the app of its track: a later move is not a new selection",
+      "steps": [
+        {
+          "event": "publish",
+          "item": "A",
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "B",
+            "from": "A"
+          },
+          "phase": "loaded B",
+          "playerError": "none",
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "load",
+          "item": "A",
+          "report": false,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "fail",
+          "phase": "failed A",
+          "playerError": "none",
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "publish",
+          "item": "A",
+          "phase": "failed A",
+          "playerError": "none",
+          "active": "B",
+          "reported": "A"
+        },
+        {
+          "event": "play",
+          "reload": "B",
+          "phase": "loaded B",
+          "playerError": "none",
+          "active": "B",
+          "reported": "A"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-11 a backend switch restores a loaded track: it is active and reported; none restored is a new selection",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "adopt",
+          "item": "C",
+          "phase": "loaded C",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        },
+        {
+          "event": "play",
+          "reload": null,
+          "phase": "loaded C",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        },
+        {
+          "event": "load",
+          "item": "D",
+          "report": false,
+          "phase": "loading D",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        },
+        {
+          "event": "fail",
+          "phase": "failed D",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        },
+        {
+          "event": "play",
+          "reload": "C",
+          "phase": "loaded C",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        },
+        {
+          "event": "adopt",
+          "item": null,
+          "phase": "selecting",
+          "playerError": "none",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "load",
+          "item": "E",
+          "report": true,
+          "phase": "loading E",
+          "playerError": "none",
+          "active": null,
+          "reported": "E"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-12 new metadata for a track keeps its place: loaded, failed or reported",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "replace",
+          "item": "A",
+          "with": "A2",
+          "phase": "loaded A2",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "fail",
+          "phase": "loaded A2",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "replace",
+          "item": "B",
+          "with": "B2",
+          "phase": "failed B2",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "play",
+          "reload": "A2",
+          "phase": "loaded A2",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "load",
+          "item": "C",
+          "report": false,
+          "phase": "loading C",
+          "playerError": "none",
+          "active": "A2",
+          "reported": "A2"
+        },
+        {
+          "event": "replace",
+          "item": "A2",
+          "with": "A3",
+          "phase": "loading C",
+          "playerError": "none",
+          "active": "A3",
+          "reported": "A3"
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "C",
+            "from": "A3"
+          },
+          "phase": "loaded C",
+          "playerError": "none",
+          "active": "C",
+          "reported": "C"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-13 a player error fails the load once while it lasts, whatever moves or commands come",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "error",
+          "new": true,
+          "phase": "failed B",
+          "playerError": "reported",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "error",
+          "new": false,
+          "phase": "failed B",
+          "playerError": "reported",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "command",
+          "phase": "loading B",
+          "playerError": "reported",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "error",
+          "new": false,
+          "phase": "loading B",
+          "playerError": "reported",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "recover",
+          "cleared": true,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "recover",
+          "cleared": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "error",
+          "new": true,
+          "phase": "failed B",
+          "playerError": "reported",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "reset",
+          "phase": "selecting",
+          "playerError": "reported",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "error",
+          "new": false,
+          "phase": "selecting",
+          "playerError": "reported",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "recover",
+          "cleared": true,
+          "phase": "selecting",
+          "playerError": "none",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "load",
+          "item": "C",
+          "report": true,
+          "phase": "loading C",
+          "playerError": "none",
+          "active": null,
+          "reported": "C"
+        },
+        {
+          "event": "error",
+          "report": {
+            "to": null,
+            "from": "C"
+          },
+          "new": true,
+          "phase": "failed C",
+          "playerError": "reported",
+          "active": null,
+          "reported": null
         }
       ]
     }
