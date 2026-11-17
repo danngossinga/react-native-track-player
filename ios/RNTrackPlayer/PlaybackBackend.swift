@@ -2191,11 +2191,14 @@ final class StandardCommandLoad {
         return true
     }
 
-    /// A newer command that loads, seeks or stops: the wait in progress ends cancelled.
-    func cancel() {
-        guard let current = wait else { return }
+    /// A newer command that loads, seeks, pauses or stops: the wait in progress ends cancelled.
+    /// Returns whether one was waiting (`standardTrackToReturnTo`).
+    @discardableResult
+    func cancel() -> Bool {
+        guard let current = wait else { return false }
         wait = nil
         current.settle(.cancelled)
+        return true
     }
 
     /// Whether the player's error on `item` is a command's to report (by its rejection): one
@@ -2210,6 +2213,18 @@ final class StandardCommandLoad {
     func failureCleared() {
         failureReportedByCommand = nil
     }
+}
+
+/// Where a seek, pause or stop leaves the player: when it cancelled a command's wait
+/// (`StandardCommandLoad.cancel` returned true: a skip, next, previous or load whose track was
+/// still loading), the reported track (nil: none), as crossfade's operation cancelled while it
+/// loads: the cancelled command does not take effect, the player goes back to the active track
+/// (paused, which the seek acts on). Else, or with no reported track, nil: the player stays on its
+/// own item (after a failed load too: LOAD-06, a command acts on the player's own track).
+/// Android: the same rule (`standardTrackToReturnTo`).
+func standardTrackToReturnTo(cancelledWait: Bool, playerItem: ObjectIdentifier?, reported: ObjectIdentifier?) -> ObjectIdentifier? {
+    guard cancelledWait, let reported = reported, reported != playerItem else { return nil }
+    return reported
 }
 
 /// Whether a command's wait must start its track's load: the track is not the loaded one and the
@@ -2239,12 +2254,17 @@ struct IOSPlaybackErrorSnapshot: Equatable {
 /// What the app receives for a standard load or seek given up, the same events as Android's
 /// standard player: the error state with the failure, then a playback error with its code and
 /// message when no command reports it (a load no command waits for: a natural advance, a play).
+/// With no failure, the stop that ended a give-up's error: the stopped state (Android: KotlinAudio's
+/// stop emits it; SwiftAudioEx, already stopped by the give-up, emits nothing).
 struct StandardGiveUpReport {
-    let failure: IOSPlaybackErrorSnapshot
+    let failure: IOSPlaybackErrorSnapshot?
     let reportsPlaybackError: Bool
 
     /// The events in order, by name (`EventType`'s raw value) with their body.
     var events: [(name: String, body: [String: Any])] {
+        guard let failure = failure else {
+            return [(name: "playback-state", body: ["state": "stopped"])]
+        }
         var events: [(name: String, body: [String: Any])] = [
             (name: "playback-state", body: ["state": "error", "error": failure.dictionary])
         ]
@@ -2308,6 +2328,18 @@ final class StandardGiveUps {
     /// Out of the error state, a failed seek's target stays the position until the track loads.
     func keep(_ kept: Double?) {
         state = kept.map { StandardGiveUp(failure: nil, keptPosition: $0) }
+    }
+
+    /// A stop, as Android's standard player: it ends the error (a failed seek's target stays the
+    /// position until the track loads) and the app is told the player is stopped. Returns that
+    /// report when the player was in error and SwiftAudioEx emits nothing itself (`playerStopped`:
+    /// it is already stopped, as after a give-up); else nil. A pause (`setPlayWhenReady(false)`)
+    /// is no command on the error: it stays, as Android's (nothing to call here).
+    func stopped(playerStopped: Bool) -> StandardGiveUpReport? {
+        let wasInError = failure != nil
+        keep(clear())
+        guard wasInError, playerStopped else { return nil }
+        return StandardGiveUpReport(failure: nil, reportsPlaybackError: false)
     }
 }
 

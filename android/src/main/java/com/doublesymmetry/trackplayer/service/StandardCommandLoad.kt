@@ -87,11 +87,15 @@ internal class StandardCommandLoad {
         return true
     }
 
-    /** A newer command that loads or stops: the wait in progress ends cancelled. */
-    fun cancel() {
-        val current = wait ?: return
+    /**
+     * A newer command that loads, seeks, pauses or stops: the wait in progress ends cancelled.
+     * Returns whether one was waiting ([standardTrackToReturnTo]).
+     */
+    fun cancel(): Boolean {
+        val current = wait ?: return false
         wait = null
         current.settle(Outcome.Cancelled)
+        return true
     }
 
     /** [abandoned] is no longer awaited (its caller went away): dropped without a result. */
@@ -114,6 +118,18 @@ internal class StandardCommandLoad {
         failureReportedByCommand = null
     }
 }
+
+/**
+ * Where a seek, pause or stop leaves the player: when it cancelled a command's wait
+ * ([StandardCommandLoad.cancel] returned true: a skip, next, previous or load whose track was
+ * still loading), the reported track (null: none), as crossfade's operation cancelled while it
+ * loads: the cancelled command does not take effect, the player goes back to the active track
+ * (paused, which the seek acts on). Else, or with no reported track, null: the player stays on
+ * its own item (after a failed load too: LOAD-06, a command acts on the player's own track).
+ * iOS: the same rule (`standardTrackToReturnTo`).
+ */
+internal fun standardTrackToReturnTo(cancelledWait: Boolean, playerItem: Any?, reported: Any?): Any? =
+    reported.takeIf { cancelledWait && it != null && it !== playerItem }
 
 /**
  * Whether a command's wait must start its track's load: the track is not the loaded one and the

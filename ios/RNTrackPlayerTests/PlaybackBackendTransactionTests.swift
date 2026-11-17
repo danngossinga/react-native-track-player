@@ -177,7 +177,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 13)
+        XCTAssertEqual(scenarios.count, 15)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -780,6 +780,30 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(older.count, 1, "settled once")
     }
 
+    func testStandardCommandLoadASeekPauseOrStopThatCancelsAWaitGoesBackToTheReportedTrack() {
+        // A plays; a skip to B waits for its load (the player is on B); a seek, pause or stop
+        // cancels it: the skip does not take effect, the player goes back to A (crossfade's
+        // operation cancelled while it loads). Android: the same steps.
+        let h = CommandLoadHarness()
+        h.rule.reset()
+        _ = h.rule.moved(h.first)
+        _ = h.rule.ready()
+        h.command(h.second)
+        _ = h.rule.moved(h.second)
+        XCTAssertTrue(h.loads.cancel(), "one was waiting")
+        XCTAssertEqual(h.outcomes, [.cancelled])
+        XCTAssertEqual(standardTrackToReturnTo(cancelledWait: true, playerItem: h.second, reported: h.rule.reported), h.first)
+        _ = h.rule.moved(h.first)
+        XCTAssertEqual(h.rule.phase, .loaded(h.first))
+        XCTAssertNil(h.rule.play(), "nothing reported, nothing to reload")
+        // No wait cancelled (after a failed load too, LOAD-06): the player's own track.
+        XCTAssertFalse(h.loads.cancel(), "none waits any more")
+        XCTAssertNil(standardTrackToReturnTo(cancelledWait: false, playerItem: h.second, reported: h.first))
+        // Already on the reported track, or none reported (the first load failed): it stays.
+        XCTAssertNil(standardTrackToReturnTo(cancelledWait: true, playerItem: h.first, reported: h.first))
+        XCTAssertNil(standardTrackToReturnTo(cancelledWait: true, playerItem: h.second, reported: nil))
+    }
+
     func testStandardCommandLoadCodesAreTheCrossfadePaths() {
         XCTAssertEqual(standardPrepareTimeoutCode, "crossfade_prepare_timeout")
         XCTAssertEqual(standardLoadErrorCode, "crossfade_engine_error")
@@ -857,6 +881,34 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         // A stop or pause: out of the error, the target stays the position until the track loads.
         giveUps.seekGaveUp(IOSPlaybackErrorSnapshot(message: "m", code: "standard_seek_timeout"), keptPosition: 42) { _ in }
         giveUps.keep(giveUps.clear())
+        XCTAssertNil(giveUps.failure)
+        XCTAssertEqual(giveUps.position(live: 0), 42)
+    }
+
+    func testStandardGiveUpAStopEndsTheErrorStoppedAndAPauseKeepsIt() {
+        // As Android's standard player (StandardBackendHlsTest.afterAGiveUpAPauseKeepsTheErrorAndAStopEndsItStopped).
+        let giveUps = StandardGiveUps()
+        let loads = StandardCommandLoad()
+        let track = NSObject()
+        giveUps.loadGaveUp(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000, item: ObjectIdentifier(track), commandLoads: loads) { _ in }
+        // A pause (setPlayWhenReady(false)) is no command on the error: nothing changes.
+        XCTAssertNotNil(giveUps.failure, "a pause keeps the error")
+        // A stop ends it, and the app is told the player stopped (SwiftAudioEx, already stopped
+        // by the give-up, emits nothing).
+        let stop = giveUps.stopped(playerStopped: true)
+        XCTAssertNil(giveUps.failure)
+        let events = stop?.events ?? []
+        XCTAssertEqual(events.map { $0.name }, ["playback-state"])
+        XCTAssertEqual(events.first.map { $0.body as NSDictionary }, ["state": "stopped"] as NSDictionary)
+        // Out of the error: a stop emits nothing more here (the player's own stop does).
+        XCTAssertNil(giveUps.stopped(playerStopped: true))
+        // A player not stopped emits its own stopped state.
+        giveUps.loadGaveUp(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000, item: ObjectIdentifier(track), commandLoads: loads) { _ in }
+        XCTAssertNil(giveUps.stopped(playerStopped: false))
+        XCTAssertNil(giveUps.failure)
+        // A failed seek's target stays the position after the stop.
+        giveUps.seekGaveUp(IOSPlaybackErrorSnapshot(message: "m", code: "standard_seek_timeout"), keptPosition: 42) { _ in }
+        XCTAssertNotNil(giveUps.stopped(playerStopped: true))
         XCTAssertNil(giveUps.failure)
         XCTAssertEqual(giveUps.position(live: 0), 42)
     }

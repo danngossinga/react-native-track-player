@@ -19,7 +19,9 @@ Plays or resumes the current track.
 
 ## `pause()`
 
-Pauses the current track.
+Pauses the current track. A skip or load still waiting for its track rejects `cancelled` and does
+not take effect: the active track stays (both backends). After a load or seek that gave up, the
+player stays in its error state (standard backend, Android and iOS).
 
 ## `stop()`
 
@@ -27,7 +29,10 @@ Stops playback. Behavior is the same as `TrackPlayer.pause()` where
 `playWhenReady` becomes `false`, but instead of just pausing playback, the item
 is unloaded.
 
-This function causes any further loading / buffering to stop.
+This function causes any further loading / buffering to stop. A skip or load still waiting for
+its track rejects `cancelled` and does not take effect. After a load or seek that gave up, the
+player leaves its error state for the stopped state, with a `PlaybackState` event (standard
+backend, Android and iOS).
 
 ## `retry()`
 
@@ -61,6 +66,10 @@ on the backend, the same on Android and iOS:
 | crossfade | `cancelled` | a newer command took over |
 
 iOS alone rejects a position that is not a finite number, with `seek_failed`.
+
+A seek during a skip or load that still waits for its track cancels it (`cancelled`) and acts on
+the active track, paused. After a failed load, a seek acts on the track that failed; when that
+seek fails as well, the next play loads the active track again.
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |

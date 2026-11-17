@@ -153,6 +153,9 @@ internal class AutoTransitionCounter : com.google.android.exoplayer2.analytics.A
 /** The code of a standard seek that gives up (no progress, or over its limit). */
 internal const val STANDARD_SEEK_TIMEOUT_CODE = "standard_seek_timeout"
 
+/** The code of a standard seek with no track, or whose track failed to load. */
+internal const val STANDARD_SEEK_UNAVAILABLE_CODE = "standard_seek_unavailable"
+
 internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
@@ -187,7 +190,7 @@ internal class StandardSeekGate(
     suspend fun await(targetMs: Long, item: Any?, observe: () -> StandardSeekObservation) {
         current?.cancel("newer_seek")
         if (item == null) {
-            throw RejectionException("No active track is available for seeking.", "standard_seek_unavailable")
+            throw RejectionException("No active track is available for seeking.", STANDARD_SEEK_UNAVAILABLE_CODE)
         }
         val ticket = PlaybackOperationTicket(0L)
         current = ticket
@@ -221,7 +224,7 @@ internal class StandardSeekGate(
                 lastCheckAt = checkedAt
                 if (observed.item !== item) throw PlaybackOperationCancelledException("item_changed")
                 if (observed.state == AudioPlayerState.ERROR) {
-                    throw RejectionException("The active track failed to load.", "standard_seek_unavailable")
+                    throw RejectionException("The active track failed to load.", STANDARD_SEEK_UNAVAILABLE_CODE)
                 }
                 val target = targetMs.coerceAtLeast(0L).let { if (observed.durationMs > 0L) minOf(it, observed.durationMs) else it }
                 observed.state == AudioPlayerState.ENDED ||

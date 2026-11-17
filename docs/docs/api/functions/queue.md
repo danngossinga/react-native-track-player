@@ -47,8 +47,10 @@ The promise resolves once the track loaded and is the active one (`getActiveTrac
 it), on both backends and both platforms, even while paused; then `initialPosition` is applied.
 When the track fails to load it rejects, and the previous track stays active: `crossfade_prepare_timeout`
 (no progress for `stallTimeoutMs`, or over `prepareTimeoutMs`), `crossfade_engine_error` (the player
-failed the track), or `cancelled` (a newer skip, load, seek, stop or queue change took over). A
-failure the promise reports is not also sent as a `PlaybackError` event. Once the track loaded, a
+failed the track), or `cancelled` (a newer skip, load, seek, pause, stop or queue change took
+over). A skip a seek, pause or stop cancelled does not take effect: the player goes back to the
+active track, paused, and the seek acts there. A failure the promise reports is not also sent as a
+`PlaybackError` event. Once the track loaded, a
 failed `initialPosition` seek rejects with the seek's code (see
 [`seekTo`](./player.md#seektoseconds)), on both platforms.
 

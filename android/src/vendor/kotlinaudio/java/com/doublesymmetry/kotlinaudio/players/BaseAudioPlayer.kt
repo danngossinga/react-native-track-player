@@ -423,14 +423,15 @@ abstract class BaseAudioPlayer internal constructor(
     /**
      * Fork: the host gave up on the item's load or seek (no progress for its stall timeout): the
      * player stops loading at once, as [stop], and is in the error state with [error], as after an
-     * ExoPlayer error; [report] also emits it as a playback error. A prepare loads the item again.
+     * ExoPlayer error; [report] also emits it as a playback error, after the error state (as the
+     * crossfade path and iOS). A prepare loads the item again.
      */
     fun failLoad(error: PlaybackError, report: Boolean) {
         exoPlayer.playWhenReady = false
         exoPlayer.stop()
         playbackError = error
-        if (report) playerEventHolder.updatePlaybackError(error)
         playerState = AudioPlayerState.ERROR
+        if (report) playerEventHolder.updatePlaybackError(error)
     }
 
     /** Fork: in the error of a host give-up ([failLoad]), which no player event ends. */

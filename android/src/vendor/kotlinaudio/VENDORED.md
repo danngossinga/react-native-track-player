@@ -55,7 +55,8 @@ section 4(b)); line numbers below include that notice.
   - `:423-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error
-    (reported as a playback error for a load no command waits for);
+    (reported as a playback error for a load no command waits for, after the error state, as the
+    crossfade path and iOS: state, then error);
   - `:436-438` `isHostFailure()` (new) and `:774-776` in `onEvents`: the play-when-ready change
     ExoPlayer reports a message after `failLoad`'s stop no longer turns that error into PAUSED
     (upstream: any pause while not stopped); the player stays in the host's error until the next

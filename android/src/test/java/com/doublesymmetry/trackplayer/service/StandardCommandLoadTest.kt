@@ -147,6 +147,30 @@ class StandardCommandLoadTest {
     }
 
     @Test
+    fun aSeekPauseOrStopThatCancelsAWaitGoesBackToTheReportedTrack() {
+        // A plays; a skip to B waits for its load (the player is on B); a seek, pause or stop
+        // cancels it: the skip does not take effect, the player goes back to A (crossfade's
+        // operation cancelled while it loads). iOS: the same steps.
+        rule.reset()
+        rule.moved(first)
+        rule.ready()
+        command(second)
+        rule.moved(second)
+        assertTrue("one was waiting", loads.cancel())
+        assertEquals(listOf<StandardCommandLoad.Outcome>(StandardCommandLoad.Outcome.Cancelled), outcomes)
+        assertTrue(standardTrackToReturnTo(cancelledWait = true, playerItem = second, reported = rule.reported) === first)
+        rule.moved(first)
+        assertEquals(FailedLoadRule.Phase.Loaded(first), rule.phase)
+        assertNull("nothing reported, nothing to reload", rule.play())
+        // No wait cancelled (after a failed load too, LOAD-06): the player's own track.
+        assertFalse("none waits any more", loads.cancel())
+        assertNull(standardTrackToReturnTo(cancelledWait = false, playerItem = second, reported = first))
+        // Already on the reported track, or none reported (the first load failed): it stays.
+        assertNull(standardTrackToReturnTo(cancelledWait = true, playerItem = first, reported = first))
+        assertNull(standardTrackToReturnTo(cancelledWait = true, playerItem = second, reported = null))
+    }
+
+    @Test
     fun aDroppedWaitEndsWithoutAResult() {
         val wait = loads.begin(first, null, null) { outcomes += it }!!
         loads.drop(wait)

@@ -1,5 +1,5 @@
 {
-  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule); both crossfade orchestrators follow the same rule. Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded, and only then is it reported (active-track change, deprecated track-changed event, lock screen); while it loads and after its load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the failed track is never reported as active. The next play loads the previous track again or, when there was none, retries the track that failed. Items are named. Events: 'load' the player moves to an item ('report': whether the move is reported at once: only the first item of a new queue, which a standard player selects when the queue is set, before any load); 'ready' the item is ready (playing or with media); 'fail' its load fails; 'play' the next play ('reload': the item it loads first, null: it plays the current one); 'command' another command (a seek, a stop) on the player's own track; 'reset' the queue replaced or cleared; 'remove' an item removed from the queue; 'publish' the app told of an item another way (a logical idle activation); 'adopt' a backend switch restored an item, loaded and known to the app (null: none); 'replace' new metadata for the same track ('item' replaced by 'with'); 'error' the player reports an error ('new': whether it fails the load now: only the first time while it lasts; then 'report' as for fail); 'recover' the player has no error ('cleared': whether one had failed the load). After each step, 'active' is the track that loaded last and 'reported' the track the app was last told (null: none). 'report' on ready, fail and command is the change reported then, 'to' (null: no track) from 'from'; no 'report' key: none. 'phase' is the rule's one explicit state (FailedLoadRule.Phase): 'selecting' (a new queue: the first move is reported at once), 'loading X' (the player is on X, not loaded since it moved there), 'loaded X' (X loaded and is the active track), 'failed X' (X's load failed: the next play loads the active track, else X); 'none' for no item. 'playerError' is 'reported' from a player error that failed the load until the player has none.",
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule); both crossfade orchestrators follow the same rule. Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded, and only then is it reported (active-track change, deprecated track-changed event, lock screen); while it loads and after its load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the failed track is never reported as active. The next play loads the previous track again or, when there was none, retries the track that failed. Items are named. Events: 'load' the player moves to an item ('report': whether the move is reported at once: only the first item of a new queue, which a standard player selects when the queue is set, before any load); 'ready' the item is ready (playing or with media); 'fail' its load fails; 'play' the next play ('reload': the item it loads first, null: it plays the current one); 'command' another command (a seek, a stop) on the player's own track; 'reset' the queue replaced or cleared; 'remove' an item removed from the queue; 'publish' the app told of an item another way (a logical idle activation); 'adopt' a backend switch restored an item, loaded and known to the app (null: none); 'replace' new metadata for the same track ('item' replaced by 'with'); 'error' the player reports an error ('new': whether it fails the load now: only the first time while it lasts; then 'report' as for fail); 'recover' the player has no error ('cleared': whether one had failed the load). After each step, 'active' is the track that loaded last and 'reported' the track the app was last told (null: none). 'report' on ready, fail and command is the change reported then, 'to' (null: no track) from 'from'; no 'report' key: none. 'phase' is the rule's one explicit state (FailedLoadRule.Phase): 'selecting' (a new queue: the first move is reported at once), 'loading X' (the player is on X, not loaded since it moved there), 'loaded X' (X loaded and is the active track), 'failed X' (X's load failed: the next play loads the active track, else X); 'none' for no item. 'playerError' is 'reported' from a player error that failed the load until the player has none. A seek that gives up on its track, or finds it failed to load, fails that track again ('fail' after 'command'): a no-op on the loaded track. A seek, pause or stop that cancels a skip or load still waiting for its track moves the player back to the reported track ('load' of it: loaded at once, as the active track).",
   "scenarios": [
     {
       "id": "LOAD-01 a skip whose load fails is never reported; play reloads the previous track",
@@ -860,6 +860,149 @@
           "playerError": "reported",
           "active": null,
           "reported": null
+        }
+      ]
+    },
+    {
+      "id": "LOAD-14 a command on the failed track that fails it again (a seek that gives up, or finds it failed): play reloads the previous track",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "command",
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "phase": "failed B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "play",
+          "reload": "A",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "A",
+          "report": false,
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-15 a seek, pause or stop that cancels a skip still loading: the player goes back to the reported track, the skip's track is never reported",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "phase": "loading A",
+          "playerError": "none",
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "command",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "command",
+          "phase": "loading B",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "A",
+          "report": false,
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "play",
+          "reload": null,
+          "phase": "loaded A",
+          "playerError": "none",
+          "active": "A",
+          "reported": "A"
         }
       ]
     }

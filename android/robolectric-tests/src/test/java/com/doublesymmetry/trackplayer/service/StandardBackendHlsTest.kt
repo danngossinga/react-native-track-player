@@ -89,7 +89,10 @@ class StandardBackendHlsTest {
 
     @After
     fun tearDown() {
-        backends.forEach { runCatching { it.player.destroy() } }
+        backends.forEach {
+            it.eventScope.coroutineContext[kotlinx.coroutines.Job]?.cancel()
+            runCatching { it.player.destroy() }
+        }
         pump(0L)
         servers.forEach { it.close() }
         clock.interrupt()
@@ -439,6 +442,159 @@ class StandardBackendHlsTest {
         assertTrue("the load counted its bytes", backed.analytics.loadedBytes.value > 0L)
     }
 
+    // Smart-music-player's rollback after a skip that failed (skipWithRollback, then
+    // restorePlaybackIntent): it seeks to the position it captured, then plays. The seek acts on
+    // the player's own track (LOAD-06) and fails there too: that track failed again, so the play
+    // loads the previous track, as after the skip's own failure (FailedLoadRule.play).
+
+    @Test
+    fun aSeekThatGivesUpOnTheTrackASkipFailedToLoadLeavesThePlayToThePreviousTrack() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(stalled, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        // SMP reads the position before the skip's bridge hop; playing, the track moved on since.
+        val captured = backed.backend.positionMs - CAPTURE_LAG_MS
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+        assertEquals(0, backed.backend.currentIndex)
+        assertEquals("standard_seek_timeout", (command { backed.backend.seekTo(captured) } as RejectionException).code)
+        // LOAD-06 (an owner decision pending): the seek acts on the player's own track.
+        assertEquals("the track the seek acted on", 1, backed.player.currentIndex)
+        assertEquals("the active track after the seek", 0, backed.backend.currentIndex)
+        val playableRequests = playable.requests.size
+        assertNull(command { backed.backend.play() })
+        awaitTrue("the play loads A again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        pump(STALL_TIMEOUT_MS * 2)
+        assertEquals(0, backed.player.currentIndex)
+        assertEquals(0, backed.backend.currentIndex)
+        assertEquals(AudioPlayerState.PLAYING, backed.backend.playbackState)
+        assertTrue("A loaded again", playable.requests.size > playableRequests)
+        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    @Test
+    fun aSeekOnTheTrackThatFailedWithAPlayerErrorLeavesThePlayToThePreviousTrack() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val broken = HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(broken, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val captured = backed.backend.positionMs - CAPTURE_LAG_MS
+        assertEquals(STANDARD_LOAD_ERROR_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+        assertEquals(STANDARD_SEEK_UNAVAILABLE_CODE, (command { backed.backend.seekTo(captured) } as RejectionException).code)
+        assertEquals("the track the seek acted on", 1, backed.player.currentIndex)
+        assertNull(command { backed.backend.play() })
+        awaitTrue("the play loads A again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        assertEquals(0, backed.backend.currentIndex)
+        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    // A seek, pause or stop while a skip's track loads cancels the skip (it rejects `cancelled`)
+    // and, as crossfade's operation cancelled while it loads, the rejected skip does not take
+    // effect: the player goes back to the active track, paused (the seek acts there), and the
+    // skip's track is never reported.
+
+    @Test
+    fun aSeekDuringASkipsLoadCancelsTheSkipAndActsOnTheActiveTrack() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val target = slowServer()
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(target, 3L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val skip = launchCommand { backed.backend.skip(2) }
+        awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
+        assertNull(command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
+        awaitTrue("the skip ends") { skip() != null }
+        assertEquals("cancelled", (skip()!!.exceptionOrNull() as RejectionException).code)
+        assertEquals("the track the seek acted on", 0, backed.player.currentIndex)
+        assertEquals(0, backed.backend.currentIndex)
+        assertTrue("at the seek's target: ${backed.player.position}", backed.player.position >= LOADABLE_TARGET_MS)
+        assertFalse("paused, as a crossfade operation cancelled while it loads", backed.backend.playWhenReady)
+        val targetRequests = target.requests.size
+        pump(STALL_TIMEOUT_MS * 2)
+        assertEquals("C is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+        assertEquals(0, backed.backend.currentIndex)
+        assertEquals("C's load stopped", targetRequests, target.requests.size)
+    }
+
+    @Test
+    fun aPauseDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack() {
+        assertACommandDuringASkipsLoadLeavesTheActiveTrack { it.pause() }
+    }
+
+    @Test
+    fun aStopDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack() {
+        assertACommandDuringASkipsLoadLeavesTheActiveTrack { it.stop() }
+    }
+
+    private fun assertACommandDuringASkipsLoadLeavesTheActiveTrack(interrupt: (KotlinAudioPlaybackBackend) -> Unit) {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val target = slowServer()
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(target, 3L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val skip = launchCommand { backed.backend.skip(2) }
+        awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
+        val positionOfA = backed.backend.positionMs
+        interrupt(backed.backend)
+        awaitTrue("the skip ends") { skip() != null }
+        assertEquals("cancelled", (skip()!!.exceptionOrNull() as RejectionException).code)
+        assertEquals("the player's track", 0, backed.player.currentIndex)
+        assertEquals(0, backed.backend.currentIndex)
+        assertFalse(backed.backend.playWhenReady)
+        val targetRequests = target.requests.size
+        pump(STALL_TIMEOUT_MS)
+        assertEquals("C's load stopped", targetRequests, target.requests.size)
+        assertNull(command { backed.backend.play() })
+        awaitTrue("A plays again") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        assertTrue("from A's last position (${backed.player.position} ms, left at $positionOfA ms)", backed.player.position >= positionOfA)
+        pump(STALL_TIMEOUT_MS)
+        assertEquals("C is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+        assertEquals(0, backed.backend.currentIndex)
+    }
+
+    // After a give-up (iOS: the same, StandardGiveUps): a pause keeps the error, a stop ends it
+    // with the stopped state, which the app is told. A give-up no command waits for emits the
+    // error state, then the playback error (as the crossfade path on both platforms).
+
+    @Test
+    fun afterAGiveUpAPauseKeepsTheErrorAndAStopEndsItStopped() {
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(stalled, 1L)))
+        command { backed.backend.play() }
+        awaitTrue("a give-up", AWAIT_MS) { backed.gaveUpAtMs.isNotEmpty() }
+        backed.assertStaysInError(PREPARE_TIMEOUT_CODE)
+        val beforePause = backed.events.size
+        backed.backend.pause()
+        backed.assertStaysInError(PREPARE_TIMEOUT_CODE)
+        assertEquals("no state event at the pause", emptyList<String>(), backed.events.drop(beforePause).filter { it.startsWith("state") })
+        val beforeStop = backed.events.size
+        backed.backend.stop()
+        pump(STALL_TIMEOUT_MS)
+        assertEquals(AudioPlayerState.STOPPED, backed.player.playerState)
+        assertEquals(AudioPlayerState.STOPPED, backed.backend.playbackState)
+        assertEquals("the stop is emitted", listOf("state:STOPPED"), backed.events.drop(beforeStop).filter { it.startsWith("state") })
+    }
+
+    @Test
+    fun aGiveUpEmitsTheErrorStateThenThePlaybackError() {
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(stalled, 1L)))
+        val before = backed.events.size
+        command { backed.backend.play() }
+        awaitTrue("a give-up", AWAIT_MS) { backed.gaveUpAtMs.isNotEmpty() }
+        pump(STALL_TIMEOUT_MS)
+        val emitted = backed.events.drop(before).filter { it == "state:ERROR" || it.startsWith("error:") }
+        assertEquals(listOf("state:ERROR", "error:$PREPARE_TIMEOUT_CODE"), emitted)
+    }
+
     /** The standard backend and its player, as MusicService.createPlaybackBackend builds them. */
     private inner class Backed(seekStallMs: Long = STALL_TIMEOUT_MS) {
         val analytics = StandardPlayerAnalytics()
@@ -497,7 +653,17 @@ class StandardBackendHlsTest {
             initiallyAuthoritative = true
         ).also { it.startLoadWatch(Handler(Looper.getMainLooper())) }
 
+        /**
+         * KotlinAudio's state and playback-error events in the order the player emits them (as
+         * MusicService receives them): "state:<state>", "error:<code>". Recorded at once
+         * (undispatched); both flows replay their last value at subscription, recorded too.
+         */
+        val events: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
+        val eventScope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Main.immediate)
+
         init {
+            eventScope.launch { player.event.stateChange.collect { events += "state:$it" } }
+            eventScope.launch { player.event.playbackError.collect { events += "error:${it.code}" } }
             analytics.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
                 override fun onLoadStarted(
                     eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
@@ -646,6 +812,8 @@ class StandardBackendHlsTest {
         const val SEEK_TARGET_MS = 20_000L
         /** In the second segment, which arrives. */
         const val LOADABLE_TARGET_MS = 5_000L
+        /** How far a playing track moved on between SMP's position read and its skip. */
+        const val CAPTURE_LAG_MS = 300L
         /** Time for the watch's sampling and the threads around a give-up. */
         const val GIVE_UP_SLACK_MS = 750L
         const val CLOCK_TICK_MS = 5L

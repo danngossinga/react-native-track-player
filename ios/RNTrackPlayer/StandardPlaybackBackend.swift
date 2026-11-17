@@ -570,7 +570,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             item: (player.currentItem as AnyObject?).map(ObjectIdentifier.init),
             commandLoads: commandLoads
         ) { report in
-            stopAfterGiveUp(log: "load \(reason)", report: report, failsLoad: true)
+            stopAfterGiveUp(log: "load \(reason)", report: report)
         }
     }
 
@@ -711,6 +711,22 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
     }
 
+    /// A seek, pause or stop that cancelled a command's wait while its track loads
+    /// (`standardTrackToReturnTo`): the cancelled command does not take effect, as crossfade's
+    /// operation cancelled while it loads. The player goes back to the reported track, paused, at
+    /// `position` (nil: where the player left that track), which stops the other track's load. As
+    /// Android.
+    private func returnToReportedTrack(_ cancelledWait: Bool, at position: Double?) {
+        let current = (player.currentItem as AnyObject?).map(ObjectIdentifier.init)
+        guard let target = standardTrackToReturnTo(cancelledWait: cancelledWait, playerItem: current, reported: failedLoads.reported),
+              let index = indexOfItem(target) else { return }
+        let kept = position ?? reportedProgress().position
+        requested.request(false)
+        try? player.jumpToItem(atIndex: index, playWhenReady: false)
+        // A seek issues its own (once the item loaded); SwiftAudioEx defers this one until then.
+        if position == nil { player.seek(to: kept) }
+    }
+
     /// Before a play or retry after a failed load: the previous track, else the failed one, loads.
     @discardableResult
     private func loadActiveTrackAfterFailedLoad() -> Bool {
@@ -729,13 +745,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     /// Ends a load or seek given up (StandardGiveUps decided it): SwiftAudioEx stops (its item
     /// leaves the AVPlayer, which stops requesting media), the app is told (`report`'s events),
-    /// and the player is in error until the next command.
-    private func stopAfterGiveUp(log: String, report: StandardGiveUpReport, failsLoad: Bool) {
+    /// and the player is in error until the next command. Its track failed (again, after a seek on
+    /// a track that failed: the next play loads the active track; FailedLoadRule.failed changes
+    /// nothing on the loaded track), as Android.
+    private func stopAfterGiveUp(log: String, report: StandardGiveUpReport) {
         IOSPlaybackLog.log("standard load abandoned (\(log))")
         requested.request(false)
         player.stop()
         onLoadGaveUp(player, report)
-        if failsLoad { failLoadedTrack() }
+        failLoadedTrack()
     }
 
     /// A command after a give-up: the player is no longer in that error. Returns the position a
@@ -750,10 +768,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
 
     private func enqueueSeek(to position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
-        // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled.
-        commandLoads.cancel()
+        // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled, and
+        // does not take effect: the seek acts on the active track.
+        let cancelledWait = commandLoads.cancel()
         clearHostFailure()
         _ = failedLoads.command()
+        returnToReportedTrack(cancelledWait, at: position)
         guard !disposed, let track = player.currentItem as? Track else {
             completion(.failure(seekError("standard_seek_unavailable", "No active track is available for seeking.")))
             return
@@ -792,7 +812,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                     IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),
                     keptPosition: request.position
                 ) { report in
-                    self.stopAfterGiveUp(log: "seek \(message)", report: report, failsLoad: false)
+                    self.stopAfterGiveUp(log: "seek \(message)", report: report)
                 }
             }
             // If already emitted, keep the ticket until its real callback. A
@@ -830,6 +850,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 continue
             }
             if player.playerState == .failed {
+                // Its track failed to load (a player error): it stays failed, as Android.
+                failLoadedTrack()
                 pendingSeeks.removeFirst()
                 request.finish(.failure(seekError("standard_seek_unavailable", "The active track failed to load.")))
                 continue
@@ -881,7 +903,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 IOSPlaybackErrorSnapshot(message: "The native seek was interrupted.", code: "standard_seek_cancelled"),
                 keptPosition: request.position
             ) { report in
-                stopAfterGiveUp(log: "seek interrupted", report: report, failsLoad: false)
+                stopAfterGiveUp(log: "seek interrupted", report: report)
             }
         }
         request.finish(didFinish && sameTrack && !disposed
@@ -1155,8 +1177,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
-            loadActiveTrackAfterFailedLoad()
-            reloadAtKeptPosition(kept)
+            // A failed seek's target is its own track's: not the active track's the play loads.
+            if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
             requested.request(true)
             player.play()
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1165,6 +1187,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func pause() {
         onMain {
             cancelPendingSeeks()
+            // As crossfade's pause: a skip or load still waiting ends cancelled and does not take
+            // effect. A give-up's error stays (Android: the same).
+            returnToReportedTrack(commandLoads.cancel(), at: nil)
             requested.request(false)
             player.pause()
         }
@@ -1382,29 +1407,38 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func stop() {
         onMain {
-            giveUps.keep(clearHostFailure())
+            // As Android: the stop ends a give-up's error, and the app is told it stopped.
+            let ended = giveUps.stopped(playerStopped: player.playerState == .stopped)
             _ = failedLoads.command()
-            commandLoads.cancel()
+            let cancelledWait = commandLoads.cancel()
             cancelPendingSeeks()
+            // As crossfade's stop: a skip or load still waiting does not take effect.
+            returnToReportedTrack(cancelledWait, at: nil)
             requested.request(false)
             player.stop()
+            if let ended = ended { onLoadGaveUp(player, ended) }
         }
     }
 
     func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
+            guard value else {
+                // As pause (Android: the same command): a give-up's error stays, and a skip or
+                // load still waiting ends cancelled and does not take effect.
+                cancelPendingSeeks()
+                returnToReportedTrack(commandLoads.cancel(), at: nil)
+                player.playWhenReady = false
+                requested.request(false)
+                completion(.success(()))
+                return
+            }
             let kept = clearHostFailure()
-            if value { commandLoads.failureCleared() }
-            if !value { cancelPendingSeeks() }
-            let wasIdle = value && idleWithoutActiveTrack
+            commandLoads.failureCleared()
+            let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
-            if value {
-                loadActiveTrackAfterFailedLoad()
-                reloadAtKeptPosition(kept)
-            } else {
-                giveUps.keep(kept)
-            }
+            // A failed seek's target is its own track's: not the active track's the play loads.
+            if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
             player.playWhenReady = value
             requested.request(value)
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1429,9 +1463,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         beginIdleTrackActivationIfNeeded(wasIdle)
         if wasIdle { idleWithoutActiveTrack = false }
         let jumped = loadActiveTrackAfterFailedLoad()
-        if kept != nil {
+        // A failed seek's target is its own track's: not the active track's the retry loads.
+        if jumped {
+        } else if kept != nil {
             reloadAtKeptPosition(kept)
-        } else if !jumped {
+        } else {
             player.reload(startFromCurrentTime: true)
         }
         publishIdleTrackActivationIfNeeded(wasIdle)

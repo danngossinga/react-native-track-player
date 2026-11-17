@@ -442,12 +442,21 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        // A newer command, as a crossfade seek: a skip or load still waiting ends cancelled.\n        commandLoads.cancel()\n        failedLoads.command()\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
+    standardBackend.includes('        val cancelledWait = commandLoads.cancel()\n        failedLoads.command()\n        returnToReportedTrack(cancelledWait, positionMs)\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
+    // A seek that gives up, or finds its track failed to load, leaves that track failed: the next
+    // play loads the active track (FailedLoadRule; StandardBackendHlsTest's seek-after-failed-skip tests).
+    standardBackend.includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)\n                // Its track failed (again): the next play loads the active track, as after a failed\n                // load (FailedLoadRule.failed changes nothing on the loaded track).\n                failLoadedTrack()') &&
+    standardBackend.includes('if (error.code == STANDARD_SEEK_UNAVAILABLE_CODE && player.currentItem != null) failLoadedTrack()') &&
+    // A seek, pause or stop that cancels a waiting skip or load goes back to the reported track
+    // (crossfade's cancelled operation; standardTrackToReturnTo).
+    standardBackend.includes('returnToReportedTrack(commandLoads.cancel(), positionMs = null)\n        player.pause()') &&
+    standardBackend.includes('returnToReportedTrack(cancelledWait, positionMs = null)\n        player.stop()') &&
+    standardBackend.includes('val target = standardTrackToReturnTo(cancelledWait, player.currentItem, failedLoads.reported) ?: return') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
     // So do a pause, a stop, a load and a relative seek (iOS: cancelPendingSeeks).
-    ['seekGate.cancel("pause")\n        player.pause()', 'seekGate.cancel("stop")\n        player.stop()',
+    ['seekGate.cancel("pause")\n        // As crossfade\'s pause', 'seekGate.cancel("stop")\n        // As crossfade\'s stop',
       'seekGate.cancel("load")\n        runActivatingOperation('].every((s) => standardBackend.includes(s)) &&
     // seekBy is a waited seek with the same limits, as on iOS.
     standardBackend.includes('override suspend fun seekBy(offsetMs: Long) = seekTo(maxOf(0L, player.position + offsetMs))') &&
@@ -924,7 +933,7 @@ assert(
 {
   const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
   assert(
-    fixture.scenarios.length === 13 &&
+    fixture.scenarios.length === 15 &&
       // One explicit state (FailedLoadRule.Phase and PlayerError): the backend keeps no flag of its own.
       read('android/src/main/java/com/doublesymmetry/trackplayer/service/FailedLoadRule.kt').includes('sealed class Phase {') &&
       !standardBackend.includes('sawPlayerError') &&
@@ -987,14 +996,21 @@ assert(
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('commandLoads.ruleSettled(failedLoads.active, failedLoads.reported)') &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
       section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)') &&
-      ['override fun stop() {\n        commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        commandLoads.cancel()',
+      ['override fun stop() {\n        val cancelledWait = commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        commandLoads.cancel()',
         'override fun clearQueue() {\n        commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
       playbackErrors.includes('if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt",') &&
       ['aSkipAfterSettingTheQueueResolvesOnceTheTargetLoadedAndIsTheActiveTrack', 'aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded',
         'aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded', 'aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive',
         'aNewerSkipCancelsTheWaitOfTheOlderOne', 'aStopOrANewQueueEndsAWaitingSkipCancelled',
-        'aGiveUpThatNoCommandWaitsForIsReportedAfterARejectedSkip'].every((t) => hls.includes(`fun ${t}()`)),
+        'aGiveUpThatNoCommandWaitsForIsReportedAfterARejectedSkip',
+        'aSeekThatGivesUpOnTheTrackASkipFailedToLoadLeavesThePlayToThePreviousTrack',
+        'aSeekOnTheTrackThatFailedWithAPlayerErrorLeavesThePlayToThePreviousTrack',
+        'aSeekDuringASkipsLoadCancelsTheSkipAndActsOnTheActiveTrack',
+        'aPauseDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack',
+        'aStopDuringASkipsLoadCancelsTheSkipAndThePlayResumesTheActiveTrack',
+        'afterAGiveUpAPauseKeepsTheErrorAndAStopEndsItStopped',
+        'aGiveUpEmitsTheErrorStateThenThePlaybackError'].every((t) => hls.includes(`fun ${t}()`)),
     'Android standard skip, next, previous and load must end once their track loaded, as crossfade.'
   );
 }

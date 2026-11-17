@@ -115,11 +115,17 @@ Added fork surface:
   after that load. When the track fails to load they reject and the previous
   track stays active: `crossfade_prepare_timeout` (a give-up),
   `crossfade_engine_error` (a player error) or `cancelled` (a newer skip, load,
-  seek, stop or queue change took over; on the standard backend a pause does not
-  end the load, so it does not cancel the command). The rejection is the report:
+  seek, pause, stop or queue change took over). A command rejected `cancelled` by
+  a seek, pause or stop does not take effect, on both backends and platforms: its
+  track is never reported, the player goes back to the active track, paused
+  (crossfade's cancelled operation), and the seek acts on that track (before: the
+  standard backend paused or sought the loading track, which then became active;
+  a pause did not cancel the command). The rejection is the report:
   no `PlaybackError` event for it. A load no command waits for (a natural
   advance, a play or retry after a failure) reports its failure with a
-  `PlaybackError` event (`code`, `message`). iOS now rejects crossfade loads that
+  `PlaybackError` event (`code`, `message`), after the `PlaybackState` error event
+  (both backends and platforms; before, Android's standard backend sent the
+  `PlaybackError` first). iOS now rejects crossfade loads that
   give up or are cancelled with these codes too (before: `skip_failed`,
   `playback_backend_load_failed`), as Android.
 - A track becomes the active one once it loaded, on both backends and both
@@ -128,7 +134,10 @@ Added fork surface:
   failed to load (a give-up or a player error). While a track loads, and after its
   load failed, the previous track is the active one (none when there was none);
   the next play loads it again or, when there was none, retries the track that
-  failed. The standard backend reports a new queue's first track at once (it is
+  failed. A seek after a failed load acts on the track that failed (the player's
+  own track); when that seek fails too (it gives up, or finds the track failed),
+  the track is still the one that failed, and the next play loads the previous
+  track (before: on the standard backend that play retried the failed track). The standard backend reports a new queue's first track at once (it is
   selected when the queue is set). After a failed load the lock screen and the
   notification show the active track again. A failed seek keeps its target as the
   position on both backends and platforms.
