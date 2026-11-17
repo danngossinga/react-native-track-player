@@ -2328,7 +2328,7 @@ final class StandardCommandLoad {
     }
 
     /// A newer command that loads, seeks, pauses or stops: the wait in progress ends cancelled.
-    /// Returns whether one was waiting (`standardTrackToReturnTo`).
+    /// Returns whether one was waiting (`standardCancelledLoad`).
     @discardableResult
     func cancel() -> Bool {
         guard let current = wait else { return false }
@@ -2351,16 +2351,36 @@ final class StandardCommandLoad {
     }
 }
 
-/// Where a seek, pause or stop leaves the player: when it cancelled a command's wait
+/// Where a seek, pause or stop leaves the player when it cancelled a command's wait
 /// (`StandardCommandLoad.cancel` returned true: a skip, next, previous or load whose track was
-/// still loading), the reported track (nil: none), as crossfade's operation cancelled while it
-/// loads: the cancelled command does not take effect, the player goes back to the active track
-/// (paused, which the seek acts on). Else, or with no reported track, nil: the player stays on its
-/// own item (after a failed load too: LOAD-06, a command acts on the player's own track).
-/// Android: the same rule (`standardTrackToReturnTo`).
-func standardTrackToReturnTo(cancelledWait: Bool, playerItem: ObjectIdentifier?, reported: ObjectIdentifier?) -> ObjectIdentifier? {
-    guard cancelledWait, let reported = reported, reported != playerItem else { return nil }
-    return reported
+/// still loading), as crossfade's operation cancelled while it loads: the cancelled command does
+/// not take effect, and its track is never reported. Android: the same rule
+/// (`standardCancelledLoad`, `StandardCancelledLoad`).
+enum StandardCancelledLoad: Equatable {
+    /// No wait cancelled (after a failed load too: LOAD-06, a command acts on the player's own
+    /// track), or the player is on the reported track: it stays.
+    case stays
+    /// The player goes back to the reported track, paused (the seek acts there).
+    case returnsTo(ObjectIdentifier)
+    /// No track is reported (the first load failed, or the reported one left the queue): the
+    /// cancelled load stops and the player has no active track (the logical idle, as crossfade's
+    /// active index -1): nothing loads or is reported until a play, skip or load selects a track
+    /// again (a play from idle starts the first track, as crossfade's).
+    case stopsInIdle
+}
+
+/// What a cancel leaves (`StandardCancelledLoad`); `reported`: the track the app was told is active.
+func standardCancelledLoad(cancelledWait: Bool, playerItem: ObjectIdentifier?, reported: ObjectIdentifier?) -> StandardCancelledLoad {
+    guard cancelledWait else { return .stays }
+    guard let reported = reported else { return .stopsInIdle }
+    return reported == playerItem ? .stays : .returnsTo(reported)
+}
+
+/// The track a play, load or retry from the logical idle (no active track) selects first: the
+/// queue's first one when the player is elsewhere, as Android (selectFirstPhysicalItemIfNeeded)
+/// and crossfade's play with no active track. Nil: the player is on it, or the queue is empty.
+func standardFirstTrackToSelect(currentIndex: Int, count: Int) -> Int? {
+    return count > 0 && currentIndex != 0 ? 0 : nil
 }
 
 /// Whether a command's wait must start its track's load: the track is not the loaded one and the
@@ -2506,6 +2526,26 @@ protocol StandardLoadPlayer: AnyObject {
     func followNowPlaying()
     /// Logs a failed load (`active`: the active track then).
     func logFailedLoad(active: ObjectIdentifier?)
+    /// The position the app reads: the reported track's (`ReportedTrackProgress`, rule 13).
+    var reportedPosition: Double { get }
+    /// No track is active (the logical idle).
+    var isIdle: Bool { get }
+    /// SwiftAudioEx is stopped (its item unloaded).
+    var isPlayerStopped: Bool { get }
+    /// The module's playback request (`RequestedPlayback`): what an ended interruption resumes.
+    func requestPlayback(_ playing: Bool)
+    /// Ends the seeks in progress (`standard_seek_cancelled`).
+    func cancelSeeks()
+    /// Moves the player to `item`, paused (SwiftAudioEx's jumpToItem); false when it left the queue.
+    func jumpPaused(to item: ObjectIdentifier) -> Bool
+    /// SwiftAudioEx's seek (applied once the item loaded).
+    func seekPlayer(to position: Double)
+    /// SwiftAudioEx's pause.
+    func pausePlayer()
+    /// SwiftAudioEx's stop (its item leaves the AVPlayer, which stops requesting media).
+    func stopPlayer()
+    /// No active track any more, the queue kept (the logical idle).
+    func enterIdle()
 }
 
 /// The standard player's load sequences (StandardPlaybackBackend runs them; this file is the
@@ -2608,17 +2648,19 @@ final class StandardLoadCoordinator {
         }
     }
 
-    /// A seek's wait gave up (`message`): as a crossfade seek that gives up, the player stops
-    /// loading and is in error (the rejection is the report: no playback error), when the seek
-    /// was issued and the player is still on its track (`track`); a seek still waiting to be
-    /// issued, or for a track the player left, only rejects.
+    /// A seek's wait gave up (`message`): as a crossfade seek that gives up and as Android, the
+    /// player stops loading and is in error (the rejection is the report: no playback error), and
+    /// its track failed again (`stopAfterGiveUp`), when the player is still on its track
+    /// (`track`), the seek issued or still waiting for its item (its track's playlists never
+    /// answered: the play then loads the active track); a seek for a track the player left only
+    /// rejects.
     func seekTimedOut(issued: Bool, track: ObjectIdentifier, message: String, keptPosition: Double) {
-        guard issued, player?.currentLoadItem == track else { return }
+        guard player?.currentLoadItem == track else { return }
         giveUps.seekGaveUp(
             IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),
             keptPosition: keptPosition
         ) { report in
-            stopAfterGiveUp(log: "seek \(message)", report: report)
+            stopAfterGiveUp(log: "seek \(message)\(issued ? "" : " (never issued)")", report: report)
         }
     }
 
@@ -2634,6 +2676,81 @@ final class StandardLoadCoordinator {
         ) { report in
             stopAfterGiveUp(log: "seek interrupted", report: report)
         }
+    }
+
+    /// Whether the load watch watches the player's loads: not after a give-up, until the next
+    /// command (its error stands: the load stopped), nor with no active track (the logical idle:
+    /// nothing is reported, not even a load that ends late), nor once disposed.
+    var watchesLoads: Bool { return !disposed && giveUps.failure == nil && !(player?.isIdle ?? true) }
+
+    /// A seek, pause or stop that cancelled (`cancelledWait`) a command's wait while its track
+    /// loads leaves it (`standardCancelledLoad`): back to the reported track, paused, at `position`
+    /// (nil: where the player left that track, read before the move); or, with none reported, the
+    /// cancelled load stops and no track is active. Both pause: an ended interruption does not
+    /// resume (`requestPlayback(false)`). As Android (KotlinAudioPlaybackBackend.leaveCancelledLoad).
+    @discardableResult
+    func leaveCancelledLoad(cancelledWait: Bool, position: Double?) -> StandardCancelledLoad {
+        guard let player = player else { return .stays }
+        let left = standardCancelledLoad(cancelledWait: cancelledWait, playerItem: player.currentLoadItem, reported: failedLoads.reported)
+        switch left {
+        case .stays:
+            break
+        case let .returnsTo(target):
+            let kept = position ?? player.reportedPosition
+            player.requestPlayback(false)
+            guard player.jumpPaused(to: target) else { return .stays }
+            // A seek issues its own (once the item loaded); SwiftAudioEx defers this one until then.
+            if position == nil { player.seekPlayer(to: kept) }
+        case .stopsInIdle:
+            player.requestPlayback(false)
+            player.stopPlayer()
+            player.enterIdle()
+        }
+        return left
+    }
+
+    /// A pause (and setPlayWhenReady(false), the same command on Android): the seeks in progress
+    /// end; a skip or load still waiting ends cancelled and does not take effect
+    /// (`leaveCancelledLoad`); the player pauses, requested paused. A give-up's error stays.
+    func pause() {
+        guard let player = player else { return }
+        player.cancelSeeks()
+        leaveCancelledLoad(cancelledWait: commandLoads.cancel(), position: nil)
+        player.requestPlayback(false)
+        player.pausePlayer()
+    }
+
+    /// A stop, as Android's: it ends a give-up's error (the app is told the player stopped,
+    /// `StandardGiveUps.stopped`), a skip or load still waiting ends cancelled and does not take
+    /// effect, the seeks end, and the player stops, requested paused.
+    func stop() {
+        guard let player = player else { return }
+        let ended = giveUps.stopped(playerStopped: player.isPlayerStopped)
+        _ = failedLoads.command()
+        let cancelledWait = commandLoads.cancel()
+        player.cancelSeeks()
+        leaveCancelledLoad(cancelledWait: cancelledWait, position: nil)
+        player.requestPlayback(false)
+        player.stopPlayer()
+        if let ended = ended { player.emitGiveUp(ended) }
+    }
+
+    /// A seek's start, as a crossfade seek, a newer command: a skip or load still waiting ends
+    /// cancelled and does not take effect (the seek acts on the active track); the player is no
+    /// longer in a give-up's error; a failed track is the player's own again (LOAD-06). Returns
+    /// whether a track is active to seek in (none: it rejects, nothing loads).
+    func beginSeek(to position: Double) -> Bool {
+        let cancelledWait = commandLoads.cancel()
+        giveUps.clear()
+        _ = failedLoads.command()
+        leaveCancelledLoad(cancelledWait: cancelledWait, position: position)
+        return !(player?.isIdle ?? true)
+    }
+
+    /// A relative seek's target: from the position the app reads (the reported track's, also while
+    /// another track loads, where the seek then acts), as crossfade's seekBy and Android.
+    func seekTarget(by offset: Double) -> Double {
+        return max(0, (player?.reportedPosition ?? 0) + offset)
     }
 
     /// Ends a load or seek given up (StandardGiveUps decided it, its error is set): the player

@@ -423,7 +423,9 @@ assert(
     standardBackend2.includes('        pendingSeeks.append(request)\n        wait.start()\n        pumpSeeks()') &&
     section(standardBackend2, '// A newer seek ends the older ones at once', 'pendingSeeks.append(request)').includes('issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))') &&
     section(standardBackend2, '// A newer seek ends the older ones at once', 'pendingSeeks.append(request)').includes('superseded.forEach {') &&
-    standardBackend2.includes('onMain { enqueueSeek(to: player.currentTime + offset, completion: completion) }') &&
+    // seekBy from the position the app reads (StandardLoadCoordinator.seekTarget, tested).
+    standardBackend2.includes('onMain { enqueueSeek(to: loads.seekTarget(by: offset), completion: completion) }') &&
+    standardBackend2.includes('    var reportedPosition: Double { return reportedProgress().position }') &&
     section(standardBackend2, 'func finish(_ result: Result<Void, Error>) {', 'private var pendingSeeks').includes('wait?.cancel()') &&
     !standardBackend2.includes('DispatchWorkItem { [weak self, weak request]') &&
     !/asyncAfter\(deadline: \.now\(\) \+ [\d.]+, execute: timeout\)/.test(standardBackend2) &&
@@ -484,9 +486,18 @@ assert(
     pingPongBackend.includes('interruptionCountsAsPlaying(playWhenReady: orchestrator.playWhenReady, stateRawValue: orchestrator.playbackState.rawValue)') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func isPlaying() -> Bool { interruptionCountsAsPlaying(playWhenReady: playing, stateRawValue: state) }') &&
     section(standardBackend, '    func play() throws {', '    func seek(to position: Double) throws {').includes('requested.request(true)\n            player.play()') &&
-    section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('requested.request(false)\n            player.pause()') &&
-    section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('requested.request(false)\n            player.stop()') &&
+    // pause, setPlayWhenReady(false) and stop: StandardLoadCoordinator.pause / stop (tested: the
+    // request is paused), through one-line adapters.
+    section(standardBackend, '    func pause() {', '    func seek(to position: Double) throws {').includes('onMain { loads.pause() }') &&
+    section(standardBackend, '    func stop() {', '    func setPlayWhenReady(').includes('onMain { loads.stop() }') &&
+    section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('guard value else {') &&
+    section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '            let kept = clearHostFailure()').includes('loads.pause()\n                completion(.success(()))') &&
     section(standardBackend, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('player.playWhenReady = value\n            requested.request(value)') &&
+    standardBackend.includes('    func requestPlayback(_ playing: Bool) { requested.request(playing) }') &&
+    standardBackend.includes('    func pausePlayer() { player.pause() }') &&
+    standardBackend.includes('    func stopPlayer() { player.stop() }') &&
+    standardBackend.includes('    func cancelSeeks() { cancelPendingSeeks() }') &&
+    standardBackend.includes('    var isPlayerStopped: Bool { return player.playerState == .stopped }') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAnInterruptionResumesWhenTheSDKPausedThePlayerBeforeItWasRead()') &&
     // reset runs from deinit too: its operation holds the policy, not the module.
     section(player, 'public func reset(resolve:', 'public func play(resolve:').includes('withActivePlaybackBackendSerialized({ [interruptionPolicy] backend in') &&
@@ -687,7 +698,8 @@ assert(
   const eventTypes = read('ios/RNTrackPlayer/Utils/EventType.swift');
   const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
   assert(
-    poll.includes('guard isAuthoritative, !disposed, hostFailure == nil, !idleWithoutActiveTrack, let watch = loadWatch else {') &&
+    poll.includes('guard isAuthoritative, loads.watchesLoads, let watch = loadWatch else {') &&
+      facade.includes('var watchesLoads: Bool { return !disposed && giveUps.failure == nil && !(player?.isIdle ?? true) }') &&
       poll.includes('let phase = standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition)') &&
       poll.includes('let ownedElsewhere = issuedSeek != nil || !pendingSeeks.isEmpty') &&
       // A load's progress (StandardLoadBytes, tested): started per load before its first reading,
@@ -728,19 +740,28 @@ assert(
       section(backendSource, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }') &&
       section(backendSource, '    func retry() {', '\n    }\n').includes('if jumped {\n        } else if kept != nil {') &&
       // A seek, pause, setPlayWhenReady(false) or stop that cancels a skip or load still waiting
-      // goes back to the reported track (standardTrackToReturnTo, tested; Android's
-      // StandardBackendHlsTest a*DuringASkipsLoad* on the real player).
-      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('let cancelledWait = commandLoads.cancel()\n        clearHostFailure()\n        _ = failedLoads.command()\n        returnToReportedTrack(cancelledWait, at: position)') &&
-      section(backendSource, '    func pause() {', '    func seek(to position: Double) throws {').includes('returnToReportedTrack(commandLoads.cancel(), at: nil)') &&
-      section(backendSource, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '    func seek(to position: Double, completion').includes('guard value else {\n                // As pause (Android: the same command): a give-up\'s error stays, and a skip or\n                // load still waiting ends cancelled and does not take effect.\n                cancelPendingSeeks()\n                returnToReportedTrack(commandLoads.cancel(), at: nil)') &&
-      section(backendSource, '    func stop() {', '    func setPlayWhenReady(').includes('returnToReportedTrack(cancelledWait, at: nil)') &&
-      section(backendSource, 'private func returnToReportedTrack(', '\n    }\n').includes('guard let target = standardTrackToReturnTo(cancelledWait: cancelledWait, playerItem: current, reported: failedLoads.reported),') &&
-      section(backendSource, 'private func returnToReportedTrack(', '\n    }\n').includes('try? player.jumpToItem(atIndex: index, playWhenReady: false)') &&
+      // goes back to the reported track, or with none reported stops in idle
+      // (StandardLoadCoordinator.leaveCancelledLoad, tested; Android's StandardBackendHlsTest
+      // a*DuringASkipsLoad* and a*CancellingASkipWithNoActiveTrack* on the real player).
+      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('let hasActiveTrack = loads.beginSeek(to: position)\n        guard hasActiveTrack, !disposed, let track = player.currentItem as? Track else {') &&
+      backendSource.includes('    func jumpPaused(to item: ObjectIdentifier) -> Bool {\n        guard let index = indexOfItem(item) else { return false }\n        try? player.jumpToItem(atIndex: index, playWhenReady: false)\n        return true') &&
+      backendSource.includes('    func seekPlayer(to position: Double) { player.seek(to: position) }') &&
+      backendSource.includes('    var isIdle: Bool { return idleWithoutActiveTrack }') &&
+      backendSource.includes('    func enterIdle() {\n        guard !player.items.isEmpty else { return }\n        idleWithoutActiveTrack = true\n        idleStateFollowsPlayer = true') &&
+      backendSource.includes('return idleWithoutActiveTrack && !idleStateFollowsPlayer ? .none : State.fromPlayerState(state: player.playerState)') &&
+      // The load watch looks only while StandardLoadCoordinator.watchesLoads (tested: not after a
+      // give-up, not in the idle).
+      backendSource.includes('guard isAuthoritative, loads.watchesLoads, let watch = loadWatch else {') &&
+      // A play, setPlayWhenReady(true), retry or load from the idle starts the first track
+      // (standardFirstTrackToSelect, tested), as Android and crossfade.
+      (backendSource.match(/            selectFirstTrackIfIdle\(wasIdle\)\n/g) || []).length === 3 &&
+      (backendSource.match(/        selectFirstTrackIfIdle\(wasIdle\)\n        let jumped = loadActiveTrackAfterFailedLoad\(\)/g) || []).length === 1 &&
+      section(backendSource, 'private func selectFirstTrackIfIdle(', '\n    }\n').includes('guard wasIdle, let first = standardFirstTrackToSelect(currentIndex: player.currentIndex, count: player.items.count) else { return }\n        try? player.jumpToItem(atIndex: first, playWhenReady: false)') &&
       // After a give-up: setPlayWhenReady(false) keeps the error (no clearHostFailure before its
       // return), a stop ends it and emits the stopped state (StandardGiveUps.stopped, tested).
       !section(backendSource, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '            let kept = clearHostFailure()').includes('clearHostFailure') &&
-      section(backendSource, '    func stop() {', '    func setPlayWhenReady(').includes('let ended = giveUps.stopped(playerStopped: player.playerState == .stopped)') &&
-      section(backendSource, '    func stop() {', '    func setPlayWhenReady(').includes('player.stop()\n            if let ended = ended { onLoadGaveUp(player, ended) }') &&
+      section(facade, '    func stop() {', '    func beginSeek(').includes('let ended = giveUps.stopped(playerStopped: player.isPlayerStopped)') &&
+      section(facade, '    func stop() {', '    func beginSeek(').includes('player.stopPlayer()\n        if let ended = ended { player.emitGiveUp(ended) }') &&
       backendSource.includes('position: giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime),') &&
       backendSource.includes('return giveUps.clear()') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
@@ -777,8 +798,13 @@ assert(
         'testStandardLoadCoordinatorASkipWaitsForItsTrackToLoadThenReportsItAndEnds',
         'testStandardLoadCoordinatorAWaitReloadsATrackStandingStillAndEndsAtOnceWhenNothingIsToWaitFor',
         'testStandardLoadCoordinatorALoadGiveUpStopsThePlayerErrorsAndKeepsTheActiveTrack',
-        'testStandardLoadCoordinatorASeekThatGivesUpStopsThePlayerOnlyWhenIssuedOnItsTrack',
+        'testStandardLoadCoordinatorASeekThatGivesUpStopsThePlayerOnItsTrackIssuedOrNot',
         'testStandardLoadCoordinatorAPlayerFailureFailsTheLoadOnceAndRejectsTheWaitWithItsError',
+        'testStandardLoadCoordinatorACancelWithNoReportedTrackStopsTheLoadInIdleAndNeverReportsIt',
+        'testStandardLoadCoordinatorACancelReturnsToTheReportedTrackPausedAtItsPosition',
+        'testStandardLoadCoordinatorAnUnissuedSeekThatGivesUpOnAFailedSkipsTrackLeavesThePlayToA',
+        'testStandardSeekAndLoadLimitsAreIndependent',
+        'testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads',
         'testStandardCommandLoadResultIsTheCommandsResolution']
         .every((t) => tests.includes(`func ${t}()`)),
     'The iOS standard player must give up a load with no progress at stallTimeoutMs, as crossfade and Android.'
@@ -853,9 +879,12 @@ assert(
       section(standardBackend, 'func play() throws {', '\n    }\n').includes('commandLoads.failureCleared()') &&
       section(standardBackend, 'func retry() {', '\n    }\n').includes('onMain { commandLoads.failureCleared() }') &&
       section(facade, 'func loadGaveUp(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)') &&
-      section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('commandLoads.cancel()') &&
-      ['func stop() {', 'func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {'].every((start) =>
+      section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('loads.beginSeek(to: position)') &&
+      section(facade, '    func beginSeek(', '\n    }\n').includes('let cancelledWait = commandLoads.cancel()') &&
+      ['func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('commandLoads.cancel()')) &&
+      // stop: StandardLoadCoordinator.stop cancels it (tested).
+      section(facade, '    func stop() {', '    func beginSeek(').includes('let cancelledWait = commandLoads.cancel()') &&
       // Disposed: StandardLoadCoordinator.dispose cancels a waiting command (tested).
       section(standardBackend, 'func dispose() throws {', '\n    }\n').includes('loads.dispose()') &&
       section(player, 'func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {', '\n    }\n').includes('backend.identity === source, backend.reportsPlayerErrorThroughCommand() {') &&

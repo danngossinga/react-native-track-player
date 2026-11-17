@@ -960,16 +960,19 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         _ = h.rule.moved(h.second)
         XCTAssertTrue(h.loads.cancel(), "one was waiting")
         XCTAssertEqual(h.outcomes, [.cancelled])
-        XCTAssertEqual(standardTrackToReturnTo(cancelledWait: true, playerItem: h.second, reported: h.rule.reported), h.first)
+        XCTAssertEqual(standardCancelledLoad(cancelledWait: true, playerItem: h.second, reported: h.rule.reported), .returnsTo(h.first))
         _ = h.rule.moved(h.first)
         XCTAssertEqual(h.rule.phase, .loaded(h.first))
         XCTAssertNil(h.rule.play(), "nothing reported, nothing to reload")
         // No wait cancelled (after a failed load too, LOAD-06): the player's own track.
         XCTAssertFalse(h.loads.cancel(), "none waits any more")
-        XCTAssertNil(standardTrackToReturnTo(cancelledWait: false, playerItem: h.second, reported: h.first))
-        // Already on the reported track, or none reported (the first load failed): it stays.
-        XCTAssertNil(standardTrackToReturnTo(cancelledWait: true, playerItem: h.first, reported: h.first))
-        XCTAssertNil(standardTrackToReturnTo(cancelledWait: true, playerItem: h.second, reported: nil))
+        XCTAssertEqual(standardCancelledLoad(cancelledWait: false, playerItem: h.second, reported: h.first), .stays)
+        XCTAssertEqual(standardCancelledLoad(cancelledWait: false, playerItem: h.second, reported: nil), .stays)
+        // Already on the reported track: it stays.
+        XCTAssertEqual(standardCancelledLoad(cancelledWait: true, playerItem: h.first, reported: h.first), .stays)
+        // None reported (the first load failed): the cancelled load stops, no active track (as
+        // crossfade's active index -1), so the cancelled track is never reported.
+        XCTAssertEqual(standardCancelledLoad(cancelledWait: true, playerItem: h.second, reported: nil), .stopsInIdle)
     }
 
     func testStandardCommandLoadCodesAreTheCrossfadePaths() {
@@ -1008,6 +1011,31 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         func showAfterFailedLoad(_ reported: ObjectIdentifier?) { calls.append("show \(name(reported))") }
         func followNowPlaying() { calls.append("nowPlaying") }
         func logFailedLoad(active: ObjectIdentifier?) {}
+        var reportedPosition: Double = 0
+        var isIdle = false
+        var isPlayerStopped = false
+        /// The module's last playback request (nil: none yet).
+        var requested: Bool?
+        /// Items that left the queue (a jump to them fails).
+        var removed: Set<ObjectIdentifier> = []
+        func requestPlayback(_ playing: Bool) {
+            calls.append("request \(playing ? "play" : "pause")")
+            requested = playing
+        }
+        func cancelSeeks() { calls.append("cancelSeeks") }
+        func jumpPaused(to item: ObjectIdentifier) -> Bool {
+            guard !removed.contains(item) else { return false }
+            calls.append("jump \(name(item)) paused")
+            currentLoadItem = item
+            return true
+        }
+        func seekPlayer(to position: Double) { calls.append("seek \(position)") }
+        func pausePlayer() { calls.append("pause") }
+        func stopPlayer() { calls.append("stopPlayer") }
+        func enterIdle() {
+            calls.append("idle")
+            isIdle = true
+        }
     }
 
     private final class CoordinatorHarness {
@@ -1100,13 +1128,16 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(outcomes, [.failed(code: standardPrepareTimeoutCode, message: standardLoadGiveUpMessage(.capExceeded, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000))])
     }
 
-    func testStandardLoadCoordinatorASeekThatGivesUpStopsThePlayerOnlyWhenIssuedOnItsTrack() {
+    func testStandardLoadCoordinatorASeekThatGivesUpStopsThePlayerOnItsTrackIssuedOrNot() {
+        // Changed deliberately (fourth review, B3): a seek still waiting to be issued (its item
+        // never loaded) gives up on its track too, as Android; only a seek for a track the player
+        // left only rejects.
         let h = CoordinatorHarness()
         h.loads.failedLoads.adopted(h.ia)
         h.player.currentLoadItem = h.ia
-        h.loads.seekTimedOut(issued: false, track: h.ia, message: "m", keptPosition: 30)
         h.loads.seekTimedOut(issued: true, track: h.ib, message: "m", keptPosition: 30)
-        XCTAssertEqual(h.player.calls, [], "not issued, or for a track the player left: only its rejection")
+        h.loads.seekTimedOut(issued: false, track: h.ib, message: "m", keptPosition: 30)
+        XCTAssertEqual(h.player.calls, [], "for a track the player left: only its rejection")
         XCTAssertNil(h.loads.hostFailure)
         h.loads.seekTimedOut(issued: true, track: h.ia, message: "The native seek made no progress for 10000 ms.", keptPosition: 30)
         XCTAssertEqual(h.player.calls, ["stop", "gaveUp standard_seek_timeout playbackError=false", "nowPlaying"])
@@ -1146,6 +1177,174 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(h.loads.commandLoads.reportsFailure(of: h.ib), "the rejection is its report: no playback error")
         XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib))
         XCTAssertNil(h.loads.hostFailure, "a player error is the player's own, not a give-up")
+    }
+
+    /// A, the selected first track (reported at once), failed to load: none is active; a skip to
+    /// B waits for its load (the skip cleared the give-up's error).
+    private func coordinatorWithASkipAfterAFailedFirstLoad(_ outcomes: @escaping (StandardCommandLoadOutcome) -> Void) -> CoordinatorHarness {
+        let h = CoordinatorHarness()
+        h.player.currentLoadItem = h.ia
+        XCTAssertTrue(h.loads.failedLoads.moved(h.ia))
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertNil(h.loads.failedLoads.reported)
+        _ = h.loads.giveUps.clear()
+        _ = h.loads.failedLoads.command()
+        h.player.currentLoadItem = h.ib
+        _ = h.loads.failedLoads.moved(h.ib)
+        h.loads.waitForCommandLoad(outcomes)
+        XCTAssertTrue(h.loads.watchesLoads)
+        h.player.calls.removeAll()
+        h.player.requested = true
+        return h
+    }
+
+    func testStandardLoadCoordinatorACancelWithNoReportedTrackStopsTheLoadInIdleAndNeverReportsIt() {
+        // Fourth review, B1 (Android: a*CancellingASkipWithNoActiveTrack*): a pause, stop or seek
+        // that cancels the skip stops B's load and leaves no active track, as crossfade's
+        // operation cancelled with no current track (active index -1): B is never reported.
+        let expected: [String: [String]] = [
+            "pause": ["cancelSeeks", "request pause", "stopPlayer", "idle", "request pause", "pause"],
+            "stop": ["cancelSeeks", "request pause", "stopPlayer", "idle", "request pause", "stopPlayer"],
+            "seek": ["request pause", "stopPlayer", "idle"],
+        ]
+        for command in ["pause", "stop", "seek"] {
+            var outcomes: [StandardCommandLoadOutcome] = []
+            let h = coordinatorWithASkipAfterAFailedFirstLoad { outcomes.append($0) }
+            switch command {
+            case "pause": h.loads.pause()
+            case "stop": h.loads.stop()
+            default: XCTAssertFalse(h.loads.beginSeek(to: 5), "no active track to seek in: the seek rejects")
+            }
+            XCTAssertEqual(h.player.calls, expected[command], command)
+            XCTAssertEqual(outcomes, [.cancelled], command)
+            XCTAssertTrue(h.player.isIdle, command)
+            XCTAssertEqual(h.player.requested, false, "\(command): an ended interruption does not resume")
+            // AVPlayer's late end of B's load is not looked at: B is never reported.
+            XCTAssertFalse(h.loads.watchesLoads, "\(command): no load is watched with no active track")
+            XCTAssertNil(h.loads.failedLoads.reported, command)
+        }
+        // A play (load, retry) from the idle starts the queue's first track, as crossfade's play
+        // with no active track and Android's.
+        XCTAssertEqual(standardFirstTrackToSelect(currentIndex: 1, count: 2), 0)
+        XCTAssertNil(standardFirstTrackToSelect(currentIndex: 0, count: 2), "already on it")
+        XCTAssertNil(standardFirstTrackToSelect(currentIndex: -1, count: 0), "an empty queue")
+    }
+
+    func testStandardLoadCoordinatorACancelReturnsToTheReportedTrackPausedAtItsPosition() {
+        // Fourth review, B2 (the sequence StandardPlaybackBackend ran untested): a pause (and
+        // setPlayWhenReady(false)), stop or seek that cancels a skip goes back to A, paused, at the
+        // position the player left it (a seek: at its own target, issued by the seek), and the
+        // module's request is paused (an ended interruption does not resume). Android:
+        // a*DuringASkipsLoad*.
+        let expected: [String: [String]] = [
+            "pause": ["cancelSeeks", "request pause", "jump A paused", "seek 42.0", "request pause", "pause"],
+            "stop": ["cancelSeeks", "request pause", "jump A paused", "seek 42.0", "request pause", "stopPlayer"],
+            "seek": ["request pause", "jump A paused"],
+        ]
+        for command in ["pause", "stop", "seek"] {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            var outcomes: [StandardCommandLoadOutcome] = []
+            h.loads.waitForCommandLoad { outcomes.append($0) }
+            h.player.reportedPosition = 42
+            h.player.requested = true
+            h.player.calls.removeAll()
+            switch command {
+            case "pause": h.loads.pause()
+            case "stop": h.loads.stop()
+            default: XCTAssertTrue(h.loads.beginSeek(to: 30), "A is active: the seek acts on it")
+            }
+            XCTAssertEqual(h.player.calls, expected[command], command)
+            XCTAssertEqual(outcomes, [.cancelled], command)
+            XCTAssertEqual(h.player.currentLoadItem, h.ia, command)
+            XCTAssertEqual(h.player.requested, false, "\(command): an ended interruption does not resume")
+            XCTAssertFalse(interruptionCountsAsPlaying(playWhenReady: h.player.requested ?? true, stateRawValue: "paused"), command)
+            XCTAssertFalse(h.player.isIdle, command)
+            // SwiftAudioEx's item change (itemMoved), then A loads (back on it): reported already,
+            // nothing to tell.
+            XCTAssertFalse(h.loads.failedLoads.moved(h.ia))
+            h.player.calls.removeAll()
+            h.see(.ready)
+            XCTAssertEqual(h.player.calls, [], "\(command): B is never reported")
+            XCTAssertEqual(h.loads.failedLoads.reported, h.ia, command)
+        }
+        // No wait to cancel: a pause only pauses, requested paused (the setPlayWhenReady(false)
+        // path too).
+        let p = CoordinatorHarness()
+        p.loads.failedLoads.adopted(p.ia)
+        p.player.currentLoadItem = p.ia
+        p.player.requested = true
+        p.loads.pause()
+        XCTAssertEqual(p.player.calls, ["cancelSeeks", "request pause", "pause"])
+        XCTAssertEqual(p.player.requested, false, "an ended interruption does not resume a pause")
+        // The reported track left the queue meanwhile: the player stays.
+        let r = CoordinatorHarness()
+        r.skipFromAToB()
+        r.loads.waitForCommandLoad { _ in }
+        r.player.removed = [r.ia]
+        r.player.calls.removeAll()
+        XCTAssertEqual(r.loads.leaveCancelledLoad(cancelledWait: r.loads.commandLoads.cancel(), position: nil), .stays)
+        XCTAssertEqual(r.player.currentLoadItem, r.ib)
+    }
+
+    func testStandardLoadCoordinatorAnUnissuedSeekThatGivesUpOnAFailedSkipsTrackLeavesThePlayToA() {
+        // Fourth review, B3 (Android: aSeekOnATrackWhosePlaylistsNeverAnswer...): A plays, a skip
+        // to B fails (its playlists never answer); seekTo(captured) acts on B (LOAD-06), whose
+        // item never exists: the seek is never issued and gives up by its limit. It stops B's
+        // load, fails B again and leaves the player in error (its rejection is the report), no
+        // load give-up follows, and the play loads A.
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        var outcomes: [StandardCommandLoadOutcome] = []
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib))
+        h.player.calls.removeAll()
+        XCTAssertTrue(h.loads.beginSeek(to: 30))
+        XCTAssertEqual(h.player.calls, [], "no wait to cancel: the seek acts on the player's own track (LOAD-06)")
+        XCTAssertNil(h.loads.hostFailure, "the seek is a command: the give-up's error ended")
+        XCTAssertTrue(h.loads.watchesLoads)
+        h.loads.seekTimedOut(issued: false, track: h.ib, message: "The native seek did not complete within 30000 ms.", keptPosition: 30)
+        XCTAssertEqual(h.player.calls, ["stop", "gaveUp standard_seek_timeout playbackError=false", "show A", "nowPlaying"])
+        XCTAssertEqual(h.loads.hostFailure?.code, "standard_seek_timeout")
+        XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib), "B failed again")
+        XCTAssertFalse(h.loads.watchesLoads, "no load give-up (prepareTimeoutMs, a playback error) after it")
+        XCTAssertEqual(h.loads.failedLoads.play(), h.ia, "the play loads A")
+    }
+
+    func testStandardSeekAndLoadLimitsAreIndependent() {
+        // Fourth review, B3: standardSeekTimeoutMs and prepareTimeoutMs set apart (Android:
+        // aSeekWithALimit*). A seek's wait has its own limits (StallWaitDriver with the seek's
+        // total; a seek not issued yet has no reading, only that total); the load it owns is not
+        // watched meanwhile, whatever prepareTimeoutMs (shorter or longer).
+        for (seekTotalMs, loadTotalMs) in [(3_000, 60_000), (120_000, 5_000)] {
+            var seek = StallWatch(stallTimeoutMs: 10_000, totalTimeoutMs: seekTotalMs, startedAt: 0)
+            let limit = Double(seekTotalMs) / 1000
+            XCTAssertEqual(seek.capVerdict(at: limit - 0.001), .wait)
+            XCTAssertEqual(seek.capVerdict(at: limit), .capExceeded, "the seek's own total: \(seekTotalMs) ms")
+            // Issued, its buffered position not growing: stallTimeoutMs, unless its total ends first.
+            XCTAssertEqual(seek.check(at: 0, readings: [0]), .wait)
+            XCTAssertEqual(seek.check(at: 10, readings: [0]), seekTotalMs <= 10_000 ? .capExceeded : .stalled)
+            var now: TimeInterval = 0
+            let watch = StandardLoadWatch(stallTimeoutMs: { 10_000 }, totalTimeoutMs: { loadTotalMs }, now: { now })
+            let b = NSObject()
+            for t in stride(from: 0.0, through: limit + 1, by: 0.5) {
+                now = t
+                XCTAssertNil(watch.check(StandardLoadObservation(item: ObjectIdentifier(b), phase: .loading, readings: [0], ownedElsewhere: true)),
+                             "the seek owns the load: prepareTimeoutMs (\(loadTotalMs) ms) does not end it at \(t) s")
+            }
+        }
+    }
+
+    func testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads() {
+        // Fourth review, B4 (Android: aSeekByDuringASkipsLoadIsRelativeToTheActiveTracksPosition):
+        // while B loads, the app reads A's position (3.134 s, ReportedTrackProgress), and seekBy
+        // is relative to it (the seek then acts on A, the skip cancelled), as crossfade's.
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.player.reportedPosition = 3.134
+        XCTAssertEqual(h.loads.seekTarget(by: 2), 5.134, accuracy: 1e-9)
+        XCTAssertEqual(h.loads.seekTarget(by: -10), 0, "not before the start")
     }
 
     func testStandardCommandLoadResultIsTheCommandsResolution() {
