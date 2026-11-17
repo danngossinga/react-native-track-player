@@ -1135,7 +1135,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
     }
 
     private suspend fun monitorActiveEngine() {
-        if (state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE || !playWhenReady) return
+        // While the next track preloads the current one still plays, and may end (as iOS's end
+        // observer, which also acts while preloading); the advance cancels the preload.
+        if (!playWhenReady ||
+            (state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE &&
+                state != AndroidPlaybackOrchestratorState.PRELOADING_NEXT)
+        ) return
         if (activeEngine.playbackState != Player.STATE_ENDED) return
         val endedIndex = currentIndex
         val endedPosition = activeEngine.positionMs

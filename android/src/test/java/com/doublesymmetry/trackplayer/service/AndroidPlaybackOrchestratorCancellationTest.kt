@@ -483,6 +483,40 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aTrackThatEndsWhileTheNextOnePreloadsAdvancesAsOnIos() = runTest {
+        // The next track's preload stalls (a seek near the end, a slow network) and the playing
+        // track ends meanwhile: the player moves on at once (iOS also does so while preloading),
+        // and a stalled next track is reported at the stall timeout, not left playing in silence.
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.prepareTimeoutMs = { 60_000L }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            engineB.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            orchestrator.play()
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.PRELOADING_NEXT, orchestrator.state)
+
+            // The track ends; the next one gets no data on the engine that now loads it either.
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            engineA.ended = true
+            advanceTimeBy(250L + 2 * ENGINE_WAIT_POLL_INTERVAL_MS)
+            runCurrent()
+            assertEquals("the end is acted on", AudioPlayerState.LOADING, orchestrator.playbackState)
+            assertEquals(1, orchestrator.currentIndex)
+            advanceTimeBy(10_000L)
+            runCurrent()
+            assertEquals(listOf("crossfade_prepare_timeout"), delegate.playbackErrors.map { it.first })
+            assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aStalledSkipLeavesThePlayerInErrorAsOnIos() = runTest {
         val engineA = FakeCrossfadeEngine("engineA")
         val engineB = FakeCrossfadeEngine("engineB")
