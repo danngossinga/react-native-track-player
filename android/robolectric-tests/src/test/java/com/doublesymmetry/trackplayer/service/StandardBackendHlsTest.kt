@@ -206,11 +206,18 @@ class StandardBackendHlsTest {
     fun whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack() {
         // Rule 13 (N1), as iOS's lock screen (the reported track at its last position, rate 0):
         // while C loads, the player the media session and the notification read (KotlinAudio's
-        // sessionPlayer, given to both) reports A's last position, duration and buffered
-        // position, not playing; once C is reported, the player's own values again.
+        // sessionPlayer, given to both) reports A's last position, duration (also in the
+        // notification's media metadata) and buffered position, not playing; its play-when-ready
+        // stays the player's (the foreground service follows it); once C is reported, the
+        // player's own values again.
         val backed = backed()
         val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
-        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(slowServer(), 3L)))
+        // C's playlists are slow too: while they load, C's window is ExoPlayer's placeholder
+        // (dynamic), for which KotlinAudio's notification metadata drops the player's duration.
+        val slowPlaylists = HlsTestServer(
+            LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS / 3, segmentDelayMs = STALL_TIMEOUT_MS / 3
+        ).also { servers += it }
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(slowPlaylists, 3L)))
         command { backed.backend.play() }
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
         val session = backed.player.sessionPlayer
@@ -225,6 +232,7 @@ class StandardBackendHlsTest {
         awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
         val positionOfA = backed.backend.positionMs
         var sawLoading = false
+        var sawPlaceholder = false
         val deadline = monotonicNowMs() + AWAIT_MS
         while (skip() == null) {
             if (monotonicNowMs() >= deadline) fail("timed out waiting for the skip to C to end")
@@ -232,22 +240,53 @@ class StandardBackendHlsTest {
             if (skip() != null) break
             if (exo.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING && backed.player.currentIndex == 2) {
                 sawLoading = true
+                if (exo.isCurrentMediaItemDynamic) sawPlaceholder = true
                 assertEquals("the session's position is A's last", positionOfA, session.currentPosition)
                 assertEquals(positionOfA, session.contentPosition)
                 assertEquals("the session's duration is A's", durationOfA, session.duration)
+                assertEquals(durationOfA, session.contentDuration)
                 assertTrue("the session's buffered position is A's", session.bufferedPosition >= positionOfA)
+                assertEquals(session.bufferedPosition, session.contentBufferedPosition)
+                assertEquals(session.bufferedPosition - positionOfA, session.totalBufferedDuration)
                 assertFalse("the session is not playing", session.isPlaying)
-                assertFalse("the session does not play when ready", session.playWhenReady)
                 assertTrue("the player itself goes on to play C", exo.playWhenReady)
+                assertTrue("play-when-ready stays the player's (the notification's ongoing flag)", session.playWhenReady)
+                assertEquals(
+                    "the notification's metadata duration is A's",
+                    durationOfA,
+                    backed.player.notificationManager.getMediaMetadataCompat().getLong(android.support.v4.media.MediaMetadataCompat.METADATA_KEY_DURATION)
+                )
             }
             Thread.sleep(CLOCK_TICK_MS)
         }
         assertTrue("C's load was seen", sawLoading)
+        assertTrue("C's placeholder window was seen", sawPlaceholder)
         assertTrue(skip()!!.isSuccess)
         awaitTrue("C plays") { exo.isPlaying }
         assertTrue("C's own: playing", session.isPlaying && session.playWhenReady)
         assertEquals("C's own duration", exo.duration, session.duration)
-        assertEquals("C's own position", exo.currentPosition, session.currentPosition)
+        val before = exo.currentPosition
+        val read = session.currentPosition
+        val after = exo.currentPosition
+        assertTrue("C's own position: $read within [$before, $after]", read in before..after)
+    }
+
+    @Test
+    fun aNewQueueWhileATrackLoadsReleasesTheSessionPlayerAtOnce() {
+        // The hold of the reported track ends with it: a cleared queue reports none, and the
+        // media session reads the player again at once (no player event follows an empty queue).
+        val backed = backed()
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(slowServer(), 3L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val session = backed.player.sessionPlayer as ReportedSessionPlayer
+        val skip = launchCommand { backed.backend.skip(2) }
+        awaitTrue("the session holds A while C loads") { backed.player.currentIndex == 2 && session.held != null }
+        backed.backend.clearQueue()
+        assertNull("released at once", session.held)
+        awaitTrue("the skip ends") { skip() != null }
+        assertEquals("cancelled", (skip()!!.exceptionOrNull() as RejectionException).code)
     }
 
     @Test

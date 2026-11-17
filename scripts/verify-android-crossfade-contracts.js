@@ -1058,13 +1058,18 @@ assert(
 // (ReportedSessionPlayer, held by the backend; StandardBackendHlsTest.whileATrackLoadsTheMedia
 // SessionAndTheNotificationReadTheReportedTrack on the real player, with the instance both read).
 // What the tests cannot reach: the real MediaSessionConnector (a stub in the Robolectric build)
-// invalidates its playback state, and PlayerNotificationManager re-posts, at these two events
-// (ExoPlayer 2.19.0's MediaSessionConnector.ComponentListener.onEvents, read with javap).
+// invalidates its playback state, and PlayerNotificationManager posts again, at
+// EVENT_IS_PLAYING_CHANGED (ExoPlayer 2.19.0's MediaSessionConnector.ComponentListener.onEvents
+// and PlayerNotificationManager.PlayerListener.onEvents, read with javap).
 {
   const sessionPlayer = read('android/src/main/java/com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt');
   const vendored = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
   assert(
-    sessionPlayer.includes('FlagSet.Builder().addAll(Player.EVENT_PLAY_WHEN_READY_CHANGED, Player.EVENT_IS_PLAYING_CHANGED).build()') &&
+    sessionPlayer.includes('FlagSet.Builder().add(Player.EVENT_IS_PLAYING_CHANGED).build()') &&
+      // Play-when-ready stays the player's: PlayerNotificationManager's ongoing flag (buffering or
+      // ready, and play-when-ready) drives MusicService's foreground service.
+      !sessionPlayer.includes('override fun getPlayWhenReady()') &&
+      musicService.includes('if (it.ongoing) {\n                        if (source.playWhenReady) {\n                            startForegroundIfNecessary()') &&
       sessionPlayer.includes('listeners.toList().forEach { it.onEvents(this, events) }') &&
       standardHooks.includes('sessionPlayer = { player -> ReportedSessionPlayer(player).also { analytics.sessionPlayer = it } }') &&
       musicService.includes('standardPlayerHooks(this@MusicService, analytics, { initialBitrateEstimate.bitsPerSecond }, { stallTimeout.milliseconds })') &&

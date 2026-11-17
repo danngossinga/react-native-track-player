@@ -216,7 +216,10 @@ Added fork surface:
   track is reported. The lock screen (iOS) and the media session and notification
   (Android) also show the active track's last position, duration and buffered
   position, not playing (before, Android's media session and notification read the
-  loading track's position, duration and playing state from the player).
+  loading track's position and duration from the player). Android keeps the
+  player's play-when-ready there (the notification's ongoing flag keeps the
+  foreground service), so its session shows buffering at that position, speed 0,
+  where iOS shows the lock screen paused (rate 0).
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek, and the standard
   backend's load; on iOS the stage before the asset is playable has no progress
