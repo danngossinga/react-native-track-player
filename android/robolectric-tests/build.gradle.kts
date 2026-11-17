@@ -66,9 +66,10 @@ tasks.named("preBuild") { dependsOn(librarySources) }
 dependencies {
     // The versions the library runs with (KotlinAudio v2.1.0 brings ExoPlayer 2.19.0).
     implementation("com.google.android.exoplayer:exoplayer:2.19.0")
-    // The library resolves 1.6.4 (KotlinAudio, React Native); 1.6.4 is not in this machine's
-    // Gradle 8 cache, so these tests run on 1.9.0. The library's own JVM tests (1.6.4) cover the
-    // ticket waits (select/onTimeout) that the orchestrator uses.
+    // The library resolves kotlinx-coroutines 1.6.4 (KotlinAudio, React Native). Here, declaring
+    // 1.6.4 resolves to 1.7.1 (another dependency asks for its BOM), and 1.7.1 is not in this
+    // machine's offline Gradle 8 cache (1.6.4 is), so these tests run on 1.9.0, which is. The
+    // library's own JVM tests (on 1.6.4) cover the ticket waits (select/onTimeout).
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
