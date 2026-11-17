@@ -340,6 +340,31 @@ class CrossfadeEngineHlsTest {
         }
     }
 
+    @Test
+    fun aSlowButSteadySeekIsNotAStall() {
+        // The segments the seek lands in come slowly: bytes arrive every 60 % of the stall timeout,
+        // but no full audio frame until the end (nothing buffered meanwhile). The seek's media bytes
+        // are its progress: it finishes, though the whole download outlasts the stall timeout.
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val engine = engine(stall)
+        val server = HlsTestServer(
+            LADDER,
+            segmentCount = 8,
+            stalledFrom = 8,
+            trickleFrom = 3,
+            trickleGapMs = slowStage(stall)
+        ).also { servers += it }
+        runBlocking(engineThread) {
+            engine.prepare(hlsItem(server), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall)
+        }
+        val seekedAtMs = monotonicNowMs()
+        val result = runBlocking(engineThread) {
+            runCatching { engine.seekTo(SEEK_TARGET_MS, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
+        }
+        assertTrue("a slow but steady seek finishes, got $result", result.isSuccess)
+        assertTrue("the seek's download outlasted the stall timeout", monotonicNowMs() - seekedAtMs > stall)
+    }
+
     private fun assertGivesUpAtTheStallTimeoutAndStopsLoading(
         engine: AndroidCrossfadeEngine,
         stalled: HlsTestServer,

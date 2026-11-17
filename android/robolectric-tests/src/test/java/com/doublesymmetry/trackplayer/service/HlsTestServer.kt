@@ -39,7 +39,14 @@ internal class HlsTestServer(
      */
     private val keyDelayMs: Long? = null,
     /** How long a served segment takes before its first byte. */
-    private val segmentDelayMs: Long = 0L
+    private val segmentDelayMs: Long = 0L,
+    /**
+     * Segments from this one on come slowly but steadily: the ID3 header, a pause of
+     * [trickleGapMs], a few bytes (less than an audio frame), another pause, then the rest.
+     * -1: none.
+     */
+    private val trickleFrom: Int = -1,
+    private val trickleGapMs: Long = 0L
 ) : AutoCloseable {
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
@@ -117,6 +124,8 @@ internal class HlsTestServer(
                         stallUntilClosed(connection)
                         return
                     }
+                    segment != null && trickleFrom in 0..segment ->
+                        respondInSteps(connection, adtsSegment(segment), "audio/aac")
                     segment != null -> {
                         Thread.sleep(segmentDelayMs)
                         val clear = adtsSegment(segment)
@@ -159,6 +168,24 @@ internal class HlsTestServer(
         }
     }
 
+    /** Headers and the ID3 tag, a pause, a few bytes, a pause, the rest (see [trickleFrom]). */
+    private fun respondInSteps(connection: Socket, bytes: ByteArray, type: String) {
+        val head = "HTTP/1.1 200 OK\r\nContent-Type: $type\r\nContent-Length: ${bytes.size}\r\n\r\n"
+        val id3 = ID3_TAG_BYTES
+        val few = TRICKLE_STEP_BYTES
+        connection.getOutputStream().apply {
+            write(head.toByteArray())
+            write(bytes, 0, id3)
+            flush()
+            Thread.sleep(trickleGapMs)
+            write(bytes, id3, few)
+            flush()
+            Thread.sleep(trickleGapMs)
+            write(bytes, id3 + few, bytes.size - id3 - few)
+            flush()
+        }
+    }
+
     private fun masterPlaylist(): String = buildString {
         append("#EXTM3U\n#EXT-X-VERSION:3\n")
         for ((name, bandwidth) in renditions) {
@@ -196,6 +223,10 @@ internal class HlsTestServer(
         private const val SAMPLE_RATE = 44_100
         private const val SAMPLES_PER_FRAME = 1_024
         private const val FRAME_PAYLOAD_BYTES = 32
+        /** The ID3 tag at the start of each segment (header and timestamp frame). */
+        private val ID3_TAG_BYTES = id3Timestamp(0L).size
+        /** Fewer bytes than one audio frame: they arrive, but no media can be read from them. */
+        private const val TRICKLE_STEP_BYTES = 7 + FRAME_PAYLOAD_BYTES - 1
 
         fun segmentName(index: Int) = "segment-%03d.aac".format(index)
 
