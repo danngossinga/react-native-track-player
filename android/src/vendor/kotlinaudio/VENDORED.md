@@ -28,8 +28,8 @@ section 4(b)); line numbers below include that notice.
   resources are now merged into this library's namespace).
 - `java/com/doublesymmetry/kotlinaudio/models/PlayerHooks.kt`: new file, the hooks below
   (defaults keep upstream behaviour), including `mediaTransferListener` and `playlistTransferListener`
-  (made for each item when its source is built: that item's media requests' and playlist requests'
-  bytes, its load's progress for the host's load watch).
+  (made for each source when it is built, for its ExoPlayer `MediaItem`: that source's media
+  requests' and playlist requests' bytes, its load's progress for the host's load watch).
 - `players/BaseAudioPlayer.kt`:
   - `:1-4` the notice;
   - `:39` import of `PlayerHooks`; `:70` import of `HlsDataSourceFactory`;
@@ -41,14 +41,14 @@ section 4(b)); line numbers below include that notice.
     rule (pause, then resume) itself;
   - `:241` `hooks.configureExoPlayer(this)` before the ExoPlayer is built (the host sets a track
     selector whose selections start each track from `initialBitrateEstimateBps`);
-  - `:500-509` the item's HTTP configuration (user agent, redirects, headers) becomes a
+  - `:502-511` the item's HTTP configuration (user agent, redirects, headers) becomes a
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream;
-  - `:515-547` media requests and the rest are split: the media requests (HLS segments, DASH
+  - `:517-549` media requests and the rest are split: the media requests (HLS segments, DASH
     and SmoothStreaming chunks, a progressive file) report their bytes to the listener
-    `hooks.mediaTransferListener` makes for the item, the playlists, manifests and keys to the one
-    `hooks.playlistTransferListener` makes (HLS through an `HlsDataSourceFactory` by data type):
+    `hooks.mediaTransferListener` makes for the source's `MediaItem`, the playlists, manifests and
+    keys to the one `hooks.playlistTransferListener` makes (HLS through an `HlsDataSourceFactory` by data type):
     the host counts playlists as progress until the first segment is asked for, as the crossfade
     engines, and only the requests of the item that loads (a previous item's request still in
     flight is not the next load's progress);
@@ -56,10 +56,12 @@ section 4(b)); line numbers below include that notice.
     seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
     path does: the player stops loading at once and goes to the error state with the host's error
     (reported as a playback error for a load no command waits for);
-  - `:436-438` `isHostFailure()` (new) and `:772-774` in `onEvents`: the play-when-ready change
+  - `:436-438` `isHostFailure()` (new) and `:774-776` in `onEvents`: the play-when-ready change
     ExoPlayer reports a message after `failLoad`'s stop no longer turns that error into PAUSED
     (upstream: any pause while not stopped); the player stays in the host's error until the next
-    command (iOS: `hostFailure`). A pause after an ExoPlayer error is upstream as-is.
+    command (iOS: `hostFailure`). A pause after an ExoPlayer error is upstream as-is;
+  - `:443-444` in `clear()`: clearing the queue ends a host give-up's error (IDLE: no item, no
+    error), as iOS's `clearQueue` clears `hostFailure`.
 - `models/PlaybackError.kt`: `:1-4` the notice; `:10-11` `fromHost` (new, default false): the
   error's code is the host's own (`crossfade_prepare_timeout`, `standard_seek_timeout`), emitted
   without the `android-` prefix of ExoPlayer's codes.

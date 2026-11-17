@@ -47,8 +47,8 @@ internal class StandardLoadWatch(
     private val stallTimeoutMs: () -> Long,
     private val totalTimeoutMs: () -> Long,
     private val nowMs: () -> Long = ::monotonicNowMs,
-    /** A load of the item starts being watched (the progress counter's per-load reset: [LoadedBytes.startLoad]). */
-    private val onLoadStart: (item: Any) -> Unit = {}
+    /** A load starts being watched (the progress counter's per-load reset: [StandardPlayerAnalytics.startLoad]). */
+    private val onLoadStart: () -> Unit = {}
 ) {
     private var readyItem: Any? = null
     private var watchedItem: Any? = null
@@ -100,7 +100,7 @@ internal class StandardLoadWatch(
                 watchedItem = item
                 lastStallTimeoutMs = it.stallTimeoutMs
                 lastTotalTimeoutMs = it.totalTimeoutMs
-                onLoadStart(item)
+                onLoadStart()
             }
         val verdict = current.check(nowMs(), observed.readings)
         if (verdict == StallVerdict.WAIT) return null
@@ -199,11 +199,13 @@ internal fun standardLoadGiveUpMessage(verdict: StallVerdict, stallTimeoutMs: Lo
  * slow proxy answering the playlists must not fail a healthy track); after it, the player reloads
  * them when it falls back to another rendition, which is not progress.
  *
- * Progress belongs to one load: [startLoad] names the item that loads, and each item's sources
- * report through that item's own listeners ([media], [playlists]: the player makes them when it
- * builds the item's source). A transfer of another item (the previous track's request still in
- * flight on a loader thread when the next one starts) is not this load's progress and does not
- * end its playlists' count.
+ * Progress belongs to one load: [startLoad] names the item that loads (ExoPlayer's MediaItem of
+ * the source it loads), and each source reports through its own item's listeners ([media],
+ * [playlists]: the player makes them when it builds the source). A transfer of another item (the
+ * previous track's request still in flight on a loader thread when the next one starts) is not
+ * this load's progress and does not end its playlists' count. ExoPlayer's item, not KotlinAudio's
+ * AudioItem: new metadata for a track (replaceItem) gives KotlinAudio's queue a new AudioItem
+ * while ExoPlayer keeps loading the source built for the first one.
  */
 internal class LoadedBytes {
     private class Load(val item: Any) {

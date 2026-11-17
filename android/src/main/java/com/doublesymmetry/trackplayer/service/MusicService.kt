@@ -534,7 +534,7 @@ class MusicService : HeadlessJsTaskService() {
                     loadWatch = StandardLoadWatch(
                         stallTimeoutMs = { stallTimeout.milliseconds },
                         totalTimeoutMs = { prepareTimeout.milliseconds },
-                        onLoadStart = { item -> standardAnalytics[binding.player]?.loadedBytes?.startLoad(item) }
+                        onLoadStart = { standardAnalytics[binding.player]?.startLoad() }
                     ),
                     initiallyAuthoritative = initiallyAuthoritative
                 ).also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }

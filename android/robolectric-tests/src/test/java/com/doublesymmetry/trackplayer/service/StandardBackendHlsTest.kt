@@ -187,6 +187,21 @@ class StandardBackendHlsTest {
         assertEquals(AudioPlayerState.READY, backed.backend.playbackState)
     }
 
+    @Test
+    fun clearingTheQueueAfterAGiveUpEndsTheError() {
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(stalled, 1L)))
+        command { backed.backend.play() }
+        awaitTrue("a give-up", AWAIT_MS) { backed.gaveUpAtMs.isNotEmpty() }
+        backed.assertStaysInError(PREPARE_TIMEOUT_CODE)
+        // iOS: clearQueue clears hostFailure; no track, no error.
+        backed.backend.clearQueue()
+        pump(STALL_TIMEOUT_MS)
+        assertEquals(AudioPlayerState.IDLE, backed.backend.playbackState)
+        assertNull(backed.backend.playbackError)
+    }
+
     // Playlists are a load's progress only until its first segment is asked for: a segment that
     // fails makes the player fall back to another rendition's playlist, which is not progress.
     // Through KotlinAudio's own HLS source (its media and playlist factories).
@@ -206,6 +221,26 @@ class StandardBackendHlsTest {
         )
         assertTrue("the player fell back to another rendition: ${failing.segmentRenditions()}", failing.segmentRenditions().toSet().size > 1)
         backed.assertStaysInError(PREPARE_TIMEOUT_CODE)
+    }
+
+    // A load's progress is the requests of the source ExoPlayer loads: new metadata for a track
+    // (replace) gives KotlinAudio's queue another item, while ExoPlayer keeps loading the source
+    // built for the first one.
+
+    @Test
+    fun aTrackWhoseMetadataWasReplacedStillCountsItsSlowPlaylists() {
+        val slow = HlsTestServer(LADDER, segmentCount = 8, stalledFrom = 8, playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4)
+            .also { servers += it }
+        val backed = backed()
+        val first = item(slow, 1L)
+        backed.backend.add(listOf(first))
+        backed.backend.replace(0, first.copy(title = "New title"))
+        val startedAtMs = monotonicNowMs()
+        command { backed.backend.play() }
+        awaitTrue("the track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        assertTrue("the playlists took longer than the stall timeout", monotonicNowMs() - startedAtMs > STALL_TIMEOUT_MS)
+        assertTrue("no give-up", backed.gaveUpAtMs.isEmpty())
+        assertNull(backed.backend.playbackError)
     }
 
     @Test
@@ -267,7 +302,7 @@ class StandardBackendHlsTest {
             loadWatch = StandardLoadWatch(
                 stallTimeoutMs = { STALL_TIMEOUT_MS },
                 totalTimeoutMs = { PREPARE_TIMEOUT_MS },
-                onLoadStart = { item -> analytics.loadedBytes.startLoad(item) }
+                onLoadStart = analytics::startLoad
             ),
             initiallyAuthoritative = true
         ).also { it.startLoadWatch(Handler(Looper.getMainLooper())) }

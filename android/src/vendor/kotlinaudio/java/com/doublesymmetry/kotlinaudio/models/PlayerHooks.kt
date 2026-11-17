@@ -1,6 +1,7 @@
 package com.doublesymmetry.kotlinaudio.models
 
 import com.google.android.exoplayer2.ExoPlayer
+import com.google.android.exoplayer2.MediaItem
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
@@ -25,11 +26,11 @@ class PlayerHooks(
      */
     val hostOwnsAudioFocus: Boolean = false,
     /**
-     * The listener of an item's media requests (segments, chunks, a progressive file), not of its
-     * playlists, manifests or keys, made when the item's source is built: the host's measure of
-     * that item's load progress. Null: none.
+     * The listener of a source's media requests (segments, chunks, a progressive file), not of its
+     * playlists, manifests or keys, made when the source is built, for the ExoPlayer [MediaItem]
+     * it plays: the host's measure of that source's load progress. Null: none.
      */
-    val mediaTransferListener: ((AudioItem) -> TransferListener)? = null,
-    /** The listener of an item's playlist, manifest and key requests (null: none). */
-    val playlistTransferListener: ((AudioItem) -> TransferListener)? = null
+    val mediaTransferListener: ((MediaItem) -> TransferListener)? = null,
+    /** The listener of a source's playlist, manifest and key requests (null: none). */
+    val playlistTransferListener: ((MediaItem) -> TransferListener)? = null
 )

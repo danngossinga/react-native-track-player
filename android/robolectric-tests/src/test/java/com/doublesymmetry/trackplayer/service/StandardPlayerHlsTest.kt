@@ -382,7 +382,7 @@ class StandardPlayerHlsTest {
         configureStandardExoPlayer(builder, context, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, analytics)
         val player = builder.build().also { players += it }
         val watched = WatchedPlayer(player, analytics)
-        val watch = StandardLoadWatch(stallTimeoutMs = { STALL_TIMEOUT_MS }, totalTimeoutMs = { PREPARE_TIMEOUT_MS }, onLoadStart = bytes::startLoad)
+        val watch = StandardLoadWatch(stallTimeoutMs = { STALL_TIMEOUT_MS }, totalTimeoutMs = { PREPARE_TIMEOUT_MS }, onLoadStart = { player.currentMediaItem?.let(bytes::startLoad) })
         // As KotlinAudioPlaybackBackend.startLoadWatch: the player's events and one timer while a
         // load is watched; a waited seek owns its loading.
         watched.driver = StandardLoadDriver(

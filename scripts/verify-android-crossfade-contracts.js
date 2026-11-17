@@ -871,8 +871,10 @@ assert(
       // Each item's own listeners: progress belongs to the load of the item that loads.
       standardHooks.includes('mediaTransferListener = { item -> analytics.loadedBytes.media(item) },') &&
       standardHooks.includes('playlistTransferListener = { item -> analytics.loadedBytes.playlists(item) },') &&
-      vendored.includes('val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(audioItem)?.let { listener ->') &&
-      vendored.includes('val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(audioItem)?.let { listener ->') &&
+      vendored.includes('val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(mediaItem)?.let { listener ->') &&
+      vendored.includes('val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(mediaItem)?.let { listener ->') &&
+      // The item ExoPlayer loads (its sources' MediaItem), not KotlinAudio's queue entry (replaceItem).
+      read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('player?.currentMediaItem?.let(loadedBytes::startLoad)') &&
       watchSource.includes('private fun loadOf(item: Any): Load? = current.get()?.takeIf { it.item === item }') &&
       ['thePreviousTracksSegmentRequestDoesNotEndTheNextLoadsPlaylistProgress', 'thePreviousTracksBytesAreNotTheNextLoadsProgress']
         .every((t) => read('android/src/test/java/com/doublesymmetry/trackplayer/service/LoadedBytesTest.kt').includes(`fun ${t}()`)) &&
@@ -881,16 +883,18 @@ assert(
       vendored.includes('if (!player.playWhenReady && playerState != AudioPlayerState.STOPPED && !isHostFailure()) {') &&
       vendored.includes('playerState == AudioPlayerState.ERROR && playbackError?.fromHost == true') &&
       standardBackend.includes('if (it == AudioPlayerState.ERROR && player.playbackError?.fromHost == true) AudioPlayerState.STOPPED else it') &&
+      vendored.includes('exoPlayer.clearMediaItems()\n        // Fork: a host give-up\'s error ends with the queue (no item, no error).\n        if (isHostFailure()) playerState = AudioPlayerState.IDLE') &&
       // The real vendored player and backend against a stalled server.
       read('android/robolectric-tests/build.gradle.kts').includes('from("${rootProject.projectDir}/../src/vendor/kotlinaudio/java")') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/KotlinAudioPlaybackBackend.kt",') &&
       ['aStalledTrackTappedWhileAnotherPlaysEndsInErrorWithThePreviousTrackActive', 'aStalledFirstTrackEndsInErrorWithNoActiveTrack',
         'aStalledSeekWhilePlayingEndsInErrorAtItsTarget', 'theNextCommandEndsTheErrorASeekLoadsTheTrackAgainAtItsTarget',
-        'failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions']
+        'failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions', 'clearingTheQueueAfterAGiveUpEndsTheError',
+        'aTrackWhoseMetadataWasReplacedStillCountsItsSlowPlaylists']
         .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)) &&
       hlsTest.includes('fun failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions()') &&
       vendored.includes('MediaType.HLS -> createHlsSource(mediaItem, playlistFactory, mediaFactory)') &&
-      musicService.includes('onLoadStart = { item -> standardAnalytics[binding.player]?.loadedBytes?.startLoad(item) }') &&
+      musicService.includes('onLoadStart = { standardAnalytics[binding.player]?.startLoad() }') &&
       ['slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyStandardTrackGiveUp', 'slowPlaylistsCountAgainForTheNextStandardTrack']
         .every((t) => hlsTest.includes(`fun ${t}()`)) &&
       musicService.includes('totalTimeoutMs = { prepareTimeout.milliseconds }') &&

@@ -357,6 +357,11 @@ internal class StandardPlayerAnalytics(
     /** The bytes the player downloads (its HTTP sources count them): a load's progress. */
     val loadedBytes = LoadedBytes()
 
+    /** A load starts: the progress of the item ExoPlayer loads now (its sources' MediaItem). */
+    fun startLoad() {
+        player?.currentMediaItem?.let(loadedBytes::startLoad)
+    }
+
     init {
         addListener(transitions)
     }

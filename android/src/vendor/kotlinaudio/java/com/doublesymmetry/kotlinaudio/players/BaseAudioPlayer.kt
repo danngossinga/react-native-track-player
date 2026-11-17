@@ -440,6 +440,8 @@ abstract class BaseAudioPlayer internal constructor(
     @CallSuper
     open fun clear() {
         exoPlayer.clearMediaItems()
+        // Fork: a host give-up's error ends with the queue (no item, no error).
+        if (isHostFailure()) playerState = AudioPlayerState.IDLE
     }
 
     /**
@@ -512,12 +514,12 @@ abstract class BaseAudioPlayer internal constructor(
             }
         }
 
-        // Fork: this item's media requests (not playlists, manifests or keys) report their bytes
-        // to the host, through listeners of this item.
-        val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(audioItem)?.let { listener ->
+        // Fork: this source's media requests (not playlists, manifests or keys) report their bytes
+        // to the host, through listeners of its MediaItem.
+        val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.invoke(mediaItem)?.let { listener ->
             DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
         } ?: factory
-        val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(audioItem)?.let { listener ->
+        val playlistFactory: DataSource.Factory = hooks.playlistTransferListener?.invoke(mediaItem)?.let { listener ->
             DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
         } ?: factory
 
