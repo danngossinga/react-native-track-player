@@ -713,7 +713,7 @@ assert(
       (backendSource.match(/giveUps\.seekGaveUp\(/g) || []).length === 2 &&
       (backendSource.match(/keptPosition: request\.position\n/g) || []).length === 2 &&
       (backendSource.match(/report: report, failsLoad: false\)/g) || []).length === 2 &&
-      backendSource.includes('return giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)') &&
+      backendSource.includes('position: giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime),') &&
       backendSource.includes('return giveUps.clear()') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
       giveUp.includes('player.stop()\n        onLoadGaveUp(player, report)') &&
@@ -762,7 +762,7 @@ assert(
       backendSource.includes('loadActiveTrackAfterFailedLoad()\n            reloadAtKeptPosition(kept)\n            requested.request(true)\n            player.play()') &&
       // A track is reported once it loaded (deferred), both events, and the lock screen points
       // back to the active track after a failed load.
-      player.includes('!backend.itemMoved(item, lastPosition: lastPosition ?? 0) {') &&
+      player.includes('!backend.itemMoved(item, lastItem: lastItem, lastPosition: lastPosition ?? 0) {') &&
       player.includes('func handleStandardActiveTrackChanged(source: QueuedAudioPlayer, index: Int?, lastTrack: Track?, lastIndex: Int?, lastPosition: Double) {') &&
       section(player, 'private func emitStandardActiveTrackChanged(', '\n    }\n').includes('emit(event: EventType.PlaybackTrackChanged, body: b)') &&
       section(player, 'func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {', '\n    }\n').includes('Metadata.update(for: source, with: track.toObject())') &&
@@ -835,6 +835,40 @@ assert(
       ['player.event.stateChange.addListener(listener) { _ in wake.signal() }', 'player.event.updateDuration.addListener(listener) { _ in wake.signal() }', 'player.event.seek.addListener(listener) { _ in wake.signal() }']
         .every((line) => section(standardBackend, 'private func waitForStandardPlaybackActivation(', '\n}\n').includes(line)),
     'iOS standard seek and readiness waits must sample every stallTimeoutMs / 10 and wake at player events, as Android.'
+  );
+}
+
+// Rule 13: while a standard track loads, every reader agrees with the reported active track
+// (ReportedTrackProgress, ReportedNowPlaying: tested in PlaybackBackend.swift); the wiring the
+// XCTest target cannot reach.
+{
+  const metadata = read('ios/RNTrackPlayer/Utils/Metadata.swift');
+  const secondElapse = section(player, 'func handleAudioPlayerSecondElapse(source: QueuedAudioPlayer, seconds: Double) {', '\n    }\n');
+  const nowPlayingHandler = section(player, 'func handleStandardNowPlaying(source: QueuedAudioPlayer, index: Int?, held: Bool) {', '\n    }\n');
+  assert(
+    ['var position: Double { return reportedProgress().position }', 'var duration: Double { return reportedProgress().duration }', 'var bufferedPosition: Double { return reportedProgress().buffered }']
+      .every((line) => standardBackend.includes(line)) &&
+      section(standardBackend, 'private func reportedProgress() -> TrackProgress {', '\n    }\n').includes('reported: failedLoads.reported,') &&
+      section(standardBackend, 'func itemMoved(', '\n    }\n').includes('progress.left((lastItem as AnyObject?).map(ObjectIdentifier.init), position: lastPosition)') &&
+      section(standardBackend, 'func itemMoved(', '\n    }\n').includes('followNowPlaying()') &&
+      section(standardBackend, 'private func observeLoad() -> StandardLoadObservation {', 'private func followNowPlaying()').includes('_ = reportedProgress()\n        followNowPlaying()') &&
+      section(standardBackend, 'private func report(_ change: FailedLoadRule.Report', '\n    }\n').includes('followNowPlaying()') &&
+      section(standardBackend, 'private func followNowPlaying() {', '\n    }\n').includes('nowPlaying.follow(reported: failedLoads.reported, playerItem: current)') &&
+      section(standardBackend, 'func dispose() throws {', '\n    }\n').includes('(player.nowPlayingInfoController as? StandardNowPlayingInfoController)?.isHeld = false') &&
+      ['func set(keyValue: NowPlayingInfoKeyValue) {\n        if !isHeld { base.set(keyValue: keyValue) }', 'func set(keyValues: [NowPlayingInfoKeyValue]) {\n        if !isHeld { base.set(keyValues: keyValues) }', 'func setWithoutUpdate(keyValues: [NowPlayingInfoKeyValue]) {\n        if !isHeld { base.setWithoutUpdate(keyValues: keyValues) }']
+        .every((line) => standardBackend.includes(line)) &&
+      (player.match(/QueuedAudioPlayer\(nowPlayingInfoController: StandardNowPlayingInfoController\(\)\)/g) || []).length === 2 &&
+      !/QueuedAudioPlayer\(\)/.test(player) &&
+      player.includes('onNowPlaying: { [weak self] source, index, held in\n                    self?.handleStandardNowPlaying(source: source, index: index, held: held)') &&
+      nowPlayingHandler.includes('gate.isHeld = held && autoUpdateNowPlayingInfo') &&
+      nowPlayingHandler.includes('Metadata.update(for: source, with: metadata, through: gate.direct)') &&
+      nowPlayingHandler.includes('metadata["elapsedTime"] = backend?.position ?? source.currentTime') &&
+      metadata.includes('let target = controller ?? player.nowPlayingInfoController') &&
+      !metadata.includes('player?.nowPlayingInfoController') &&
+      secondElapse.includes('"position": backend.position,') &&
+      secondElapse.includes('"track": backend.currentIndex,') &&
+      section(player, 'public func updateMetadata(for trackIndex: NSNumber', '\n    }\n').includes('} else if !useOrchestratedCrossfade, activePlaybackBackend.currentIndex == index {\n            Metadata.update(for: player, with: metadata, through: direct)'),
+    'iOS standard readers (progress, events, lock screen) must agree with the reported active track while another loads, as Android.'
   );
 }
 

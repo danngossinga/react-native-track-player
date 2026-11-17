@@ -206,3 +206,79 @@ internal fun indexToPlayAfterFailedLoad(currentIndex: Int, failedIndex: Int?, co
     if (currentIndex in 0 until count) return currentIndex
     return failedIndex?.takeIf { it in 0 until count }
 }
+
+/** A track's progress as the app reads it (position, duration, buffered), in milliseconds. */
+internal data class TrackProgress(val positionMs: Long, val durationMs: Long, val bufferedMs: Long) {
+    companion object {
+        val NONE = TrackProgress(0L, 0L, 0L)
+    }
+}
+
+/**
+ * The progress every reader sees (getters, progress events): the reported track's, as the active
+ * track itself (monorepo rule 13: readers agree with getActiveTrack; iOS: the same
+ * `ReportedTrackProgress`). While the player is on the reported track, its live values, kept;
+ * while another track loads (or failed to load), the reported track's as the player left it (its
+ * last position, its duration, what it had buffered); with no reported track, none (zeros).
+ */
+internal class ReportedTrackProgress {
+    private var item: Any? = null
+    private var last = TrackProgress.NONE
+
+    /** What the app reads now: [live] when the player is on [reported], else what it had. */
+    fun read(reported: Any?, playerItem: Any?, live: TrackProgress): TrackProgress {
+        if (playerItem === reported) {
+            item = reported
+            last = live
+            return live
+        }
+        return if (reported != null && item === reported) last else TrackProgress.NONE
+    }
+
+    /** The player left [item] at [positionMs] (its item change): that track's last position. */
+    fun left(item: Any?, positionMs: Long) {
+        if (item == null || item !== this.item) return
+        last = last.copy(positionMs = positionMs, bufferedMs = maxOf(last.bufferedMs, positionMs))
+    }
+
+    /** [old] was replaced by [new] for the same track (new metadata): it keeps what it had. */
+    fun replaced(old: Any?, new: Any?) {
+        if (old != null && item === old) item = new
+    }
+}
+
+/**
+ * What the notification (iOS: the lock screen) shows of the standard player: the reported track,
+ * as getActiveTrack (monorepo rule 13; iOS: the same `ReportedNowPlaying`). While another track
+ * loads (or failed to load) it is held on the reported one, shown again at every move of the
+ * player (which shows its own item); once the player is on the reported track again (it loaded,
+ * or play reloads it), or none is reported, it is released. No reported track: the player's own.
+ */
+internal class ReportedNowPlaying {
+    /** Show [item] (null: the player's own item); [held]: the player's own updates are held. */
+    data class Change(val item: Any?, val held: Boolean)
+
+    private var heldItem: Any? = null
+    private var heldOn: Any? = null
+    private var held = false
+
+    /** Whether the player's own now-playing updates are held now. */
+    val isHeld: Boolean
+        get() = held
+
+    /** The reported track and the player's item now: what to show, null when nothing changes. */
+    fun follow(reported: Any?, playerItem: Any?): Change? {
+        if (reported != null && playerItem !== reported) {
+            if (held && heldItem === reported && heldOn === playerItem) return null
+            held = true
+            heldItem = reported
+            heldOn = playerItem
+            return Change(reported, held = true)
+        }
+        if (!held) return null
+        held = false
+        heldItem = null
+        heldOn = null
+        return Change(reported, held = false)
+    }
+}

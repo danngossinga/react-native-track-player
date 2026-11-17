@@ -1989,6 +1989,88 @@ final class FailedLoadRule {
     }
 }
 
+/// A track's progress as the app reads it (position, duration, buffered), in seconds.
+struct TrackProgress: Equatable {
+    let position: Double
+    let duration: Double
+    let buffered: Double
+
+    static let none = TrackProgress(position: 0, duration: 0, buffered: 0)
+}
+
+/// The progress every reader sees (getters, progress events): the reported track's, as the
+/// active track itself (monorepo rule 13: readers agree with getActiveTrack; Android: the same
+/// `ReportedTrackProgress`). While the player is on the reported track, its live values, kept;
+/// while another track loads (or failed to load), the reported track's as the player left it (its
+/// last position, its duration, what it had buffered); with no reported track, none (zeros).
+final class ReportedTrackProgress {
+    // Read by the module's read queue and the player's event queue too (getters, progress events).
+    private let lock = NSLock()
+    private var item: ObjectIdentifier?
+    private var last = TrackProgress.none
+
+    /// What the app reads now: `live` when the player is on `reported`, else what it had.
+    func read(reported: ObjectIdentifier?, playerItem: ObjectIdentifier?, live: TrackProgress) -> TrackProgress {
+        lock.lock()
+        defer { lock.unlock() }
+        if playerItem == reported {
+            item = reported
+            last = live
+            return live
+        }
+        return reported != nil && item == reported ? last : .none
+    }
+
+    /// The player left `item` at `position` (its item change): that track's last position.
+    func left(_ item: ObjectIdentifier?, position: Double) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let item = item, item == self.item else { return }
+        last = TrackProgress(position: position, duration: last.duration, buffered: max(last.buffered, position))
+    }
+
+    /// `old` was replaced by `new` for the same track (new metadata): it keeps what it had.
+    func replaced(_ old: ObjectIdentifier?, with new: ObjectIdentifier?) {
+        lock.lock()
+        defer { lock.unlock() }
+        if old != nil, item == old { item = new }
+    }
+}
+
+/// What the lock screen (Android: the notification) shows of the standard player: the reported
+/// track, as getActiveTrack (monorepo rule 13; Android: the same `ReportedNowPlaying`). While
+/// another track loads (or failed to load) it is held on the reported one, shown again at every
+/// move of the player (which shows its own item); once the player is on the reported track again
+/// (it loaded, or play reloads it), or none is reported, it is released. No reported track: the
+/// player's own. Main.
+final class ReportedNowPlaying {
+    /// Show `item` (nil: the player's own item); `held`: the player's own updates are held.
+    struct Change: Equatable {
+        let item: ObjectIdentifier?
+        let held: Bool
+    }
+
+    private var heldItem: ObjectIdentifier?
+    private var heldOn: ObjectIdentifier?
+    private(set) var isHeld = false
+
+    /// The reported track and the player's item now: what to show, nil when nothing changes.
+    func follow(reported: ObjectIdentifier?, playerItem: ObjectIdentifier?) -> Change? {
+        if let reported = reported, playerItem != reported {
+            if isHeld, heldItem == reported, heldOn == playerItem { return nil }
+            isHeld = true
+            heldItem = reported
+            heldOn = playerItem
+            return Change(item: reported, held: true)
+        }
+        guard isHeld else { return nil }
+        isHeld = false
+        heldItem = nil
+        heldOn = nil
+        return Change(item: reported, held: false)
+    }
+}
+
 /// A standard load or seek given up: the error the player is in until the next command (nil once
 /// a command acted), and, for a seek, its target, which stays the position (SwiftAudioEx's stop
 /// resets its own) until the track loads again there. As a failed crossfade seek and Android's

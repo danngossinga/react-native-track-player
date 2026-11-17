@@ -165,6 +165,11 @@ internal class KotlinAudioPlaybackBackend(
         { _, _, _, _ -> },
     /** A load failed: the active track's index (null: none), for the notification to show it again. */
     private val onLoadFailed: (activeIndex: Int?) -> Unit = {},
+    /**
+     * What the notification shows ([ReportedNowPlaying]): the reported track's index (null: the
+     * player's own item), and whether the player's own updates are held (another track loads).
+     */
+    private val onNowPlaying: (index: Int?, held: Boolean) -> Unit = { _, _ -> },
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -186,6 +191,10 @@ internal class KotlinAudioPlaybackBackend(
      * previous one is the active track.
      */
     private val failedLoads = FailedLoadRule()
+    /** What the progress readers see: the reported track's (rule 13). */
+    private val progress = ReportedTrackProgress()
+    /** What the notification shows: the reported track (rule 13). */
+    private val nowPlaying = ReportedNowPlaying()
     private var observedItem: Any? = null
     /** The position of the track the player left at its last item change (the event's lastPosition). */
     private var lastItemPositionMs = 0L
@@ -215,12 +224,23 @@ internal class KotlinAudioPlaybackBackend(
         }
     override val playWhenReady: Boolean
         get() = logicalPlaybackState.playWhenReady(player.playWhenReady)
+    // The reported track's progress, as currentIndex (rule 13): while another track loads, the
+    // reported one's as the player left it (ReportedTrackProgress).
     override val positionMs: Long
-        get() = logicalPlaybackState.positionMs(player.position)
+        get() = reportedProgress().positionMs
     override val durationMs: Long
-        get() = logicalPlaybackState.durationMs(player.duration)
+        get() = reportedProgress().durationMs
     override val bufferedMs: Long
-        get() = logicalPlaybackState.bufferedMs(player.bufferedPosition)
+        get() = reportedProgress().bufferedMs
+
+    /** The player's own item's progress (a seek, a backend switch's snapshot act on that item). */
+    private fun liveProgress() = TrackProgress(
+        logicalPlaybackState.positionMs(player.position),
+        logicalPlaybackState.durationMs(player.duration),
+        logicalPlaybackState.bufferedMs(player.bufferedPosition)
+    )
+
+    private fun reportedProgress(): TrackProgress = progress.read(failedLoads.reported, player.currentItem, liveProgress())
     override val volume: Float
         get() = player.volume
     override val rate: Float
@@ -239,7 +259,8 @@ internal class KotlinAudioPlaybackBackend(
             queueIds = queue.map { it.track.queueId.toString() },
             activeIndex = index,
             activeTrackId = index?.let { queue[it].track.queueId.toString() },
-            positionMs = positionMs.coerceAtLeast(0L),
+            // The player's own item and its position (index and position of the same track).
+            positionMs = liveProgress().positionMs.coerceAtLeast(0L),
             playWhenReady = playWhenReady,
             volume = player.volume,
             rate = player.playbackSpeed,
@@ -443,7 +464,10 @@ internal class KotlinAudioPlaybackBackend(
                 newPosition: com.google.android.exoplayer2.Player.PositionInfo,
                 reason: Int
             ) {
-                if (oldPosition.mediaItemIndex != newPosition.mediaItemIndex) lastItemPositionMs = oldPosition.positionMs
+                if (oldPosition.mediaItemIndex != newPosition.mediaItemIndex) {
+                    lastItemPositionMs = oldPosition.positionMs
+                    progress.left(player.items.getOrNull(oldPosition.mediaItemIndex), oldPosition.positionMs)
+                }
             }
         })
         val watch = loadWatch ?: return
@@ -462,6 +486,18 @@ internal class KotlinAudioPlaybackBackend(
         }
         return standardLoadObservation(exo, logicalItem, analytics()?.loadedBytes, ownedElsewhere = seekGate.isWaiting)
             .also(::followLoad)
+            .also {
+                // At every player event: the reported track's progress is kept while the player
+                // is on it, and the notification follows the reported track.
+                reportedProgress()
+                followNowPlaying()
+            }
+    }
+
+    /** The notification shows the reported track ([ReportedNowPlaying]); only the authoritative backend's. */
+    private fun followNowPlaying() {
+        if (!isAuthoritative || disposed || playerReleased) return
+        nowPlaying.follow(failedLoads.reported, player.currentItem)?.let { onNowPlaying(indexOfItem(it.item), it.held) }
     }
 
     /** Feeds [failedLoads]: the player's item changes, when it is ready, and a player error. */
@@ -542,11 +578,13 @@ internal class KotlinAudioPlaybackBackend(
         val change = failedLoads.failed()
         change?.let(::report)
         if (failedLoads.isPending(player.currentItem)) onLoadFailed(indexOfItem(failedLoads.reported))
+        followNowPlaying()
     }
 
     private fun report(change: FailedLoadRule.Report, lastIndex: Int? = indexOfItem(change.from)) {
         val lastItem = change.from as? TrackAudioItem
         onActiveTrackChanged(indexOfItem(change.to), lastIndex, lastItem, lastItemPositionMs)
+        followNowPlaying()
     }
 
     /**
@@ -666,7 +704,10 @@ internal class KotlinAudioPlaybackBackend(
 
     override fun replace(index: Int, item: TrackAudioItem) {
         // New metadata for the same track: it keeps its place in the rule.
-        player.items.getOrNull(index)?.let { failedLoads.replaced(it, item) }
+        player.items.getOrNull(index)?.let {
+            failedLoads.replaced(it, item)
+            progress.replaced(it, item)
+        }
         if (observedItem === player.items.getOrNull(index)) observedItem = item
         player.replaceItem(index, item)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })

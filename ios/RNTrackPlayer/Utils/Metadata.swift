@@ -13,8 +13,11 @@ import SwiftAudioEx
 struct Metadata {
     private static var currentImageTask: URLSessionDataTask?
 
-    static func update(for player: AudioPlayer, with metadata: [String: Any]) {
+    /// `controller`: where to write (default: the player's own; the standard player's `direct`
+    /// writes while its own updates are held, StandardNowPlayingInfoController).
+    static func update(for player: AudioPlayer, with metadata: [String: Any], through controller: NowPlayingInfoControllerProtocol? = nil) {
         currentImageTask?.cancel()
+        let target = controller ?? player.nowPlayingInfoController
         var ret: [NowPlayingInfoKeyValue] = []
         
         if let title = metadata["title"] as? String {
@@ -41,21 +44,21 @@ struct Metadata {
             ret.append(NowPlayingInfoProperty.isLiveStream(isLiveStream))
         }
         
-        player.nowPlayingInfoController.set(keyValues: ret)
+        target.set(keyValues: ret)
         
         if let artworkURL = MediaURL(object: metadata["artwork"]) {
-            currentImageTask = URLSession.shared.dataTask(with: artworkURL.value, completionHandler: { [weak player] (data, _, error) in
+            currentImageTask = URLSession.shared.dataTask(with: artworkURL.value, completionHandler: { (data, _, error) in
                 if let data = data, let image = UIImage(data: data), error == nil {
                     let artwork = MPMediaItemArtwork(boundsSize: image.size, requestHandler: { (size) -> UIImage in
                         return image
                     })
-                    player?.nowPlayingInfoController.set(keyValue: MediaItemProperty.artwork(artwork))
+                    target.set(keyValue: MediaItemProperty.artwork(artwork))
                 }
             })
             
             currentImageTask?.resume()
         } else {
-            player.nowPlayingInfoController.set(keyValue: MediaItemProperty.artwork(nil))
+            target.set(keyValue: MediaItemProperty.artwork(nil))
         }
     }
 }

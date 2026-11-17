@@ -999,4 +999,21 @@ assert(
   );
 }
 
+// Rule 13: while a standard track loads, every reader agrees with the reported active track
+// (ReportedTrackProgress, ReportedNowPlaying: ReportedTrackTest; the backend's wiring:
+// StandardBackendHlsTest.whileATrackLoadsEveryReaderAgreesWithTheReportedTrack). MusicService's
+// wiring and the progress event read the backend.
+{
+  assert(
+    section(musicService, 'onNowPlaying = { index, _ ->', '},').includes('if (index != null) updateNotificationMetadataForIndex(index)\n                            else binding.player.notificationManager.overrideAudioItem = null') &&
+      section(musicService, 'private suspend fun progressUpdateEvent(): Bundle? {', '\n    }\n').includes('putDouble(POSITION_KEY, backend.positionMs.toSeconds())') &&
+      section(musicService, 'private suspend fun progressUpdateEvent(): Bundle? {', '\n    }\n').includes('putInt(TRACK_KEY, backend.currentIndex)') &&
+      standardBackend.includes('override val positionMs: Long\n        get() = reportedProgress().positionMs') &&
+      standardBackend.includes('progress.left(player.items.getOrNull(oldPosition.mediaItemIndex), oldPosition.positionMs)') &&
+      // A backend switch's snapshot pairs the player's own index with its own position.
+      standardBackend.includes('positionMs = liveProgress().positionMs.coerceAtLeast(0L),'),
+    'Android standard readers (progress, events, notification) must agree with the reported active track while another loads, as iOS.'
+  );
+}
+
 console.log('Android crossfade contracts OK');

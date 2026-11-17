@@ -2,6 +2,62 @@ import AVFoundation
 import Foundation
 import SwiftAudioEx
 
+/// The standard player's now-playing writes (the lock screen), held while the standard backend
+/// shows the reported track and another loads (ReportedNowPlaying, rule 13): SwiftAudioEx writes
+/// the loading item's title, artwork (also later, when that artwork arrives) and times at its
+/// load and at its state changes, which would replace the reported track's. While held those
+/// writes are dropped; `direct` always writes (the reported track's metadata, the app's own
+/// updates). Chosen over turning `automaticallyUpdateNowPlayingInfo` off during the load: a
+/// natural advance's load writes before the backend hears of it, and the artwork callback does
+/// not read that flag. Set on both QueuedAudioPlayers (RNTrackPlayer).
+final class StandardNowPlayingInfoController: NowPlayingInfoControllerProtocol {
+    private let base: NowPlayingInfoController
+    private let lock = NSLock()
+    private var held = false
+
+    required init() {
+        base = NowPlayingInfoController()
+    }
+
+    required init(infoCenter: NowPlayingInfoCenter) {
+        base = NowPlayingInfoController(infoCenter: infoCenter)
+    }
+
+    /// Writes that always go through.
+    var direct: NowPlayingInfoControllerProtocol { return base }
+
+    /// Whether SwiftAudioEx's own writes are dropped (another track loads).
+    var isHeld: Bool {
+        get {
+            lock.lock()
+            defer { lock.unlock() }
+            return held
+        }
+        set {
+            lock.lock()
+            held = newValue
+            lock.unlock()
+        }
+    }
+
+    func set(keyValue: NowPlayingInfoKeyValue) {
+        if !isHeld { base.set(keyValue: keyValue) }
+    }
+
+    func set(keyValues: [NowPlayingInfoKeyValue]) {
+        if !isHeld { base.set(keyValues: keyValues) }
+    }
+
+    func setWithoutUpdate(keyValues: [NowPlayingInfoKeyValue]) {
+        if !isHeld { base.setWithoutUpdate(keyValues: keyValues) }
+    }
+
+    /// A cleared player (no item) clears the lock screen, held or not.
+    func clear() {
+        base.clear()
+    }
+}
+
 struct StandardPlaybackReadinessObservation {
     let state: AudioPlayerState
     let index: Int
@@ -319,6 +375,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let onActiveTrackChanged: (QueuedAudioPlayer, Int?, Track?, Int?, Double) -> Void
     /// A load failed: the active track's index (nil: none), for the lock screen to show it again.
     private let onLoadFailed: (QueuedAudioPlayer, Int?) -> Void
+    /// What the lock screen shows (ReportedNowPlaying): the reported track's index (nil: the
+    /// player's own item), and whether SwiftAudioEx's own updates are held (another track loads).
+    private let onNowPlaying: (QueuedAudioPlayer, Int?, Bool) -> Void
+    /// What the progress readers see: the reported track's (rule 13).
+    private let progress = ReportedTrackProgress()
+    /// What the lock screen shows: the reported track (rule 13).
+    private let nowPlaying = ReportedNowPlaying()
     // SwiftAudioEx retains the listener during asynchronous removal. Use a
     // separate identity so deinit never passes its dying self to that closure.
     private let seekListener = NSObject()
@@ -340,6 +403,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         onLoadGaveUp: @escaping (QueuedAudioPlayer, StandardGiveUpReport) -> Void = { _, _ in },
         onActiveTrackChanged: @escaping (QueuedAudioPlayer, Int?, Track?, Int?, Double) -> Void = { _, _, _, _, _ in },
         onLoadFailed: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
+        onNowPlaying: @escaping (QueuedAudioPlayer, Int?, Bool) -> Void = { _, _, _ in },
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
@@ -369,6 +433,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.onLoadGaveUp = onLoadGaveUp
         self.onActiveTrackChanged = onActiveTrackChanged
         self.onLoadFailed = onLoadFailed
+        self.onNowPlaying = onNowPlaying
         // The app's readiness timeout (standardReadyTimeoutMs), read at every activation.
         self.waitForActivationReadiness = waitForActivationReadiness ?? { player, snapshot in
             try waitForStandardPlaybackActivation(
@@ -462,7 +527,21 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             ownedElsewhere: ownedElsewhere
         )
         followLoad(observed)
+        // At every player event: the reported track's progress is kept while the player is on
+        // it, and the lock screen follows the reported track.
+        _ = reportedProgress()
+        followNowPlaying()
         return observed
+    }
+
+    /// The lock screen shows the reported track (ReportedNowPlaying); only the authoritative
+    /// backend's. Main.
+    private func followNowPlaying() {
+        guard isAuthoritative, !disposed else { return }
+        let current = (player.currentItem as AnyObject?).map(ObjectIdentifier.init)
+        if let change = nowPlaying.follow(reported: failedLoads.reported, playerItem: current) {
+            onNowPlaying(player, indexOfItem(change.item), change.held)
+        }
     }
 
     /// The URL of the current track's asset, as SwiftAudioEx builds it.
@@ -594,6 +673,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {
             onLoadFailed(player, indexOfItem(failedLoads.reported))
         }
+        followNowPlaying()
     }
 
     private func report(_ change: FailedLoadRule.Report, lastIndex: Int?? = nil, lastTrack: Track? = nil) {
@@ -604,6 +684,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             lastIndex ?? indexOfItem(change.from),
             lastItemPosition
         )
+        followNowPlaying()
     }
 
     /// The reported track left the queue: no active track, reported at once (as the crossfade
@@ -617,10 +698,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     /// The player moved to `item` (its current-item event, with the last track's position):
     /// whether to report it now (only a new queue's first track); else once it loaded.
-    func itemMoved(_ item: AudioItem?, lastPosition: Double) -> Bool {
+    func itemMoved(_ item: AudioItem?, lastItem: AudioItem?, lastPosition: Double) -> Bool {
         return onMain {
             lastItemPosition = lastPosition
+            // The track the player left: its last position, while another loads (rule 13).
+            progress.left((lastItem as AnyObject?).map(ObjectIdentifier.init), position: lastPosition)
             let moved = failedLoads.moved((item as AnyObject?).map(ObjectIdentifier.init))
+            // SwiftAudioEx has shown the new item on the lock screen: the reported one again.
+            followNowPlaying()
             loadDriver?.poke()
             return moved
         }
@@ -836,12 +921,29 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
         return idleWithoutActiveTrack ? -1 : player.currentIndex
     }
-    var position: Double {
-        // A failed seek keeps its target (SwiftAudioEx's stop reset its own position).
-        return giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)
+    // The reported track's progress, as currentIndex (rule 13): while another track loads, the
+    // reported one's as the player left it (ReportedTrackProgress).
+    var position: Double { return reportedProgress().position }
+    var duration: Double { return reportedProgress().duration }
+    var bufferedPosition: Double { return reportedProgress().buffered }
+
+    /// The player's own item's progress.
+    private func liveProgress() -> TrackProgress {
+        return TrackProgress(
+            // A failed seek keeps its target (SwiftAudioEx's stop reset its own position).
+            position: giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime),
+            duration: idleWithoutActiveTrack ? 0 : player.duration,
+            buffered: idleWithoutActiveTrack ? 0 : player.bufferedPosition
+        )
     }
-    var duration: Double { return idleWithoutActiveTrack ? 0 : player.duration }
-    var bufferedPosition: Double { return idleWithoutActiveTrack ? 0 : player.bufferedPosition }
+
+    private func reportedProgress() -> TrackProgress {
+        return progress.read(
+            reported: failedLoads.reported,
+            playerItem: (player.currentItem as AnyObject?).map(ObjectIdentifier.init),
+            live: liveProgress()
+        )
+    }
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
     var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
@@ -1086,6 +1188,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             loadDriver?.stop()
             cancelPendingSeeks()
             isAuthoritative = false
+            // The next owner of the lock screen (crossfade, another standard backend) writes freely.
+            (player.nowPlayingInfoController as? StandardNowPlayingInfoController)?.isHeld = false
             if !controlSurfaceRelinquished {
                 player.remoteCommands = []
             }

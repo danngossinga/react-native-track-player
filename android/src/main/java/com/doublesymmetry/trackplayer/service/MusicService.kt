@@ -531,6 +531,14 @@ class MusicService : HeadlessJsTaskService() {
                             activeIndex?.let(::updateNotificationMetadataForIndex)
                         }
                     },
+                    // While another track loads the notification keeps the reported one (KotlinAudio
+                    // shows the loading item at its transition); none reported: the player's own.
+                    onNowPlaying = { index, _ ->
+                        if (isActivePlayer(binding.player, binding.identity)) {
+                            if (index != null) updateNotificationMetadataForIndex(index)
+                            else binding.player.notificationManager.overrideAudioItem = null
+                        }
+                    },
                     loadWatch = StandardLoadWatch(
                         stallTimeoutMs = { stallTimeout.milliseconds },
                         totalTimeoutMs = { prepareTimeout.milliseconds },

@@ -130,6 +130,15 @@ Added fork surface:
   selected when the queue is set). After a failed load the lock screen and the
   notification show the active track again. A failed seek keeps its target as the
   position on both backends and platforms.
+- On the standard backend, while a track loads (and after its load failed) every
+  reader agrees with the active track: `getProgress`/`useProgress` and the
+  progress events give the active track's last position, duration and buffered
+  position (not the loading track's), and the lock screen (iOS) and the
+  notification (Android) keep showing the active track; they switch when the new
+  track is reported. On iOS the lock screen also shows the active track's last
+  position, not moving; Android's media session still reads its position from the
+  player (the loading track's) while the notification shows the active track's
+  title and artwork.
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends

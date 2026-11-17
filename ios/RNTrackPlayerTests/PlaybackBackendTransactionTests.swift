@@ -246,6 +246,49 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testReportedTrackProgressIsTheReportedTracksWhileAnotherLoads() {
+        // Android: ReportedTrackTest, the same steps.
+        let a = NSObject(), b = NSObject(), c = NSObject()
+        let ia = ObjectIdentifier(a), ib = ObjectIdentifier(b), ic = ObjectIdentifier(c)
+        let progress = ReportedTrackProgress()
+        let playing = TrackProgress(position: 60, duration: 180, buffered: 90)
+        XCTAssertEqual(progress.read(reported: ia, playerItem: ia, live: playing), playing)
+        // The player left it at 61 s for B, which loads: A's last position, duration and buffer.
+        progress.left(ia, position: 61)
+        progress.left(ib, position: 5)
+        XCTAssertEqual(progress.read(reported: ia, playerItem: ib, live: .none), TrackProgress(position: 61, duration: 180, buffered: 90))
+        // B loaded and is reported: its live values.
+        let playingB = TrackProgress(position: 0.2, duration: 240, buffered: 10)
+        XCTAssertEqual(progress.read(reported: ib, playerItem: ib, live: playingB), playingB)
+        // New metadata for B keeps what it had; C loads.
+        let b2 = NSObject()
+        progress.replaced(ib, with: ObjectIdentifier(b2))
+        progress.left(ObjectIdentifier(b2), position: 0.3)
+        XCTAssertEqual(progress.read(reported: ObjectIdentifier(b2), playerItem: ic, live: .none), TrackProgress(position: 0.3, duration: 240, buffered: 10))
+        // No reported track: none; a reported track never played here: none yet.
+        XCTAssertEqual(progress.read(reported: nil, playerItem: ic, live: playingB), .none)
+        XCTAssertEqual(ReportedTrackProgress().read(reported: ia, playerItem: ib, live: playingB), .none)
+    }
+
+    func testReportedNowPlayingShowsTheReportedTrackWhileAnotherLoads() {
+        let a = NSObject(), b = NSObject(), c = NSObject()
+        let ia = ObjectIdentifier(a), ib = ObjectIdentifier(b), ic = ObjectIdentifier(c)
+        let nowPlaying = ReportedNowPlaying()
+        XCTAssertNil(nowPlaying.follow(reported: ia, playerItem: ia), "on the reported track: the player's own")
+        XCTAssertEqual(nowPlaying.follow(reported: ia, playerItem: ib), .init(item: ia, held: true))
+        XCTAssertTrue(nowPlaying.isHeld)
+        XCTAssertNil(nowPlaying.follow(reported: ia, playerItem: ib), "nothing new")
+        // The player moved again (it shows its own item at every move): A again.
+        XCTAssertEqual(nowPlaying.follow(reported: ia, playerItem: ic), .init(item: ia, held: true))
+        // C loaded and is reported: released, C shown.
+        XCTAssertEqual(nowPlaying.follow(reported: ic, playerItem: ic), .init(item: ic, held: false))
+        XCTAssertFalse(nowPlaying.isHeld)
+        XCTAssertNil(nowPlaying.follow(reported: nil, playerItem: ib))
+        // Held, then the reported track left the queue: released to the player's own item.
+        _ = nowPlaying.follow(reported: ic, playerItem: ib)
+        XCTAssertEqual(nowPlaying.follow(reported: nil, playerItem: ib), .init(item: nil, held: false))
+    }
+
     func testTheBridgeSendsTheSameRejectionCodesAsAndroid() {
         // Android sends every command failure's own code; iOS the same codes. Standard seeks
         // (before: all `seek_failed` on iOS) and crossfade seeks.

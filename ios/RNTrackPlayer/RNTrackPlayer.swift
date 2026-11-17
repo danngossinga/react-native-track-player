@@ -52,7 +52,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
     private var hasInitialized = false
     private var setupInProgress = false
-    private var player = QueuedAudioPlayer()
+    // Its lock-screen writes can be held while another track loads (StandardNowPlayingInfoController).
+    private var player = QueuedAudioPlayer(nowPlayingInfoController: StandardNowPlayingInfoController())
     private var playbackOrchestrator = IOSPlaybackOrchestrator()
     /// The crossfade engines' load timeout (`prepareTimeoutMs` option); every orchestrator reads it.
     private let prepareTimeout = TimeoutSetting(optionKey: "prepareTimeoutMs", defaultMs: prepareTimeoutDefaultMs)
@@ -539,6 +540,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onLoadFailed: { [weak self] source, activeIndex in
                     self?.handleStandardLoadFailed(source: source, activeIndex: activeIndex)
                 },
+                onNowPlaying: { [weak self] source, index, held in
+                    self?.handleStandardNowPlaying(source: source, index: index, held: held)
+                },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
                     self?.autoUpdateNowPlayingInfo ?? true
                 },
@@ -597,7 +601,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     private func makeStandardPlayerCandidate() -> QueuedAudioPlayer {
-        let candidate = QueuedAudioPlayer()
+        let candidate = QueuedAudioPlayer(nowPlayingInfoController: StandardNowPlayingInfoController())
         candidate.automaticallyUpdateNowPlayingInfo = false
         candidate.playWhenReady = false
         candidate.bufferDuration = player.bufferDuration
@@ -1884,8 +1888,13 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         let track : Track = player.items[index] as! Track;
         track.updateMetadata(dictionary: metadata)
 
-        if ((useOrchestratedCrossfade && playbackOrchestrator.currentIndex == index) || (!useOrchestratedCrossfade && player.currentIndex == index)) {
+        // The active track as the app reads it (the standard backend's reported one while another
+        // loads, rule 13): its lock screen entry follows, also while the player's own writes are held.
+        let direct = (player.nowPlayingInfoController as? StandardNowPlayingInfoController)?.direct
+        if useOrchestratedCrossfade && playbackOrchestrator.currentIndex == index {
             Metadata.update(for: player, with: metadata)
+        } else if !useOrchestratedCrossfade, activePlaybackBackend.currentIndex == index {
+            Metadata.update(for: player, with: metadata, through: direct)
         }
 
         resolve(NSNull())
@@ -1903,7 +1912,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     public func updateNowPlayingMetadata(metadata: [String: Any], resolve: RCTPromiseResolveBlock, reject: RCTPromiseRejectBlock) {
         if (rejectWhenNotInitialized(reject: reject)) { return }
 
-        Metadata.update(for: player, with: metadata)
+        // The app's own lock screen entry: written also while the player's own writes are held.
+        Metadata.update(for: player, with: metadata, through: (player.nowPlayingInfoController as? StandardNowPlayingInfoController)?.direct)
         resolve(NSNull())
     }
 
@@ -2008,6 +2018,31 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         Metadata.update(for: source, with: track.toObject())
     }
 
+    /// The lock screen shows the standard player's reported track (ReportedNowPlaying, rule 13),
+    /// as getActiveTrack, when the app lets the module update it (`autoUpdateMetadata`): while
+    /// another track loads, the reported track at its last position, not moving (SwiftAudioEx's
+    /// own writes of the loading item held); once the player is on it again, its live times (and
+    /// SwiftAudioEx's writes again). No reported track: the player's own item. As Android's
+    /// notification.
+    func handleStandardNowPlaying(source: QueuedAudioPlayer, index: Int?, held: Bool) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              let gate = source.nowPlayingInfoController as? StandardNowPlayingInfoController else { return }
+        gate.isHeld = held && autoUpdateNowPlayingInfo
+        guard autoUpdateNowPlayingInfo else { return }
+        guard let index = index, source.items.indices.contains(index), let track = source.items[index] as? Track else {
+            source.loadNowPlayingMetaValues()
+            return
+        }
+        let backend = (playbackBackendFacade?.currentBackend as? StandardPlaybackBackend).flatMap { $0.identity === source ? $0 : nil }
+        var metadata = track.toObject()
+        metadata["elapsedTime"] = backend?.position ?? source.currentTime
+        if let duration = backend?.duration ?? Optional(source.duration), duration > 0 {
+            metadata["duration"] = duration
+        }
+        Metadata.update(for: source, with: metadata, through: gate.direct)
+        gate.direct.set(keyValue: NowPlayingInfoProperty.playbackRate(!held && source.playWhenReady ? Double(source.rate) : 0))
+    }
+
     private func emitStandardActiveTrackChanged(index: Int?, track: Track?, lastIndex: Int?, lastTrack: Track?, lastPosition: Double) {
         var a: Dictionary<String, Any> = ["lastPosition": lastPosition]
         if let lastIndex = lastIndex {
@@ -2098,7 +2133,7 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         // fails to load, as the crossfade path and Android: only a new queue's first track now.
         if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
            backend.identity === source,
-           !backend.itemMoved(item, lastPosition: lastPosition ?? 0) {
+           !backend.itemMoved(item, lastItem: lastItem, lastPosition: lastPosition ?? 0) {
             return
         }
         emitStandardActiveTrackChanged(
@@ -2118,6 +2153,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         // _after_ a manipulation to the queu causing no currentItem to exist (see reset)
         // in which case we shouldn't emit anything or we'll get an exception.
         if !shouldEmitProgressEvent || source.currentItem == nil { return }
+        // The reported track's progress and index, as the getters (rule 13): while another track
+        // loads, the reported one's (StandardPlaybackBackend), as Android's progress events.
+        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend, backend.identity === source {
+            emit(
+                event: EventType.PlaybackProgressUpdated,
+                body: [
+                    "position": backend.position,
+                    "duration": backend.duration,
+                    "buffered": backend.bufferedPosition,
+                    "track": backend.currentIndex,
+                ]
+            )
+            return
+        }
         emit(
             event: EventType.PlaybackProgressUpdated,
             body: [

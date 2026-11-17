@@ -20,6 +20,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Assert.fail
 import org.junit.Before
@@ -156,6 +157,44 @@ class StandardBackendHlsTest {
         assertEquals("the active track when next returned", 2, next.index)
         assertEquals(com.google.android.exoplayer2.Player.STATE_READY, next.exoState)
         assertTrue(backed.gaveUpAtMs.isEmpty())
+    }
+
+    @Test
+    fun whileATrackLoadsEveryReaderAgreesWithTheReportedTrack() {
+        // Rule 13: while C loads, getActiveTrack is A, and so are the progress (A's last position
+        // and duration, not C's) and the notification (KotlinAudio shows C at its transition).
+        // C, not B: ExoPlayer buffers the next item ahead.
+        val backed = backed()
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        backed.backend.add(listOf(item(playable, 1L), item(slowServer(), 2L), item(slowServer(), 3L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val durationOfA = backed.backend.durationMs
+        assertTrue("A's duration is known", durationOfA > 0L)
+        val skip = launchCommand { backed.backend.skip(2) }
+        awaitTrue("the player moved to C") { backed.player.currentIndex == 2 }
+        val positionOfA = backed.backend.positionMs
+        assertTrue("A's last position, $positionOfA ms", positionOfA >= PLAYED_MS)
+        var sawLoading = false
+        while (skip() == null) {
+            shadowOf(Looper.getMainLooper()).idle()
+            if (skip() != null) break
+            if (backed.analytics.player?.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING && backed.player.currentIndex == 2) {
+                sawLoading = true
+                assertEquals("the active track", 0, backed.backend.currentIndex)
+                assertEquals("the position is A's last", positionOfA, backed.backend.positionMs)
+                assertEquals("the duration is A's", durationOfA, backed.backend.durationMs)
+                assertTrue("the buffered position is A's", backed.backend.bufferedMs >= positionOfA)
+                assertSame("the notification shows A", backed.player.items[0], backed.player.notificationManager.overrideAudioItem)
+            }
+            Thread.sleep(CLOCK_TICK_MS)
+        }
+        assertTrue("C's load was seen", sawLoading)
+        assertTrue(skip()!!.isSuccess)
+        assertEquals(2, backed.backend.currentIndex)
+        assertSame("the notification shows C once reported", backed.player.items[2], backed.player.notificationManager.overrideAudioItem)
+        assertEquals(listOf<Pair<Int?, Boolean>>(0 to true, 2 to false), backed.nowPlayingShown)
+        assertTrue("C's own position", backed.backend.positionMs < positionOfA)
     }
 
     @Test
@@ -422,6 +461,8 @@ class StandardBackendHlsTest {
         val mediaLoadsStartedAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
         val activeTrackChanges = mutableListOf<Pair<Int?, Int?>>()
         val loadFailures = mutableListOf<Int?>()
+        /** What the notification was told to show (MusicService's onNowPlaying), in order. */
+        val nowPlayingShown = mutableListOf<Pair<Int?, Boolean>>()
         /** When the load under test began (a command; the stalled request may go out earlier). */
         var loadStartedAtMs = 0L
         val backend = KotlinAudioPlaybackBackend(
@@ -441,6 +482,12 @@ class StandardBackendHlsTest {
                 gaveUpAtMs += monotonicNowMs()
                 loadFailures += activeIndex
                 markStopProcessed()
+            },
+            // As MusicService: the notification shows the reported track (KotlinAudio's override).
+            onNowPlaying = { index, held ->
+                nowPlayingShown += index to held
+                if (index != null) player.notificationManager.overrideMetadata(player.items[index])
+                else player.notificationManager.overrideAudioItem = null
             },
             loadWatch = StandardLoadWatch(
                 stallTimeoutMs = { STALL_TIMEOUT_MS },
