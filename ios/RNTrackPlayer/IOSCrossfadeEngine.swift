@@ -183,7 +183,7 @@ final class IOSCrossfadeEngine {
             settled = true
             if let loadWait = loadWait { self.endWait(loadWait) }
             loadWait = nil
-            completion(result)
+            settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)
         }
         let wait = startWait(
             totalTimeoutMs: prepareTimeoutMs(),
@@ -199,7 +199,6 @@ final class IOSCrossfadeEngine {
             self.itemStatusObservation = nil
             loadItem?.cancelPendingSeeks()
             self.player.cancelPendingPrerolls()
-            self.abandonLoad()
             self.state = .failed
             settle(.failure(NSError(
                 domain: "RNTP-Crossfade",
@@ -207,7 +206,7 @@ final class IOSCrossfadeEngine {
                 userInfo: [
                     NSLocalizedDescriptionKey: loadItem == nil
                         ? "Crossfade engine did not become playable (\(reason))."
-                        : "Crossfade engine did not become ready (\(reason)).",
+                        : crossfadeLoadTimeoutMessage(reason),
                     "code": "crossfade_prepare_timeout"
                 ]
             )))
@@ -308,7 +307,7 @@ final class IOSCrossfadeEngine {
                     domain: "RNTP-Crossfade",
                     code: 3,
                     userInfo: [
-                        NSLocalizedDescriptionKey: "Crossfade engine seek did not finish (\(reason)).",
+                        NSLocalizedDescriptionKey: crossfadeSeekTimeoutMessage(reason),
                         "code": "crossfade_seek_timeout"
                     ]
                 )))
@@ -367,6 +366,8 @@ final class IOSCrossfadeEngine {
     /// the next play loads the track again. As Android's engine.
     private func abandonLoad() {
         IOSPlaybackLog.log("\(name) load abandoned")
+        pendingAsset?.cancelLoading()
+        pendingAsset = nil
         stopLoading(player)
     }
 
@@ -543,8 +544,6 @@ final class IOSCrossfadeEngine {
     }
 
     private static func describe(_ verdict: StallVerdict, _ watch: StallWatch) -> String {
-        return verdict == .stalled
-            ? "no progress for \(watch.stallTimeoutMs) ms"
-            : "over the \(watch.totalTimeoutMs) ms limit"
+        return verdict.reason(stallTimeoutMs: watch.stallTimeoutMs, totalTimeoutMs: watch.totalTimeoutMs)
     }
 }

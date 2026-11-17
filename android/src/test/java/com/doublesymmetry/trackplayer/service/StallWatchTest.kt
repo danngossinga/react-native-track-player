@@ -98,4 +98,21 @@ class StallWatchTest {
             assertTrue(error.message == "player error")
         }
     }
+
+    @Test
+    fun aGiveUpIsWordedAsOnIosWithoutEngineNames() {
+        // Same text as iOS (PlaybackBackendTransactionTests.testAGiveUpIsWordedAsOnAndroid...).
+        assertEquals(
+            "Crossfade engine did not become ready (no progress for 10000 ms).",
+            crossfadeLoadTimeoutMessage(stallVerdictReason(StallVerdict.STALLED, 10_000L, 60_000L))
+        )
+        assertEquals(
+            "Crossfade engine did not become ready (over the 60000 ms limit).",
+            crossfadeLoadTimeoutMessage(stallVerdictReason(StallVerdict.CAP_EXCEEDED, 10_000L, 60_000L))
+        )
+        assertEquals(
+            "Crossfade engine seek did not finish (no progress for 10000 ms).",
+            crossfadeSeekTimeoutMessage(stallVerdictReason(StallVerdict.STALLED, 10_000L, 60_000L))
+        )
+    }
 }

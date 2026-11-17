@@ -558,4 +558,21 @@ assert(
   'The Android end monitor must also act while the next track preloads, as iOS.'
 );
 
+// A give-up says the same as on iOS, with no engine names; both platforms' tests pin the text.
+{
+  const androidTest = read('android/src/test/java/com/doublesymmetry/trackplayer/service/StallWatchTest.kt');
+  const iosTest = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  for (const text of [
+    'Crossfade engine did not become ready (no progress for 10000 ms).',
+    'Crossfade engine did not become ready (over the 60000 ms limit).',
+    'Crossfade engine seek did not finish (no progress for 10000 ms).'
+  ]) {
+    assert(androidTest.includes(`"${text}"`) && iosTest.includes(`"${text}"`), `Both platforms must pin the give-up text: ${text}`);
+  }
+  assert(
+    !/RejectionException\("\$name/.test(engineSource),
+    'Android engine errors must not name the engine (engineA/engineB) in their message.'
+  );
+}
+
 console.log('Android crossfade contracts OK');

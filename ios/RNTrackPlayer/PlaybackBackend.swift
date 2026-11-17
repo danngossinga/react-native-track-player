@@ -140,6 +140,37 @@ func advanceAfterTrackEnd(
     }
 }
 
+extension StallVerdict {
+    /// Why a wait gave up, in the words both platforms use (Android `stallVerdictReason`).
+    func reason(stallTimeoutMs: Int, totalTimeoutMs: Int) -> String {
+        return self == .stalled
+            ? "no progress for \(stallTimeoutMs) ms"
+            : "over the \(totalTimeoutMs) ms limit"
+    }
+}
+
+/// A crossfade load's give-up message: the same text on Android, no engine names.
+func crossfadeLoadTimeoutMessage(_ reason: String) -> String {
+    return "Crossfade engine did not become ready (\(reason))."
+}
+
+/// A crossfade seek's give-up message: the same text on Android, no engine names.
+func crossfadeSeekTimeoutMessage(_ reason: String) -> String {
+    return "Crossfade engine seek did not finish (\(reason))."
+}
+
+/// Ends a crossfade load: a load that failed for any reason (a stall, the limit, a player or
+/// item error, a failed seek or preroll) stops loading first, as Android's engine does for every
+/// failed load; then the caller learns the result.
+func settleCrossfadeLoad(
+    _ result: Result<Void, Error>,
+    stopLoading: () -> Void,
+    complete: (Result<Void, Error>) -> Void
+) {
+    if case .failure = result { stopLoading() }
+    complete(result)
+}
+
 /// The player a crossfade engine stops loading on (AVPlayer; tests may pass another).
 protocol ItemLoadingPlayer: AnyObject {
     func replaceCurrentItem(with item: AVPlayerItem?)

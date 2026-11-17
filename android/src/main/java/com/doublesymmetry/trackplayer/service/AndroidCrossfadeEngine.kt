@@ -223,11 +223,11 @@ internal class AndroidCrossfadeEngine(
             ) {
                 if (player.playbackState == Player.STATE_ENDED) {
                     if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
-                    throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
+                    throw RejectionException("Crossfade engine ended before it was ready.", "crossfade_engine_ended")
                 }
                 if (player.playerError != null) {
                     if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-                    throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
+                    throw RejectionException(player.playerError?.message ?: "Crossfade engine failed to prepare.", "crossfade_engine_error")
                 }
                 player.playbackState == Player.STATE_READY
             }
@@ -237,9 +237,9 @@ internal class AndroidCrossfadeEngine(
         }
         if (verdict != null) {
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
+            val reason = stallVerdictReason(verdict, stallTimeoutMs, timeoutMs)
             abandonLoad(generation, "load $reason")
-            throw RejectionException("$name did not become ready ($reason).", "crossfade_prepare_timeout")
+            throw RejectionException(crossfadeLoadTimeoutMessage(reason), "crossfade_prepare_timeout")
         }
 
         ticket?.ensureActive()
@@ -319,9 +319,9 @@ internal class AndroidCrossfadeEngine(
             player.playWhenReady = false
             player.pause()
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
+            val reason = stallVerdictReason(verdict, stallTimeoutMs, timeoutMs)
             abandonLoad(generation, "seek $reason")
-            throw RejectionException("$name did not finish seeking ($reason).", "crossfade_seek_timeout")
+            throw RejectionException(crossfadeSeekTimeoutMessage(reason), "crossfade_seek_timeout")
         }
         ticket?.ensureActive()
         if (operationGeneration != generation) {
