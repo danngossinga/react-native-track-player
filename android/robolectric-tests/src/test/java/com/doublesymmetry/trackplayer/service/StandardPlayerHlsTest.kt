@@ -365,15 +365,21 @@ class StandardPlayerHlsTest {
         // playlists and keys until the first segment request, as the crossfade engines; each
         // item's own listeners, made when its source is built.
         val sources = object : com.google.android.exoplayer2.source.MediaSource.Factory {
-            private val shared = CrossfadeMediaSourceFactory(playlistDataSourceFactory = http, mediaDataSourceFactory = http)
+            private val progressive = com.google.android.exoplayer2.source.DefaultMediaSourceFactory(http)
             override fun setDrmSessionManagerProvider(provider: com.google.android.exoplayer2.drm.DrmSessionManagerProvider) = this
             override fun setLoadErrorHandlingPolicy(policy: com.google.android.exoplayer2.upstream.LoadErrorHandlingPolicy) = this
-            override fun getSupportedTypes(): IntArray = shared.supportedTypes
-            override fun createMediaSource(mediaItem: MediaItem) =
-                CrossfadeMediaSourceFactory(
-                    playlistDataSourceFactory = http.countingBytes(bytes.playlists(mediaItem)),
-                    mediaDataSourceFactory = http.countingBytes(bytes.media(mediaItem))
+            override fun getSupportedTypes(): IntArray = progressive.supportedTypes
+            // As vendored KotlinAudio's createHlsSource: segments through the item's media
+            // listener, playlists and keys through its playlist listener.
+            override fun createMediaSource(mediaItem: MediaItem): com.google.android.exoplayer2.source.MediaSource {
+                val playlists = http.countingBytes(bytes.playlists(mediaItem))
+                val media = http.countingBytes(bytes.media(mediaItem))
+                return com.google.android.exoplayer2.source.hls.HlsMediaSource.Factory(
+                    com.google.android.exoplayer2.source.hls.HlsDataSourceFactory { dataType ->
+                        (if (dataType == com.google.android.exoplayer2.C.DATA_TYPE_MEDIA) media else playlists).createDataSource()
+                    }
                 ).createMediaSource(mediaItem)
+            }
         }
         val builder = ExoPlayer.Builder(context)
             .setLooper(thread.looper)

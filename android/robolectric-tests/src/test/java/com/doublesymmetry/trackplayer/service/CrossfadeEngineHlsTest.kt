@@ -14,6 +14,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.android.asCoroutineDispatcher
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -31,6 +32,9 @@ import org.robolectric.shadows.ShadowMediaCodec
 import org.robolectric.shadows.ShadowMediaCodecList
 import org.robolectric.shadows.ShadowSystemClock
 import java.time.Duration
+import java.util.concurrent.CountDownLatch
+import com.google.android.exoplayer2.upstream.DataSource
+import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 
 /**
  * A crossfade engine with its real ExoPlayer, loading HLS from a local server ([HlsTestServer]):
@@ -163,22 +167,17 @@ class CrossfadeEngineHlsTest {
 
     @Test
     fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyTrackGiveUp() {
-        // Device case: a busy proxy answers the master and the media playlist slowly (each just
-        // within the stall timeout, together well past it); the segments then come at once.
-        // Until the first segment is asked for, playlists arriving are the load's progress.
-        val engine = engine(STALL_TIMEOUT_MS)
-        val slow = HlsTestServer(
-            LADDER,
-            segmentCount = 8,
-            stalledFrom = 8,
-            playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4
-        ).also { servers += it }
-        val startedAtMs = monotonicNowMs()
+        // Device case: a busy proxy answers the master and the media playlist slowly (each well
+        // within the stall timeout, together past it); the segments then come at once. Until the
+        // first segment is asked for, playlists arriving are the load's progress.
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val engine = engine(stall)
+        val slow = slowServer(playlistDelayMs = slowStage(stall))
         val result = runBlocking(engineThread) {
-            runCatching { engine.prepare(hlsItem(slow), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+            runCatching { engine.prepare(hlsItem(slow), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
         }
-        assertTrue("a healthy track loads after ${monotonicNowMs() - startedAtMs}ms, got $result", result.isSuccess)
-        assertTrue("the playlists took longer than the stall timeout", monotonicNowMs() - startedAtMs > STALL_TIMEOUT_MS)
+        assertTrue("a healthy track loads, got $result", result.isSuccess)
+        assertPlaylistsOutlastedTheStallTimeout(slow, stall)
     }
 
     @Test
@@ -186,40 +185,71 @@ class CrossfadeEngineHlsTest {
         // Encrypted track: playlists, then the key (slow), then the first segment (slow to start).
         // The key arriving is progress, since no segment was asked for yet; without it the gap from
         // the media playlist to the first segment bytes would exceed the stall timeout.
-        val engine = engine(STALL_TIMEOUT_MS)
-        val encrypted = HlsTestServer(
-            LADDER,
-            segmentCount = 8,
-            stalledFrom = 8,
-            keyDelayMs = STALL_TIMEOUT_MS * 3 / 4,
-            segmentDelayMs = STALL_TIMEOUT_MS / 2
-        ).also { servers += it }
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val engine = engine(stall)
+        val encrypted = slowServer(keyDelayMs = slowStage(stall), segmentDelayMs = slowStage(stall))
         val result = runBlocking(engineThread) {
-            runCatching { engine.prepare(hlsItem(encrypted), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+            runCatching { engine.prepare(hlsItem(encrypted), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
         }
         assertTrue("a healthy encrypted track loads, got $result (requests: ${encrypted.requests})", result.isSuccess)
         assertTrue("the key was asked for", encrypted.requests.any { it.endsWith("/key.bin") })
     }
 
     @Test
-    fun slowPlaylistsCountAgainForTheNextTrackOnTheSameEngine() {
-        // The previous track asked for segments; the next one's playlists are progress again.
-        val engine = engine(STALL_TIMEOUT_MS)
-        val first = server(LADDER, segmentCount = 8, stalledFrom = 8)
-        runBlocking(engineThread) {
-            engine.prepare(hlsItem(first), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS)
-        }
-        val slow = HlsTestServer(
+    fun aStaleSegmentRequestOfThePreviousTrackDoesNotStopTheNextTracksPlaylistsCounting() {
+        // Device case: the fan taps an uncached track while another loads, behind a slow proxy.
+        // The previous track's segment request is already on its way when the engine resets; it
+        // starts while the next track's playlists are still coming. It belongs to the previous
+        // load: the next track's playlists must still count as its progress.
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val previous = server(LADDER)
+        val held = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val engine = engine(stall, requestSource = { factory, timeoutMs ->
+            GatedDataSource(
+                httpSourceWithTimeouts(factory, timeoutMs),
+                isHeld = { it.uri.port == previous.port && it.uri.path.orEmpty().endsWith(".aac") },
+                held = held,
+                release = release
+            )
+        })
+        startLoading(engine, previous, stall)
+        awaitTrue("the previous track's first segment request is held") { held.count == 0L }
+
+        val next = HlsTestServer(
             LADDER,
             segmentCount = 8,
             stalledFrom = 8,
-            playlistDelayMs = STALL_TIMEOUT_MS * 3 / 4
+            playlistDelayMs = slowStage(stall)
         ).also { servers += it }
+        val result = CoroutineScope(engineThread).async {
+            loads.forEach { it.cancel() }
+            engine.reset()
+            runCatching { engine.prepare(hlsItem(next), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
+        }
+        // The stale request starts once the next track has asked for its master playlist.
+        awaitTrue("the next track's master playlist request") { next.requests.contains("/master.m3u8") }
+        release.countDown()
+        val outcome = runBlocking { result.await() }
+        assertTrue("the next healthy track loads, got $outcome", outcome.isSuccess)
+    }
+
+    @Test
+    fun slowPlaylistsCountAgainForTheNextTrackOnTheSameEngine() {
+        // The previous track asked for segments; the next one's playlists are progress again.
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val engine = engine(stall)
+        val first = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        runBlocking(engineThread) {
+            engine.prepare(hlsItem(first), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall)
+        }
+        val slow = slowServer(playlistDelayMs = slowStage(stall))
         val result = runBlocking(engineThread) {
             engine.reset()
-            runCatching { engine.prepare(hlsItem(slow), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS) }
+            runCatching { engine.prepare(hlsItem(slow), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
         }
         assertTrue("the next healthy track loads, got $result", result.isSuccess)
+        assertPlaylistsOutlastedTheStallTimeout(slow, stall)
     }
 
     @Test
@@ -310,6 +340,31 @@ class CrossfadeEngineHlsTest {
         }
     }
 
+    @Test
+    fun aSlowButSteadySeekIsNotAStall() {
+        // The segments the seek lands in come slowly: bytes arrive every 60 % of the stall timeout,
+        // but no full audio frame until the end (nothing buffered meanwhile). The seek's media bytes
+        // are its progress: it finishes, though the whole download outlasts the stall timeout.
+        val stall = SLOW_STALL_TIMEOUT_MS
+        val engine = engine(stall)
+        val server = HlsTestServer(
+            LADDER,
+            segmentCount = 8,
+            stalledFrom = 8,
+            trickleFrom = 3,
+            trickleGapMs = slowStage(stall)
+        ).also { servers += it }
+        runBlocking(engineThread) {
+            engine.prepare(hlsItem(server), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall)
+        }
+        val seekedAtMs = monotonicNowMs()
+        val result = runBlocking(engineThread) {
+            runCatching { engine.seekTo(SEEK_TARGET_MS, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stall) }
+        }
+        assertTrue("a slow but steady seek finishes, got $result", result.isSuccess)
+        assertTrue("the seek's download outlasted the stall timeout", monotonicNowMs() - seekedAtMs > stall)
+    }
+
     private fun assertGivesUpAtTheStallTimeoutAndStopsLoading(
         engine: AndroidCrossfadeEngine,
         stalled: HlsTestServer,
@@ -368,6 +423,33 @@ class CrossfadeEngineHlsTest {
         }
     }
 
+    /**
+     * One slow stage of a healthy load: well within the stall timeout (a loaded machine has 40 %
+     * of it to spare), while two stages together outlast it.
+     */
+    private fun slowStage(stallTimeoutMs: Long) = stallTimeoutMs * 3 / 5
+
+    /** A healthy track (all segments served) behind a slow server. */
+    private fun slowServer(playlistDelayMs: Long = 0L, keyDelayMs: Long? = null, segmentDelayMs: Long = 0L) =
+        HlsTestServer(
+            LADDER,
+            segmentCount = 8,
+            stalledFrom = 8,
+            playlistDelayMs = playlistDelayMs,
+            keyDelayMs = keyDelayMs,
+            segmentDelayMs = segmentDelayMs
+        ).also { servers += it }
+
+    /** The playlists came in over more than the stall timeout (the server's own clock). */
+    private fun assertPlaylistsOutlastedTheStallTimeout(server: HlsTestServer, stallTimeoutMs: Long) {
+        val masterAt = server.firstRequestAtMs { it == "/master.m3u8" }!!
+        val firstSegmentAt = server.firstRequestAtMs { it.endsWith(".aac") }!!
+        assertTrue(
+            "the first segment was asked for ${firstSegmentAt - masterAt}ms after the master playlist",
+            firstSegmentAt - masterAt > stallTimeoutMs
+        )
+    }
+
     private fun server(
         renditions: List<Pair<String, Int>>,
         segmentCount: Int = 2,
@@ -379,7 +461,8 @@ class CrossfadeEngineHlsTest {
 
     private fun engine(
         stallTimeoutMs: Long,
-        initialBitrateEstimateBps: Long = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS
+        initialBitrateEstimateBps: Long = DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS,
+        requestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
     ): AndroidCrossfadeEngine = runBlocking(engineThread) {
         AndroidCrossfadeEngine(
             RuntimeEnvironment.getApplication(),
@@ -387,15 +470,16 @@ class CrossfadeEngineHlsTest {
             C.AUDIO_CONTENT_TYPE_MUSIC,
             /* handleAudioFocus= */ false,
             initialBitrateEstimateBps = { initialBitrateEstimateBps },
-            stallTimeoutMs = { stallTimeoutMs }
+            stallTimeoutMs = { stallTimeoutMs },
+            requestSource = requestSource
         ).also { engines += it }
     }
 
     /** Starts loading the server's track; the load goes on in the background. */
-    private fun startLoading(engine: AndroidCrossfadeEngine, server: HlsTestServer) {
+    private fun startLoading(engine: AndroidCrossfadeEngine, server: HlsTestServer, stallTimeoutMs: Long = STALL_TIMEOUT_MS) {
         loads += CoroutineScope(engineThread).launch {
             runCatching {
-                engine.prepare(hlsItem(server), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS)
+                engine.prepare(hlsItem(server), 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = stallTimeoutMs)
             }
         }
     }
@@ -433,6 +517,8 @@ class CrossfadeEngineHlsTest {
         const val CODEC_BUFFER_BYTES = 100 * 1024
         val LADDER = listOf("v064" to 64_000, "v128" to 128_000, "v192" to 192_000)
         const val STALL_TIMEOUT_MS = 2_000L
+        /** For the slow-but-healthy loads: long enough that each slow stage has a wide margin. */
+        const val SLOW_STALL_TIMEOUT_MS = 4_000L
         const val PREPARE_TIMEOUT_MS = 60_000L
         const val PLAYED_MS = 1_000L
         const val SEEK_TARGET_MS = 20_000L

@@ -1838,7 +1838,9 @@ class PlaybackBackendTransactionTest {
         var readPlaybackError: AndroidPlaybackErrorSnapshot? = null,
         override val identity: Any = Any()
     ) : AndroidPlaybackBackendRouting {
-        val calls = mutableListOf<String>()
+        // The facade disposes a replaced backend on its cleanup scope (Dispatchers.Default unless a
+        // test passes its own), which appends "dispose" while the test thread reads the list.
+        val calls: MutableList<String> = java.util.concurrent.CopyOnWriteArrayList()
         val preparedSnapshots = mutableListOf<PlaybackBackendSnapshot>()
         var restoredSnapshot: PlaybackBackendSnapshot? = null
         var committedQueue: List<String>? = null
