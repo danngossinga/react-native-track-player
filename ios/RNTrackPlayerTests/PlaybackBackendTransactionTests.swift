@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import RNTrackPlayerBackendCore
 
@@ -102,6 +103,46 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             "code": "cancelled"
         ])
         XCTAssertNil(PlaybackAdvanceFailure(.failure(cancelled)))
+    }
+
+    func testAnAdvanceAfterATrackEndReportsItsFailureOnce() {
+        var reports: [PlaybackAdvanceFailure] = []
+        var skips = 0
+        let stall = NSError(domain: "RNTP-Crossfade", code: 5, userInfo: [
+            NSLocalizedDescriptionKey: "Crossfade engine did not become ready (no progress for 10000 ms).",
+            "code": "crossfade_prepare_timeout"
+        ])
+        advanceAfterTrackEnd(
+            skip: { completion in skips += 1; completion(.failure(stall)) },
+            report: { reports.append($0) }
+        )
+        XCTAssertEqual(skips, 1)
+        XCTAssertEqual(reports, [PlaybackAdvanceFailure(
+            code: "crossfade_prepare_timeout",
+            message: "Crossfade engine did not become ready (no progress for 10000 ms)."
+        )])
+    }
+
+    func testAnAdvanceAfterATrackEndReportsNothingWhenItStartsOrIsCancelled() {
+        var reports: [PlaybackAdvanceFailure] = []
+        let cancelled = NSError(domain: "RNTP-Orchestrator", code: 1, userInfo: ["code": "cancelled"])
+        advanceAfterTrackEnd(skip: { $0(.success(())) }, report: { reports.append($0) })
+        advanceAfterTrackEnd(skip: { $0(.failure(cancelled)) }, report: { reports.append($0) })
+        XCTAssertTrue(reports.isEmpty)
+    }
+
+    func testAnAdvanceFailureIsEmittedWithTheFieldsAndroidSends() {
+        let body = PlaybackAdvanceFailure(code: "crossfade_prepare_timeout", message: "stalled").eventBody
+        XCTAssertEqual(body.count, 2)
+        XCTAssertEqual(body["code"] as? String, "crossfade_prepare_timeout")
+        XCTAssertEqual(body["message"] as? String, "stalled")
+    }
+
+    func testStoppingALoadRemovesTheItemFromARealPlayer() {
+        let player = AVPlayer(playerItem: AVPlayerItem(url: URL(string: "http://127.0.0.1:9/never.m3u8")!))
+        XCTAssertNotNil(player.currentItem)
+        stopLoading(player)
+        XCTAssertNil(player.currentItem, "the player keeps no item, so it requests nothing more")
     }
 
     // The stall watch: every wait gives up after `stallTimeoutMs` with no progress, or at its cap.

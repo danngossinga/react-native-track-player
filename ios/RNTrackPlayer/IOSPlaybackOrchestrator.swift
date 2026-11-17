@@ -674,6 +674,9 @@ final class IOSPlaybackOrchestrator {
                         self.scheduleEndObserver()
                     }
                 case .failure:
+                    // As Android: the position after a failed seek is its target (the engine
+                    // dropped the item), where the next play loads the track again.
+                    self.checkpoint(position: position, reason: "seek_failed")
                     self.state = .error
                 }
                 self.operationRegistry.performAfterCurrentMutation {
@@ -1786,11 +1789,14 @@ final class IOSPlaybackOrchestrator {
             if let next = nextIndex(after: currentIndex) {
                 // The load leaves the player in error when it fails; the app learns why from a
                 // playback error, as from a failed skip's rejection.
-                skip(to: next, initialTime: 0) { [weak self] result in
-                    guard let self = self, let failure = PlaybackAdvanceFailure(result) else { return }
-                    IOSPlaybackLog.log("advance failed toIndex=\(next) error=\(failure.code)")
-                    self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)
-                }
+                advanceAfterTrackEnd(
+                    skip: { completion in self.skip(to: next, initialTime: 0, completion: completion) },
+                    report: { [weak self] failure in
+                        guard let self = self else { return }
+                        IOSPlaybackLog.log("advance failed toIndex=\(next) error=\(failure.code)")
+                        self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)
+                    }
+                )
             } else {
                 state = .ended
                 emitStateIfNeeded()

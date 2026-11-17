@@ -367,7 +367,7 @@ final class IOSCrossfadeEngine {
     /// the next play loads the track again. As Android's engine.
     private func abandonLoad() {
         IOSPlaybackLog.log("\(name) load abandoned")
-        player.replaceCurrentItem(with: nil)
+        stopLoading(player)
     }
 
     func reset() {
