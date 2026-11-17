@@ -76,9 +76,9 @@ the error state) is how the app learns of it, on Android and iOS.
 With the standard backend, it reports a load that gives up (no progress for
 `stallTimeoutMs`, or over `prepareTimeoutMs`), with the same
 `crossfade_prepare_timeout` code, on Android and iOS: standard loads (load, skip,
-the next track) are not awaited by their commands. On either backend, the track
-that failed to load does not stay the active one: the previous track is active
-again (`PlaybackActiveTrackChanged` back to it on the standard backend).
+the next track) are not awaited by their commands. On either backend, a track is
+reported active (`PlaybackActiveTrackChanged`) once it loaded, never one that
+failed to load: the previous track stays active.
 
 | Param   | Type     | Description       |
 | ------- | -------- | ----------------- |
