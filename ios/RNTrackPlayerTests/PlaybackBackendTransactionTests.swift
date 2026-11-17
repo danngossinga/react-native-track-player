@@ -380,14 +380,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         var logs: [ObjectIdentifier: [Int64]] = [:]
         var buffered = 0.0
 
-        func observe(_ phase: StandardLoadPhase = .loading) -> StallVerdict? {
+        func observe(_ phase: StandardLoadPhase = .loading, owned: Bool = false) -> StallVerdict? {
             let item = ObjectIdentifier(watch.a)
-            if watch.watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [])) {
+            if watch.watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [], ownedElsewhere: owned)) {
                 bytes.startLoad(url: url)
             }
             bytes.playerItem(playerItem)
             let progress = bytes.read { [unowned self] in self.logs[ObjectIdentifier($0)] ?? [] }
-            return watch.watch.check(StandardLoadObservation(item: item, phase: phase, readings: [progress, buffered]))
+            return watch.watch.check(StandardLoadObservation(item: item, phase: phase, readings: [progress, buffered], ownedElsewhere: owned))
         }
     }
 
@@ -440,6 +440,26 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(bytes.read { _ in [-1] }, 61, "a log that reads lower is no progress")
     }
 
+    func testStandardLoadBytesALoadWatchedAgainAfterASeekKeepsCountingItsItem() {
+        // A seek owned the loading of an item never ready; once it ended, the same AVPlayerItem
+        // loads on (a new watch, Android's startLoad of the same item): its bytes still count.
+        let h = LoadBytesHarness()
+        let item = NSObject()
+        h.playerItem = item
+        XCTAssertNil(h.observe())
+        h.watch.now = 2
+        XCTAssertNil(h.observe(owned: true))
+        h.watch.now = 3
+        XCTAssertNil(h.observe())
+        h.watch.now = 8
+        h.logs[ObjectIdentifier(item)] = [100]
+        XCTAssertNil(h.observe())
+        h.watch.now = 13
+        XCTAssertNil(h.observe(), "bytes arrived at 8 s")
+        h.watch.now = 18
+        XCTAssertEqual(h.observe(), .stalled)
+    }
+
     func testStandardLoadBytesALoadCountsOnlyItsOwnItem() {
         // Progress belongs to one load (Android: LoadedBytes.startLoad): a retry of the same track
         // (same URL, a new item) never counts the previous item's late entries.
@@ -452,9 +472,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         bytes.startLoad(url: url)
         bytes.playerItem(old)
         XCTAssertEqual(bytes.read(entries), 101)
+        // A retry: SwiftAudioEx gives its AVPlayer a new item (its load clears the old one).
         bytes.startLoad(url: url)
-        // The previous item, still the player's or posting a late entry: not this load's.
-        bytes.playerItem(old)
+        // The previous item posting a late entry: not this load's.
         XCTAssertFalse(bytes.loggedItem(old, url: url))
         XCTAssertFalse(bytes.isLoadEvent(old, url: url, player: .unavailable))
         logs[ObjectIdentifier(old)] = [500]
@@ -506,8 +526,9 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         guard case .item(nil) = standardPlayerItem(of: player) else {
             return XCTFail("no item yet")
         }
-        let item = AVPlayerItem(url: URL(string: "https://media.example/a.mp3")!)
+        let item = AVPlayerItem(url: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("absent.mp3"))
         player.avPlayer.replaceCurrentItem(with: item)
+        defer { player.avPlayer.replaceCurrentItem(with: nil) }
         guard case let .item(read) = standardPlayerItem(of: player) else {
             return XCTFail("the wrapper's player is read")
         }

@@ -2163,9 +2163,9 @@ func standardAccessLogBytes(_ item: AnyObject) -> [Int64] {
 /// request), then every byte of its item's access log (media, which Android counts always).
 ///
 /// Progress belongs to one load (Android: `startLoad`): its item is the player's own current item
-/// first seen after the load started (`playerItem`) or, when the player's item cannot be read, the
-/// first item of the load's URL that posts an access-log entry (`loggedItem`); never an item an
-/// earlier load had, so a previous item's late entries do not count. Main.
+/// (`playerItem`) or, when the player's item cannot be read, the first item of the load's URL that
+/// posts an access-log entry after the load started, never one an earlier load had
+/// (`loggedItem`), so a previous item's late entries do not count. Main.
 final class StandardLoadBytes {
     private final class Earlier {
         weak var item: AnyObject?
@@ -2188,10 +2188,12 @@ final class StandardLoadBytes {
         self.url = url
     }
 
-    /// The player's own current item (`standardPlayerItem`): the load's item when no earlier load
-    /// had it (a reload within the load replaces it).
+    /// The player's own current item (`standardPlayerItem`): the load's item (a reload within the
+    /// load replaces it). SwiftAudioEx's load clears its AVPlayer's item (or makes a new AVPlayer)
+    /// before it starts loading, so that item is never an earlier load's; the same item watched
+    /// again (a seek owned its loading meanwhile) loads on, as Android's startLoad of that item.
     func playerItem(_ candidate: AnyObject?) {
-        guard let candidate = candidate, candidate !== item, !hadEarlier(candidate) else { return }
+        guard let candidate = candidate, candidate !== item else { return }
         bind(candidate)
     }
 

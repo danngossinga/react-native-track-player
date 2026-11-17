@@ -729,6 +729,7 @@ assert(
         'testStandardLoadBytesArrivingKeepALoadGoingWhileItsBufferedPositionStandsStill',
         'testStandardLoadBytesTheItemAppearingIsProgressAndUnknownBytesCountAsNothing',
         'testStandardLoadBytesALoadCountsOnlyItsOwnItem',
+        'testStandardLoadBytesALoadWatchedAgainAfterASeekKeepsCountingItsItem',
         'testStandardLoadBytesWithoutThePlayersItemTheLoadTakesTheFirstLoggedItemOfItsURL',
         'testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper',
         'testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching',
