@@ -69,7 +69,10 @@ Fired at the `progressUpdateEventInterval` if the player is playing _and_ if a `
 | track       | `number` | The current index in the queue of the track.                           |
 
 ### `PlaybackError`
-Fired when an error occurs.
+Fired when an error occurs. With the crossfade backend, it also reports a track
+that failed to load when the previous one ended (a stall at `stallTimeoutMs`, the
+total limit, a player error): no command waits for that load, so this event (and
+the error state) is how the app learns of it, on Android and iOS.
 
 | Param   | Type     | Description       |
 | ------- | -------- | ----------------- |

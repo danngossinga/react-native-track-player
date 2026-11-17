@@ -71,6 +71,12 @@ Added fork surface:
   fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
+  A crossfade load or seek that gives up stops loading at once (Android stops the
+  player, iOS removes the item: no request is retried in the background) and
+  leaves the player in an error state; the next play loads the track again. When
+  the track that follows an ended one fails to load (no command waits for it),
+  the crossfade backend reports it with a `PlaybackError` event (`code`, for
+  example `crossfade_prepare_timeout`, and `message`) on both platforms.
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends
@@ -89,7 +95,8 @@ Added fork surface:
   `updateOptions`, default 96000): the bandwidth each track starts from before the
   player has measured the network. An adaptive stream starts at the highest
   rendition fitting about 70 % of it, or the lowest when none fits, and climbs as
-  the player measures. It is a start-of-track estimate: a new value is used at
+  the player measures (HLS audio renditions adapt even though the master playlist
+  gives no channel count or sample rate). It is a start-of-track estimate: a new value is used at
   the next track start; the playing track is not reset mid-track (its rendition
   follows the measured bandwidth).
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.
