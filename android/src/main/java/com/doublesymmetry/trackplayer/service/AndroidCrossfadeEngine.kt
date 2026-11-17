@@ -13,12 +13,10 @@ import com.google.android.exoplayer2.MediaItem
 import com.google.android.exoplayer2.MediaMetadata
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.audio.AudioAttributes
-import com.google.android.exoplayer2.drm.DrmSessionManagerProvider
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
 import com.google.android.exoplayer2.source.MediaSource
 import com.google.android.exoplayer2.source.hls.HlsDataSourceFactory
 import com.google.android.exoplayer2.source.hls.HlsMediaSource
-import com.google.android.exoplayer2.upstream.LoadErrorHandlingPolicy
 import com.google.android.exoplayer2.util.MimeTypes
 import com.google.android.exoplayer2.util.Util
 import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
@@ -26,6 +24,7 @@ import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import com.google.android.exoplayer2.upstream.DefaultDataSource
+import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
 import kotlinx.coroutines.delay
 import timber.log.Timber
@@ -100,55 +99,28 @@ internal class AndroidCrossfadeEngine(
      * The app's current `stallTimeoutMs`, read at every HTTP request: the connect and read
      * timeouts follow it (see [CurrentTimeoutHttpDataSourceFactory]).
      */
-    stallTimeoutMs: () -> Long
+    stallTimeoutMs: () -> Long,
+    /** Opens one HTTP request with the given timeout (tests gate it). */
+    requestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
 ) : AndroidCrossfadeEnginePort {
     private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->
         crossfadeBandwidthMeter(context, estimate)
     }
+    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, requestSource)
+    /** Each load's media source gets its own data sources, reporting to that load's progress. */
+    private val mediaSourceFactory = CrossfadeMediaSourceFactory {
+        DefaultDataSource.Factory(context, httpDataSourceFactory)
+    }
     /**
-     * Bytes this player has downloaded that count as a load's progress: media (segments, a
-     * progressive file) always; HLS playlists and keys only until the track's first segment is
-     * asked for. Before that they are the load's only progress (a slow proxy answering the
-     * playlists must not fail a healthy track); after it, the player reloads them when it falls
-     * back to another rendition after a failed segment, which is not progress. The total limit
-     * (prepareTimeoutMs) bounds both stages.
+     * The progress of the track loaded now (see [LoadProgress]). A new one at every load: a
+     * request of an earlier track still on its way reports to that track's, never to this one.
      */
-    private val bytesLoaded = AtomicLong(0L)
-    /** Set once the current track has asked for a segment; reset at every load. */
-    private val mediaRequested = AtomicBoolean(false)
-    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)
-    /** HLS playlists and keys: progress until the first segment is asked for. */
-    private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
-        .setTransferListener(object : TransferListener {
-            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-                if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())
-            }
-            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-        })
-    /** Media: segments and progressive files, whose bytes are progress. */
-    private val mediaDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
-        .setTransferListener(object : TransferListener {
-            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
-                mediaRequested.set(true)
-            }
-            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-                bytesLoaded.addAndGet(bytesTransferred.toLong())
-            }
-            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-        })
-    private val mediaSourceFactory = CrossfadeMediaSourceFactory(
-        playlistDataSourceFactory = dataSourceFactory,
-        mediaDataSourceFactory = mediaDataSourceFactory
-    )
+    private var currentLoad = LoadProgress()
     private var preparedItem: TrackAudioItem? = null
     private var preparedTrackKey: String? = null
     private var operationGeneration = 0L
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(mediaSourceFactory)
         .setBandwidthMeter(bandwidthMeter)
         .setTrackSelector(crossfadeTrackSelector(context))
         .build()
@@ -196,7 +168,7 @@ internal class AndroidCrossfadeEngine(
 
     /** What a wait reads as progress: bytes downloaded and media buffered. */
     private fun loadProgress(): LongArray =
-        longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)
+        longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)
 
     override suspend fun prepare(
         item: TrackAudioItem,
@@ -219,11 +191,12 @@ internal class AndroidCrossfadeEngine(
         // Every track starts from the app's current estimate, not from the last track's measure.
         // A start-of-track estimate: a new value waits for the next track; the playing one keeps
         // following the measured bandwidth.
-        // A new track: its playlists are progress again until it asks for a segment.
-        mediaRequested.set(false)
         val initialEstimate = bandwidthMeter.startTrack()
         androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
-        player.setMediaItem(buildMediaItem(item))
+        // A new track, a new progress: its playlists count again until it asks for a segment.
+        val load = LoadProgress()
+        currentLoad = load
+        player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))
         player.prepare()
         player.seekTo(max(0L, positionMs))
         preparedItem = item
@@ -415,38 +388,65 @@ internal class AndroidCrossfadeEngine(
 }
 
 /**
- * The crossfade players' media sources. An HLS track loads its segments from
- * [mediaDataSourceFactory] (whose bytes count as a load's progress) and its playlists and keys
- * from [playlistDataSourceFactory]; any other track is media only.
+ * One load's progress: the bytes downloaded for it that count. Media (segments, a progressive
+ * file) always; HLS playlists and keys only until the load asks for its first segment. Before
+ * that they are the load's only progress (a slow proxy answering the playlists must not fail a
+ * healthy track); after it, the player reloads them when it falls back to another rendition
+ * after a failed segment, which is not progress. The total limit (prepareTimeoutMs) bounds both
+ * stages. Each load has its own, so a request of an earlier load cannot change it.
+ */
+internal class LoadProgress {
+    val bytesLoaded = AtomicLong(0L)
+    /** Set once this load has asked for a segment. */
+    val mediaRequested = AtomicBoolean(false)
+
+    /** HLS playlists and keys: progress until the first segment is asked for. */
+    val playlistListener: TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    }
+
+    /** Media: segments and progressive files, whose bytes are progress. */
+    val mediaListener: TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+            mediaRequested.set(true)
+        }
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            bytesLoaded.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    }
+}
+
+/**
+ * The crossfade players' media sources, one per load. An HLS track loads its segments through
+ * data sources reporting to [LoadProgress.mediaListener] and its playlists and keys through ones
+ * reporting to [LoadProgress.playlistListener]; any other track is media only.
  */
 internal class CrossfadeMediaSourceFactory(
-    playlistDataSourceFactory: DataSource.Factory,
-    mediaDataSourceFactory: DataSource.Factory
-) : MediaSource.Factory {
-    private val hls = HlsMediaSource.Factory(
-        HlsDataSourceFactory { dataType ->
-            (if (dataType == C.DATA_TYPE_MEDIA) mediaDataSourceFactory else playlistDataSourceFactory).createDataSource()
-        }
-    )
-    private val other = DefaultMediaSourceFactory(mediaDataSourceFactory)
-
-    override fun setDrmSessionManagerProvider(provider: DrmSessionManagerProvider): MediaSource.Factory = apply {
-        hls.setDrmSessionManagerProvider(provider)
-        other.setDrmSessionManagerProvider(provider)
-    }
-
-    override fun setLoadErrorHandlingPolicy(policy: LoadErrorHandlingPolicy): MediaSource.Factory = apply {
-        hls.setLoadErrorHandlingPolicy(policy)
-        other.setLoadErrorHandlingPolicy(policy)
-    }
-
-    override fun getSupportedTypes(): IntArray = other.supportedTypes
-
-    override fun createMediaSource(mediaItem: MediaItem): MediaSource {
+    /** A fresh data source factory (HTTP and local), to which a load adds its listener. */
+    private val newDataSourceFactory: () -> DefaultDataSource.Factory
+) {
+    fun createMediaSource(mediaItem: MediaItem, load: LoadProgress): MediaSource {
+        val playlists = newDataSourceFactory().setTransferListener(load.playlistListener)
+        val media = newDataSourceFactory().setTransferListener(load.mediaListener)
         val configuration = mediaItem.localConfiguration
         val isHls = configuration != null &&
             Util.inferContentTypeForUriAndMimeType(configuration.uri, configuration.mimeType) == C.CONTENT_TYPE_HLS
-        return if (isHls) hls.createMediaSource(mediaItem) else other.createMediaSource(mediaItem)
+        return if (isHls) {
+            HlsMediaSource.Factory(
+                HlsDataSourceFactory { dataType ->
+                    (if (dataType == C.DATA_TYPE_MEDIA) media else playlists).createDataSource()
+                }
+            ).createMediaSource(mediaItem)
+        } else {
+            DefaultMediaSourceFactory(media).createMediaSource(mediaItem)
+        }
     }
 }
 

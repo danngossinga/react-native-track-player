@@ -288,9 +288,9 @@ for (const [label, wait] of [['load', enginePrepare], ['seek', engineSeek]]) {
   );
 }
 assert(
-  engineSource.includes('longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
+  engineSource.includes('longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
     engineSource.includes('bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
-    engineSource.includes('.setTransferListener(object : TransferListener {') &&
+    engineSource.includes('val mediaListener: TransferListener = object : TransferListener {') &&
     stallWatchSource.includes('val watch = StallWatch(stallTimeoutMs, totalTimeoutMs, nowMs())') &&
     stallWatchSource.includes('val verdict = watch.check(nowMs(), readings())'),
   'Android engine waits must read downloaded bytes and buffered media as progress.'
@@ -305,7 +305,7 @@ assert(
     engineSource.includes('private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->\n        crossfadeBandwidthMeter(context, estimate)') &&
     enginePrepare.includes('val initialEstimate = bandwidthMeter.startTrack()') &&
     enginePrepare.includes('androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")') &&
-    enginePrepare.indexOf('bandwidthMeter.startTrack()') < enginePrepare.indexOf('player.setMediaItem(buildMediaItem(item))') &&
+    enginePrepare.indexOf('bandwidthMeter.startTrack()') < enginePrepare.indexOf('player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))') &&
     section(engineSource, 'internal fun crossfadeBandwidthMeter(', '/**').includes('.setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
     startTrack.includes('val estimate = initialBitrateEstimateBps()') &&
     startTrack.includes('val fresh = newMeter(estimate)') &&
@@ -401,7 +401,8 @@ assert(
 const perRequestHttp = read('android/src/main/java/com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt');
 const perRequestOpen = section(perRequestHttp, 'override fun open(dataSpec: DataSpec): Long {', 'override fun read(');
 assert(
-  engineSource.includes('private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)') &&
+  engineSource.includes('private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, requestSource)') &&
+    engineSource.includes('requestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts') &&
     engineSource.includes('DefaultDataSource.Factory(context, httpDataSourceFactory)') &&
     perRequestOpen.includes('val source = openRequestSource()') &&
     perRequestOpen.indexOf('listeners.forEach(source::addTransferListener)') < perRequestOpen.indexOf('return source.open(dataSpec)') &&
@@ -439,7 +440,7 @@ assert(
   const requestOptions = section(engineSource, 'private fun configureRequestOptions(', '\n    }\n');
   assert(
     prepareBody.includes('configureRequestOptions(item)') &&
-      prepareBody.indexOf('configureRequestOptions(item)') < prepareBody.indexOf('player.setMediaItem(') &&
+      prepareBody.indexOf('configureRequestOptions(item)') < prepareBody.indexOf('player.setMediaSource(') &&
       requestOptions.includes('options?.userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }') &&
       requestOptions.includes('setDefaultRequestProperties'),
     'Android crossfade must give each track its headers and user agent before setting the item.'
@@ -540,28 +541,27 @@ assert(
   );
 }
 
-// Only media bytes are a load's progress: HLS playlists and keys (reloaded when the player falls
-// back to another rendition) come from a factory without the progress listener.
+// A load's progress is its own (LoadProgress, one per load: a request of an earlier track cannot
+// change it). Media bytes count; HLS playlists and keys count until the load asks for its first
+// segment, not after (reloads when the player falls back to another rendition).
 {
   const factory = section(engineSource, 'internal class CrossfadeMediaSourceFactory(', '\n}\n');
-  const fields = section(engineSource, 'private val bytesLoaded = AtomicLong(0L)', 'private var preparedItem');
+  const load = section(engineSource, 'internal class LoadProgress {', '\n}\n');
+  const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+  const hlsTests = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt');
   assert(
-    factory.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaDataSourceFactory else playlistDataSourceFactory).createDataSource()') &&
-      factory.includes('private val other = DefaultMediaSourceFactory(mediaDataSourceFactory)') &&
-      fields.includes('private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)\n') &&
-      fields.includes('private val mediaDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)\n        .setTransferListener(') &&
-      fields.includes('playlistDataSourceFactory = dataSourceFactory,') &&
-      fields.includes('mediaDataSourceFactory = mediaDataSourceFactory'),
-    'Android engine waits must count media bytes only, not playlist or key reloads.'
-  );
-  // Until the track's first segment is asked for, playlists and keys are its only progress.
-  assert(
-    fields.includes('if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
-      fields.includes('override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {\n                mediaRequested.set(true)') &&
-      section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)').includes('mediaRequested.set(false)') &&
-      read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt')
-        .includes('fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyTrackGiveUp()'),
-    'Android engine waits must count playlists and keys as progress until the first segment is asked for.'
+    factory.includes('val playlists = newDataSourceFactory().setTransferListener(load.playlistListener)') &&
+      factory.includes('val media = newDataSourceFactory().setTransferListener(load.mediaListener)') &&
+      factory.includes('(if (dataType == C.DATA_TYPE_MEDIA) media else playlists).createDataSource()') &&
+      factory.includes('DefaultMediaSourceFactory(media).createMediaSource(mediaItem)') &&
+      load.includes('if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
+      load.includes('override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {\n            mediaRequested.set(true)') &&
+      prepareBody.includes('val load = LoadProgress()\n        currentLoad = load\n        player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))') &&
+      engineSource.includes('longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
+      !/\.setMediaSourceFactory\(/.test(engineSource) &&
+      hlsTests.includes('fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyTrackGiveUp()') &&
+      hlsTests.includes('fun aStaleSegmentRequestOfThePreviousTrackDoesNotStopTheNextTracksPlaylistsCounting()'),
+    'Android engine waits must count each load\'s own progress: media always, playlists and keys until its first segment.'
   );
 }
 

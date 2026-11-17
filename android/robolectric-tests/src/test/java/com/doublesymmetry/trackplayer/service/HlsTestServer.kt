@@ -49,6 +49,14 @@ internal class HlsTestServer(
     /** Request paths, in arrival order. */
     val requests: MutableList<String> = Collections.synchronizedList(mutableListOf())
 
+    /** Arrival time (monotonic, ms) of each request in [requests]. */
+    private val requestTimesMs: MutableList<Long> = Collections.synchronizedList(mutableListOf())
+
+    /** When the first request whose path matches arrived (monotonic, ms), or null. */
+    fun firstRequestAtMs(matches: (String) -> Boolean): Long? = synchronized(requests) {
+        requests.indexOfFirst(matches).takeIf { it >= 0 }?.let { requestTimesMs[it] }
+    }
+
     /** Arrival time (monotonic, ms) of each stalled segment request, in order. */
     val stalledRequestTimesMs: MutableList<Long> = Collections.synchronizedList(mutableListOf())
 
@@ -57,6 +65,9 @@ internal class HlsTestServer(
 
     val masterUrl: String
         get() = "http://127.0.0.1:${socket.localPort}/master.m3u8"
+
+    val port: Int
+        get() = socket.localPort
 
     init {
         pool.execute {
@@ -79,7 +90,10 @@ internal class HlsTestServer(
                     if (header.isEmpty()) break
                 }
                 val path = requestLine.split(' ').getOrNull(1)?.substringBefore('?') ?: break
-                requests += path
+                synchronized(requests) {
+                    requests += path
+                    requestTimesMs += monotonicNowMs()
+                }
                 val segment = SEGMENT_NAME.matchEntire(path.substringAfterLast('/'))?.groupValues?.get(1)?.toInt()
                 when {
                     path == "/master.m3u8" -> {
