@@ -795,9 +795,10 @@ abstract class BaseAudioPlayer internal constructor(
                     .replace("_", "-"),
                 error.message
             )
-            playerEventHolder.updatePlaybackError(_playbackError)
+            // Fork: the error state, then the playback error (as failLoad, the crossfade path and iOS).
             playbackError = _playbackError
             playerState = AudioPlayerState.ERROR
+            playerEventHolder.updatePlaybackError(_playbackError)
         }
     }
 }

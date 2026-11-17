@@ -851,6 +851,22 @@ class StandardBackendHlsTest {
     }
 
     @Test
+    fun aPlayerErrorNoCommandWaitsForEmitsTheErrorStateThenThePlaybackError() {
+        // ExoPlayer's own error (a master playlist it cannot parse), as a give-up: state, then
+        // error (KotlinAudio emitted the error first; iOS and the crossfade path: state first).
+        val broken = HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
+        val backed = backed()
+        backed.backend.add(listOf(item(broken, 1L)))
+        val before = backed.events.size
+        command { backed.backend.play() }
+        awaitTrue("a player error") { backed.player.playerState == AudioPlayerState.ERROR }
+        pump(STALL_TIMEOUT_MS)
+        assertFalse("no command waits for the load", backed.backend.reportsPlayerErrorThroughCommand())
+        val emitted = backed.events.drop(before).filter { it == "state:ERROR" || it.startsWith("error:") }
+        assertEquals(listOf("state:ERROR", "error:parsing-manifest-malformed"), emitted)
+    }
+
+    @Test
     fun aGiveUpEmitsTheErrorStateThenThePlaybackError() {
         val stalled = server(LADDER)
         val backed = backed()
@@ -927,16 +943,18 @@ class StandardBackendHlsTest {
         ).also { it.startLoadWatch(Handler(Looper.getMainLooper())) }
 
         /**
-         * KotlinAudio's state and playback-error events in the order the player emits them (as
-         * MusicService receives them): "state:<state>", "error:<code>". Recorded at once
-         * (undispatched); both flows replay their last value at subscription, recorded too.
+         * KotlinAudio's state and playback-error events in the order MusicService emits them to
+         * JS (PLAYBACK_STATE, PLAYBACK_ERROR): "state:<state>", "error:<code>". Collected as
+         * MusicService's observeEvents does (its MainScope, collectWithAdmission, admitted);
+         * both flows replay their last value at subscription, recorded too.
          */
         val events: MutableList<String> = java.util.Collections.synchronizedList(mutableListOf())
-        val eventScope = CoroutineScope(kotlinx.coroutines.SupervisorJob() + Dispatchers.Main.immediate)
+        val eventScope = kotlinx.coroutines.MainScope()
 
         init {
-            eventScope.launch { player.event.stateChange.collect { events += "state:$it" } }
-            eventScope.launch { player.event.playbackError.collect { events += "error:${it.code}" } }
+            val admission = SharedFlowAdmissionGate().also { it.admit() }
+            eventScope.collectWithAdmission(player.event.stateChange, admission) { events += "state:$it" }
+            eventScope.collectWithAdmission(player.event.playbackError, admission) { events += "error:${it.code}" }
         }
 
         /** What a command left when it returned (or threw), read at that moment. */
