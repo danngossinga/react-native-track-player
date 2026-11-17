@@ -190,25 +190,68 @@ jobs:
         run: |-
           cd example
           yarn install
+      # Both Gradle builds share these caches: the example (Gradle 7.5.1) and the Robolectric
+      # engine tests (Gradle 8.7, AGP 8.6.1), so the keys cover both builds' files.
       - name: Cache Gradle Wrapper
         if: ${{ needs.check-changes.outputs.should-build-android }}
         uses: actions/cache@v4
         with:
           path: ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-wrapper-${{ hashFiles('example/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-gradle-wrapper-${{ hashFiles('example/android/gradle/wrapper/gradle-wrapper.properties', 'android/robolectric-tests/gradle/wrapper/gradle-wrapper.properties') }}
       - name: Cache Gradle Dependencies
         if: ${{ needs.check-changes.outputs.should-build-android }}
         uses: actions/cache@v4
         with:
           path: ~/.gradle/caches
-          key: ${{ runner.os }}-gradle-caches-${{ hashFiles('example/android/gradle/wrapper/gradle-wrapper.properties') }}
+          key: ${{ runner.os }}-gradle-caches-${{ hashFiles('example/android/gradle/wrapper/gradle-wrapper.properties', 'example/android/build.gradle', 'android/build.gradle', 'android/robolectric-tests/*.gradle.kts', 'android/robolectric-tests/gradle/wrapper/gradle-wrapper.properties') }}
           restore-keys: |
             ${{ runner.os }}-gradle-caches-
+      # Robolectric's android-all jar (SDK 35), which Robolectric downloads into ~/.m2.
+      - name: Cache Robolectric Android Jars
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository/org/robolectric
+          key: ${{ runner.os }}-robolectric-${{ hashFiles('android/robolectric-tests/build.gradle.kts', 'android/robolectric-tests/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-robolectric-
       - name: Build App
         if: ${{ needs.check-changes.outputs.should-build-android }}
         run: |-
           cd example/android
           ./gradlew assembleDebug --no-daemon
+      - name: Library Unit Tests
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        run: |-
+          cd example/android
+          ./gradlew :react-native-track-player:testDebugUnitTest --no-daemon
+      # The crossfade engine's real ExoPlayer against a local HLS server (Robolectric, its own
+      # Gradle 8.7 build). Robolectric downloads its android-all jar on a fresh runner.
+      - name: Engine Tests (Robolectric)
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        run: |-
+          cd android/robolectric-tests
+          ./gradlew testDebugUnitTest --no-daemon
+  contracts:
+    # Source contracts of both platforms' players.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+      - name: Setup Yarn
+        run: |
+          npm install --global corepack@0.34.0
+          corepack enable
+          corepack prepare yarn@1.22.22 --activate
+      # The module fallback contract compiles the TypeScript entry (typescript is a devDependency).
+      - name: Install Dependencies
+        run: yarn install --frozen-lockfile
+      - name: Player Contracts
+        run: yarn run test:contracts
   build-docs:
     runs-on: ubuntu-latest
     needs: check-changes

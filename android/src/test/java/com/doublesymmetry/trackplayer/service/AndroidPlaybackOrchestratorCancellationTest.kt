@@ -449,6 +449,149 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aStalledNaturalAdvanceReportsAPlaybackErrorAtTheStallTimeout() = runTest {
+        // No command waits for the next track when one ends: the stall must still reach the app,
+        // as an error state and a playback-error with the code a failed skip rejects with.
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.prepareTimeoutMs = { 60_000L }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            assertEquals(AudioPlayerState.PLAYING, delegate.playbackStates.last())
+
+            // The track ends; the next one gets no data at all.
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            engineA.ended = true
+            // The monitor looks every 250 ms, then the load waits the stall timeout.
+            advanceTimeBy(9_900L)
+            runCurrent()
+            assertTrue("no error before the stall timeout", delegate.playbackErrors.isEmpty())
+            advanceTimeBy(250L + 2 * ENGINE_WAIT_POLL_INTERVAL_MS + 100L)
+            runCurrent()
+            assertEquals(listOf("crossfade_prepare_timeout"), delegate.playbackErrors.map { it.first })
+            assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
+            assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
+            assertEquals(1, orchestrator.currentIndex)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aTrackThatEndsWhileTheNextOnePreloadsAdvancesAsOnIos() = runTest {
+        // The next track's preload stalls (a seek near the end, a slow network) and the playing
+        // track ends meanwhile: the player moves on at once (iOS also does so while preloading),
+        // and a stalled next track is reported at the stall timeout, not left playing in silence.
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.prepareTimeoutMs = { 60_000L }
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            engineB.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            orchestrator.play()
+            runCurrent()
+            assertEquals(AndroidPlaybackOrchestratorState.PRELOADING_NEXT, orchestrator.state)
+
+            // The track ends; the next one gets no data on the engine that now loads it either.
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            engineA.ended = true
+            advanceTimeBy(250L + 2 * ENGINE_WAIT_POLL_INTERVAL_MS)
+            runCurrent()
+            assertEquals("the end is acted on", AudioPlayerState.LOADING, orchestrator.playbackState)
+            assertEquals(1, orchestrator.currentIndex)
+            advanceTimeBy(10_000L)
+            runCurrent()
+            assertEquals(listOf("crossfade_prepare_timeout"), delegate.playbackErrors.map { it.first })
+            assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aPlayOrSeekAfterAGiveUpThatStallsAgainEndsInErrorAsOnIos() = runTest {
+        // After a give-up the track is not prepared: play and seek load it again. When that load
+        // stalls too, the player reports an error (iOS .error), not loading forever.
+        for (command in listOf("play", "seek")) {
+            val engineA = FakeCrossfadeEngine("engineA")
+            val engineB = FakeCrossfadeEngine("engineB")
+            val delegate = RecordingOrchestratorDelegate()
+            val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+            try {
+                orchestrator.stallTimeoutMs = { 10_000L }
+                orchestrator.setQueue(testItems(3))
+                orchestrator.play()
+                runCurrent()
+                engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+                runCatching { orchestrator.skip(2) }
+                assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
+
+                engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+                val error = runCatching {
+                    if (command == "play") orchestrator.play() else orchestrator.seekTo(5_000L)
+                }.exceptionOrNull()
+                assertEquals("$command after a give-up", "crossfade_prepare_timeout", (error as? RejectionException)?.code)
+                assertEquals("$command after a give-up", AudioPlayerState.ERROR, orchestrator.playbackState)
+                assertEquals("$command after a give-up", AudioPlayerState.ERROR, delegate.playbackStates.last())
+            } finally {
+                orchestrator.release()
+            }
+        }
+    }
+
+    @Test
+    fun aStalledLoadOfANewItemEndsInErrorAsOnIos() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            val error = runCatching { orchestrator.load(testItems(1).single()) }.exceptionOrNull()
+            assertEquals("crossfade_prepare_timeout", (error as? RejectionException)?.code)
+            assertEquals(AudioPlayerState.ERROR, orchestrator.playbackState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
+    fun aStalledSkipLeavesThePlayerInErrorAsOnIos() = runTest {
+        val engineA = FakeCrossfadeEngine("engineA")
+        val engineB = FakeCrossfadeEngine("engineB")
+        val delegate = RecordingOrchestratorDelegate()
+        val orchestrator = AndroidPlaybackOrchestrator.forTesting(backgroundScope, delegate, engineA, engineB)
+        try {
+            orchestrator.stallTimeoutMs = { 10_000L }
+            orchestrator.setQueue(testItems(3))
+            orchestrator.play()
+            runCurrent()
+            engineA.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            try {
+                orchestrator.skip(2)
+                fail("Expected the stalled load to fail")
+            } catch (error: RejectionException) {
+                assertEquals("crossfade_prepare_timeout", error.code)
+            }
+            // Like iOS's load: an error state, not "loading" forever. The rejection is the report
+            // (no playback-error on top of it).
+            assertEquals(AudioPlayerState.ERROR, delegate.playbackStates.last())
+            assertTrue(delegate.playbackErrors.isEmpty())
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aCrossfadeFallsBackAfterTheIncomingStallGraceTheAppSet() = runTest {
         // The fake engines never move, so the incoming track always stalls: the fallback comes
         // after the grace read at that moment.
@@ -748,8 +891,14 @@ class AndroidPlaybackOrchestratorCancellationTest {
             get() = if (ready) durationMs else position
         override val isReady: Boolean
             get() = ready
+        /** Set to end the prepared track, as the player does at its last sample. */
+        var ended = false
         override val playbackState: Int
-            get() = if (ready) Player.STATE_READY else Player.STATE_IDLE
+            get() = when {
+                ended -> Player.STATE_ENDED
+                ready -> Player.STATE_READY
+                else -> Player.STATE_IDLE
+            }
         override val currentVolume: Float
             get() = volume
         override val playerErrorMessage: String? = null
@@ -807,6 +956,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
             preparedItem = item
             position = positionMs
             ready = true
+            ended = false
         }
 
         override fun play(rate: Float) = Unit
@@ -815,6 +965,7 @@ class AndroidPlaybackOrchestratorCancellationTest {
         override fun reset() {
             preparedItem = null
             ready = false
+            ended = false
             position = 0L
             volume = 0f
         }

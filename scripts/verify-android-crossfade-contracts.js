@@ -263,8 +263,9 @@ assert(
 // never a number.
 assert(
   !/timeoutMs\s*=\s*\d/.test(orchestrator) &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 6 &&
-    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 6 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\)/g) || []).length === 4 &&
+    (orchestrator.match(/timeoutMs = prepareTimeoutMs\(\), stallTimeoutMs = stallTimeoutMs\(\), ticket = ticket\)/g) || []).length === 4 &&
+    (orchestrator.match(/prepareActiveOrFail\(/g) || []).length === 4 &&
     orchestrator.includes('var stallTimeoutMs: () -> Long = { DEFAULT_STALL_TIMEOUT_MS }'),
   'Android engine loads and seeks must all pass prepareTimeoutMs() and stallTimeoutMs(), never a fixed timeout.'
 );
@@ -287,9 +288,9 @@ for (const [label, wait] of [['load', enginePrepare], ['seek', engineSeek]]) {
   );
 }
 assert(
-  engineSource.includes('longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
+  engineSource.includes('longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
     engineSource.includes('bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
-    engineSource.includes('.setTransferListener(object : TransferListener {') &&
+    engineSource.includes('val mediaListener: TransferListener = object : TransferListener {') &&
     stallWatchSource.includes('val watch = StallWatch(stallTimeoutMs, totalTimeoutMs, nowMs())') &&
     stallWatchSource.includes('val verdict = watch.check(nowMs(), readings())'),
   'Android engine waits must read downloaded bytes and buffered media as progress.'
@@ -304,7 +305,7 @@ assert(
     engineSource.includes('private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->\n        crossfadeBandwidthMeter(context, estimate)') &&
     enginePrepare.includes('val initialEstimate = bandwidthMeter.startTrack()') &&
     enginePrepare.includes('androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")') &&
-    enginePrepare.indexOf('bandwidthMeter.startTrack()') < enginePrepare.indexOf('player.setMediaItem(buildMediaItem(item))') &&
+    enginePrepare.indexOf('bandwidthMeter.startTrack()') < enginePrepare.indexOf('player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))') &&
     section(engineSource, 'internal fun crossfadeBandwidthMeter(', '/**').includes('.setInitialBitrateEstimate(initialBitrateEstimateBps)') &&
     startTrack.includes('val estimate = initialBitrateEstimateBps()') &&
     startTrack.includes('val fresh = newMeter(estimate)') &&
@@ -400,7 +401,8 @@ assert(
 const perRequestHttp = read('android/src/main/java/com/doublesymmetry/trackplayer/service/CurrentTimeoutHttpDataSource.kt');
 const perRequestOpen = section(perRequestHttp, 'override fun open(dataSpec: DataSpec): Long {', 'override fun read(');
 assert(
-  engineSource.includes('private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)') &&
+  engineSource.includes('private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, requestSource)') &&
+    engineSource.includes('requestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts') &&
     engineSource.includes('DefaultDataSource.Factory(context, httpDataSourceFactory)') &&
     perRequestOpen.includes('val source = openRequestSource()') &&
     perRequestOpen.indexOf('listeners.forEach(source::addTransferListener)') < perRequestOpen.indexOf('return source.open(dataSpec)') &&
@@ -438,7 +440,7 @@ assert(
   const requestOptions = section(engineSource, 'private fun configureRequestOptions(', '\n    }\n');
   assert(
     prepareBody.includes('configureRequestOptions(item)') &&
-      prepareBody.indexOf('configureRequestOptions(item)') < prepareBody.indexOf('player.setMediaItem(') &&
+      prepareBody.indexOf('configureRequestOptions(item)') < prepareBody.indexOf('player.setMediaSource(') &&
       requestOptions.includes('options?.userAgent?.takeIf { it.isNotBlank() }?.let { setUserAgent(it) }') &&
       requestOptions.includes('setDefaultRequestProperties'),
     'Android crossfade must give each track its headers and user agent before setting the item.'
@@ -449,6 +451,150 @@ assert(
 assert(
   /internal open class WholeNumberSetting\(defaultValue: Long\) \{\s*@Volatile\s*var value: Long/.test(engineSource),
   'WholeNumberSetting.value must stay @Volatile: loading threads read it at every HTTP request.'
+);
+
+// An uncached adaptive track starts at its lowest rendition: the crossfade players' track
+// selector lets audio renditions with unknown channel counts or sample rates (an HLS master
+// playlist names neither) adapt from the bandwidth estimate. Pinned behaviour:
+// android/robolectric-tests CrossfadeEngineHlsTest.anUncachedTrack...
+{
+  const builder = section(engineSource, 'val player: ExoPlayer = ExoPlayer.Builder(context)', '.build()');
+  const parameters = section(engineSource, 'internal fun crossfadeTrackSelectorParameters(', '.build()');
+  assert(
+    builder.includes('.setTrackSelector(crossfadeTrackSelector(context))') &&
+      builder.includes('.setBandwidthMeter(bandwidthMeter)') &&
+      parameters.includes('.setAllowAudioMixedChannelCountAdaptiveness(true)') &&
+      parameters.includes('.setAllowAudioMixedSampleRateAdaptiveness(true)') &&
+      true,
+    'Android crossfade players must select adaptively among audio renditions (lowest first at a low estimate).'
+  );
+}
+
+// A load or seek an engine gives up on stops loading (no background retries) and forgets the
+// track, as iOS removes the item.
+{
+  const abandon = section(engineSource, 'private fun abandonLoad(generation: Long, why: String) {', '\n    }\n');
+  const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+  const seekBody = section(engineSource, 'override suspend fun seekTo(', 'override fun setVolume(');
+  assert(
+    abandon.includes('if (operationGeneration != generation) return') &&
+      abandon.includes('player.stop()') &&
+      abandon.includes('preparedItem = null') &&
+      abandon.includes('preparedTrackKey = null') &&
+      abandon.includes('load abandoned ($why)') &&
+      prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation, "load ${error.code}: ${error.message}")\n            throw error') &&
+      section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "load $reason")') &&
+      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")') &&
+      seekBody.includes('player.playerError?.let { error ->') &&
+      seekBody.includes('abandonLoad(generation, "seek ${error.code}: ${error.message}")'),
+    'An Android engine that gives up on a load or seek must stop the player and forget the track.'
+  );
+}
+
+// A track that fails to load leaves the player in error (as iOS); the load started when a track
+// ends reports its failure as a playback-error (no command waits for it), as iOS.
+{
+  const startTrack = section(orchestrator, 'private suspend fun startTrackAt(', 'private suspend fun ensureActivePrepared(');
+  const monitor = section(orchestrator, 'private suspend fun monitorActiveEngine() {', 'private suspend fun advanceToNextTrack(');
+  const advance = section(orchestrator, 'private suspend fun advanceToNextTrack(', 'private fun cancelCrossfade(');
+  assert(
+    startTrack.includes('prepareActiveOrFail(queue[index], positionMs, ticket)') &&
+      section(orchestrator, 'private suspend fun ensureActivePrepared(', 'private suspend fun prepareStandby(').includes('prepareActiveOrFail(item, positionMs, ticket)') &&
+      section(orchestrator, 'suspend fun load(item: TrackAudioItem)', 'fun setNowPlayingOverride(').includes('prepareActiveOrFail(item, 0L, ticket)') &&
+      section(orchestrator, 'private suspend fun prepareActiveOrFail(', 'private suspend fun prepareStandby(').includes('} catch (error: RejectionException) {\n            ticket?.ensureActive()\n            setState(AndroidPlaybackOrchestratorState.ERROR)\n            throw error') &&
+      monitor.includes('advanceToNextTrack(nextIndex, endedPosition)') &&
+      !monitor.includes('startTrackAt(') &&
+      advance.includes('val ticket = operationController.begin()') &&
+      advance.includes('delegate.onPlaybackError(error.code, error.message)') &&
+      advance.includes('operationController.finish(ticket)') &&
+      musicService.includes('override fun onPlaybackError(code: String, message: String?) {') &&
+      musicService.includes('emit(MusicEvents.PLAYBACK_ERROR, Bundle().apply {\n                        putString("code", code)'),
+    'A failed Android natural advance must leave the player in error and emit playback-error.'
+  );
+}
+
+// The engine behaviours are pinned by the Robolectric tests (real ExoPlayer, local HLS server),
+// which CI runs: each named test must keep its assertion, and the workflow must run the project.
+{
+  const hlsTests = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt');
+  const workflow = read('.github/workflows/validate.yml');
+  const testBody = (name) => section(hlsTests, `fun ${name}()`, '\n    @Test');
+  for (const name of [
+    'anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionHighestListedFirst',
+    'anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionLowestListedFirst'
+  ]) {
+    assert(
+      testBody(name).includes('assertEquals("v064", awaitFirstSegmentRendition(server))'),
+      `${name} must assert the first segment requested is the lowest rendition.`
+    );
+  }
+  assert(
+    testBody('failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions')
+      .includes('gaveUpAfterMs < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS') &&
+      hlsTests.includes('assertStopsLoading(engine, item, stalled, gaveUpAtMs)') &&
+      hlsTests.includes('assertFalse("a track that failed is not prepared", engine.isPreparedFor(item))') &&
+      hlsTests.includes('assertEquals(SEEK_TARGET_MS, runBlocking(engineThread) { engine.positionMs })') &&
+      workflow.includes('cd android/robolectric-tests') &&
+      workflow.includes('./gradlew testDebugUnitTest') &&
+      workflow.includes(':react-native-track-player:testDebugUnitTest'),
+    'The Robolectric engine tests must keep their assertions and run in CI with the unit tests.'
+  );
+}
+
+// A load's progress is its own (LoadProgress, one per load: a request of an earlier track cannot
+// change it). Media bytes count; HLS playlists and keys count until the load asks for its first
+// segment, not after (reloads when the player falls back to another rendition).
+{
+  const factory = section(engineSource, 'internal class CrossfadeMediaSourceFactory(', '\n}\n');
+  const load = section(engineSource, 'internal class LoadProgress {', '\n}\n');
+  const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
+  const hlsTests = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt');
+  assert(
+    factory.includes('val playlists = newDataSourceFactory().setTransferListener(load.playlistListener)') &&
+      factory.includes('val media = newDataSourceFactory().setTransferListener(load.mediaListener)') &&
+      factory.includes('(if (dataType == C.DATA_TYPE_MEDIA) media else playlists).createDataSource()') &&
+      factory.includes('DefaultMediaSourceFactory(media).createMediaSource(mediaItem)') &&
+      load.includes('if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
+      load.includes('override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {\n            mediaRequested.set(true)') &&
+      prepareBody.includes('val load = LoadProgress()\n        currentLoad = load\n        player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))') &&
+      engineSource.includes('longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)') &&
+      !/\.setMediaSourceFactory\(/.test(engineSource) &&
+      hlsTests.includes('fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyTrackGiveUp()') &&
+      hlsTests.includes('fun aStaleSegmentRequestOfThePreviousTrackDoesNotStopTheNextTracksPlaylistsCounting()'),
+    'Android engine waits must count each load\'s own progress: media always, playlists and keys until its first segment.'
+  );
+}
+
+// A track that ends while the next one preloads advances (iOS acts in preloadingNext too).
+assert(
+  section(orchestrator, 'private suspend fun monitorActiveEngine() {', 'val endedIndex = currentIndex')
+    .includes('state != AndroidPlaybackOrchestratorState.PRELOADING_NEXT'),
+  'The Android end monitor must also act while the next track preloads, as iOS.'
+);
+
+// A give-up says the same as on iOS, with no engine names; both platforms' tests pin the text.
+{
+  const androidTest = read('android/src/test/java/com/doublesymmetry/trackplayer/service/StallWatchTest.kt');
+  const iosTest = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+  for (const text of [
+    'Crossfade engine did not become ready (no progress for 10000 ms).',
+    'Crossfade engine did not become ready (over the 60000 ms limit).',
+    'Crossfade engine seek did not finish (no progress for 10000 ms).'
+  ]) {
+    assert(androidTest.includes(`"${text}"`) && iosTest.includes(`"${text}"`), `Both platforms must pin the give-up text: ${text}`);
+  }
+  assert(
+    !/RejectionException\("\$name/.test(engineSource),
+    'Android engine errors must not name the engine (engineA/engineB) in their message.'
+  );
+}
+
+// The engine gives ExoPlayer each load's own media source; a media item would go through
+// ExoPlayer's default factory (no progress listener, no per-request HTTP timeouts).
+assert(
+  !/\.(setMediaItem|setMediaItems|addMediaItem|addMediaItems)\(/.test(engineSource) &&
+    (engineSource.match(/player\.setMediaSource\(/g) || []).length === 1,
+  'The Android crossfade engine must load tracks only with setMediaSource(its per-load source), never a media item.'
 );
 
 console.log('Android crossfade contracts OK');

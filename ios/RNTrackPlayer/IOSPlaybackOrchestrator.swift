@@ -41,6 +41,8 @@ protocol IOSPlaybackOrchestratorDelegate: AnyObject {
         errorCode: String?
     )
     func playbackOrchestratorDidUpdateNowPlaying(_ orchestrator: IOSPlaybackOrchestrator)
+    /// The track that should follow an ended one failed to start (no command waits for it).
+    func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure)
 }
 
 private final class IOSCrossfadeContext {
@@ -672,6 +674,9 @@ final class IOSPlaybackOrchestrator {
                         self.scheduleEndObserver()
                     }
                 case .failure:
+                    // As Android: the position after a failed seek is its target (the engine
+                    // dropped the item), where the next play loads the track again.
+                    self.checkpoint(position: position, reason: "seek_failed")
                     self.state = .error
                 }
                 self.operationRegistry.performAfterCurrentMutation {
@@ -1782,7 +1787,16 @@ final class IOSPlaybackOrchestrator {
         let total = duration
         if total > 0 && currentTime >= max(0, total - 0.15) {
             if let next = nextIndex(after: currentIndex) {
-                skip(to: next, initialTime: 0) { _ in }
+                // The load leaves the player in error when it fails; the app learns why from a
+                // playback error, as from a failed skip's rejection.
+                advanceAfterTrackEnd(
+                    skip: { completion in self.skip(to: next, initialTime: 0, completion: completion) },
+                    report: { [weak self] failure in
+                        guard let self = self else { return }
+                        IOSPlaybackLog.log("advance failed toIndex=\(next) error=\(failure.code)")
+                        self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)
+                    }
+                )
             } else {
                 state = .ended
                 emitStateIfNeeded()

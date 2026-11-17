@@ -71,6 +71,45 @@ Added fork surface:
   fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
+  Progress on Android is media data; an HLS track's playlists and keys count too
+  until its first segment is asked for (a slow proxy answering the playlists
+  does not fail a healthy track), and not after it (the playlists the player
+  reloads when it falls back to another rendition after a failed segment are
+  not progress). On iOS the stage that loads the playlists (before the asset is
+  playable) has no progress signal, so only `prepareTimeoutMs` ends it; after
+  it, until the first segment, a media playlist that is slow by itself is not
+  progress either (on Android playlists count until the first segment). From
+  then on, progress is new buffered time (time a buffer that empties and fills
+  again does not count twice, so a rendition refilling time a switch dropped
+  is not progress, while Android counts its media bytes) and the media bytes of
+  the item's access log (AVFoundation never counts playlists there). After a
+  failed request or a rendition switch (a new error-log entry, or an
+  access-log event that is neither the first one nor that of a seek the wait
+  issued), those bytes stop
+  counting until new time is buffered: the bytes posted with a switch (the
+  failed transfers of the rendition left, the new rendition's segments
+  downloaded again) are not progress. Android counts every media byte, so
+  there bytes downloaded again count; iOS is stricter on that point. A seek
+  into an HLS CMAF (fMP4) segment shows no progress on iOS until that segment
+  is buffered (in the measured run neither its bytes nor the loaded ranges
+  moved while it arrived), while Android counts media bytes in flight: a CMAF
+  segment slower than `stallTimeoutMs` fails a seek on iOS. These iOS
+  behaviours were measured on HLS only (packed AAC and CMAF); the same rule
+  applies to every crossfade item, progressive files included. On Android the
+  no-progress countdown of a crossfade load runs from the start of the load:
+  until its first segment is requested, playlist and key bytes reset it; after
+  that only media bytes (and buffered media) do. When it reaches
+  `stallTimeoutMs` (10 s by default) the load gives up and stops the player's
+  background retries. Emulator check at
+  commit 1cbac20 (before playlists counted until the first segment): a load
+  whose segment never came gave up 10.0–10.4 s after it started; a longer wait
+  seen by the app came from its own calls.
+  A crossfade load or seek that gives up stops loading at once (Android stops the
+  player, iOS removes the item: no request is retried in the background) and
+  leaves the player in an error state; the next play loads the track again. When
+  the track that follows an ended one fails to load (no command waits for it),
+  the crossfade backend reports it with a `PlaybackError` event (`code`, for
+  example `crossfade_prepare_timeout`, and `message`) on both platforms.
 - The total limits, safety caps behind the stall timeout, with the same rules:
   `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
   before the asset is playable has no progress signal, so only this limit ends
@@ -89,7 +128,8 @@ Added fork surface:
   `updateOptions`, default 96000): the bandwidth each track starts from before the
   player has measured the network. An adaptive stream starts at the highest
   rendition fitting about 70 % of it, or the lowest when none fits, and climbs as
-  the player measures. It is a start-of-track estimate: a new value is used at
+  the player measures (HLS audio renditions adapt even though the master playlist
+  gives no channel count or sample rate). It is a start-of-track estimate: a new value is used at
   the next track start; the playing track is not reset mid-track (its rendition
   follows the measured bandwidth).
 - `crossFadePrepare(previous?, seekTo?)` prepares the alternate native player.

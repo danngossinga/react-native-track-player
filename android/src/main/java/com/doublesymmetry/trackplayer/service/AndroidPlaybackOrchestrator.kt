@@ -388,7 +388,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             activeEngine.reset()
             standbyEngine.reset()
             setState(AndroidPlaybackOrchestratorState.LOADING)
-            activeEngine.prepare(item, 0L, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+            prepareActiveOrFail(item, 0L, ticket)
             ticket.ensureActive()
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
@@ -909,7 +909,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         }
         delegate.onNowPlayingChanged(index)
         notifySnapshotChanged()
-        activeEngine.prepare(queue[index], positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        prepareActiveOrFail(queue[index], positionMs, ticket)
         ticket?.ensureActive()
         activeEngine.setVolume(if (playWhenReady) volume else 0f)
         if (playWhenReady) {
@@ -931,8 +931,24 @@ internal class AndroidPlaybackOrchestrator private constructor(
         val item = queue[index]
         if (activeEngine.isPreparedFor(item)) return
         setState(AndroidPlaybackOrchestratorState.LOADING)
-        activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        prepareActiveOrFail(item, positionMs, ticket)
         ticket?.ensureActive()
+    }
+
+    /**
+     * Loads [item] on the active engine. As iOS's load: a track that fails to load (a stall, the
+     * total limit, a player error) leaves the player in an error state, not loading forever,
+     * whichever command started the load (skip, play, seek, load, an advance). A newer command
+     * that took over says otherwise.
+     */
+    private suspend fun prepareActiveOrFail(item: TrackAudioItem, positionMs: Long, ticket: PlaybackOperationTicket?) {
+        try {
+            activeEngine.prepare(item, positionMs, timeoutMs = prepareTimeoutMs(), stallTimeoutMs = stallTimeoutMs(), ticket = ticket)
+        } catch (error: RejectionException) {
+            ticket?.ensureActive()
+            setState(AndroidPlaybackOrchestratorState.ERROR)
+            throw error
+        }
     }
 
     private suspend fun prepareStandby(
@@ -1127,16 +1143,41 @@ internal class AndroidPlaybackOrchestrator private constructor(
     }
 
     private suspend fun monitorActiveEngine() {
-        if (state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE || !playWhenReady) return
+        // While the next track preloads the current one still plays, and may end (as iOS's end
+        // observer, which also acts while preloading); the advance cancels the preload.
+        if (!playWhenReady ||
+            (state != AndroidPlaybackOrchestratorState.PLAYING_SINGLE &&
+                state != AndroidPlaybackOrchestratorState.PRELOADING_NEXT)
+        ) return
         if (activeEngine.playbackState != Player.STATE_ENDED) return
         val endedIndex = currentIndex
         val endedPosition = activeEngine.positionMs
         val nextIndex = nextIndexFor(currentIndex)
         if (nextIndex != null) {
-            startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPosition)
+            advanceToNextTrack(nextIndex, endedPosition)
         } else {
             setState(AndroidPlaybackOrchestratorState.ENDED)
             delegate.onQueueEnded(endedIndex, endedPosition)
+        }
+    }
+
+    /**
+     * Starts the next track when the playing one ends: a playback operation like a skip, so a
+     * newer command cancels it. No command waits for its result, so a load that fails (a stall at
+     * `stallTimeoutMs`, a player error, the total limit) is reported as a playback error, with the
+     * code a skip would reject with, after the player went to its error state.
+     */
+    private suspend fun advanceToNextTrack(nextIndex: Int, endedPositionMs: Long) {
+        val ticket = operationController.begin()
+        try {
+            startTrackAt(nextIndex, 0L, emitTrackChange = true, oldPositionMs = endedPositionMs, ticket = ticket)
+        } catch (_: PlaybackOperationCancelledException) {
+            // A newer command took over; it reports its own outcome.
+        } catch (error: RejectionException) {
+            androidXfadeLog("advance failed toIndex=$nextIndex error=${error.code}")
+            delegate.onPlaybackError(error.code, error.message)
+        } finally {
+            operationController.finish(ticket)
         }
     }
 

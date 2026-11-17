@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.util.Log
 import android.os.SystemClock
+import com.doublesymmetry.kotlinaudio.models.MediaType
 import com.doublesymmetry.trackplayer.model.TrackAudioItem
 import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.C
@@ -13,13 +14,21 @@ import com.google.android.exoplayer2.MediaMetadata
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.audio.AudioAttributes
 import com.google.android.exoplayer2.source.DefaultMediaSourceFactory
+import com.google.android.exoplayer2.source.MediaSource
+import com.google.android.exoplayer2.source.hls.HlsDataSourceFactory
+import com.google.android.exoplayer2.source.hls.HlsMediaSource
+import com.google.android.exoplayer2.util.MimeTypes
+import com.google.android.exoplayer2.util.Util
+import com.google.android.exoplayer2.trackselection.DefaultTrackSelector
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.DefaultBandwidthMeter
 import com.google.android.exoplayer2.upstream.DefaultDataSource
+import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
 import com.google.android.exoplayer2.upstream.TransferListener
 import kotlinx.coroutines.delay
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.math.max
 
@@ -90,31 +99,30 @@ internal class AndroidCrossfadeEngine(
      * The app's current `stallTimeoutMs`, read at every HTTP request: the connect and read
      * timeouts follow it (see [CurrentTimeoutHttpDataSourceFactory]).
      */
-    stallTimeoutMs: () -> Long
+    stallTimeoutMs: () -> Long,
+    /** Opens one HTTP request with the given timeout (tests gate it). */
+    requestSource: (DefaultHttpDataSource.Factory, Int) -> DataSource = ::httpSourceWithTimeouts
 ) : AndroidCrossfadeEnginePort {
     private val bandwidthMeter = PerTrackBandwidthMeter(initialBitrateEstimateBps) { estimate ->
         crossfadeBandwidthMeter(context, estimate)
     }
-    /** Bytes this player has downloaded: a load's progress, counted while a segment arrives. */
-    private val bytesLoaded = AtomicLong(0L)
-    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs)
-    private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)
-        .setTransferListener(object : TransferListener {
-            override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-            override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-            override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
-                bytesLoaded.addAndGet(bytesTransferred.toLong())
-            }
-            override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
-        })
-    private val mediaSourceFactory = DefaultMediaSourceFactory(dataSourceFactory)
+    private val httpDataSourceFactory = CurrentTimeoutHttpDataSourceFactory(stallTimeoutMs, requestSource)
+    /** Each load's media source gets its own data sources, reporting to that load's progress. */
+    private val mediaSourceFactory = CrossfadeMediaSourceFactory {
+        DefaultDataSource.Factory(context, httpDataSourceFactory)
+    }
+    /**
+     * The progress of the track loaded now (see [LoadProgress]). A new one at every load: a
+     * request of an earlier track still on its way reports to that track's, never to this one.
+     */
+    private var currentLoad = LoadProgress()
     private var preparedItem: TrackAudioItem? = null
     private var preparedTrackKey: String? = null
     private var operationGeneration = 0L
 
     val player: ExoPlayer = ExoPlayer.Builder(context)
-        .setMediaSourceFactory(mediaSourceFactory)
         .setBandwidthMeter(bandwidthMeter)
+        .setTrackSelector(crossfadeTrackSelector(context))
         .build()
         .apply {
             volume = 0f
@@ -160,7 +168,7 @@ internal class AndroidCrossfadeEngine(
 
     /** What a wait reads as progress: bytes downloaded and media buffered. */
     private fun loadProgress(): LongArray =
-        longArrayOf(bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)
+        longArrayOf(currentLoad.bytesLoaded.get(), player.bufferedPosition, player.totalBufferedDuration)
 
     override suspend fun prepare(
         item: TrackAudioItem,
@@ -185,35 +193,44 @@ internal class AndroidCrossfadeEngine(
         // following the measured bandwidth.
         val initialEstimate = bandwidthMeter.startTrack()
         androidXfadeLog("$name track start initialBitrateEstimateBps=$initialEstimate")
-        player.setMediaItem(buildMediaItem(item))
+        // A new track, a new progress: its playlists count again until it asks for a segment.
+        val load = LoadProgress()
+        currentLoad = load
+        player.setMediaSource(mediaSourceFactory.createMediaSource(buildMediaItem(item), load))
         player.prepare()
         player.seekTo(max(0L, positionMs))
         preparedItem = item
         preparedTrackKey = trackKey
 
         // Fails when nothing loads for stallTimeoutMs, or after timeoutMs in all.
-        val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs,
-            totalTimeoutMs = timeoutMs,
-            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
-            nowMs = SystemClock::elapsedRealtime,
-            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
-            readings = ::loadProgress
-        ) {
-            if (player.playbackState == Player.STATE_ENDED) {
-                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
-                throw RejectionException("$name ended before it was ready.", "crossfade_engine_ended")
+        val verdict = try {
+            awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs,
+                totalTimeoutMs = timeoutMs,
+                pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                nowMs = SystemClock::elapsedRealtime,
+                pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+                readings = ::loadProgress
+            ) {
+                if (player.playbackState == Player.STATE_ENDED) {
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.ENDED
+                    throw RejectionException("Crossfade engine ended before it was ready.", "crossfade_engine_ended")
+                }
+                if (player.playerError != null) {
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+                    throw RejectionException(player.playerError?.message ?: "Crossfade engine failed to prepare.", "crossfade_engine_error")
+                }
+                player.playbackState == Player.STATE_READY
             }
-            if (player.playerError != null) {
-                if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-                throw RejectionException(player.playerError?.message ?: "$name failed to prepare.", "crossfade_engine_error")
-            }
-            player.playbackState == Player.STATE_READY
+        } catch (error: RejectionException) {
+            abandonLoad(generation, "load ${error.code}: ${error.message}")
+            throw error
         }
         if (verdict != null) {
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
-            throw RejectionException("$name did not become ready ($reason).", "crossfade_prepare_timeout")
+            val reason = stallVerdictReason(verdict, stallTimeoutMs, timeoutMs)
+            abandonLoad(generation, "load $reason")
+            throw RejectionException(crossfadeLoadTimeoutMessage(reason), "crossfade_prepare_timeout")
         }
 
         ticket?.ensureActive()
@@ -280,21 +297,34 @@ internal class AndroidCrossfadeEngine(
         val target = max(0L, positionMs)
         androidXfadeLog("$name seek start positionMs=$target")
         player.seekTo(target)
-        val verdict = awaitWhileProgressing(
-            stallTimeoutMs = stallTimeoutMs,
-            totalTimeoutMs = timeoutMs,
-            pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
-            nowMs = SystemClock::elapsedRealtime,
-            pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
-            readings = ::loadProgress
-        ) { player.playbackState != Player.STATE_BUFFERING }
+        val verdict = try {
+            awaitWhileProgressing(
+                stallTimeoutMs = stallTimeoutMs,
+                totalTimeoutMs = timeoutMs,
+                pollIntervalMs = ENGINE_WAIT_POLL_INTERVAL_MS,
+                nowMs = SystemClock::elapsedRealtime,
+                pause = { if (ticket == null) delay(it) else ticket.delayOrThrow(it) },
+                readings = ::loadProgress
+            ) {
+                // A player error ends the seek as a failure, not as "done buffering".
+                player.playerError?.let { error ->
+                    if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
+                    throw RejectionException(error.message ?: "Crossfade engine seek failed.", "crossfade_engine_error")
+                }
+                player.playbackState != Player.STATE_BUFFERING
+            }
+        } catch (error: RejectionException) {
+            abandonLoad(generation, "seek ${error.code}: ${error.message}")
+            throw error
+        }
         if (verdict != null) {
             // As on iOS: the player stops, so audio does not resume by itself when data arrives.
             player.playWhenReady = false
             player.pause()
             if (operationGeneration == generation) state = AndroidCrossfadeEngineState.FAILED
-            val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallTimeoutMs}ms" else "over the ${timeoutMs}ms limit"
-            throw RejectionException("$name did not finish seeking ($reason).", "crossfade_seek_timeout")
+            val reason = stallVerdictReason(verdict, stallTimeoutMs, timeoutMs)
+            abandonLoad(generation, "seek $reason")
+            throw RejectionException(crossfadeSeekTimeoutMessage(reason), "crossfade_seek_timeout")
         }
         ticket?.ensureActive()
         if (operationGeneration != generation) {
@@ -305,6 +335,22 @@ internal class AndroidCrossfadeEngine(
 
     override fun setVolume(value: Float) {
         player.volume = value
+    }
+
+    /**
+     * Ends a load or seek the engine gave up on: the player stops loading at once (ExoPlayer would
+     * otherwise keep the stalled request open and retry it in the background, for minutes with its
+     * default retry policy), and the track is no longer prepared, so the next play loads it again.
+     * Only for the operation that gave up: a newer load owns the player.
+     */
+    private fun abandonLoad(generation: Long, why: String) {
+        if (operationGeneration != generation) return
+        // Says which limit or error ended the wait (the device evidence had no trace of it).
+        androidXfadeLog("$name load abandoned ($why) positionMs=$positionMs")
+        player.playWhenReady = false
+        player.stop()
+        preparedItem = null
+        preparedTrackKey = null
     }
 
     override fun setRate(value: Float) {
@@ -329,6 +375,7 @@ internal class AndroidCrossfadeEngine(
         }
         return MediaItem.Builder()
             .setUri(Uri.parse(item.audioUrl))
+            .apply { if (item.type == MediaType.HLS) setMimeType(MimeTypes.APPLICATION_M3U8) }
             .setMediaMetadata(metadataBuilder.build())
             .build()
     }
@@ -338,6 +385,69 @@ internal class AndroidCrossfadeEngine(
             ?: item.audioUrl
     }
 
+}
+
+/**
+ * One load's progress: the bytes downloaded for it that count. Media (segments, a progressive
+ * file) always; HLS playlists and keys only until the load asks for its first segment. Before
+ * that they are the load's only progress (a slow proxy answering the playlists must not fail a
+ * healthy track); after it, the player reloads them when it falls back to another rendition
+ * after a failed segment, which is not progress. The total limit (prepareTimeoutMs) bounds both
+ * stages. Each load has its own, so a request of an earlier load cannot change it.
+ */
+internal class LoadProgress {
+    val bytesLoaded = AtomicLong(0L)
+    /** Set once this load has asked for a segment. */
+    val mediaRequested = AtomicBoolean(false)
+
+    /** HLS playlists and keys: progress until the first segment is asked for. */
+    val playlistListener: TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    }
+
+    /** Media: segments and progressive files, whose bytes are progress. */
+    val mediaListener: TransferListener = object : TransferListener {
+        override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {
+            mediaRequested.set(true)
+        }
+        override fun onTransferStart(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+        override fun onBytesTransferred(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean, bytesTransferred: Int) {
+            bytesLoaded.addAndGet(bytesTransferred.toLong())
+        }
+        override fun onTransferEnd(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) = Unit
+    }
+}
+
+/**
+ * The crossfade players' media sources, one per load. An HLS track loads its segments through
+ * data sources reporting to [LoadProgress.mediaListener] and its playlists and keys through ones
+ * reporting to [LoadProgress.playlistListener]; any other track is media only.
+ */
+internal class CrossfadeMediaSourceFactory(
+    /** A fresh data source factory (HTTP and local), to which a load adds its listener. */
+    private val newDataSourceFactory: () -> DefaultDataSource.Factory
+) {
+    fun createMediaSource(mediaItem: MediaItem, load: LoadProgress): MediaSource {
+        val playlists = newDataSourceFactory().setTransferListener(load.playlistListener)
+        val media = newDataSourceFactory().setTransferListener(load.mediaListener)
+        val configuration = mediaItem.localConfiguration
+        val isHls = configuration != null &&
+            Util.inferContentTypeForUriAndMimeType(configuration.uri, configuration.mimeType) == C.CONTENT_TYPE_HLS
+        return if (isHls) {
+            HlsMediaSource.Factory(
+                HlsDataSourceFactory { dataType ->
+                    (if (dataType == C.DATA_TYPE_MEDIA) media else playlists).createDataSource()
+                }
+            ).createMediaSource(mediaItem)
+        } else {
+            DefaultMediaSourceFactory(media).createMediaSource(mediaItem)
+        }
+    }
 }
 
 /** How often an engine's load or seek wait reads its progress (a poll interval, not a limit). */
@@ -386,6 +496,25 @@ internal fun crossfadeBandwidthMeter(context: Context, initialBitrateEstimateBps
         .setInitialBitrateEstimate(initialBitrateEstimateBps)
         .build()
 internal const val INITIAL_BITRATE_ESTIMATE_KEY = "initialBitrateEstimateBps"
+
+/**
+ * The track selector of a crossfade player: the audio renditions of an HLS (or DASH) track adapt.
+ * An HLS master playlist gives each rendition's bitrate and codec but not its channel count or
+ * sample rate; ExoPlayer's default selector only adapts between renditions where both are known
+ * and equal, so it fell back to a fixed choice, always the highest bitrate, whatever the bandwidth
+ * estimate. Allowing renditions whose count or rate is unknown or different to adapt lets the
+ * selection start from the estimate ([crossfadeBandwidthMeter]): the lowest rendition at the
+ * default estimate, then up as the player measures.
+ */
+internal fun crossfadeTrackSelector(context: Context): DefaultTrackSelector =
+    DefaultTrackSelector(context, crossfadeTrackSelectorParameters(DefaultTrackSelector.Parameters.Builder(context)))
+
+internal fun crossfadeTrackSelectorParameters(
+    builder: DefaultTrackSelector.Parameters.Builder
+): DefaultTrackSelector.Parameters = builder
+    .setAllowAudioMixedChannelCountAdaptiveness(true)
+    .setAllowAudioMixedSampleRateAdaptiveness(true)
+    .build()
 
 /**
  * A timeout option (`prepareTimeoutMs`, `standardReadyTimeoutMs`), in milliseconds, read from setup

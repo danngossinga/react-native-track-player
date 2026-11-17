@@ -260,7 +260,17 @@ const waitForPlaying = section(engine, 'private func waitForPlaying(', 'private 
 const startWait = section(engine, 'private func startWait(', 'private func endWait(');
 const prepareGiveUp = section(enginePrepare, ') { [weak self] verdict, watch in', 'loadWait = wait');
 assert(
-  enginePrepare.includes('let wait = startWait(\n            totalTimeoutMs: prepareTimeoutMs(),\n            readings: { loadItem.map(Self.loadProgress(of:)) }') &&
+  enginePrepare.includes('let wait = startWait(\n            totalTimeoutMs: prepareTimeoutMs(),\n            readings: { loadItem.map(reader.readings) }') &&
+    // Each wait reads its item through its own ItemLoadProgress (a fresh reader per wait).
+    [enginePrepare, engineSeek, waitForPlaying].every((wait) =>
+      (wait.match(/let reader = ItemLoadReader\(ItemLoadSnapshot\.init\(of:\)\)/g) || []).length === 1) &&
+    !engine.includes('private let reader') && !engine.includes('private var reader') &&
+    // The seeks a wait issues are noted, so their access-log event is not taken for a switch.
+    enginePrepare.includes('reader.noteSeek(before: item)\n                        self.seek(to: position, watched: false)') &&
+    enginePrepare.includes('!settled else { return }\n                            reader.seekFinished(after: item)\n                            switch seekResult {') &&
+    engineSeek.includes('seekReader.noteSeek(before: current)\n        }\n        player.seek(to: time,') &&
+    !engine.includes('loadProgress(of:') &&
+    !engine.includes('accessLog()') &&
     enginePrepare.includes('loadItem = item\n                wait.noteProgress()') &&
     (enginePrepare.match(/wait\.noteProgress\(\)/g) || []).length === 2 &&
     enginePrepare.includes('self.seek(to: position, watched: false)') &&
@@ -282,11 +292,11 @@ assert(
     waitForPlaying.includes('weak var observation: NSKeyValueObservation?') &&
     // A failed start pauses the engine wherever playback starts (play and a load that plays).
     orchestrator.includes('self.playWhenReady = false\n                                            // As after a failed play(): audio must not start by itself later.\n                                            self.activeEngine.pause()') &&
-    engineSeek.includes('readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }') &&
+    engineSeek.includes('readings: { item.map(reader.readings) ?? [0, 0] }') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('item?.cancelPendingSeeks()\n                // The player goes to an error state: audio must not resume by itself when the\n                // data arrives later, as after a failed play start.\n                self.player.pause()') &&
     // Every wait ends (stops and leaves the engine) when it settles, gives up or is reset.
-    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            completion(result)') &&
-    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            completion?(result)') &&
+    enginePrepare.includes('if let loadWait = loadWait { self.endWait(loadWait) }\n            loadWait = nil\n            settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)') &&
+    engineSeek.includes('if let seekWait = seekWait { endWait(seekWait) }\n            seekWait = nil\n            settleCrossfadeSeek(\n                result,\n                isLatest: seeks.isLatest(seekNumber),\n                stopLoading: { self.abandonLoad() },\n                complete: { completion?($0) }\n            )') &&
     waitForPlaying.includes('if let playWait = playWait { self.endWait(playWait) }\n            playWait = nil\n            completion(result)') &&
     startWait.includes('if let self = self, let driver = driver { self.endWait(driver) }\n            onGiveUp(verdict, watch)') &&
     section(engine, 'private func endWait(_ driver: StallWaitDriver) {', '\n    }').includes('driver.cancel()\n        waits.removeAll { $0 === driver }') &&
@@ -298,7 +308,7 @@ assert(
     section(engine, 'func reset() {', 'private func preroll(').includes('timeControlObservations.forEach { $0.invalidate() }') &&
     section(engineSeek, ') { [weak self] verdict, watch in', 'player.seek(to: time').includes('finish(.failure(NSError(') &&
     waitForPlaying.includes('playWait = startWait(\n            totalTimeoutMs: timeoutMs,') &&
-    waitForPlaying.includes('return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]') &&
+    waitForPlaying.includes('return (self.player.currentItem.map(reader.readings) ?? [0, 0]) + [self.currentTime]') &&
     waitForPlaying.indexOf(') { [weak self] verdict, watch in') > 0 &&
     waitForPlaying.slice(waitForPlaying.indexOf(') { [weak self] verdict, watch in')).includes('finish(.failure(NSError(') &&
     startWait.includes('stallTimeoutMs: stallTimeoutMs(),\n            totalTimeoutMs: totalTimeoutMs,') &&
@@ -307,8 +317,8 @@ assert(
     section(engine, 'func reset() {', 'private func preroll(').includes('waits.forEach { $0.cancel() }') &&
     !engine.includes('asyncAfter') &&
     !engine.includes('DispatchWorkItem') &&
-    engine.includes('let loadedSeconds = item.loadedTimeRanges.reduce(0.0) { total, value in') &&
-    engine.includes('total + Double(max(0, event.numberOfBytesTransferred))') &&
+    facade.includes('loadedRanges = item.loadedTimeRanges.compactMap { value in') &&
+    facade.includes('total + Double(max(0, event.numberOfBytesTransferred))') &&
     engine.includes('var stallTimeoutMs: () -> Int = { stallTimeoutDefaultMs }') &&
     engine.includes('waitForPlaying(generation: currentGeneration, timeoutMs: playStartTimeoutMs(), completion: completion)') &&
     orchestrator.includes('engineA.stallTimeoutMs = stallTimeoutMs') &&
@@ -317,6 +327,41 @@ assert(
 );
 const driverSource = section(facade, 'final class StallWaitDriver {', 'func backendStepTimeout(');
 const transactionTests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
+
+// After a failed request or a variant switch, the bytes AVFoundation posts with it (the left
+// variant's failed transfers, segments downloaded again) are not progress until media of a new
+// time is buffered; buffered time counts once (a buffer that empties and refills adds nothing).
+// One explicit state.
+const itemProgress = section(facade, 'struct ItemLoadProgress {', 'final class ItemLoadReader<Item> {');
+assert(
+  facade.includes('enum ItemByteCounting: Equatable {') &&
+    facade.includes('    case counting\n') &&
+    facade.includes('    case pausedUntilMedia\n}') &&
+    itemProgress.includes('let failedOrSwitched = snapshot.errorLogEntries > previous.errorLogEntries\n            || newEvents > seekEvents') &&
+    itemProgress.includes('let newTime = buffered.add(snapshot.loadedRanges)') &&
+    itemProgress.includes('if failedOrSwitched {\n            byteCounting = .pausedUntilMedia\n        } else if byteCounting == .pausedUntilMedia, newTime > 0 {\n            byteCounting = .counting\n        }') &&
+    itemProgress.includes('if byteCounting == .counting {\n            countedBytes += newBytes') &&
+    itemProgress.includes('return [buffered.seconds, countedBytes]') &&
+    !/private var \w+: Bool/.test(itemProgress) &&
+    facade.includes('accessLogEvents = events.count') &&
+    facade.includes('errorLogEntries = item.errorLog()?.events.count ?? 0') &&
+    [
+      'testItemLoadProgressPausesTheByteCountAfterAnErrorOrASwitchUntilNewMediaIsBuffered',
+      'testABufferDipAndRefillAtASwitchIsNotProgress',
+      'testAWaitThroughABufferDipGivesUpOneStallTimeoutAfterItStarted',
+      'testMediaInTheSameReadingAsASwitchCountsButDoesNotResumeTheBytes',
+      'testAFirstAccessLogEventThatComesWithASwitchDoesNotCount',
+      'testASeekTheWaitIssuedIsNotASwitch',
+      'testTheLoadsSeekNoteDoesNotReadAnItemItsWaitAlreadyReads',
+      'testBufferedTimeCountsEachSecondOnce',
+      'testItemLoadProgressCountsPostedBytesWithoutAnErrorOrASwitch',
+      'testEachWaitReadsItsOwnItemProgress',
+      'testFailingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions',
+      'testASlowButHealthyFallbackAfterFailedSegmentsKeepsLoading',
+      'testARealPlayerWhoseSegmentsFailPartWayGivesUpAtTheStallTimeoutDespiteTheLateBytesOfItsSwitch',
+    ].every((name) => transactionTests.includes(`func ${name}()`)),
+  'iOS crossfade waits must stop counting the bytes posted with an error or a switch, and a buffer refill, until new media is buffered, with its tests.'
+);
 assert(
   driverSource.includes('let verdict = readings?().map { watch.check(at: at, readings: $0) } ?? watch.capVerdict(at: at)') &&
     // A wait releases its closures (the caller's completion, the engine) when it ends.
@@ -455,5 +500,56 @@ assert(
   }, 0);
   assert(unwatched === 1, 'Only the load\'s own seek may pass watched: false in ios/RNTrackPlayer (found ' + unwatched + ').');
 }
+
+// The load started when a track ends reports its failure as a playback-error (no command waits
+// for it), with the same fields as Android's orchestrator.
+{
+  const observeEnd = section(orchestrator, 'private func observeEnd() {', 'private func stabilizeCancelledOperation() {');
+  const delegateImpl = section(player, 'func playbackOrchestrator(_ orchestrator: IOSPlaybackOrchestrator, didFailToAdvance failure: PlaybackAdvanceFailure) {', '\n    }\n');
+  assert(
+    observeEnd.includes('advanceAfterTrackEnd(\n                    skip: { completion in self.skip(to: next, initialTime: 0, completion: completion) },') &&
+      observeEnd.includes('self.delegate?.playbackOrchestrator(self, didFailToAdvance: failure)') &&
+      !observeEnd.includes('{ _ in }') &&
+      delegateImpl.includes('isAuthoritative(.pingPong, identity: orchestrator)') &&
+      delegateImpl.includes('emit(event: EventType.PlaybackError, body: failure.eventBody)') &&
+      facade.includes('struct PlaybackAdvanceFailure: Equatable {'),
+    'A failed iOS natural advance must emit playback-error with its code and message.'
+  );
+}
+
+// A load or seek an engine gives up on stops loading (the item leaves the player), as Android's
+// engine stops its player.
+{
+  const prepare = section(engine, 'func prepare(track: Track, position: Double, completion:', 'asset.loadValuesAsynchronously(');
+  const seek = section(engine, 'func seek(to position: Double, watched: Bool = true,', 'player.seek(to: time,');
+  assert(
+    engine.includes('private func abandonLoad() {') &&
+      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('stopLoading(player)') &&
+      section(facade, 'func stopLoading(_ player: ItemLoadingPlayer) {', '\n}\n').includes('player.replaceCurrentItem(with: nil)') &&
+      prepare.includes('settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)') &&
+      section(facade, 'func settleCrossfadeLoad(', '\n}\n').includes('if case .failure = result { stopLoading() }') &&
+      section(engine, 'private func abandonLoad() {', '\n    }\n').includes('pendingAsset?.cancelLoading()') &&
+      prepare.includes('"code": "crossfade_prepare_timeout"') &&
+      seek.includes('let seekNumber = seeks.begin()') &&
+      section(facade, 'func settleCrossfadeSeek(', '\n}\n').includes('if case .failure = result, isLatest { stopLoading() }') &&
+      seek.includes('"code": "crossfade_seek_timeout"'),
+    'An iOS engine that gives up on a load or seek must remove the item (stop loading) and name the code.'
+  );
+}
+
+// After a failed seek the position is its target (the item was dropped), as on Android.
+assert(
+  section(orchestrator, 'func seek(to position: Double, completion:', 'func seek(by offset: Double')
+    .includes('self.checkpoint(position: position, reason: "seek_failed")\n                    self.state = .error') &&
+    section(orchestrator, 'private func observeEnd() {', 'if total > 0').includes('state == .playingSingle || state == .preloadingNext'),
+  'An iOS failed seek must report its target; the end observer must act while preloading.'
+);
+
+// A load that gives up says the same as on Android whichever stage it reached.
+assert(
+  !engine.includes('did not become playable') &&
+    section(engine, 'func prepare(track: Track, position: Double, completion:', 'asset.loadValuesAsynchronously(').includes('NSLocalizedDescriptionKey: crossfadeLoadTimeoutMessage(reason),'),
+  'An iOS load that gives up must use the shared give-up message at every stage.'
+);
 
 console.log('iOS crossfade contracts OK');

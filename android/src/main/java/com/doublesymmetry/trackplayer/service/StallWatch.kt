@@ -60,5 +60,15 @@ internal suspend fun awaitWhileProgressing(
     }
 }
 
+/** Why a wait gave up, in the words both platforms use (iOS `StallVerdict.reason`). */
+internal fun stallVerdictReason(verdict: StallVerdict, stallTimeoutMs: Long, totalTimeoutMs: Long): String =
+    if (verdict == StallVerdict.STALLED) "no progress for $stallTimeoutMs ms" else "over the $totalTimeoutMs ms limit"
+
+/** A crossfade load's give-up message: the same text on iOS, no engine names. */
+internal fun crossfadeLoadTimeoutMessage(reason: String): String = "Crossfade engine did not become ready ($reason)."
+
+/** A crossfade seek's give-up message: the same text on iOS, no engine names. */
+internal fun crossfadeSeekTimeoutMessage(reason: String): String = "Crossfade engine seek did not finish ($reason)."
+
 /** A monotonic clock for the waits, in milliseconds (works in JVM unit tests too). */
 internal fun monotonicNowMs(): Long = System.nanoTime() / 1_000_000L

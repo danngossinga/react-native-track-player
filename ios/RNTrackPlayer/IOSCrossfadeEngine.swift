@@ -92,6 +92,7 @@ final class IOSCrossfadeEngine {
     /// The waits running on this engine; each wait owns its driver, a reset cancels them all.
     private var waits: [StallWaitDriver] = []
     private var generation = 0
+    private let seeks = SeekSequence()
     private let name: String
     private(set) var state: IOSCrossfadeEngineState = .idle
 
@@ -178,16 +179,17 @@ final class IOSCrossfadeEngine {
         var loadItem: AVPlayerItem?
         var settled = false
         var loadWait: StallWaitDriver?
+        let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
         func settle(_ result: Result<Void, Error>) {
             guard !settled else { return }
             settled = true
             if let loadWait = loadWait { self.endWait(loadWait) }
             loadWait = nil
-            completion(result)
+            settleCrossfadeLoad(result, stopLoading: { self.abandonLoad() }, complete: completion)
         }
         let wait = startWait(
             totalTimeoutMs: prepareTimeoutMs(),
-            readings: { loadItem.map(Self.loadProgress(of:)) }
+            readings: { loadItem.map(reader.readings) }
         ) { [weak self] verdict, watch in
             guard let self = self, self.generation == currentGeneration, !settled else { return }
             let reason = Self.describe(verdict, watch)
@@ -203,9 +205,11 @@ final class IOSCrossfadeEngine {
             settle(.failure(NSError(
                 domain: "RNTP-Crossfade",
                 code: 5,
-                userInfo: [NSLocalizedDescriptionKey: loadItem == nil
-                    ? "Crossfade engine did not become playable (\(reason))."
-                    : "Crossfade engine did not become ready (\(reason))."]
+                userInfo: [
+                    // The same words whichever stage gave up (the log names it), as on Android.
+                    NSLocalizedDescriptionKey: crossfadeLoadTimeoutMessage(reason),
+                    "code": "crossfade_prepare_timeout"
+                ]
             )))
         }
         loadWait = wait
@@ -244,8 +248,10 @@ final class IOSCrossfadeEngine {
                     case .success:
                         // Reaching ready is progress; the seek and preroll stay under this wait.
                         wait.noteProgress()
+                        reader.noteSeek(before: item)
                         self.seek(to: position, watched: false) { [weak self] seekResult in
                             guard let self = self, self.generation == currentGeneration, !settled else { return }
+                            reader.seekFinished(after: item)
                             switch seekResult {
                             case .failure(let error):
                                 self.state = .failed
@@ -276,20 +282,29 @@ final class IOSCrossfadeEngine {
         let time = CMTime(seconds: max(0, position), preferredTimescale: 1000)
         let tolerance = CMTime(seconds: 0.05, preferredTimescale: 1000)
         IOSPlaybackLog.log("\(name) seek to=\(max(0, position))")
+        let seekNumber = seeks.begin()
         var done = false
         var seekWait: StallWaitDriver?
+        var seekReader: ItemLoadReader<AVPlayerItem>?
         func finish(_ result: Result<Void, Error>) {
             guard !done else { return }
             done = true
             if let seekWait = seekWait { endWait(seekWait) }
             seekWait = nil
-            completion?(result)
+            settleCrossfadeSeek(
+                result,
+                isLatest: seeks.isLatest(seekNumber),
+                stopLoading: { self.abandonLoad() },
+                complete: { completion?($0) }
+            )
         }
         if watched, completion != nil {
             let item = player.currentItem
+            let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
+            seekReader = reader
             seekWait = startWait(
                 totalTimeoutMs: prepareTimeoutMs(),
-                readings: { item.map(Self.loadProgress(of:)) ?? [0, 0] }
+                readings: { item.map(reader.readings) ?? [0, 0] }
             ) { [weak self] verdict, watch in
                 guard let self = self, self.generation == currentGeneration, !done else { return }
                 let reason = Self.describe(verdict, watch)
@@ -302,9 +317,15 @@ final class IOSCrossfadeEngine {
                 finish(.failure(NSError(
                     domain: "RNTP-Crossfade",
                     code: 3,
-                    userInfo: [NSLocalizedDescriptionKey: "Crossfade engine seek did not finish (\(reason))."]
+                    userInfo: [
+                        NSLocalizedDescriptionKey: crossfadeSeekTimeoutMessage(reason),
+                        "code": "crossfade_seek_timeout"
+                    ]
                 )))
             }
+        }
+        if let seekReader = seekReader, let current = player.currentItem {
+            seekReader.noteSeek(before: current)
         }
         player.seek(to: time, toleranceBefore: tolerance, toleranceAfter: tolerance) { [weak self] finished in
             DispatchQueue.main.async {
@@ -314,7 +335,10 @@ final class IOSCrossfadeEngine {
                     finish(.failure(NSError(
                         domain: "RNTP-Crossfade",
                         code: 3,
-                        userInfo: [NSLocalizedDescriptionKey: "Crossfade engine seek failed."]
+                        userInfo: [
+                            NSLocalizedDescriptionKey: "Crossfade engine seek failed.",
+                            "code": "crossfade_engine_error"
+                        ]
                     )))
                     return
                 }
@@ -352,6 +376,16 @@ final class IOSCrossfadeEngine {
         player.pause()
         player.seek(to: .zero)
         state = .idle
+    }
+
+    /// Ends a load or seek the engine gave up on: the item leaves the player, so AVPlayer stops
+    /// requesting its media (it would otherwise keep the stalled request going in the background);
+    /// the next play loads the track again. As Android's engine.
+    private func abandonLoad() {
+        IOSPlaybackLog.log("\(name) load abandoned")
+        pendingAsset?.cancelLoading()
+        pendingAsset = nil
+        stopLoading(player)
     }
 
     func reset() {
@@ -467,11 +501,12 @@ final class IOSCrossfadeEngine {
         observation = observed
 
         // Waiting to play while media keeps loading (or time advancing) is progress.
+        let reader = ItemLoadReader(ItemLoadSnapshot.init(of:))
         playWait = startWait(
             totalTimeoutMs: timeoutMs,
             readings: { [weak self] in
                 guard let self = self else { return nil }
-                return (self.player.currentItem.map(Self.loadProgress(of:)) ?? [0, 0]) + [self.currentTime]
+                return (self.player.currentItem.map(reader.readings) ?? [0, 0]) + [self.currentTime]
             }
         ) { [weak self] verdict, watch in
             guard let self = self, self.generation == generation, !didComplete else { return }
@@ -512,23 +547,7 @@ final class IOSCrossfadeEngine {
         waits.removeAll { $0 === driver }
     }
 
-    /// The progress of a load or of a start that waits: the seconds of media the item has loaded,
-    /// and the bytes its access log reports downloaded (which grow while a first segment arrives,
-    /// before any loaded time range exists).
-    private static func loadProgress(of item: AVPlayerItem) -> [Double] {
-        let loadedSeconds = item.loadedTimeRanges.reduce(0.0) { total, value in
-            let seconds = value.timeRangeValue.duration.seconds
-            return seconds.isFinite ? total + seconds : total
-        }
-        let bytes = item.accessLog()?.events.reduce(0.0) { total, event in
-            total + Double(max(0, event.numberOfBytesTransferred))
-        } ?? 0
-        return [loadedSeconds, bytes]
-    }
-
     private static func describe(_ verdict: StallVerdict, _ watch: StallWatch) -> String {
-        return verdict == .stalled
-            ? "no progress for \(watch.stallTimeoutMs) ms"
-            : "over the \(watch.totalTimeoutMs) ms limit"
+        return verdict.reason(stallTimeoutMs: watch.stallTimeoutMs, totalTimeoutMs: watch.totalTimeoutMs)
     }
 }
