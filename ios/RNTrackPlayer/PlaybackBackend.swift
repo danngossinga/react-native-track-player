@@ -94,6 +94,12 @@ struct StallWatch: Equatable {
         return (now - startedAt) * 1000 >= Double(totalTimeoutMs) ? .capExceeded : .wait
     }
 
+    /// When the total limit ends the wait (same clock as `check`): the deadline of a stage with no
+    /// progress signal.
+    func capDeadline() -> TimeInterval {
+        return startedAt + Double(totalTimeoutMs) / 1000
+    }
+
     private func verdict(at now: TimeInterval) -> StallVerdict {
         if capVerdict(at: now) == .capExceeded { return .capExceeded }
         if (now - lastProgressAt) * 1000 >= Double(stallTimeoutMs) { return .stalled }
@@ -1604,8 +1610,9 @@ struct StandardLoadObservation {
     /// candidate backend).
     let item: ObjectIdentifier?
     let phase: StandardLoadPhase
-    /// Its progress: the load's bytes (`StandardLoadBytes`) and the buffered position.
-    let readings: [Double]
+    /// Its progress: the load's bytes (`StandardLoadBytes`) and the buffered position; nil while
+    /// the load has no progress signal (its AVPlayerItem does not exist yet: `standardLoadReadings`).
+    let readings: [Double]?
     /// Another wait owns the player's loading now (a seek): not watched, but whether the item was
     /// ready is kept, so buffering once that wait ended is a rebuffer, not a load.
     var ownedElsewhere = false
@@ -1625,7 +1632,28 @@ final class StandardLoadWatch {
         let item: ObjectIdentifier
         let startedAt: TimeInterval
         var progressStarted: Bool
-        var watch: StallWatch?
+        var watch: Watch?
+    }
+
+    /// A watched load's stage, as crossfade's prepare (IOSCrossfadeEngine: its playable stage has
+    /// no readings, `StallWaitDriver` applies `capVerdict`):
+    /// - `playable`: the load has no progress signal (nil readings: SwiftAudioEx has not created
+    ///   the AVPlayerItem yet, it loads the asset's playable key, an HLS track's playlists). Only
+    ///   the total limit ends it: a playlist slower than `stallTimeoutMs` does not fail the track
+    ///   (Android counts playlist bytes as progress until the first segment is asked for).
+    /// - `item`: readings arrived (the item exists): the stall rule, its clock restarted when the
+    ///   item appeared (crossfade's `noteProgress` at the item's creation).
+    /// Moves: watched -> playable or item (by its first readings); playable -readings-> item
+    /// (progress noted); item -nil readings-> playable (the item went away: no signal again).
+    enum Watch: Equatable {
+        case playable(StallWatch)
+        case item(StallWatch)
+
+        var stall: StallWatch {
+            switch self {
+            case let .playable(watch), let .item(watch): return watch
+            }
+        }
     }
 
     /// Where the watch stands (one explicit state, the monorepo's state-machine form 3: a closed
@@ -1677,7 +1705,7 @@ final class StandardLoadWatch {
         return nil
     }
 
-    private var watched: StallWatch? { return load?.watch }
+    private var watched: Watch? { return load?.watch }
 
     /// Whether `check` would start a new load's progress with `observed` (its readings aside): an
     /// item loading, not ready since it was loaded and whose load has not started its progress
@@ -1724,15 +1752,34 @@ final class StandardLoadWatch {
             return nil
         }
         var load = loadOf(item)
-        if load.watch == nil {
+        var watch: Watch
+        if let current = load.watch {
+            watch = current
+        } else {
             var created = StallWatch(stallTimeoutMs: stallTimeoutMs(), totalTimeoutMs: totalTimeoutMs(), startedAt: load.startedAt)
             created.noteProgress(at: now())
-            load.watch = created
+            watch = .playable(created)
             load.progressStarted = true
             lastStallTimeoutMs = created.stallTimeoutMs
             lastTotalTimeoutMs = created.totalTimeoutMs
         }
-        let verdict = load.watch!.check(at: now(), readings: observed.readings)
+        let at = now()
+        let verdict: StallVerdict
+        switch (watch, observed.readings) {
+        case let (.playable(stall), nil), let (.item(stall), nil):
+            // No progress signal (no item yet, or no more): only the total limit.
+            watch = .playable(stall)
+            verdict = stall.capVerdict(at: at)
+        case (.playable(var stall), let readings?):
+            // The item appeared: a stage reached, the stall clock starts again from it.
+            stall.noteProgress(at: at)
+            verdict = stall.check(at: at, readings: readings)
+            watch = .item(stall)
+        case (.item(var stall), let readings?):
+            verdict = stall.check(at: at, readings: readings)
+            watch = .item(stall)
+        }
+        load.watch = watch
         guard verdict != .wait else {
             state = .loading(ready: ready, load: load)
             return nil
@@ -1752,8 +1799,15 @@ final class StandardLoadWatch {
     /// it, to read the progress the player does not signal. Same rule as Android.
     func nextCheckInMs() -> Int? {
         guard let watch = watched else { return nil }
-        let untilDeadline = max(0, Int(((watch.deadline() - now()) * 1000).rounded(.up)))
-        return min(untilDeadline, standardLoadSampleIntervalMs(watch.stallTimeoutMs))
+        let deadline: TimeInterval
+        switch watch {
+        // No progress signal: only the total limit ends it (the stall deadline would set a timer
+        // at 0 ms in a loop); it is read every tenth of the stall timeout to see the item appear.
+        case let .playable(stall): deadline = stall.capDeadline()
+        case let .item(stall): deadline = stall.deadline()
+        }
+        let untilDeadline = max(0, Int(((deadline - now()) * 1000).rounded(.up)))
+        return min(untilDeadline, standardLoadSampleIntervalMs(watch.stall.stallTimeoutMs))
     }
 
     /// Forgets the load in progress.
@@ -2412,6 +2466,18 @@ func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {
 /// track, else the URL string.
 func standardAssetURL(source: String, isFile: Bool) -> URL? {
     return isFile ? URL(fileURLWithPath: source) : URL(string: source)
+}
+
+/// What the standard load watch reads of a load: its bytes (`StandardLoadBytes.read`) and the
+/// player's buffered position, or nil while SwiftAudioEx's player has no AVPlayerItem (`player`:
+/// `standardPlayerItem`): before the asset is playable nothing shows progress, so that stage has
+/// only the total limit (`StandardLoadWatch.Watch.playable`), as crossfade's prepare. When the
+/// player's item cannot be read (another SwiftAudioEx layout) the readings are kept: the stall
+/// rule applies from the load's start, as before (a playlist slower than `stallTimeoutMs` then
+/// fails the track).
+func standardLoadReadings(_ player: StandardPlayerItemLookup, bytes: Double, buffered: Double) -> [Double]? {
+    if case .item(nil) = player { return nil }
+    return [bytes, buffered]
 }
 
 /// The bytes each access-log entry of `item` (an AVPlayerItem) reports transferred.

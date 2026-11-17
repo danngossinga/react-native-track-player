@@ -21,8 +21,14 @@ internal data class StandardLoadObservation(
     /** ExoPlayer's own `Player.STATE_*`. */
     val playbackState: Int,
     val hasError: Boolean,
-    /** Its progress: bytes downloaded, buffered position, total buffered duration. */
-    val readings: LongArray,
+    /**
+     * Its progress: bytes downloaded, buffered position, total buffered duration; null while the
+     * load has no progress signal. ExoPlayer's load always has one (its playlist bytes count until
+     * the first segment is asked for, [LoadedBytes]): [standardLoadObservation] never sends null.
+     * Kept for the same moves as iOS's watch, whose player has no item (no signal) before the
+     * asset is playable.
+     */
+    val readings: LongArray?,
     /**
      * Another wait owns the player's loading now (a seek): not watched, but whether the item was
      * ready is kept, so buffering once that wait ended is a rebuffer, not a load.
@@ -60,8 +66,21 @@ internal class StandardLoadWatch(
         val item: Any,
         val startedAtMs: Long,
         val progressStarted: Boolean = false,
-        val watch: StallWatch? = null
+        val watch: Watch? = null
     )
+
+    /**
+     * A watched load's stage (iOS: `StandardLoadWatch.Watch`, the same moves):
+     * - [Playable]: no progress signal (null readings): only the total limit ends it.
+     * - [Item]: readings arrived: the stall rule, its clock restarted when they first came.
+     * Moves: watched -> Playable or Item (by its first readings); Playable -readings-> Item
+     * (progress noted); Item -null readings-> Playable. ExoPlayer's loads are always [Item].
+     */
+    sealed class Watch {
+        abstract val stall: StallWatch
+        data class Playable(override val stall: StallWatch) : Watch()
+        data class Item(override val stall: StallWatch) : Watch()
+    }
 
     /**
      * Where the watch stands (one explicit state, the monorepo's state-machine form 3: a closed
@@ -139,11 +158,27 @@ internal class StandardLoadWatch(
             lastStallTimeoutMs = created.stallTimeoutMs
             lastTotalTimeoutMs = created.totalTimeoutMs
             val starts = !current.progressStarted
-            current = current.copy(progressStarted = true, watch = created)
+            current = current.copy(progressStarted = true, watch = Watch.Playable(created))
             state = State.Loading(ready, current)
             if (starts) onLoadStart()
         }
-        val verdict = current.watch!!.check(nowMs(), observed.readings)
+        val at = nowMs()
+        val watch = current.watch!!
+        val readings = observed.readings
+        val verdict = when {
+            // No progress signal: only the total limit.
+            readings == null -> {
+                current = current.copy(watch = Watch.Playable(watch.stall))
+                watch.stall.capVerdict(at)
+            }
+            watch is Watch.Playable -> {
+                // The signal appeared: a stage reached, the stall clock starts again from it.
+                watch.stall.noteProgress(at)
+                current = current.copy(watch = Watch.Item(watch.stall))
+                watch.stall.check(at, readings)
+            }
+            else -> watch.stall.check(at, readings)
+        }
         if (verdict == StallVerdict.WAIT) {
             state = State.Loading(ready, current)
             return null
@@ -162,8 +197,11 @@ internal class StandardLoadWatch(
      */
     fun nextCheckInMs(): Long? {
         val current = load?.watch ?: return null
-        val untilDeadline = (current.deadlineMs() - nowMs()).coerceAtLeast(0L)
-        return minOf(untilDeadline, standardLoadSampleIntervalMs(current.stallTimeoutMs))
+        // No progress signal: only the total limit ends it (the stall deadline would set a timer
+        // at 0 ms in a loop).
+        val deadline = if (current is Watch.Playable) current.stall.capDeadlineMs() else current.stall.deadlineMs()
+        val untilDeadline = (deadline - nowMs()).coerceAtLeast(0L)
+        return minOf(untilDeadline, standardLoadSampleIntervalMs(current.stall.stallTimeoutMs))
     }
 
     /** Forgets the load in progress (the player is no longer this backend's to watch). */

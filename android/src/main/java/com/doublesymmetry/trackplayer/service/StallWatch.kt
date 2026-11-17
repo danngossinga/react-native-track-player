@@ -40,6 +40,22 @@ internal class StallWatch(
 
     /** When the wait gives up if nothing progresses from now on (same clock as the readings). */
     fun deadlineMs(): Long = minOf(lastProgressAtMs + stallTimeoutMs, startedAtMs + totalTimeoutMs)
+
+    /**
+     * Counts as progress without a reading (a stage reached, such as an item that appeared); the
+     * next readings set a new baseline. As iOS's `noteProgress`.
+     */
+    fun noteProgress(nowMs: Long) {
+        lastProgressAtMs = nowMs
+        previous = null
+    }
+
+    /** For a stage with no progress signal: only the total limit. As iOS's `capVerdict`. */
+    fun capVerdict(nowMs: Long): StallVerdict =
+        if (nowMs - startedAtMs >= totalTimeoutMs) StallVerdict.CAP_EXCEEDED else StallVerdict.WAIT
+
+    /** When the total limit ends the wait (same clock as the readings). */
+    fun capDeadlineMs(): Long = startedAtMs + totalTimeoutMs
 }
 
 /**

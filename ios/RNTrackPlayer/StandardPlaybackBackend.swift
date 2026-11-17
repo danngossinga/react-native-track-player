@@ -517,13 +517,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         if watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [], ownedElsewhere: ownedElsewhere)) {
             loadBytes.startLoad(url: currentAssetURL())
         }
-        if case let .item(current) = standardPlayerItem(of: player) {
+        let playerItem = standardPlayerItem(of: player)
+        if case let .item(current) = playerItem {
             loadBytes.playerItem(current)
         }
+        // None while the player has no AVPlayerItem (the playable stage: only the total limit).
         let observed = StandardLoadObservation(
             item: item,
             phase: phase,
-            readings: [loadBytes.read(standardAccessLogBytes), player.bufferedPosition],
+            readings: standardLoadReadings(playerItem, bytes: loadBytes.read(standardAccessLogBytes), buffered: player.bufferedPosition),
             ownedElsewhere: ownedElsewhere
         )
         followLoad(observed)

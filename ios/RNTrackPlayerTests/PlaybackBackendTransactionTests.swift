@@ -392,6 +392,71 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         driver.stop()
     }
 
+    func testStandardLoadBeforeItsItemExistsOnlyTheTotalLimitEndsALoadAndTheStallRuleRunsFromTheItemsCreation() {
+        // SwiftAudioEx creates the AVPlayerItem once the asset is playable (an HLS master and
+        // media playlist arrived): before it nothing shows progress (nil readings), so only
+        // prepareTimeoutMs ends that stage, as crossfade's prepare (StallWaitDriver, capVerdict). A
+        // playlist slower than stallTimeoutMs does not fail the track (Android counts playlist
+        // bytes as progress). Android: StandardLoadWatchTest, the same steps.
+        let h = LoadWatchHarness()
+        func see(_ readings: [Double]?) -> StallVerdict? {
+            return h.watch.check(StandardLoadObservation(item: ObjectIdentifier(h.a), phase: .loading, readings: readings))
+        }
+        XCTAssertNil(see(nil))
+        h.now = 15
+        XCTAssertNil(see(nil), "no item after the stall timeout: the load goes on")
+        // The item appears at 20 s: progress (its creation), then the stall rule.
+        h.now = 20
+        XCTAssertNil(see([1, 0]))
+        h.now = 29.999
+        XCTAssertNil(see([1, 0]))
+        h.now = 30
+        XCTAssertEqual(see([1, 0]), .stalled, "no progress for stallTimeoutMs from the item's creation")
+        // With no item at all, the total limit.
+        h.now = 100
+        _ = h.observe(h.b, .ready)
+        _ = h.observe(h.b, .idle)
+        XCTAssertNil(h.watch.check(StandardLoadObservation(item: ObjectIdentifier(h.b), phase: .loading, readings: nil)))
+        h.now = 159.999
+        XCTAssertNil(h.watch.check(StandardLoadObservation(item: ObjectIdentifier(h.b), phase: .loading, readings: nil)))
+        h.now = 160
+        XCTAssertEqual(h.watch.check(StandardLoadObservation(item: ObjectIdentifier(h.b), phase: .loading, readings: nil)), .capExceeded)
+    }
+
+    func testStandardLoadBeforeItsItemExistsTheNextCheckIsAtTheTotalLimitOrATenthOfTheStallTimeout() {
+        // The stall deadline does not end that stage, so it does not bring the next check forward
+        // (a timer at 0 ms, firing in a loop): every tenth of the stall timeout, to see the item
+        // appear, then at the total limit.
+        let h = LoadWatchHarness()
+        var delays: [Int] = []
+        var pending: (() -> Void)?
+        var verdicts: [StallVerdict] = []
+        let driver = StandardLoadDriver(
+            watch: h.watch,
+            observe: { StandardLoadObservation(item: ObjectIdentifier(h.a), phase: .loading, readings: nil) },
+            giveUp: { verdicts.append($0) },
+            schedule: { delay, work in delays.append(delay); pending = work; return DispatchWorkItem {} }
+        )
+        driver.poke()
+        while verdicts.isEmpty, delays.count < 100 {
+            h.now += Double(delays.last!) / 1000
+            pending?()
+        }
+        XCTAssertEqual(verdicts, [.capExceeded])
+        XCTAssertEqual(delays.count, 60, "every second until the total limit")
+        XCTAssertFalse(delays.contains(0))
+        XCTAssertEqual(h.now, 60, accuracy: 0.0001)
+        driver.stop()
+    }
+
+    func testStandardLoadReadingsAreNoneWhileThePlayerHasNoItem() {
+        let item = AVPlayerItem(url: URL(string: "https://example.invalid/a.m3u8")!)
+        XCTAssertNil(standardLoadReadings(.item(nil), bytes: 3, buffered: 0), "no item: no progress signal")
+        XCTAssertEqual(standardLoadReadings(.item(item), bytes: 3, buffered: 1), [3, 1])
+        // SwiftAudioEx's layout changed (its item cannot be read): the stall rule as before.
+        XCTAssertEqual(standardLoadReadings(.unavailable, bytes: 3, buffered: 1), [3, 1])
+    }
+
     func testStandardLoadAnItemLoadingThatNeverWasReadyGivesUpAtTheStallTimeout() {
         let h = LoadWatchHarness()
         XCTAssertNil(h.observe(h.a, .loading))

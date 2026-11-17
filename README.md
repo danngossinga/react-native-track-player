@@ -75,10 +75,16 @@ Added fork surface:
   until its first segment is asked for (a slow proxy answering the playlists
   does not fail a healthy track), and not after it (the playlists the player
   reloads when it falls back to another rendition after a failed segment are
-  not progress). On iOS the stage that loads the playlists (before the asset is
-  playable) has no progress signal, so only `prepareTimeoutMs` ends it; after
-  it, progress is buffered media and the item's transferred bytes, which
-  AVFoundation does not split between playlists and media. On Android the
+  not progress). On iOS a load has two stages, the same on the crossfade and
+  the standard backend: until the asset is playable (an HLS track's playlists,
+  a file's first requests) the player has no item and nothing shows progress,
+  so only `prepareTimeoutMs` ends that stage (a playlist slower than
+  `stallTimeoutMs` does not fail the track, as on Android, where its bytes are
+  progress); from the item's creation the no-progress countdown starts again,
+  and progress is buffered media and the item's transferred bytes, which
+  AVFoundation does not split between playlists and media (before, the iOS
+  standard backend applied `stallTimeoutMs` from the start of the load, so a
+  playlist slower than it failed the track). On Android the
   no-progress countdown of a crossfade load runs from the start of the load:
   until its first segment is requested, playlist and key bytes reset it; after
   that only media bytes (and buffered media) do. When it reaches
@@ -151,9 +157,10 @@ Added fork surface:
   player (the loading track's) while the notification shows the active track's
   title and artwork.
 - The total limits, safety caps behind the stall timeout, with the same rules:
-  `prepareTimeoutMs` (crossfade load and every crossfade seek; on iOS the stage
-  before the asset is playable has no progress signal, so only this limit ends
-  it; an iOS crossfade seek, which had no limit before, now fails on a stall or
+  `prepareTimeoutMs` (crossfade load and every crossfade seek, and the standard
+  backend's load; on iOS the stage before the asset is playable has no progress
+  signal on either backend, so only this limit ends it, and `stallTimeoutMs`
+  applies from the item's creation; an iOS crossfade seek, which had no limit before, now fails on a stall or
   at this limit and the player then reports an error state), `playStartTimeoutMs` (crossfade play start, iOS and Android),
   `standardReadyTimeoutMs` (standard backend readiness) and
   `standardSeekTimeoutMs` (standard seek, iOS and Android; on iOS, before the seek

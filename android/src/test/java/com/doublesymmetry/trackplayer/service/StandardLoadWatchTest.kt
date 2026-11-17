@@ -220,4 +220,44 @@ class StandardLoadWatchTest {
         watch.reset()
         assertEquals(StandardLoadWatch.State.Idle(null), watch.state)
     }
+
+    @Test
+    fun withoutAProgressSignalOnlyTheTotalLimitEndsALoadAndTheStallRuleRunsFromTheSignal() {
+        // iOS: testStandardLoadBeforeItsItemExistsOnlyTheTotalLimitEndsALoadAndTheStallRuleRunsFromTheItemsCreation,
+        // the same steps (ExoPlayer's loads always have readings: the moves are kept the same).
+        fun see(item: Any, readings: LongArray?) =
+            watch.check(StandardLoadObservation(item, Player.STATE_BUFFERING, false, readings))
+        assertNull(see(a, null))
+        now = 15_000L
+        assertNull("no signal after the stall timeout: the load goes on", see(a, null))
+        now = 20_000L
+        assertNull(see(a, longArrayOf(1L, 0L, 0L)))
+        now = 29_999L
+        assertNull(see(a, longArrayOf(1L, 0L, 0L)))
+        now = 30_000L
+        assertEquals("no progress for stallTimeoutMs from the signal", StallVerdict.STALLED, see(a, longArrayOf(1L, 0L, 0L)))
+        now = 100_000L
+        observe(b, Player.STATE_READY)
+        observe(b, Player.STATE_IDLE)
+        assertNull(see(b, null))
+        now = 159_999L
+        assertNull(see(b, null))
+        now = 160_000L
+        assertEquals(StallVerdict.CAP_EXCEEDED, see(b, null))
+    }
+
+    @Test
+    fun withoutAProgressSignalTheNextCheckIsAtTheTotalLimitOrATenthOfTheStallTimeout() {
+        // iOS: testStandardLoadBeforeItsItemExistsTheNextCheckIsAtTheTotalLimitOrATenthOfTheStallTimeout.
+        val delays = mutableListOf<Long>()
+        var verdict: StallVerdict? = null
+        while (verdict == null && delays.size < 100) {
+            verdict = watch.check(StandardLoadObservation(a, Player.STATE_BUFFERING, false, null))
+            watch.nextCheckInMs()?.let { delays += it; now += it }
+        }
+        assertEquals(StallVerdict.CAP_EXCEEDED, verdict)
+        assertEquals("every second until the total limit", 60, delays.size)
+        assertFalse(delays.contains(0L))
+        assertEquals(60_000L, now)
+    }
 }

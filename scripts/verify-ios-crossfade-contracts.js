@@ -692,8 +692,10 @@ assert(
       // A load's progress (StandardLoadBytes, tested): started per load before its first reading,
       // its item read from SwiftAudioEx's AVPlayer, its access-log bytes with the buffered position.
       poll.includes('if watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [], ownedElsewhere: ownedElsewhere)) {\n            loadBytes.startLoad(url: currentAssetURL())') &&
-      poll.includes('if case let .item(current) = standardPlayerItem(of: player) {\n            loadBytes.playerItem(current)') &&
-      poll.includes('readings: [loadBytes.read(standardAccessLogBytes), player.bufferedPosition],') &&
+      poll.includes('let playerItem = standardPlayerItem(of: player)\n        if case let .item(current) = playerItem {\n            loadBytes.playerItem(current)') &&
+      // No readings while the player has no AVPlayerItem (standardLoadReadings, tested): the
+      // playable stage has only the total limit, as crossfade's prepare.
+      poll.includes('readings: standardLoadReadings(playerItem, bytes: loadBytes.read(standardAccessLogBytes), buffered: player.bufferedPosition),') &&
       section(backendSource, 'private func currentAssetURL() -> URL? {', '\n    }\n').includes('return standardAssetURL(source: track.getSourceUrl(), isFile: track.getSourceType() == .file)') &&
       // AVFoundation's item events check the load at once when they are its item's.
       backendSource.includes('itemObservers = [.AVPlayerItemNewAccessLogEntry, .AVPlayerItemNewErrorLogEntry, .AVPlayerItemFailedToPlayToEndTime].map { name in') &&
