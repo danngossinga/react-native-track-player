@@ -7,7 +7,8 @@
 - **RN:** Standard backend: a seek that gives up fails its track again whether it was issued or still waited for its track's item (iOS), so the next play loads the active track
 - **RN:** A track becomes the active one (`PlaybackActiveTrackChanged`) once it loaded, never for a track that failed to load (both backends, both platforms)
 - **RN:** Standard backend: a load or seek with no progress for `stallTimeoutMs` gives up (`crossfade_prepare_timeout`, `standard_seek_timeout`), stops loading and leaves the player in error until the next command (on iOS the countdown starts once the player item exists)
-- **RN:** A failed load no command waits for emits the `PlaybackState` error event, then `PlaybackError` (Android's standard backend sent `PlaybackError` first)
+- **RN:** A failed load no command waits for emits the `PlaybackState` error event, then `PlaybackError`, whether the load gave up or the player failed (before, the standard backend sent `PlaybackError` first: on Android for both, on iOS for a player error). On iOS SwiftAudioEx's failed-to-play-to-end failure, which leaves the player's state unchanged, still comes alone
+- **ios:** Standard backend: after a failed request or a rendition switch, a load's progress is new buffered time; the bytes posted with the switch (the left rendition's failed transfers, segments downloaded again) no longer restart its no-progress countdown
 - **RN:** Standard backend: a seek in a track the player cannot seek in (a stream with no length) resolves where the player lands instead of timing out
 
 ## [4.1.2](https://github.com/doublesymmetry/react-native-track-player/compare/v4.1.1...v4.1.2) (2025-08-12)

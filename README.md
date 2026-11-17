@@ -81,10 +81,19 @@ Added fork surface:
   so only `prepareTimeoutMs` ends that stage (a playlist slower than
   `stallTimeoutMs` does not fail the track, as on Android, where its bytes are
   progress); from the item's creation the no-progress countdown starts again,
-  and progress is buffered media and the item's transferred bytes, which
-  AVFoundation does not split between playlists and media (before, the iOS
-  standard backend applied `stallTimeoutMs` from the start of the load, so a
-  playlist slower than it failed the track). Remaining gap: on iOS an HLS
+  and progress on the standard backend is new buffered time (time a buffer
+  that empties and fills again does not count twice) and the media bytes of
+  the item's access log (AVFoundation never counts playlists there). After a
+  failed request or a rendition switch (a new error-log entry, or an
+  access-log event that is neither the first one nor that of a seek the
+  backend issued), those bytes stop counting until new time is buffered: the
+  bytes posted with a switch (the failed transfers of the rendition left, the
+  new rendition's segments downloaded again) are not progress (before, every
+  access-log byte and any growth of the buffered position counted, so each
+  switch restarted the countdown). Android counts every media byte, so there
+  bytes downloaded again at a switch count; iOS is stricter on that point.
+  (Before, the iOS standard backend also applied `stallTimeoutMs` from the
+  start of the load, so a playlist slower than it failed the track.) Remaining gap: on iOS an HLS
   segment counts only once it has completely arrived. AVFoundation updates neither
   the access log nor the loaded time ranges (the buffered position) while a
   segment downloads, nor any other public signal of the item (measured with
@@ -159,8 +168,12 @@ Added fork surface:
   no `PlaybackError` event for it. A load no command waits for (a natural
   advance, a play or retry after a failure) reports its failure with a
   `PlaybackError` event (`code`, `message`), after the `PlaybackState` error event
-  (both backends and platforms; before, Android's standard backend sent the
-  `PlaybackError` first). iOS now rejects crossfade loads that
+  (both backends and platforms, a give-up and a player error alike; before, the
+  standard backend sent the `PlaybackError` first: on Android for both, on iOS
+  for a player error, whose state SwiftAudioEx emits later from another queue).
+  One case keeps the iOS error alone: SwiftAudioEx's failed-to-play-to-end
+  failure leaves its state unchanged, so no error state precedes it (Android's
+  player is in error after every player error). iOS now rejects crossfade loads that
   give up or are cancelled with these codes too (before: `skip_failed`,
   `playback_backend_load_failed`), as Android.
 - A track becomes the active one once it loaded, on both backends and both

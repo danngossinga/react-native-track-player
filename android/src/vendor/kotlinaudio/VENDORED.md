@@ -21,7 +21,8 @@ privately, so these need small changes in it.
 ## Modified lines (everything else is upstream as-is)
 
 Each modified upstream file starts with a notice that it was modified (Apache License 2.0,
-section 4(b)); line numbers below include that notice.
+section 4(b)); line numbers below include that notice, and each range covers the fork's lines
+with their own comments (checked against the upstream archive with `diff`).
 
 - `java/com/doublesymmetry/kotlinaudio/notification/NotificationManager.kt`: `:1-4` the notice;
   `:27` `import com.doublesymmetry.kotlinaudio.R` → `import com.doublesymmetry.trackplayer.R` (the
@@ -68,7 +69,8 @@ section 4(b)); line numbers below include that notice.
     `failLoad`, the crossfade path and iOS: state, then error.
 - `models/PlaybackError.kt`: `:1-4` the notice; `:9` a comma after `message`; `:10-11` `fromHost` (new, default false): the
   error's code is the host's own (`crossfade_prepare_timeout`, `standard_seek_timeout`), emitted
-  without the `android-` prefix of ExoPlayer's codes.
+  without the `android-` prefix of ExoPlayer's codes; `:12` the closing parenthesis now ends
+  with a newline (upstream's file had none).
 - `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
   passed to `BaseAudioPlayer`;
   `:219-231` `releaseSource(index)` (new): a new, unprepared source for a non-current item in place
