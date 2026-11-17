@@ -10,10 +10,10 @@ import com.doublesymmetry.trackplayer.utils.RejectionException
 import com.google.android.exoplayer2.C
 import com.google.android.exoplayer2.Player
 import com.google.android.exoplayer2.util.MimeTypes
-import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.android.asCoroutineDispatcher
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -31,7 +31,6 @@ import org.robolectric.shadows.ShadowMediaCodec
 import org.robolectric.shadows.ShadowMediaCodecList
 import org.robolectric.shadows.ShadowSystemClock
 import java.time.Duration
-import kotlin.coroutines.CoroutineContext
 
 /**
  * A crossfade engine with its real ExoPlayer, loading HLS from a local server ([HlsTestServer]):
@@ -42,13 +41,11 @@ import kotlin.coroutines.CoroutineContext
 class CrossfadeEngineHlsTest {
     private val thread = HandlerThread("crossfade-engine-test").apply { start() }
 
-    /** The engine's thread: ExoPlayer is built and driven there, as on the service's main thread. */
-    private val engineThread = object : CoroutineDispatcher() {
-        private val handler = Handler(thread.looper)
-        override fun dispatch(context: CoroutineContext, block: Runnable) {
-            handler.post(block)
-        }
-    }
+    /**
+     * The engine's thread: ExoPlayer is built and driven there, and the waits' delays are its
+     * looper's, as on the service's main thread (Dispatchers.Main is a handler dispatcher too).
+     */
+    private val engineThread = Handler(thread.looper).asCoroutineDispatcher()
     private val servers = mutableListOf<HlsTestServer>()
     private val engines = mutableListOf<AndroidCrossfadeEngine>()
     private val loads = mutableListOf<Job>()
@@ -146,10 +143,12 @@ class CrossfadeEngineHlsTest {
         awaitTrue("the first track plays") { runBlocking(engineThread) { engine.positionMs } >= PLAYED_MS }
 
         val stalled = server(LADDER)
+        val operations = PlaybackOperationController()
         assertGivesUpAtTheStallTimeoutAndStopsLoading(engine, stalled) { item ->
-            // As the orchestrator starts a track: reset, then load.
+            // As the orchestrator starts a track: a playback operation, reset, then load.
+            val ticket = operations.begin()
             engine.reset()
-            engine.prepare(item, 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS)
+            engine.prepare(item, 0L, timeoutMs = PREPARE_TIMEOUT_MS, stallTimeoutMs = STALL_TIMEOUT_MS, ticket = ticket)
         }
     }
 

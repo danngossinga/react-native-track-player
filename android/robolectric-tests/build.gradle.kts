@@ -67,6 +67,7 @@ dependencies {
     // The versions the library runs with (KotlinAudio v2.1.0 brings ExoPlayer 2.19.0).
     implementation("com.google.android.exoplayer:exoplayer:2.19.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.robolectric:robolectric:4.14")
