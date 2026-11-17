@@ -209,6 +209,30 @@ jobs:
         run: |-
           cd example/android
           ./gradlew assembleDebug --no-daemon
+      - name: Library Unit Tests
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        run: |-
+          cd example/android
+          ./gradlew :react-native-track-player:testDebugUnitTest --no-daemon
+      # The crossfade engine's real ExoPlayer against a local HLS server (Robolectric, its own
+      # Gradle 8.7 build). Robolectric downloads its android-all jar on a fresh runner.
+      - name: Engine Tests (Robolectric)
+        if: ${{ needs.check-changes.outputs.should-build-android }}
+        run: |-
+          cd android/robolectric-tests
+          ./gradlew testDebugUnitTest --no-daemon
+  contracts:
+    # Source contracts of both platforms' players (Node only, no dependency install).
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repo
+        uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version-file: .node-version
+      - name: Player Contracts
+        run: npm run test:contracts
   build-docs:
     runs-on: ubuntu-latest
     needs: check-changes

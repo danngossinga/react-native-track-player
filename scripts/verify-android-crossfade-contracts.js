@@ -463,8 +463,7 @@ assert(
       builder.includes('.setBandwidthMeter(bandwidthMeter)') &&
       parameters.includes('.setAllowAudioMixedChannelCountAdaptiveness(true)') &&
       parameters.includes('.setAllowAudioMixedSampleRateAdaptiveness(true)') &&
-      read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt')
-        .includes('fun anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionHighestListedFirst()'),
+      true,
     'Android crossfade players must select adaptively among audio renditions (lowest first at a low estimate).'
   );
 }
@@ -472,7 +471,7 @@ assert(
 // A load or seek an engine gives up on stops loading (no background retries) and forgets the
 // track, as iOS removes the item.
 {
-  const abandon = section(engineSource, 'private fun abandonLoad(generation: Long) {', '\n    }\n');
+  const abandon = section(engineSource, 'private fun abandonLoad(generation: Long, why: String) {', '\n    }\n');
   const prepareBody = section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)');
   const seekBody = section(engineSource, 'override suspend fun seekTo(', 'override fun setVolume(');
   assert(
@@ -480,9 +479,10 @@ assert(
       abandon.includes('player.stop()') &&
       abandon.includes('preparedItem = null') &&
       abandon.includes('preparedTrackKey = null') &&
-      prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation)\n            throw error') &&
-      section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation)') &&
-      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation)'),
+      abandon.includes('load abandoned ($why)') &&
+      prepareBody.includes('} catch (error: RejectionException) {\n            abandonLoad(generation, "load ${error.code}: ${error.message}")\n            throw error') &&
+      section(prepareBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "load $reason")') &&
+      section(seekBody, 'if (verdict != null) {', 'throw RejectionException(').includes('abandonLoad(generation, "seek $reason")'),
     'An Android engine that gives up on a load or seek must stop the player and forget the track.'
   );
 }
@@ -506,5 +506,56 @@ assert(
     'A failed Android natural advance must leave the player in error and emit playback-error.'
   );
 }
+
+// The engine behaviours are pinned by the Robolectric tests (real ExoPlayer, local HLS server),
+// which CI runs: each named test must keep its assertion, and the workflow must run the project.
+{
+  const hlsTests = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt');
+  const workflow = read('.github/workflows/validate.yml');
+  const testBody = (name) => section(hlsTests, `fun ${name}()`, '\n    @Test');
+  for (const name of [
+    'anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionHighestListedFirst',
+    'anUncachedTrackAsksForItsFirstSegmentAtTheLowestRenditionLowestListedFirst'
+  ]) {
+    assert(
+      testBody(name).includes('assertEquals("v064", awaitFirstSegmentRendition(server))'),
+      `${name} must assert the first segment requested is the lowest rendition.`
+    );
+  }
+  assert(
+    testBody('failingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions')
+      .includes('gaveUpAfterMs < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS') &&
+      hlsTests.includes('assertStopsLoading(engine, item, stalled, gaveUpAtMs)') &&
+      hlsTests.includes('assertFalse("a track that failed is not prepared", engine.isPreparedFor(item))') &&
+      hlsTests.includes('assertEquals(SEEK_TARGET_MS, runBlocking(engineThread) { engine.positionMs })') &&
+      workflow.includes('cd android/robolectric-tests') &&
+      workflow.includes('./gradlew testDebugUnitTest') &&
+      workflow.includes(':react-native-track-player:testDebugUnitTest'),
+    'The Robolectric engine tests must keep their assertions and run in CI with the unit tests.'
+  );
+}
+
+// Only media bytes are a load's progress: HLS playlists and keys (reloaded when the player falls
+// back to another rendition) come from a factory without the progress listener.
+{
+  const factory = section(engineSource, 'internal class CrossfadeMediaSourceFactory(', '\n}\n');
+  const fields = section(engineSource, 'private val bytesLoaded = AtomicLong(0L)', 'private var preparedItem');
+  assert(
+    factory.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaDataSourceFactory else playlistDataSourceFactory).createDataSource()') &&
+      factory.includes('private val other = DefaultMediaSourceFactory(mediaDataSourceFactory)') &&
+      fields.includes('private val dataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)\n') &&
+      fields.includes('private val mediaDataSourceFactory = DefaultDataSource.Factory(context, httpDataSourceFactory)\n        .setTransferListener(') &&
+      fields.includes('playlistDataSourceFactory = dataSourceFactory,') &&
+      fields.includes('mediaDataSourceFactory = mediaDataSourceFactory'),
+    'Android engine waits must count media bytes only, not playlist or key reloads.'
+  );
+}
+
+// A track that ends while the next one preloads advances (iOS acts in preloadingNext too).
+assert(
+  section(orchestrator, 'private suspend fun monitorActiveEngine() {', 'val endedIndex = currentIndex')
+    .includes('state != AndroidPlaybackOrchestratorState.PRELOADING_NEXT'),
+  'The Android end monitor must also act while the next track preloads, as iOS.'
+);
 
 console.log('Android crossfade contracts OK');
