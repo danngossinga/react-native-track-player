@@ -954,6 +954,181 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     // A standard give-up as StandardPlaybackBackend applies it and RNTrackPlayer emits it
     // (StandardGiveUps, StandardGiveUpReport.events): the same events as Android.
 
+    // StandardLoadCoordinator: the standard backend's load sequences, run against a fake player
+    // (StandardPlaybackBackend is that player over SwiftAudioEx, one-line adapters).
+
+    private final class FakeLoadPlayer: StandardLoadPlayer {
+        var currentLoadItem: ObjectIdentifier?
+        var loadStateRawValue = "loading"
+        var loadErrorMessage: String?
+        var calls: [String] = []
+        var names: [ObjectIdentifier: String] = [:]
+        weak var coordinator: StandardLoadCoordinator?
+        /// Whether SwiftAudioEx's `stopped` would be emitted at the give-up's stop (its state
+        /// event comes after the stop, asynchronously, so later still).
+        var stoppedEmittedAtStop: Bool?
+
+        func name(_ item: ObjectIdentifier?) -> String { return item.flatMap { names[$0] } ?? "none" }
+        func reloadForCommand() { calls.append("reload") }
+        func checkLoad() { calls.append("check") }
+        func stopLoading(log: String) {
+            calls.append("stop")
+            stoppedEmittedAtStop = coordinator?.emitsPlayerState("stopped")
+        }
+        func emitGiveUp(_ report: StandardGiveUpReport) {
+            calls.append("gaveUp \(report.failure?.code ?? "none") playbackError=\(report.reportsPlaybackError)")
+        }
+        func reportActiveTrack(_ change: FailedLoadRule.Report) { calls.append("active \(name(change.to)) from \(name(change.from))") }
+        func showAfterFailedLoad(_ reported: ObjectIdentifier?) { calls.append("show \(name(reported))") }
+        func followNowPlaying() { calls.append("nowPlaying") }
+        func logFailedLoad(active: ObjectIdentifier?) {}
+    }
+
+    private final class CoordinatorHarness {
+        let a = NSObject(), b = NSObject()
+        lazy var ia = ObjectIdentifier(a)
+        lazy var ib = ObjectIdentifier(b)
+        let player = FakeLoadPlayer()
+        lazy var loads: StandardLoadCoordinator = {
+            let loads = StandardLoadCoordinator(player: player, watched: true)
+            player.coordinator = loads
+            player.names = [ia: "A", ib: "B"]
+            return loads
+        }()
+
+        /// A plays (loaded and reported); the player moves to B (a skip), not loaded yet.
+        func skipFromAToB() {
+            loads.failedLoads.adopted(ia)
+            player.currentLoadItem = ib
+            _ = loads.failedLoads.moved(ib)
+        }
+
+        func see(_ phase: StandardLoadPhase, owned: Bool = false) {
+            loads.followLoad(StandardLoadObservation(item: player.currentLoadItem, phase: phase, readings: [0], ownedElsewhere: owned))
+        }
+    }
+
+    func testStandardLoadCoordinatorASkipWaitsForItsTrackToLoadThenReportsItAndEnds() {
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        var outcomes: [StandardCommandLoadOutcome] = []
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        XCTAssertEqual(outcomes, [], "the skip waits for B's load")
+        XCTAssertEqual(h.player.calls, ["check"], "the load is looked at now")
+        h.see(.loading)
+        h.see(.ready, owned: true)
+        XCTAssertEqual(outcomes, [], "a seek owns the loading: not settled by it")
+        h.see(.ready)
+        XCTAssertEqual(h.player.calls, ["check", "active B from A"], "B loaded: reported")
+        XCTAssertEqual(outcomes, [.loaded], "then the skip ends")
+        XCTAssertTrue(h.loads.commandLoads.isWaiting == false)
+    }
+
+    func testStandardLoadCoordinatorAWaitReloadsATrackStandingStillAndEndsAtOnceWhenNothingIsToWaitFor() {
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.player.loadStateRawValue = "failed"
+        var outcomes: [StandardCommandLoadOutcome] = []
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        XCTAssertEqual(h.player.calls, ["reload", "check"], "after a failure on it the player stands still: its load starts again")
+        XCTAssertEqual(outcomes, [])
+        // A skip to the track loaded and reported ends at once.
+        h.player.currentLoadItem = h.ia
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        XCTAssertEqual(outcomes, [.cancelled, .loaded], "the newer command cancelled the older wait")
+        // Disposed: a waiting command ends cancelled, a new one does not wait.
+        h.player.currentLoadItem = h.ib
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        h.loads.dispose()
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        XCTAssertEqual(outcomes, [.cancelled, .loaded, .cancelled, .loaded])
+        // Loads not watched (no load watch): a command does not wait.
+        let unwatchedPlayer = FakeLoadPlayer()
+        unwatchedPlayer.currentLoadItem = h.ib
+        let unwatched = StandardLoadCoordinator(player: unwatchedPlayer, watched: false)
+        unwatched.waitForCommandLoad { outcomes.append($0) }
+        XCTAssertEqual(outcomes.last, .loaded)
+        XCTAssertEqual(unwatchedPlayer.calls, [])
+    }
+
+    func testStandardLoadCoordinatorALoadGiveUpStopsThePlayerErrorsAndKeepsTheActiveTrack() {
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertEqual(h.player.calls, ["stop", "gaveUp crossfade_prepare_timeout playbackError=true", "show A", "nowPlaying"])
+        XCTAssertEqual(h.player.stoppedEmittedAtStop, false, "SwiftAudioEx's own stopped after a give-up is not emitted: the player is in error")
+        XCTAssertEqual(h.loads.hostFailure?.code, standardPrepareTimeoutCode)
+        XCTAssertFalse(h.loads.emitsPlayerState("stopped"))
+        XCTAssertTrue(h.loads.emitsPlayerState("playing"))
+        XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib))
+        // A stop ends the error: SwiftAudioEx's next stopped is emitted.
+        _ = h.loads.giveUps.stopped(playerStopped: true)
+        XCTAssertTrue(h.loads.emitsPlayerState("stopped"))
+        // A command waiting for the load: rejected with the give-up, no playback error.
+        let w = CoordinatorHarness()
+        w.skipFromAToB()
+        var outcomes: [StandardCommandLoadOutcome] = []
+        w.loads.waitForCommandLoad { outcomes.append($0) }
+        w.loads.giveUpLoad(.capExceeded, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertEqual(w.player.calls, ["check", "stop", "gaveUp crossfade_prepare_timeout playbackError=false", "show A", "nowPlaying"])
+        XCTAssertEqual(outcomes, [.failed(code: standardPrepareTimeoutCode, message: standardLoadGiveUpMessage(.capExceeded, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000))])
+    }
+
+    func testStandardLoadCoordinatorASeekThatGivesUpStopsThePlayerOnlyWhenIssuedOnItsTrack() {
+        let h = CoordinatorHarness()
+        h.loads.failedLoads.adopted(h.ia)
+        h.player.currentLoadItem = h.ia
+        h.loads.seekTimedOut(issued: false, track: h.ia, message: "m", keptPosition: 30)
+        h.loads.seekTimedOut(issued: true, track: h.ib, message: "m", keptPosition: 30)
+        XCTAssertEqual(h.player.calls, [], "not issued, or for a track the player left: only its rejection")
+        XCTAssertNil(h.loads.hostFailure)
+        h.loads.seekTimedOut(issued: true, track: h.ia, message: "The native seek made no progress for 10000 ms.", keptPosition: 30)
+        XCTAssertEqual(h.player.calls, ["stop", "gaveUp standard_seek_timeout playbackError=false", "nowPlaying"])
+        XCTAssertEqual(h.player.stoppedEmittedAtStop, false)
+        XCTAssertEqual(h.loads.hostFailure?.code, "standard_seek_timeout")
+        XCTAssertEqual(h.loads.giveUps.position(live: 0), 30, "its target stays the position")
+        XCTAssertEqual(h.loads.failedLoads.phase, .loaded(h.ia), "a seek give-up on the loaded track leaves it loaded")
+        // A native seek that ended unfinished: only the latest, on its track, while not disposed.
+        let n = CoordinatorHarness()
+        n.loads.failedLoads.adopted(n.ia)
+        n.player.currentLoadItem = n.ia
+        n.loads.nativeSeekEnded(didFinish: true, track: n.ia, isLatest: true, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: false, keptPosition: 5)
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ib, isLatest: true, keptPosition: 5)
+        XCTAssertEqual(n.player.calls, [])
+        n.loads.nativeSeekEnded(didFinish: false, track: n.ia, isLatest: true, keptPosition: 5)
+        XCTAssertEqual(n.player.calls, ["stop", "gaveUp standard_seek_cancelled playbackError=false", "nowPlaying"])
+        let d = CoordinatorHarness()
+        d.player.currentLoadItem = d.ia
+        d.loads.dispose()
+        d.loads.nativeSeekEnded(didFinish: false, track: d.ia, isLatest: true, keptPosition: 5)
+        XCTAssertEqual(d.player.calls, [], "disposed: no give-up")
+    }
+
+    func testStandardLoadCoordinatorAPlayerFailureFailsTheLoadOnceAndRejectsTheWaitWithItsError() {
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.player.loadErrorMessage = "The track could not be played"
+        var outcomes: [StandardCommandLoadOutcome] = []
+        h.loads.waitForCommandLoad { outcomes.append($0) }
+        h.see(.failed)
+        h.see(.failed)
+        XCTAssertEqual(h.player.calls, ["check", "show A", "nowPlaying"], "one failure per player error")
+        XCTAssertEqual(outcomes, [.failed(code: standardLoadErrorCode, message: "The track could not be played")])
+        XCTAssertTrue(h.loads.commandLoads.reportsFailure(of: h.ib), "the rejection is its report: no playback error")
+        XCTAssertEqual(h.loads.failedLoads.phase, .failed(h.ib))
+        XCTAssertNil(h.loads.hostFailure, "a player error is the player's own, not a give-up")
+    }
+
+    func testStandardCommandLoadResultIsTheCommandsResolution() {
+        XCTAssertNoThrow(try standardCommandLoadResult(.loaded).get())
+        for (outcome, code) in [(StandardCommandLoadOutcome.failed(code: "crossfade_prepare_timeout", message: "m"), "crossfade_prepare_timeout"),
+                                (.cancelled, "cancelled")] {
+            guard case let .failure(error) = standardCommandLoadResult(outcome) else { return XCTFail("\(outcome) fails") }
+            XCTAssertEqual((error as NSError).userInfo["code"] as? String, code)
+        }
+    }
+
     func testStandardGiveUpOfALoadNoCommandWaitsForIsAnErrorStateAndAPlaybackError() {
         let giveUps = StandardGiveUps()
         let loads = StandardCommandLoad()

@@ -329,6 +329,14 @@ func audioFocusRefusedError() -> Error {
     ])
 }
 
+/// A playback backend's error: `message`, with its `code` (the code JS rejects with).
+func playbackBackendError(code: String, message: String) -> Error {
+    return NSError(domain: "RNTrackPlayer.PlaybackBackend", code: 1, userInfo: [
+        NSLocalizedDescriptionKey: message,
+        "code": code
+    ])
+}
+
 /// The `remote-duck` event for an interruption event: `paused` while the audio is taken away,
 /// `permanent` when it will not be given back (same meaning on iOS and Android).
 struct RemoteDuckPayload: Equatable {
@@ -2433,6 +2441,199 @@ final class StandardGiveUps {
         keep(clear())
         guard wasInError, playerStopped else { return nil }
         return StandardGiveUpReport(failure: nil, reportsPlaybackError: false)
+    }
+}
+
+/// What `StandardLoadCoordinator` asks of the standard player: `StandardPlaybackBackend` over
+/// SwiftAudioEx (each a one-line adapter, pinned by verify-ios-crossfade-contracts), a fake in
+/// tests. Main.
+protocol StandardLoadPlayer: AnyObject {
+    /// The player's current item (nil: none).
+    var currentLoadItem: ObjectIdentifier? { get }
+    /// SwiftAudioEx's state (`AVPlayerWrapperState.rawValue`).
+    var loadStateRawValue: String { get }
+    /// The player's own error message, when it failed.
+    var loadErrorMessage: String? { get }
+    /// Loads the current item again from its start (SwiftAudioEx's reload).
+    func reloadForCommand()
+    /// Looks at the load now (`StandardLoadDriver.poke`).
+    func checkLoad()
+    /// Stops loading after a give-up: the module's request becomes "paused" and SwiftAudioEx stops
+    /// (its item leaves the AVPlayer, which stops requesting media).
+    func stopLoading(log: String)
+    /// Emits a give-up's events (`StandardGiveUpReport.events`).
+    func emitGiveUp(_ report: StandardGiveUpReport)
+    /// Tells the app of a change of the active track (`FailedLoadRule.Report`).
+    func reportActiveTrack(_ change: FailedLoadRule.Report)
+    /// A load failed while `reported` stays the active track: the lock screen shows it again.
+    func showAfterFailedLoad(_ reported: ObjectIdentifier?)
+    /// The lock screen follows the reported track (`ReportedNowPlaying`).
+    func followNowPlaying()
+    /// Logs a failed load (`active`: the active track then).
+    func logFailedLoad(active: ObjectIdentifier?)
+}
+
+/// The standard player's load sequences (StandardPlaybackBackend runs them; this file is the
+/// one the tests execute, so deleting a step breaks a test, not only a text pin): which track is
+/// active (`failedLoads`), a command's wait for its track's load (`commandLoads`), the give-ups
+/// (`giveUps`) and what each event does with them, in order. As the crossfade path and Android's
+/// standard player (KotlinAudioPlaybackBackend). Main.
+final class StandardLoadCoordinator {
+    let failedLoads = FailedLoadRule()
+    let commandLoads = StandardCommandLoad()
+    let giveUps = StandardGiveUps()
+    private weak var player: StandardLoadPlayer?
+    /// The player's loads are watched (a load watch exists): a command waits for its load.
+    private let watched: Bool
+    private(set) var disposed = false
+
+    init(player: StandardLoadPlayer, watched: Bool) {
+        self.player = player
+        self.watched = watched
+    }
+
+    /// The error a give-up left the player in, until the next command (nil: none).
+    var hostFailure: IOSPlaybackErrorSnapshot? { return giveUps.failure }
+
+    /// The backend is disposed: a waiting command ends cancelled, no more give-ups.
+    func dispose() {
+        disposed = true
+        commandLoads.cancel()
+    }
+
+    /// Whether SwiftAudioEx's own state event is emitted: not its `stopped` after a give-up (the
+    /// give-up stopped it; the player is in error, emitted with the give-up), as Android, where
+    /// the give-up's ERROR state is the last state. A stop ends that error first
+    /// (`StandardGiveUps.stopped`): its own `stopped` is emitted.
+    func emitsPlayerState(_ stateRawValue: String) -> Bool {
+        return !(stateRawValue == "stopped" && giveUps.failure != nil)
+    }
+
+    /// What the load watch saw (`StandardLoadObservation`), fed to `failedLoads` and
+    /// `commandLoads`: a player failure fails the load (once per error) and rejects a waiting
+    /// command with the player's error; a ready item is the active track (reported when the app
+    /// was not told) and ends a command waiting for it.
+    func followLoad(_ observed: StandardLoadObservation) {
+        guard observed.item != nil else { return }
+        if observed.phase == .failed {
+            if failedLoads.playerErrorSeen() {
+                failLoadedTrack()
+                // A command waiting for this load rejects with the player's error, as a crossfade
+                // load that fails (crossfade_engine_error).
+                commandLoads.failed(
+                    observed.item,
+                    code: standardLoadErrorCode,
+                    message: player?.loadErrorMessage ?? standardLoadFailedMessage,
+                    reportedByPlayer: true
+                )
+            }
+            return
+        }
+        if failedLoads.playerErrorGone() { commandLoads.failureCleared() }
+        if observed.ownedElsewhere { return }
+        if observed.phase == .ready {
+            if let change = failedLoads.ready() { player?.reportActiveTrack(change) }
+            commandLoads.ruleSettled(active: failedLoads.active, reported: failedLoads.reported)
+        }
+    }
+
+    /// Waits for the load a command started (skip, next, previous, load) on the player's current
+    /// item, as the crossfade path: `loaded` once it loaded and is the active track; `failed`
+    /// with the load's failure (crossfade_prepare_timeout, crossfade_engine_error); `cancelled`
+    /// when a newer command replaced it. Loads not watched (no load watch), disposed, or no item:
+    /// `loaded` at once.
+    func waitForCommandLoad(_ completion: @escaping (StandardCommandLoadOutcome) -> Void) {
+        guard watched, !disposed, let player = player, let target = player.currentLoadItem else {
+            completion(.loaded)
+            return
+        }
+        let wait = commandLoads.begin(target: target, active: failedLoads.active, reported: failedLoads.reported, settle: completion)
+        // Its track must load: after a give-up or a player error on it (a skip to the same
+        // track does not jump), the player stands still.
+        if wait != nil, standardCommandLoadMustStart(targetLoaded: false, stateRawValue: player.loadStateRawValue) {
+            player.reloadForCommand()
+        }
+        // The load is looked at now (the player's events of the command may have come first).
+        player.checkLoad()
+    }
+
+    /// The load watch gave up the current item's load (`verdict`, with the limits it used): a load
+    /// no command waits for is reported as a playback error, one a command waits for by its
+    /// rejection (StandardGiveUps).
+    func giveUpLoad(_ verdict: StallVerdict, stallTimeoutMs: Int, totalTimeoutMs: Int) {
+        let reason = verdict.reason(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: totalTimeoutMs)
+        giveUps.loadGaveUp(
+            verdict,
+            stallTimeoutMs: stallTimeoutMs,
+            totalTimeoutMs: totalTimeoutMs,
+            item: player?.currentLoadItem,
+            commandLoads: commandLoads
+        ) { report in
+            stopAfterGiveUp(log: "load \(reason)", report: report)
+        }
+    }
+
+    /// A seek's wait gave up (`message`): as a crossfade seek that gives up, the player stops
+    /// loading and is in error (the rejection is the report: no playback error), when the seek
+    /// was issued and the player is still on its track (`track`); a seek still waiting to be
+    /// issued, or for a track the player left, only rejects.
+    func seekTimedOut(issued: Bool, track: ObjectIdentifier, message: String, keptPosition: Double) {
+        guard issued, player?.currentLoadItem == track else { return }
+        giveUps.seekGaveUp(
+            IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),
+            keptPosition: keptPosition
+        ) { report in
+            stopAfterGiveUp(log: "seek \(message)", report: report)
+        }
+    }
+
+    /// A native seek ended: one that ended unfinished on its track and was the latest stops
+    /// loading (`standardSeekEndStopsLoading`); one a newer seek replaced does not.
+    func nativeSeekEnded(didFinish: Bool, track: ObjectIdentifier, isLatest: Bool, keptPosition: Double) {
+        guard !disposed,
+              standardSeekEndStopsLoading(didFinish: didFinish, sameTrack: player?.currentLoadItem == track, isLatest: isLatest) else { return }
+        giveUps.seekGaveUp(
+            IOSPlaybackErrorSnapshot(message: "The native seek was interrupted.", code: "standard_seek_cancelled"),
+            keptPosition: keptPosition
+        ) { report in
+            stopAfterGiveUp(log: "seek interrupted", report: report)
+        }
+    }
+
+    /// Ends a load or seek given up (StandardGiveUps decided it, its error is set): the player
+    /// stops loading, the app is told (`report`'s events), and the player is in error until the
+    /// next command. Its track failed (again, after a seek on a track that failed: the next play
+    /// loads the active track; FailedLoadRule.failed changes nothing on the loaded track), as
+    /// Android.
+    func stopAfterGiveUp(log: String, report: StandardGiveUpReport) {
+        guard let player = player else { return }
+        player.stopLoading(log: log)
+        player.emitGiveUp(report)
+        failLoadedTrack()
+    }
+
+    /// A load failed: the previous track stays active (none when there was none), as the crossfade
+    /// path and Android; the lock screen shows it again.
+    func failLoadedTrack() {
+        guard let player = player else { return }
+        player.logFailedLoad(active: failedLoads.active)
+        if let change = failedLoads.failed() { player.reportActiveTrack(change) }
+        if failedLoads.isPending(player.currentLoadItem) {
+            player.showAfterFailedLoad(failedLoads.reported)
+        }
+        player.followNowPlaying()
+    }
+}
+
+/// A standard command's result from its wait's outcome (`cancelled`: a newer command replaced it).
+func standardCommandLoadResult(_ outcome: StandardCommandLoadOutcome) -> Result<Void, Error> {
+    switch outcome {
+    case .loaded:
+        return .success(())
+    case let .failed(code, message):
+        return .failure(playbackBackendError(code: code, message: message))
+    case .cancelled:
+        return .failure(playbackBackendError(code: "cancelled", message: standardCommandLoadCancelledMessage))
     }
 }
 

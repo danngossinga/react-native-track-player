@@ -1944,9 +1944,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     func handleAudioPlayerStateChange(source: QueuedAudioPlayer, state: AVPlayerWrapperState) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         // A load or seek given up stopped the player: it is in error (handleStandardLoadGaveUp
-        // emitted it), not stopped.
-        if state == .stopped, let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
-           backend.identity === source, backend.hostFailure != nil {
+        // emitted it), not stopped (StandardLoadCoordinator.emitsPlayerState, tested).
+        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
+           backend.identity === source, !backend.emitsPlayerState(state.rawValue) {
             return
         }
         emit(
