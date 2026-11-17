@@ -228,7 +228,7 @@ assert(
 );
 assert(
   standardBackend.includes('private val logicalPlaybackState = KotlinAudioLogicalPlaybackStateSidecar()') &&
-    standardBackend.includes('override val currentIndex: Int\n        get() = if (failedLoads.isReverted) activeIndexAfterFailedLoad() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
+    standardBackend.includes('override val currentIndex: Int\n        get() = if (failedLoads.isPending(player.currentItem)) reportedIndex() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
     standardBackend.includes('selectFirstPhysicalItemIfNeeded()') &&
     standardBackend.includes('if (logicalPlaybackState.shouldIgnorePrevious()) return') &&
     mediaSessionInstrumentation.includes('testRestoredIdlePlayPublishesCanonicalFirstTrack') &&
@@ -439,7 +439,7 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        failedLoads.command()?.let { reportCorrection(it, null) }\n        // As a crossfade seek that gives up: the player stops loading and is in error.\n        seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
+    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        failedLoads.command()\n        try {\n            // As a crossfade seek that gives up: the player stops loading and is in error.\n            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
@@ -834,13 +834,21 @@ assert(
   const watchSource = read('android/src/main/java/com/doublesymmetry/trackplayer/service/StandardLoadWatch.kt');
   const vendored = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
   const hlsTest = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardPlayerHlsTest.kt');
-  const supervise = section(standardBackend, 'suspend fun superviseLoads() {', 'private fun giveUpLoad(');
+  const supervise = section(standardBackend, 'private fun observeLoad(): StandardLoadObservation {', 'private fun followLoad(');
+  const driver = section(watchSource, 'internal class StandardLoadDriver(', '\n}\n');
   const giveUp = section(standardBackend, 'private fun giveUpLoad(', '\n    }\n');
   const failLoad = section(vendored, 'fun failLoad(error: PlaybackError, report: Boolean) {', '\n    }\n');
   assert(
     watchSource.includes('internal const val PREPARE_TIMEOUT_CODE = "crossfade_prepare_timeout"') &&
-      supervise.includes('if (!isAuthoritative || disposed || playerReleased || seekGate.isWaiting) {') &&
-      supervise.includes('standardLoadObservation(exo, player.currentItem, analytics()?.loadedBytes)') &&
+      supervise.includes('if (!isAuthoritative || disposed || playerReleased || logicalItem == null) {') &&
+      supervise.includes('standardLoadObservation(exo, logicalItem, analytics()?.loadedBytes, ownedElsewhere = seekGate.isWaiting)') &&
+      // Event-driven, one timer only while a load is watched, at an interval from the settings.
+      driver.includes('watch.nextCheckInMs()?.let {\n            handler.postDelayed(check, it)') &&
+      driver.includes('override fun onEvents(player: Player, events: com.google.android.exoplayer2.analytics.AnalyticsListener.Events) {\n                poke()') &&
+      watchSource.includes('internal fun standardLoadSampleIntervalMs(stallTimeoutMs: Long): Long = (stallTimeoutMs / 10L).coerceAtLeast(1L)') &&
+      !/ENGINE_WAIT_POLL_INTERVAL_MS|delay\(/.test(watchSource) &&
+      section(standardBackend, 'fun startLoadWatch(handler: android.os.Handler) {', '\n    }\n').includes('it.listenTo(collector)') &&
+      section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('loadDriver?.poke()') &&
       giveUp.includes('androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")') &&
       giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),\n            report = true') &&
       failLoad.includes('exoPlayer.stop()') && failLoad.includes('playerState = AudioPlayerState.ERROR') &&
@@ -848,7 +856,7 @@ assert(
       vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
       standardHooks.includes('mediaTransferListener = analytics.loadedBytes,') &&
       musicService.includes('totalTimeoutMs = { prepareTimeout.milliseconds }') &&
-      musicService.includes('                    binding.ownerScope.launch { backend.superviseLoads() }\n') &&
+      musicService.includes('.also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }') &&
       section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardLoadWatch.kt",') &&
       ['aStalledStandardLoadGivesUpAtTheStallTimeoutAndStopsLoading', 'aStalledStandardLoadWhileATrackPlaysGivesUpAtTheStallTimeout',
@@ -866,18 +874,21 @@ assert(
 {
   const fixture = JSON.parse(read('scripts/fixtures/failed-load-scenarios.json'));
   assert(
-    fixture.scenarios.length === 7 &&
+    fixture.scenarios.length === 8 &&
       read('android/src/test/java/com/doublesymmetry/trackplayer/service/FailedLoadRuleTest.kt').includes('readSharedFixture("scripts/fixtures/failed-load-scenarios.json")') &&
-      standardBackend.includes('get() = if (failedLoads.isReverted) activeIndexAfterFailedLoad() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
-      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('revertFailedLoad()') &&
-      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('revertFailedLoad()') &&
+      standardBackend.includes('get() = if (failedLoads.isPending(player.currentItem)) reportedIndex() else logicalPlaybackState.currentIndex(player.currentIndex)') &&
+      section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('failLoadedTrack()') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('failLoadedTrack()') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('if (failedLoads.moved(item)) report(FailedLoadRule.Report(item, from))') &&
+      section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('failedLoads.ready()?.let(::report)') &&
       section(standardBackend, 'override suspend fun play() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.play()') &&
       section(standardBackend, 'override suspend fun retry() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.prepare()') &&
-      musicService.includes('emitPlaybackTrackChangedEvents(index, lastIndex, 0.0)\n                            index?.let(::updateNotificationMetadataForIndex)') &&
-      musicService.includes('binding.reportsItemMove = backend::reportsItemMove') &&
-      musicService.includes("if (it !is AudioItemTransitionReason.REPEAT && reports?.invoke(source.currentItem) != false) {") &&
-      (standardBackend.match(/failedLoads\.command\(\)\?\.let \{ reportCorrection\(it, null\) \}/g) || []).length === 8 &&
-      !/failedLoads\.command\(\)\n/.test(standardBackend),
+      musicService.includes('emitPlaybackTrackChangedEvents(index, lastIndex, lastPositionMs.toSeconds(), lastItem?.track)\n                            index?.let(::updateNotificationMetadataForIndex)') &&
+      musicService.includes('activeIndex?.let(::updateNotificationMetadataForIndex)') &&
+      // KotlinAudio's own item transition no longer reports the active track (the backend does).
+      !section(musicService, 'ownerScope.collectWithAdmission(source.event.audioItemTransition, admission) {', 'ownerScope.collectWithAdmission(source.event.onTimedMetadata').includes('emitPlaybackTrackChangedEvents') &&
+      section(orchestrator, 'private suspend fun playFromStill() = withPlaybackOperation', 'private suspend fun awaitPlaybackStart(').includes('indexToPlayAfterFailedLoad(currentIndex, queue.indexOfFirst { it === failedLoadItem }.takeIf { it >= 0 }, queue.size)') &&
+      read('android/src/test/java/com/doublesymmetry/trackplayer/service/AndroidPlaybackOrchestratorCancellationTest.kt').includes('fun aPlayAfterAFailedFirstLoadRetriesTheTrackThatFailedAsOnIos()'),
     'The Android standard player must keep the previous track active after a failed load, as iOS.'
   );
 }

@@ -13,8 +13,8 @@ class StandardLoadWatchTest {
     private val a = Any()
     private val b = Any()
 
-    private fun observe(item: Any?, state: Int, bytes: Long = 0L, error: Boolean = false) =
-        watch.check(StandardLoadObservation(item, state, error, longArrayOf(bytes, 0L, 0L)))
+    private fun observe(item: Any?, state: Int, bytes: Long = 0L, error: Boolean = false, owned: Boolean = false) =
+        watch.check(StandardLoadObservation(item, state, error, longArrayOf(bytes, 0L, 0L), ownedElsewhere = owned))
 
     @Test
     fun aBufferingItemThatNeverWasReadyGivesUpAtTheStallTimeout() {
@@ -92,5 +92,42 @@ class StandardLoadWatchTest {
     fun aGiveUpSaysTheSameAsOnIos() {
         assertEquals("The track did not become ready (no progress for 10000 ms).", standardLoadGiveUpMessage(StallVerdict.STALLED, 10_000L, 60_000L))
         assertEquals("The track did not become ready (over the 60000 ms limit).", standardLoadGiveUpMessage(StallVerdict.CAP_EXCEEDED, 10_000L, 60_000L))
+    }
+
+    @Test
+    fun aRebufferAfterASeekThatWasCancelledIsNotALoad() {
+        // Ready, then a seek owns the loading (watch it not), then the seek is cancelled and the
+        // item buffers: it was ready, so this is a rebuffer, not a load.
+        observe(a, Player.STATE_READY)
+        assertNull(observe(a, Player.STATE_BUFFERING, owned = true))
+        assertNull(observe(a, Player.STATE_BUFFERING))
+        now = 30_000L
+        assertNull(observe(a, Player.STATE_BUFFERING))
+        // A seek on an item that never was ready leaves a load to watch once it ends.
+        // While the seek owns it, nothing is given up, however long it takes (its own limits).
+        assertNull(observe(b, Player.STATE_BUFFERING, owned = true))
+        now = 60_000L
+        assertNull(observe(b, Player.STATE_BUFFERING, owned = true))
+        assertNull(observe(b, Player.STATE_BUFFERING))
+        now = 70_000L
+        assertEquals(StallVerdict.STALLED, observe(b, Player.STATE_BUFFERING))
+    }
+
+    @Test
+    fun theNextCheckIsAtTheGiveUpOrATenthOfTheStallTimeoutAndNoneWithoutALoad() {
+        assertNull(watch.nextCheckInMs())
+        observe(a, Player.STATE_BUFFERING)
+        // 10 s stall timeout: read the progress every second.
+        assertEquals(1_000L, watch.nextCheckInMs())
+        now = 9_500L
+        observe(a, Player.STATE_BUFFERING)
+        // Half a second before the give-up: check then.
+        assertEquals(500L, watch.nextCheckInMs())
+        stall = 2_000L
+        observe(b, Player.STATE_BUFFERING)
+        assertEquals(200L, watch.nextCheckInMs())
+        observe(b, Player.STATE_READY)
+        assertNull(watch.nextCheckInMs())
+        assertEquals(1L, standardLoadSampleIntervalMs(5L))
     }
 }

@@ -35,6 +35,9 @@ internal class StallWatch(
         if (nowMs - lastProgressAtMs >= stallTimeoutMs) return StallVerdict.STALLED
         return StallVerdict.WAIT
     }
+
+    /** When the wait gives up if nothing progresses from now on (same clock as the readings). */
+    fun deadlineMs(): Long = minOf(lastProgressAtMs + stallTimeoutMs, startedAtMs + totalTimeoutMs)
 }
 
 /**

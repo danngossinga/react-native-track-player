@@ -157,11 +157,14 @@ internal class KotlinAudioPlaybackBackend(
     /** Gives up the loads that make no progress ([superviseLoads]); null: none (tests). */
     private val loadWatch: StandardLoadWatch? = null,
     /**
-     * The active track to report again ([FailedLoadRule]): its index (null: none) and the track
-     * the app had (null when not known): back to the previous track after a failed load, to the
-     * player's own after a command or a track that became ready unreported.
+     * Reports a change of the active track ([FailedLoadRule]: once the track loaded, never a
+     * track that failed to load): its index (null: none), the track the app had (index, item;
+     * null: none) and that track's last position (ms).
      */
-    private val onActiveTrackCorrected: (Int?, Int?) -> Unit = { _, _ -> },
+    private val onActiveTrackChanged: (index: Int?, lastIndex: Int?, lastItem: TrackAudioItem?, lastPositionMs: Long) -> Unit =
+        { _, _, _, _ -> },
+    /** A load failed: the active track's index (null: none), for the notification to show it again. */
+    private val onLoadFailed: (activeIndex: Int?) -> Unit = {},
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -175,16 +178,31 @@ internal class KotlinAudioPlaybackBackend(
     override val queueItems: List<TrackAudioItem>
         get() = queueStore.snapshot()
     override val currentIndex: Int
-        get() = if (failedLoads.isReverted) activeIndexAfterFailedLoad() else logicalPlaybackState.currentIndex(player.currentIndex)
+        get() = if (failedLoads.isPending(player.currentItem)) reportedIndex() else logicalPlaybackState.currentIndex(player.currentIndex)
 
-    /** Which track is active around a load (iOS's rule): after a failed load, the previous one. */
+    /**
+     * Which track is active around a load, and when the app is told (iOS's crossfade rule): the
+     * player's track is reported once it loaded; while it loads, and after its load failed, the
+     * previous one is the active track.
+     */
     private val failedLoads = FailedLoadRule()
     private var sawPlayerError = false
+    private var observedItem: Any? = null
+    /** The position of the track the player left at its last item change (the event's lastPosition). */
+    private var lastItemPositionMs = 0L
+    private var loadDriver: StandardLoadDriver? = null
+
+    /** A new queue (replaced, cleared, emptied): its first track is a new selection. */
+    private fun forgetReportedTrack() {
+        failedLoads.reset()
+        observedItem = null
+    }
 
     private fun indexOfItem(item: Any?): Int? =
         item?.let { target -> player.items.indexOfFirst { it === target } }?.takeIf { it >= 0 }
 
-    private fun activeIndexAfterFailedLoad(): Int = indexOfItem(failedLoads.active) ?: -1
+    /** The track the app was told is active (-1: none, or it left the queue). */
+    private fun reportedIndex(): Int = indexOfItem(failedLoads.reported) ?: -1
     override val playbackState: AudioPlayerState
         get() = logicalPlaybackState.playbackState(player.playerState)
     override val playbackError: AndroidPlaybackErrorSnapshot?
@@ -340,6 +358,9 @@ internal class KotlinAudioPlaybackBackend(
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
         pendingSnapshot = snapshot
         val committedQueue = queueState.commit()
+        // A backend switch restored this track, ready (the readiness gate): the app has it.
+        failedLoads.adopted(player.currentItem.takeIf { logicalPlaybackState.hasLogicalActiveItem(player.currentIndex) })
+        observedItem = player.currentItem
         isAuthoritative = true
         queueStore.replaceWith(committedQueue)
         onCommitted(player)
@@ -377,74 +398,97 @@ internal class KotlinAudioPlaybackBackend(
         player.pause()
     }
     override suspend fun seekTo(positionMs: Long) {
-        failedLoads.command()?.let { reportCorrection(it, null) }
-        // As a crossfade seek that gives up: the player stops loading and is in error.
-        seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->
-            androidXfadeLog("standard load abandoned (seek ${error.message}) positionMs=${player.position}")
-            player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)
+        failedLoads.command()
+        try {
+            // As a crossfade seek that gives up: the player stops loading and is in error.
+            seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->
+                androidXfadeLog("standard load abandoned (seek ${error.message}) positionMs=${player.position}")
+                player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)
+            }
+        } finally {
+            // The seek no longer owns the loading: the load watch looks again at once.
+            loadDriver?.poke()
         }
     }
 
     /**
-     * Runs the stall rule on this player's loads while it lives (the caller's scope, main thread):
-     * only while it is the authoritative backend (a candidate's readiness is
-     * [StandardPlaybackReadinessGate]'s) and no seek waits (the seek owns its loading, and gives up
+     * Starts the stall rule on this player's loads, on its thread ([handler], the main one):
+     * checked at each of the player's events and, only while a load is watched, by one timer
+     * (StandardLoadDriver). Only the authoritative backend's player is watched (a candidate's
+     * readiness is [StandardPlaybackReadinessGate]'s); a waited seek owns its loading (it gives up
      * by its own limits). A load that gives up stops the player, which goes to the error state and
      * reports the error, as a crossfade advance that fails.
      */
-    suspend fun superviseLoads() {
+    fun startLoadWatch(handler: android.os.Handler) {
         val watch = loadWatch ?: return
-        watch.supervise(
-            observe = {
-                val exo = analytics()?.player
-                if (!isAuthoritative || disposed || playerReleased || seekGate.isWaiting) {
-                    standardLoadObservation(exo, null, null)
-                } else {
-                    standardLoadObservation(exo, player.currentItem, analytics()?.loadedBytes).also(::followLoad)
-                }
-            },
-            giveUp = { verdict -> giveUpLoad(verdict) }
-        )
+        val collector = analytics() ?: return
+        collector.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
+            override fun onPositionDiscontinuity(
+                eventTime: com.google.android.exoplayer2.analytics.AnalyticsListener.EventTime,
+                oldPosition: com.google.android.exoplayer2.Player.PositionInfo,
+                newPosition: com.google.android.exoplayer2.Player.PositionInfo,
+                reason: Int
+            ) {
+                if (oldPosition.mediaItemIndex != newPosition.mediaItemIndex) lastItemPositionMs = oldPosition.positionMs
+            }
+        })
+        loadDriver = StandardLoadDriver(watch, handler, ::observeLoad, ::giveUpLoad).also {
+            it.listenTo(collector)
+            it.poke()
+        }
     }
 
-    /** Feeds [failedLoads]: the item the player is on, when it is ready, and a player error. */
+    /** What the load watch sees, after feeding [failedLoads] (item moves, ready, errors). */
+    private fun observeLoad(): StandardLoadObservation {
+        val exo = analytics()?.player
+        val logicalItem = player.currentItem.takeIf { logicalPlaybackState.hasLogicalActiveItem(player.currentIndex) }
+        if (!isAuthoritative || disposed || playerReleased || logicalItem == null) {
+            return standardLoadObservation(exo, null, null)
+        }
+        return standardLoadObservation(exo, logicalItem, analytics()?.loadedBytes, ownedElsewhere = seekGate.isWaiting)
+            .also(::followLoad)
+    }
+
+    /** Feeds [failedLoads]: the player's item changes, when it is ready, and a player error. */
     private fun followLoad(observed: StandardLoadObservation) {
         val item = observed.item ?: return
-        failedLoads.loaded(item)
+        if (item !== observedItem) {
+            val from = failedLoads.reported
+            observedItem = item
+            // The selection of a new queue's first track is reported at once; a move to another
+            // track once it loaded.
+            if (failedLoads.moved(item)) report(FailedLoadRule.Report(item, from))
+        }
         if (observed.hasError) {
             if (!sawPlayerError) {
                 sawPlayerError = true
-                revertFailedLoad()
+                failLoadedTrack()
             }
             return
         }
         sawPlayerError = false
+        if (observed.ownedElsewhere) return
         if (observed.playbackState == com.google.android.exoplayer2.Player.STATE_READY ||
             observed.playbackState == com.google.android.exoplayer2.Player.STATE_ENDED
         ) {
-            failedLoads.ready()?.let { reportCorrection(it, null) }
+            failedLoads.ready()?.let(::report)
         }
     }
 
-    /** A load failed: the previous track is active again (none when there was none), as iOS. */
-    private fun revertFailedLoad() {
-        val failedIndex = player.currentIndex
-        val revert = failedLoads.failed() ?: return
-        androidXfadeLog("standard failed load reverted toIndex=${indexOfItem(revert.to)} failedIndex=$failedIndex")
-        reportCorrection(revert, failedIndex)
+    /** A load failed: the previous track stays active (none when there was none), as iOS. */
+    private fun failLoadedTrack() {
+        androidXfadeLog("standard load failed index=${player.currentIndex} activeIndex=${indexOfItem(failedLoads.active)}")
+        val change = failedLoads.failed()
+        change?.let(::report)
+        if (failedLoads.isPending(player.currentItem)) onLoadFailed(indexOfItem(failedLoads.reported))
     }
 
-    private fun reportCorrection(report: FailedLoadRule.Report, lastIndex: Int?) {
-        onActiveTrackCorrected(indexOfItem(report.to), lastIndex)
+    private fun report(change: FailedLoadRule.Report) {
+        val lastItem = change.from as? TrackAudioItem
+        onActiveTrackChanged(indexOfItem(change.to), indexOfItem(change.from), lastItem, lastItemPositionMs)
     }
 
-    /**
-     * The player moved to [item] and is about to report it (its item transition): whether the
-     * app is to be told (false: it already has it, after a play that reloaded the previous track).
-     */
-    fun reportsItemMove(item: Any?): Boolean = failedLoads.moved(item)
-
-    /** Before a play or retry: after a failed load, the previous track is the one loaded. */
+    /** Before a play or retry after a failed load: the previous track, else the failed one, loads. */
     private fun loadActiveTrackAfterFailedLoad() {
         val target = indexOfItem(failedLoads.play()) ?: return
         if (target != player.currentIndex) player.jumpToItem(target)
@@ -459,7 +503,7 @@ internal class KotlinAudioPlaybackBackend(
             PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),
             report = true
         )
-        revertFailedLoad()
+        failLoadedTrack()
     }
 
     /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
@@ -486,6 +530,7 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun dispose() {
         if (disposed) return
         disposed = true
+        loadDriver?.stop()
         isAuthoritative = false
         if (!playerReleased) player.stop()
         releasePlayer()
@@ -509,6 +554,7 @@ internal class KotlinAudioPlaybackBackend(
 
     override fun remove(indexes: List<Int>) {
         player.remove(indexes)
+        if (player.items.isEmpty()) forgetReportedTrack()
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
@@ -528,12 +574,15 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun replace(index: Int, item: TrackAudioItem) {
+        // New metadata for the same track: it keeps its place in the rule.
+        player.items.getOrNull(index)?.let { failedLoads.replaced(it, item) }
+        if (observedItem === player.items.getOrNull(index)) observedItem = item
         player.replaceItem(index, item)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
 
     override fun replaceQueue(items: List<TrackAudioItem>) {
-        failedLoads.command()?.let { reportCorrection(it, null) }
+        forgetReportedTrack()
         player.clear()
         player.add(items)
         logicalPlaybackState.onQueueSizeChanged(items.size)
@@ -541,14 +590,14 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun clearQueue() {
-        failedLoads.command()?.let { reportCorrection(it, null) }
+        forgetReportedTrack()
         player.clear()
         logicalPlaybackState.onQueueCleared()
         queueStore.clear()
     }
 
     override suspend fun load(item: TrackAudioItem) {
-        failedLoads.command()?.let { reportCorrection(it, null) }
+        failedLoads.command()
         seekGate.cancel("load")
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
@@ -562,7 +611,7 @@ internal class KotlinAudioPlaybackBackend(
             throw IndexOutOfBoundsException("The track index is out of bounds: $index")
         }
         seekGate.cancel("skip")
-        failedLoads.command()?.let { reportCorrection(it, null) }
+        failedLoads.command()
         runActivatingOperation(
             publishLogicalActivation = index == player.currentIndex
         ) { _ -> player.jumpToItem(index) }
@@ -570,9 +619,10 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun skipToNext() {
         seekGate.cancel("skip")
         // After a failed load, next is relative to the active (previous) track, as iOS.
-        if (failedLoads.isReverted) {
-            val active = activeIndexAfterFailedLoad()
-            failedLoads.command()?.let { reportCorrection(it, null) }
+        // While a track loads or after it failed, next is relative to the active one, as iOS.
+        if (failedLoads.isPending(player.currentItem)) {
+            val active = reportedIndex()
+            failedLoads.command()
             if (active >= 0 && active + 1 < player.items.size) {
                 player.jumpToItem(active + 1)
                 return
@@ -593,9 +643,9 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun skipToPrevious() {
         if (logicalPlaybackState.shouldIgnorePrevious()) return
         seekGate.cancel("skip")
-        if (failedLoads.isReverted) {
-            val active = activeIndexAfterFailedLoad()
-            failedLoads.command()?.let { reportCorrection(it, null) }
+        if (failedLoads.isPending(player.currentItem)) {
+            val active = reportedIndex()
+            failedLoads.command()
             if (active - 1 >= 0) {
                 player.jumpToItem(active - 1)
                 return
@@ -613,7 +663,7 @@ internal class KotlinAudioPlaybackBackend(
         }
     }
     override fun stop() {
-        failedLoads.command()?.let { reportCorrection(it, null) }
+        failedLoads.command()
         seekGate.cancel("stop")
         player.stop()
     }
@@ -652,7 +702,8 @@ internal class KotlinAudioPlaybackBackend(
     private fun publishCurrentPhysicalItem() {
         player.currentIndex.takeIf { it in player.items.indices }
             ?.let {
-                failedLoads.moved(player.currentItem)
+                failedLoads.published(player.currentItem)
+                observedItem = player.currentItem
                 onLogicalActiveItemActivated(it)
             }
     }

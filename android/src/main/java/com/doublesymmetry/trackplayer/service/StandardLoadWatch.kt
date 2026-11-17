@@ -5,7 +5,6 @@ import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DataSpec
 import com.google.android.exoplayer2.upstream.TransferListener
 import java.util.concurrent.atomic.AtomicLong
-import kotlinx.coroutines.delay
 
 /**
  * The code a load that gives up reports, on both backends and both platforms (the crossfade
@@ -21,7 +20,12 @@ internal data class StandardLoadObservation(
     val playbackState: Int,
     val hasError: Boolean,
     /** Its progress: bytes downloaded, buffered position, total buffered duration. */
-    val readings: LongArray
+    val readings: LongArray,
+    /**
+     * Another wait owns the player's loading now (a seek): not watched, but whether the item was
+     * ready is kept, so buffering once that wait ended is a rebuffer, not a load.
+     */
+    val ownedElsewhere: Boolean = false
 )
 
 /**
@@ -64,6 +68,10 @@ internal class StandardLoadWatch(
             disarm()
             return null
         }
+        if (observed.ownedElsewhere) {
+            disarm()
+            return null
+        }
         when (observed.playbackState) {
             Player.STATE_READY, Player.STATE_ENDED -> {
                 readyItem = item
@@ -95,7 +103,18 @@ internal class StandardLoadWatch(
         return verdict
     }
 
-    /** Forgets the load in progress (another owner waits for it: a seek, a backend switch). */
+    /**
+     * When to check next, in milliseconds from [nowMs], while a load is watched (null: none): at
+     * the moment the load would give up if nothing progresses, and every
+     * [standardLoadSampleIntervalMs] before it, to read the progress the player does not signal.
+     */
+    fun nextCheckInMs(): Long? {
+        val current = watch ?: return null
+        val untilDeadline = (current.deadlineMs() - nowMs()).coerceAtLeast(0L)
+        return minOf(untilDeadline, standardLoadSampleIntervalMs(current.stallTimeoutMs))
+    }
+
+    /** Forgets the load in progress (the player is no longer this backend's to watch). */
     fun reset() {
         readyItem = null
         disarm()
@@ -108,18 +127,56 @@ internal class StandardLoadWatch(
 }
 
 /**
- * Runs [watch] on the player for as long as the calling coroutine (the player's owner, on the main
- * thread) is active: every poll it reads [observe] and, when a load gives up, calls [giveUp] (which
- * stops the player and reports the error).
+ * How often a watched load's progress is read between events, from its stall timeout: a tenth of
+ * it, so a give-up comes at most that late after the last progress. Same rule on iOS
+ * (`standardLoadSampleIntervalMs`); no fixed interval.
  */
-internal suspend fun StandardLoadWatch.supervise(
-    observe: () -> StandardLoadObservation,
-    giveUp: (StallVerdict) -> Unit,
-    pollIntervalMs: Long = ENGINE_WAIT_POLL_INTERVAL_MS
+internal fun standardLoadSampleIntervalMs(stallTimeoutMs: Long): Long = (stallTimeoutMs / 10L).coerceAtLeast(1L)
+
+/**
+ * Runs a [StandardLoadWatch] on a player's thread ([handler]), driven by the player's events
+ * ([poke]: [listenTo] wires ExoPlayer's), and, only while a load is watched, by one timer at the
+ * watch's next check ([StandardLoadWatch.nextCheckInMs]). No load, no timer.
+ */
+internal class StandardLoadDriver(
+    private val watch: StandardLoadWatch,
+    private val handler: android.os.Handler,
+    private val observe: () -> StandardLoadObservation,
+    private val giveUp: (StallVerdict) -> Unit
 ) {
-    while (true) {
-        check(observe())?.let(giveUp)
-        delay(pollIntervalMs)
+    private val check = Runnable { poke() }
+    private var stopped = false
+
+    /** A timer is set (a load is watched). */
+    var isScheduled = false
+        private set
+
+    /** Checks now (an event, a command), then sets the timer while a load is watched. */
+    fun poke() {
+        handler.removeCallbacks(check)
+        isScheduled = false
+        if (stopped) return
+        watch.check(observe())?.let(giveUp)
+        if (stopped) return
+        watch.nextCheckInMs()?.let {
+            handler.postDelayed(check, it)
+            isScheduled = true
+        }
+    }
+
+    fun stop() {
+        stopped = true
+        handler.removeCallbacks(check)
+        isScheduled = false
+    }
+
+    /** Checks at every event of the player [analytics] collects (state, item, error, loading). */
+    fun listenTo(analytics: com.google.android.exoplayer2.analytics.DefaultAnalyticsCollector) {
+        analytics.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
+            override fun onEvents(player: Player, events: com.google.android.exoplayer2.analytics.AnalyticsListener.Events) {
+                poke()
+            }
+        })
     }
 }
 
@@ -151,10 +208,16 @@ internal fun DataSource.Factory.countingBytes(bytes: LoadedBytes): DataSource.Fa
 }
 
 /** What the load watch reads of ExoPlayer [player] with its [bytes] counter. */
-internal fun standardLoadObservation(player: Player?, item: Any?, bytes: LoadedBytes?): StandardLoadObservation =
+internal fun standardLoadObservation(
+    player: Player?,
+    item: Any?,
+    bytes: LoadedBytes?,
+    ownedElsewhere: Boolean = false
+): StandardLoadObservation =
     StandardLoadObservation(
         item = item,
         playbackState = player?.playbackState ?: Player.STATE_IDLE,
         hasError = player?.playerError != null,
-        readings = longArrayOf(bytes?.value ?: 0L, player?.bufferedPosition ?: 0L, player?.totalBufferedDuration ?: 0L)
+        readings = longArrayOf(bytes?.value ?: 0L, player?.bufferedPosition ?: 0L, player?.totalBufferedDuration ?: 0L),
+        ownedElsewhere = ownedElsewhere
     )

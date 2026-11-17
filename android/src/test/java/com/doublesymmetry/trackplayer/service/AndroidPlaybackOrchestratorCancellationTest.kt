@@ -1265,6 +1265,27 @@ class AndroidPlaybackOrchestratorCancellationTest {
     }
 
     @Test
+    fun aPlayAfterAFailedFirstLoadRetriesTheTrackThatFailedAsOnIos() = runTest {
+        // No track was active (a new queue); a skip to track 2 fails to load. The play retries
+        // track 2 (iOS: indexToPlayAfterFailedLoad; standard: FailedLoadRule LOAD-03), not 0.
+        val (orchestrator, engines, delegate) = ninth()
+        try {
+            val items = testItems(3)
+            orchestrator.setQueue(items)
+            engines.first.simulatedLoad = SimulatedLoad(bytesPerPoll = 0L, readyAfterMs = 60_000L, nowMs = { currentTime })
+            runCatching { orchestrator.skip(2) }
+            assertEquals(AudioPlayerState.ERROR, orchestrator.snapshot().playbackState)
+            assertEquals(-1, orchestrator.currentIndex)
+            orchestrator.play()
+            assertSame(items[2], engines.first.lastPrepareItem)
+            assertEquals(2, orchestrator.currentIndex)
+            assertEquals(AudioPlayerState.PLAYING, orchestrator.snapshot().playbackState)
+        } finally {
+            orchestrator.release()
+        }
+    }
+
+    @Test
     fun aFailedLoadOfANewTrackLeavesNoActiveTrackAsOnIos() = runTest {
         // iOS's load replaces the queue with no active track (-1) and commits index 0 once loaded.
         val (orchestrator, engines, delegate) = ninth()

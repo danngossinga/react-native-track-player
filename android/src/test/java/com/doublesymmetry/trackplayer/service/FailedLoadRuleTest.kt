@@ -9,7 +9,7 @@ class FailedLoadRuleTest {
     fun followsTheSharedScenarios() {
         @Suppress("UNCHECKED_CAST")
         val scenarios = readSharedFixture("scripts/fixtures/failed-load-scenarios.json")["scenarios"] as List<Map<String, Any?>>
-        assertEquals(7, scenarios.size)
+        assertEquals(8, scenarios.size)
         for (scenario in scenarios) {
             val id = scenario["id"] as String
             val rule = FailedLoadRule()
@@ -19,18 +19,22 @@ class FailedLoadRuleTest {
             @Suppress("UNCHECKED_CAST")
             for ((index, step) in (scenario["steps"] as List<Map<String, Any?>>).withIndex()) {
                 val where = "$id step $index"
-                // A report expected (absent: none), and to which track (null: none).
-                fun assertReport(report: FailedLoadRule.Report?) =
-                    assertEquals(where, if (step.containsKey("report")) FailedLoadRule.Report(item(step["report"])) else null, report)
+                // The change expected (no key: none), to and from which track (null: none).
+                fun assertReport(report: FailedLoadRule.Report?) {
+                    val expected = (step["report"] as Map<String, Any?>?)?.let { FailedLoadRule.Report(item(it["to"]), item(it["from"])) }
+                    assertEquals(where, expected, report)
+                }
                 when (val event = step["event"] as String) {
                     "load" -> assertEquals(where, step["report"], rule.moved(item(step["item"])))
                     "ready" -> assertReport(rule.ready())
                     "fail" -> assertReport(rule.failed())
                     "command" -> assertReport(rule.command())
                     "play" -> assertEquals(where, item(step["reload"]), rule.play())
+                    "reset" -> rule.reset()
                     else -> error("unknown event $event in $id")
                 }
-                assertEquals(where, item(step["active"]), rule.active)
+                assertEquals("$where active", item(step["active"]), rule.active)
+                assertEquals("$where reported", item(step["reported"]), rule.reported)
             }
         }
     }

@@ -42,6 +42,7 @@ class StandardPlayerHlsTest {
     private val servers = mutableListOf<HlsTestServer>()
     private val players = mutableListOf<ExoPlayer>()
     private val watches = mutableListOf<Job>()
+    private val drivers = mutableListOf<StandardLoadDriver>()
 
     /** Robolectric's SystemClock stands still unless moved: move it with real time. */
     private val clock = Thread {
@@ -84,6 +85,7 @@ class StandardPlayerHlsTest {
     fun tearDown() {
         runBlocking(playerThread) {
             watches.forEach { it.cancel() }
+            drivers.forEach { it.stop() }
             players.forEach { it.release() }
         }
         servers.forEach { it.close() }
@@ -182,16 +184,24 @@ class StandardPlayerHlsTest {
         val watched = watchedStandardPlayer()
         load(watched.player, server)
         awaitTrue("the track is ready") { runBlocking(playerThread) { watched.player.playbackState == Player.STATE_READY } }
-        val gate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS })
+        val gate = watched.seekGate
         val seekPlayer = exoSeekPlayer(watched.player)
         val seekedAt = monotonicNowMs()
         val error = runBlocking(playerThread) {
-            runCatching { gate.seekOrGiveUp(seekPlayer, 20_000L) { watched.giveUp() } }
+            runCatching {
+                try {
+                    gate.seekOrGiveUp(seekPlayer, 20_000L) { watched.giveUp() }
+                } finally {
+                    watched.driver.poke()
+                }
+            }
         }.exceptionOrNull()
         assertEquals("standard_seek_timeout", (error as com.doublesymmetry.trackplayer.utils.RejectionException).code)
         assertTrue("gave up ${monotonicNowMs() - seekedAt}ms after the seek", monotonicNowMs() - seekedAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS)
         // The seek's give-up only: the load watch did not give up too (one report).
         watched.assertGivesUpAtTheStallTimeoutAndStopsLoading(server)
+        // A failed seek keeps its target as the position (as the crossfade path and iOS).
+        runBlocking(playerThread) { assertEquals(20_000L, watched.player.currentPosition) }
     }
 
     /** The seek gate's view of a plain ExoPlayer (KotlinAudio's adapter reads the same values). */
@@ -210,6 +220,8 @@ class StandardPlayerHlsTest {
     }
 
     private inner class WatchedPlayer(val player: ExoPlayer) {
+        lateinit var driver: StandardLoadDriver
+        val seekGate = StandardSeekGate(timeoutMs = { PREPARE_TIMEOUT_MS }, stallTimeoutMs = { STALL_TIMEOUT_MS })
         val gaveUpAtMs = java.util.Collections.synchronizedList(mutableListOf<Long>())
         /** When the player moved to another item (a natural advance): that item's load starts. */
         @Volatile
@@ -244,7 +256,11 @@ class StandardPlayerHlsTest {
             val requestsAtGiveUp = server.stalledRequestTimesMs.size
             // ExoPlayer's default policy retries a failed request after 0, 1, 2 s...: wait past those.
             Thread.sleep(3 * STALL_TIMEOUT_MS)
-            assertEquals("stalled requests after the give-up", requestsAtGiveUp, server.stalledRequestTimesMs.size)
+            assertEquals(
+                "stalled requests after the give-up (times ${server.stalledRequestTimesMs.map { it - gaveUpAt }}, closed ${server.stalledRequestClosedTimesMs.map { it - gaveUpAt }})",
+                requestsAtGiveUp,
+                server.stalledRequestTimesMs.size
+            )
             assertEquals("every stalled request is closed", server.stalledRequestTimesMs.size, server.stalledRequestClosedTimesMs.size)
             assertEquals("one give-up per load", givenUpBefore + 1, gaveUpAtMs.size)
             runBlocking(playerThread) { assertEquals(Player.STATE_IDLE, player.playbackState) }
@@ -261,15 +277,22 @@ class StandardPlayerHlsTest {
         val builder = ExoPlayer.Builder(context)
             .setLooper(thread.looper)
             .setMediaSourceFactory(CrossfadeMediaSourceFactory(playlistDataSourceFactory = http, mediaDataSourceFactory = http.countingBytes(bytes)))
-        configureStandardExoPlayer(builder, context, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, StandardPlayerAnalytics())
+        val analytics = StandardPlayerAnalytics()
+        configureStandardExoPlayer(builder, context, { DEFAULT_INITIAL_BITRATE_ESTIMATE_BPS }, analytics)
         val player = builder.build().also { players += it }
         val watched = WatchedPlayer(player)
         val watch = StandardLoadWatch(stallTimeoutMs = { STALL_TIMEOUT_MS }, totalTimeoutMs = { PREPARE_TIMEOUT_MS })
-        watches += CoroutineScope(playerThread).launch {
-            watch.supervise(
-                observe = { standardLoadObservation(player, player.currentMediaItem, bytes) },
-                giveUp = { watched.giveUp() }
-            )
+        // As KotlinAudioPlaybackBackend.startLoadWatch: the player's events and one timer while a
+        // load is watched; a waited seek owns its loading.
+        watched.driver = StandardLoadDriver(
+            watch,
+            Handler(thread.looper),
+            observe = { standardLoadObservation(player, player.currentMediaItem, bytes, ownedElsewhere = watched.seekGate.isWaiting) },
+            giveUp = { watched.giveUp() }
+        ).also {
+            drivers += it
+            it.listenTo(analytics)
+            it.poke()
         }
         watched
     }

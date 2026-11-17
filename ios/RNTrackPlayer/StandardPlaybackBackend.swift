@@ -291,22 +291,31 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private var issuedSeek: PendingSeek?
     private var nativeSeeks = NativeSeekLedger<PendingSeek>()
     private var seekReadinessPoll: DispatchWorkItem?
-    /// The stall rule on this player's loads (nil: none, tests); see `pollLoads`.
+    /// The stall rule on this player's loads (nil: none, tests); see `observeLoad`.
     private let loadWatch: StandardLoadWatch?
-    private var loadWatchPoll: DispatchWorkItem?
+    private var loadDriver: StandardLoadDriver?
+    private let stateListener = NSObject()
     /// Told when a load or seek was given up (the player stopped loading and is in error);
     /// `report`: also emit it as a playback error (a load no command waits for).
     private let onLoadGaveUp: (QueuedAudioPlayer, IOSPlaybackErrorSnapshot, Bool) -> Void
-    /// The error of a load or seek given up, until the next command: the player is in error
-    /// (SwiftAudioEx itself is stopped).
-    private(set) var hostFailure: IOSPlaybackErrorSnapshot?
-    /// Which track is active around a load (the crossfade rule): after a failed load, the previous.
+    /// The load or seek given up, until the next command: the player is in error (SwiftAudioEx
+    /// itself is stopped), and a failed seek keeps its target as the position.
+    private(set) var hostFailure: IOSPlaybackErrorSnapshot? {
+        get { return giveUpState?.failure }
+        set { giveUpState = newValue.map { StandardGiveUp(failure: $0, keptPosition: nil) } }
+    }
+    private var giveUpState: StandardGiveUp<IOSPlaybackErrorSnapshot>?
+    /// Which track is active around a load, and when the app is told (the crossfade rule): a track
+    /// is reported once it loaded, never one that failed to load.
     private let failedLoads = FailedLoadRule()
     private var sawPlayerFailure = false
-    /// The active track to report again (`FailedLoadRule`): its index (nil: none) and the track
-    /// the app had (nil when not known): back to the previous track after a failed load, to the
-    /// player's own after a command or a track that became ready unreported.
-    private let onActiveTrackCorrected: (QueuedAudioPlayer, Int?, Int?) -> Void
+    /// The position of the track the player left at its last item change (lastPosition).
+    private var lastItemPosition: Double = 0
+    /// Reports a change of the active track: the player, its index (nil: none), the track the app
+    /// had and its index (nil: none), and that track's last position (s).
+    private let onActiveTrackChanged: (QueuedAudioPlayer, Int?, Track?, Int?, Double) -> Void
+    /// A load failed: the active track's index (nil: none), for the lock screen to show it again.
+    private let onLoadFailed: (QueuedAudioPlayer, Int?) -> Void
     // SwiftAudioEx retains the listener during asynchronous removal. Use a
     // separate identity so deinit never passes its dying self to that closure.
     private let seekListener = NSObject()
@@ -324,7 +333,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         /// The app's `prepareTimeoutMs`: a load's total limit. Nil: loads are not watched.
         prepareTimeoutMs: (() -> Int)? = nil,
         onLoadGaveUp: @escaping (QueuedAudioPlayer, IOSPlaybackErrorSnapshot, Bool) -> Void = { _, _, _ in },
-        onActiveTrackCorrected: @escaping (QueuedAudioPlayer, Int?, Int?) -> Void = { _, _, _ in },
+        onActiveTrackChanged: @escaping (QueuedAudioPlayer, Int?, Track?, Int?, Double) -> Void = { _, _, _, _, _ in },
+        onLoadFailed: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
         automaticallyUpdateNowPlayingInfo: @escaping () -> Bool,
         onCommitted: @escaping (QueuedAudioPlayer) -> Void,
         onActivated: @escaping (QueuedAudioPlayer) -> Void,
@@ -352,7 +362,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.stallTimeoutMs = stallTimeoutMs
         self.loadWatch = prepareTimeoutMs.map { StandardLoadWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: $0) }
         self.onLoadGaveUp = onLoadGaveUp
-        self.onActiveTrackCorrected = onActiveTrackCorrected
+        self.onActiveTrackChanged = onActiveTrackChanged
+        self.onLoadFailed = onLoadFailed
         // The app's readiness timeout (standardReadyTimeoutMs), read at every activation.
         self.waitForActivationReadiness = waitForActivationReadiness ?? { player, snapshot in
             try waitForStandardPlaybackActivation(
@@ -377,13 +388,23 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 self?.didCompleteNativeSeek(position: event.seconds, didFinish: event.didFinish)
             }
         }
-        if loadWatch != nil {
-            DispatchQueue.main.async { [weak self] in self?.scheduleLoadPoll() }
+        if let watch = loadWatch {
+            // The player's events drive the watch; one timer only while a load is watched.
+            loadDriver = StandardLoadDriver(
+                watch: watch,
+                observe: { [unowned self] in self.observeLoad() },
+                giveUp: { [unowned self] verdict in self.giveUpLoad(verdict, watch: watch) }
+            )
+            player.event.stateChange.addListener(stateListener) { [weak self] _ in
+                DispatchQueue.main.async { self?.loadDriver?.poke() }
+            }
+            DispatchQueue.main.async { [weak self] in self?.loadDriver?.poke() }
         }
     }
 
     deinit {
-        loadWatchPoll?.cancel()
+        loadDriver?.stop()
+        player.event.stateChange.removeListener(stateListener)
         seekReadinessPoll?.cancel()
         player.event.seek.removeListener(seekListener)
     }
@@ -393,56 +414,49 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         return try DispatchQueue.main.sync(execute: operation)
     }
 
-    private func scheduleLoadPoll() {
-        let poll = DispatchWorkItem { [weak self] in self?.pollLoads() }
-        loadWatchPoll = poll
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(stallCheckIntervalMs), execute: poll)
-    }
-
-    /// The stall rule on this player's loads, as the crossfade path and Android's standard player:
-    /// no command waits for a standard load (load, skip and a natural advance return first). Only
-    /// while it is the authoritative backend (a candidate's readiness is
-    /// `StandardPlaybackReadinessGate`'s) and no seek waits (a seek has its own limits). Main.
-    private func pollLoads() {
-        guard let watch = loadWatch, !disposed else { return }
-        let observed: StandardLoadObservation
-        if !isAuthoritative || issuedSeek != nil || !pendingSeeks.isEmpty || hostFailure != nil {
-            observed = StandardLoadObservation(item: nil, phase: .idle, readings: [])
-        } else {
-            observed = StandardLoadObservation(
-                item: (player.currentItem as AnyObject?).map(ObjectIdentifier.init),
-                phase: standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition),
-                readings: [player.bufferedPosition]
-            )
+    /// What the load watch sees, after feeding `failedLoads` (ready, failures): the stall rule on
+    /// this player's loads, as the crossfade path and Android's standard player (no command waits
+    /// for a standard load). Only while it is the authoritative backend (a candidate's readiness is
+    /// `StandardPlaybackReadinessGate`'s); a waited seek owns its loading (its own limits). Main.
+    private func observeLoad() -> StandardLoadObservation {
+        guard isAuthoritative, !disposed, hostFailure == nil, !idleWithoutActiveTrack else {
+            return StandardLoadObservation(item: nil, phase: .idle, readings: [])
         }
+        let observed = StandardLoadObservation(
+            item: (player.currentItem as AnyObject?).map(ObjectIdentifier.init),
+            phase: standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition),
+            readings: [player.bufferedPosition],
+            ownedElsewhere: issuedSeek != nil || !pendingSeeks.isEmpty
+        )
         followLoad(observed)
-        if let verdict = watch.check(observed) {
-            let reason = verdict.reason(stallTimeoutMs: watch.lastStallTimeoutMs, totalTimeoutMs: watch.lastTotalTimeoutMs)
-            giveUp(
-                log: "load \(reason)",
-                failure: IOSPlaybackErrorSnapshot(
-                    message: standardLoadGiveUpMessage(verdict, stallTimeoutMs: watch.lastStallTimeoutMs, totalTimeoutMs: watch.lastTotalTimeoutMs),
-                    code: standardPrepareTimeoutCode
-                ),
-                report: true
-            )
-        }
-        scheduleLoadPoll()
+        return observed
     }
 
-    /// Feeds `failedLoads`: the item the player is on, when it is ready, and a player failure.
+    private func giveUpLoad(_ verdict: StallVerdict, watch: StandardLoadWatch) {
+        let reason = verdict.reason(stallTimeoutMs: watch.lastStallTimeoutMs, totalTimeoutMs: watch.lastTotalTimeoutMs)
+        giveUp(
+            log: "load \(reason)",
+            failure: IOSPlaybackErrorSnapshot(
+                message: standardLoadGiveUpMessage(verdict, stallTimeoutMs: watch.lastStallTimeoutMs, totalTimeoutMs: watch.lastTotalTimeoutMs),
+                code: standardPrepareTimeoutCode
+            ),
+            report: true
+        )
+    }
+
+    /// Feeds `failedLoads`: when the item is ready, and a player failure.
     private func followLoad(_ observed: StandardLoadObservation) {
-        guard let item = observed.item else { return }
-        failedLoads.loaded(item)
+        guard observed.item != nil else { return }
         if observed.phase == .failed {
             if !sawPlayerFailure {
                 sawPlayerFailure = true
-                revertFailedLoad()
+                failLoadedTrack()
             }
             return
         }
         sawPlayerFailure = false
-        if observed.phase == .ready, let report = failedLoads.ready() { reportCorrection(report, lastIndex: nil) }
+        if observed.ownedElsewhere { return }
+        if observed.phase == .ready, let change = failedLoads.ready() { report(change) }
     }
 
     private func indexOfItem(_ item: ObjectIdentifier?) -> Int? {
@@ -450,46 +464,75 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         return player.items.firstIndex { ObjectIdentifier($0 as AnyObject) == item }
     }
 
-    /// A load failed: the previous track is active again (none when there was none), as the
-    /// crossfade path and Android.
-    private func revertFailedLoad() {
-        let failedIndex = player.currentIndex
-        guard let revert = failedLoads.failed() else { return }
-        IOSPlaybackLog.log("standard failed load reverted toIndex=\(indexOfItem(revert.to).map(String.init) ?? "none") failedIndex=\(failedIndex)")
-        reportCorrection(revert, lastIndex: failedIndex)
+    private func trackOf(_ item: ObjectIdentifier?) -> Track? {
+        guard let index = indexOfItem(item) else { return nil }
+        return player.items[index] as? Track
     }
 
-    private func reportCorrection(_ report: FailedLoadRule.Report, lastIndex: Int?) {
-        onActiveTrackCorrected(player, indexOfItem(report.to), lastIndex)
+    /// A load failed: the previous track stays active (none when there was none), as the crossfade
+    /// path and Android; the lock screen shows it again.
+    private func failLoadedTrack() {
+        IOSPlaybackLog.log("standard load failed index=\(player.currentIndex) activeIndex=\(indexOfItem(failedLoads.active).map(String.init) ?? "none")")
+        if let change = failedLoads.failed() { report(change) }
+        if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {
+            onLoadFailed(player, indexOfItem(failedLoads.reported))
+        }
     }
 
-    /// The player moved to `item` and reports it (its current-item event): whether the app is to
-    /// be told (false: it already has it, after a play that reloaded the previous track).
-    func reportsItemMove(_ item: AudioItem?) -> Bool {
-        return failedLoads.moved((item as AnyObject?).map(ObjectIdentifier.init))
+    private func report(_ change: FailedLoadRule.Report) {
+        onActiveTrackChanged(player, indexOfItem(change.to), trackOf(change.from), indexOfItem(change.from), lastItemPosition)
     }
 
-    /// Before a play or retry: after a failed load, the previous track is the one loaded.
-    private func loadActiveTrackAfterFailedLoad() {
-        guard let target = indexOfItem(failedLoads.play()), target != player.currentIndex else { return }
+    /// The player moved to `item` (its current-item event, with the last track's position):
+    /// whether to report it now (only a new queue's first track); else once it loaded.
+    func itemMoved(_ item: AudioItem?, lastPosition: Double) -> Bool {
+        return onMain {
+            lastItemPosition = lastPosition
+            let moved = failedLoads.moved((item as AnyObject?).map(ObjectIdentifier.init))
+            loadDriver?.poke()
+            return moved
+        }
+    }
+
+    /// Before a play or retry after a failed load: the previous track, else the failed one, loads.
+    @discardableResult
+    private func loadActiveTrackAfterFailedLoad() -> Bool {
+        guard let target = indexOfItem(failedLoads.play()), target != player.currentIndex else { return false }
         try? player.jumpToItem(atIndex: target, playWhenReady: player.playWhenReady)
+        return true
+    }
+
+    /// Out of the error state, a failed seek's target stays the position until the track loads.
+    private func keepPosition(_ kept: Double?) {
+        giveUpState = kept.map { StandardGiveUp(failure: nil, keptPosition: $0) }
+    }
+
+    /// After a failed seek: the track loads again at the seek's target (kept as the position),
+    /// as Android's player resumes from it; SwiftAudioEx applies the seek once the item loaded.
+    private func reloadAtKeptPosition(_ kept: Double?) {
+        guard let kept = kept else { return }
+        player.reload(startFromCurrentTime: false)
+        player.seek(to: kept)
     }
 
     /// Ends a load or seek given up: SwiftAudioEx stops (its item leaves the AVPlayer, which stops
     /// requesting media) and the player is in error with `failure` until the next command.
-    private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {
+    private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, keptPosition: Double? = nil) {
         IOSPlaybackLog.log("standard load abandoned (\(log))")
-        hostFailure = failure
+        giveUpState = StandardGiveUp(failure: failure, keptPosition: keptPosition)
         requested.request(false)
         player.stop()
         onLoadGaveUp(player, failure, report)
-        if report { revertFailedLoad() }
+        if report { failLoadedTrack() }
     }
 
-    /// A command after a give-up: the player is no longer in that error, and reports its own
-    /// track again (a play or retry first reloads the active one: `loadActiveTrackAfterFailedLoad`).
-    private func clearHostFailure() {
-        hostFailure = nil
+    /// A command after a give-up: the player is no longer in that error. Returns the position a
+    /// failed seek kept, for a play or retry to load the track there.
+    @discardableResult
+    private func clearHostFailure() -> Double? {
+        let kept = giveUpState?.keptPosition
+        giveUpState = nil
+        return kept
     }
 
     private func seekError(_ code: String, _ message: String) -> Error {
@@ -498,7 +541,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     private func enqueueSeek(to position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
         clearHostFailure()
-        failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+        _ = failedLoads.command()
         guard !disposed, let track = player.currentItem as? Track else {
             completion(.failure(seekError("standard_seek_unavailable", "No active track is available for seeking.")))
             return
@@ -532,7 +575,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 self.giveUp(
                     log: "seek \(message)",
                     failure: IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),
-                    report: false
+                    report: false,
+                    keptPosition: request.position
                 )
             }
             // If already emitted, keep the ticket until its real callback. A
@@ -628,10 +672,16 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         return hostFailure ?? iosPlaybackErrorSnapshot(from: player.playbackError)
     }
     var currentIndex: Int {
-        if failedLoads.isReverted { return indexOfItem(failedLoads.active) ?? -1 }
+        if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {
+            return indexOfItem(failedLoads.reported) ?? -1
+        }
         return idleWithoutActiveTrack ? -1 : player.currentIndex
     }
-    var position: Double { return idleWithoutActiveTrack ? 0 : player.currentTime }
+    var position: Double {
+        // A failed seek keeps its target (SwiftAudioEx's stop reset its own position).
+        return giveUpState?.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)
+            ?? (idleWithoutActiveTrack ? 0 : player.currentTime)
+    }
     var duration: Double { return idleWithoutActiveTrack ? 0 : player.duration }
     var bufferedPosition: Double { return idleWithoutActiveTrack ? 0 : player.bufferedPosition }
     var publicVolume: Float { return player.volume }
@@ -690,7 +740,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func restore(_ snapshot: PlaybackBackendSnapshot) throws {
         try onMain {
             clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            _ = failedLoads.command()
             cancelPendingSeeks()
             transitionGenerationSidecar.restore(snapshot.transitionGeneration)
             let queue = isAuthoritative ? queueState.authoritative : queueState.pending
@@ -809,7 +859,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         transitionGenerationSidecar.restore(snapshot.transitionGeneration)
         pendingSnapshot = snapshot
         _ = queueState.commit()
+        // A backend switch restored this track, ready (the readiness gate): the app has it.
+        failedLoads.adopted(idleWithoutActiveTrack ? nil : (player.currentItem as AnyObject?).map(ObjectIdentifier.init))
         isAuthoritative = true
+        loadDriver?.poke()
     }
 
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
@@ -836,11 +889,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func play() throws {
         onMain {
-            clearHostFailure()
+            let kept = clearHostFailure()
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
             loadActiveTrackAfterFailedLoad()
+            reloadAtKeptPosition(kept)
             requested.request(true)
             player.play()
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -868,6 +922,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         onMain {
             if disposed { return }
             disposed = true
+            loadDriver?.stop()
             cancelPendingSeeks()
             isAuthoritative = false
             if !controlSurfaceRelinquished {
@@ -913,7 +968,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func replaceQueue(_ tracks: [Track]) throws {
         try onMain {
             clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            // A new queue: its first track is a new selection.
+            failedLoads.reset()
             cancelPendingSeeks()
             player.clear()
             try player.add(items: tracks)
@@ -924,7 +980,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func clearQueue() {
         onMain {
             clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            failedLoads.reset()
             cancelPendingSeeks()
             player.clear()
             idleWithoutActiveTrack = false
@@ -934,7 +990,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {
         onMain {
             clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            _ = failedLoads.command()
             cancelPendingSeeks()
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
@@ -948,7 +1004,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
             clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            _ = failedLoads.command()
             let wasIdle = idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             do {
@@ -1002,11 +1058,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 return
             }
             // After a failed load, next is relative to the active (previous) track, as Android.
-            if failedLoads.isReverted, let active = indexOfItem(failedLoads.active), active + 1 < player.items.count {
-                failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active + 1 < player.items.count {
+                _ = failedLoads.command()
                 try? player.jumpToItem(atIndex: active + 1, playWhenReady: player.playWhenReady)
             } else {
-                failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+                _ = failedLoads.command()
                 player.next()
             }
             if initialTime >= 0 {
@@ -1028,11 +1084,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             cancelPendingSeeks()
             clearHostFailure()
-            if failedLoads.isReverted, let active = indexOfItem(failedLoads.active), active - 1 >= 0 {
-                failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active - 1 >= 0 {
+                _ = failedLoads.command()
                 try? player.jumpToItem(atIndex: active - 1, playWhenReady: player.playWhenReady)
             } else {
-                failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+                _ = failedLoads.command()
                 player.previous()
             }
             if initialTime >= 0 {
@@ -1054,8 +1110,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func stop() {
         onMain {
-            clearHostFailure()
-            failedLoads.command().map { reportCorrection($0, lastIndex: nil) }
+            keepPosition(clearHostFailure())
+            _ = failedLoads.command()
             cancelPendingSeeks()
             requested.request(false)
             player.stop()
@@ -1064,12 +1120,17 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
-            clearHostFailure()
+            let kept = clearHostFailure()
             if !value { cancelPendingSeeks() }
             let wasIdle = value && idleWithoutActiveTrack
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { idleWithoutActiveTrack = false }
-            if value { loadActiveTrackAfterFailedLoad() }
+            if value {
+                loadActiveTrackAfterFailedLoad()
+                reloadAtKeptPosition(kept)
+            } else {
+                keepPosition(kept)
+            }
             player.playWhenReady = value
             requested.request(value)
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1088,13 +1149,16 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func setVolume(_ value: Float) { player.volume = value }
     func setRate(_ value: Float) { player.rate = value }
     func retry() {
-        clearHostFailure()
+        let kept = clearHostFailure()
         let wasIdle = idleWithoutActiveTrack
         beginIdleTrackActivationIfNeeded(wasIdle)
         if wasIdle { idleWithoutActiveTrack = false }
-        let reverted = failedLoads.isReverted
-        loadActiveTrackAfterFailedLoad()
-        if !reverted { player.reload(startFromCurrentTime: true) }
+        let jumped = loadActiveTrackAfterFailedLoad()
+        if kept != nil {
+            reloadAtKeptPosition(kept)
+        } else if !jumped {
+            player.reload(startFromCurrentTime: true)
+        }
         publishIdleTrackActivationIfNeeded(wasIdle)
     }
     func setRepeatMode(_ rawValue: Int) {
@@ -1127,6 +1191,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     private func publishIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
         guard wasIdle else { return }
+        // The app is told of this track now (the idle activation's own event).
+        failedLoads.published((player.currentItem as AnyObject?).map(ObjectIdentifier.init))
         onIdleTrackActivated(player, player.currentIndex >= 0 ? player.currentIndex : nil)
     }
 

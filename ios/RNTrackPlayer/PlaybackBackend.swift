@@ -84,6 +84,11 @@ struct StallWatch {
         previous = nil
     }
 
+    /// When the wait gives up if nothing progresses from now on (same clock as `check`).
+    func deadline() -> TimeInterval {
+        return min(lastProgressAt + Double(stallTimeoutMs) / 1000, startedAt + Double(totalTimeoutMs) / 1000)
+    }
+
     /// For a stage with no progress signal (the asset's playable stage): only the total limit.
     func capVerdict(at now: TimeInterval) -> StallVerdict {
         return (now - startedAt) * 1000 >= Double(totalTimeoutMs) ? .capExceeded : .wait
@@ -1554,6 +1559,9 @@ struct StandardLoadObservation {
     let phase: StandardLoadPhase
     /// Its progress: the buffered position (the only one SwiftAudioEx exposes).
     let readings: [Double]
+    /// Another wait owns the player's loading now (a seek): not watched, but whether the item was
+    /// ready is kept, so buffering once that wait ended is a rebuffer, not a load.
+    var ownedElsewhere = false
 }
 
 /// The stall rule for the standard player's loads, as the crossfade engines apply it to theirs
@@ -1591,6 +1599,10 @@ final class StandardLoadWatch {
             disarm()
             return nil
         }
+        if observed.ownedElsewhere {
+            disarm()
+            return nil
+        }
         switch observed.phase {
         case .ready:
             readyItem = item
@@ -1620,6 +1632,15 @@ final class StandardLoadWatch {
         return verdict
     }
 
+    /// When to check next, in milliseconds, while a load is watched (nil: none): at the moment the
+    /// load would give up if nothing progresses, and every `standardLoadSampleIntervalMs` before
+    /// it, to read the progress the player does not signal. Same rule as Android.
+    func nextCheckInMs() -> Int? {
+        guard let watch = watch else { return nil }
+        let untilDeadline = max(0, Int(((watch.deadline() - now()) * 1000).rounded(.up)))
+        return min(untilDeadline, standardLoadSampleIntervalMs(watch.stallTimeoutMs))
+    }
+
     /// Forgets the load in progress.
     func reset() {
         readyItem = nil
@@ -1632,82 +1653,195 @@ final class StandardLoadWatch {
     }
 }
 
+/// How often a watched load's progress is read between events, from its stall timeout: a tenth
+/// of it. Same rule on Android (`standardLoadSampleIntervalMs`); no fixed interval.
+func standardLoadSampleIntervalMs(_ stallTimeoutMs: Int) -> Int {
+    return max(1, stallTimeoutMs / 10)
+}
+
+/// Runs a `StandardLoadWatch`: at each of the player's events (`poke`) and, only while a load is
+/// watched, by one timer at the watch's next check. No load, no timer. Main thread. As Android's
+/// StandardLoadDriver.
+final class StandardLoadDriver {
+    typealias Schedule = (_ delayMs: Int, _ work: @escaping () -> Void) -> DispatchWorkItem
+    private let watch: StandardLoadWatch
+    private let observe: () -> StandardLoadObservation
+    private let giveUp: (StallVerdict) -> Void
+    private let schedule: Schedule
+    private var timer: DispatchWorkItem?
+    private var stopped = false
+
+    init(
+        watch: StandardLoadWatch,
+        observe: @escaping () -> StandardLoadObservation,
+        giveUp: @escaping (StallVerdict) -> Void,
+        schedule: @escaping Schedule = { delayMs, work in
+            let item = DispatchWorkItem(block: work)
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delayMs), execute: item)
+            return item
+        }
+    ) {
+        self.watch = watch
+        self.observe = observe
+        self.giveUp = giveUp
+        self.schedule = schedule
+    }
+
+    /// A timer is set (a load is watched).
+    var isScheduled: Bool { return timer != nil }
+
+    /// Checks now (an event, a command), then sets the timer while a load is watched.
+    func poke() {
+        timer?.cancel()
+        timer = nil
+        guard !stopped else { return }
+        if let verdict = watch.check(observe()) { giveUp(verdict) }
+        guard !stopped, let delay = watch.nextCheckInMs() else { return }
+        timer = schedule(delay) { [weak self] in self?.poke() }
+    }
+
+    func stop() {
+        stopped = true
+        timer?.cancel()
+        timer = nil
+    }
+}
+
 /// The message of a standard load that gave up: the crossfade load's words without the engine
 /// ("The track did not become ready (no progress for N ms)."), the same text on Android.
 func standardLoadGiveUpMessage(_ verdict: StallVerdict, stallTimeoutMs: Int, totalTimeoutMs: Int) -> String {
     return "The track did not become ready (\(verdict.reason(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: totalTimeoutMs)))."
 }
 
-/// Which track is active around a load, as the crossfade loadIndex decides it (chosen alignment
-/// for both backends and both platforms; Android: `FailedLoadRule`, same rules): a track becomes
-/// the active one once it loaded (ready); when its load fails (a give-up, a player error) the
-/// previous track stays active (none when there was none), and the next play loads that previous
-/// track. Items are compared by identity. Shared scenarios:
-/// scripts/fixtures/failed-load-scenarios.json.
+/// Which track is active around a load, and when the app is told, as the crossfade loadIndex
+/// decides it (chosen alignment for both backends and both platforms; Android: `FailedLoadRule`,
+/// same rules): a track becomes the active one once it loaded (ready), and only then is it
+/// reported; while it loads and after its load fails (a give-up, a player error) the previous
+/// track stays active (none when there was none) and the failed track is never reported. The next
+/// play loads the previous track again or, when there was none, retries the track that failed.
+/// Items are compared by identity. Shared scenarios: scripts/fixtures/failed-load-scenarios.json.
 ///
-/// A standard player moves to an item before it loads and reports it then (`moved`); the rule
-/// also keeps what the app was last told, so each correction is reported once: back to the
-/// previous track when a load fails (`failed`), to the player's own track when a command acts
-/// after that (`command`) or when a track never reported becomes ready (`ready`), and not again
-/// when a play reloads the previous track (`play`, then `moved`).
+/// A standard player moves to an item before it loads (`moved`); the rule says when to report it.
+/// The only move reported at once is the selection of a new queue's first track.
 final class FailedLoadRule {
-    /// A change of the active track to report: `to` (nil: none).
-    struct Revert: Equatable {
+    /// A change of the active track to report: `to` (nil: none) from `from` (nil: none).
+    struct Report: Equatable {
         let to: ObjectIdentifier?
+        let from: ObjectIdentifier?
     }
-    typealias Report = Revert
 
     private var current: ObjectIdentifier?
-    private var reported: ObjectIdentifier?
+    private var reverted = false
+    private var selectionPending = true
+    /// The active track: the last one that loaded.
     private(set) var active: ObjectIdentifier?
-    /// A failed load was reverted and no command has acted since: `active` is what to report.
-    private(set) var isReverted = false
+    /// The track the app was last told is active (nil: none).
+    private(set) var reported: ObjectIdentifier?
 
-    /// The player is on `item` (polled).
-    func loaded(_ item: ObjectIdentifier?) {
-        current = item
-    }
-
-    /// The player moved to `item` and would report it: whether to (false: the app has it).
+    /// The player moved to `item`: whether to report it now (else once it loaded).
     func moved(_ item: ObjectIdentifier?) -> Bool {
         current = item
-        guard item != reported else { return false }
+        if item == reported || !selectionPending { return false }
+        selectionPending = false
         reported = item
         return true
     }
 
-    /// The current item is ready: it is the active track; a report when the app was not told.
+    /// The current item is ready: it is the active track, reported when the app was not told.
     func ready() -> Report? {
         active = current
-        isReverted = false
-        guard current != reported else { return nil }
-        reported = current
-        return Report(to: current)
+        reverted = false
+        selectionPending = false
+        return reportTrack(current)
     }
 
-    /// The current item's load failed: the revert to report, or nil when it was the active one.
+    /// The current item's load failed: the previous track stays active; a report only when the
+    /// failed track had been reported (a selected first track): back to the active one.
     func failed() -> Report? {
         guard current != active else { return nil }
-        isReverted = true
-        reported = active
-        return Report(to: active)
+        reverted = true
+        return reportTrack(active)
     }
 
-    /// A play: the item to load first (the active one after a revert), or nil to play the current.
+    /// A play: the item to load first (the active one, else the failed one), or nil to play the current.
     func play() -> ObjectIdentifier? {
-        guard isReverted else { return nil }
-        isReverted = false
-        guard let target = active else { return nil }
+        guard reverted else { return nil }
+        reverted = false
+        let target = active ?? current
         current = target
         return target
     }
 
-    /// Another command acts on the player's own track: a report when the app was told another.
+    /// Another command acts on the player's own track: reported once it loads (no report now).
     func command() -> Report? {
-        guard isReverted else { return nil }
-        isReverted = false
-        guard current != reported else { return nil }
-        reported = current
-        return Report(to: current)
+        reverted = false
+        return nil
     }
+
+    /// The queue was replaced or cleared: its first track is a new selection.
+    func reset() {
+        current = nil
+        active = nil
+        reported = nil
+        reverted = false
+        selectionPending = true
+    }
+
+    /// The app was told about `item` another way (a logical idle activation).
+    func published(_ item: ObjectIdentifier?) {
+        current = item
+        reported = item
+        selectionPending = false
+    }
+
+    /// The player is on `item`, loaded and known to the app (a backend switch restored it).
+    func adopted(_ item: ObjectIdentifier?) {
+        current = item
+        active = item
+        reported = item
+        reverted = false
+        selectionPending = item == nil
+    }
+
+    /// `old` was replaced by `new` for the same track (new metadata): it keeps its place.
+    func replaced(_ old: ObjectIdentifier?, with new: ObjectIdentifier?) {
+        if current == old { current = new }
+        if active == old { active = new }
+        if reported == old { reported = new }
+    }
+
+    /// The player is on an item other than the one reported: report `reported`'s index instead.
+    func isPending(_ item: ObjectIdentifier?) -> Bool {
+        return item != reported
+    }
+
+    private func reportTrack(_ to: ObjectIdentifier?) -> Report? {
+        guard to != reported else { return nil }
+        let from = reported
+        reported = to
+        return Report(to: to, from: from)
+    }
+}
+
+/// A standard load or seek given up: the error the player is in until the next command (nil once
+/// a command acted), and, for a seek, its target, which stays the position (SwiftAudioEx's stop
+/// resets its own) until the track loads again there. As a failed crossfade seek and Android's
+/// standard player (ExoPlayer keeps the position at its stop).
+struct StandardGiveUp<Failure> {
+    let failure: Failure?
+    let keptPosition: Double?
+
+    /// The position to report: a failed seek's target, else the player's own.
+    func position(live: Double) -> Double {
+        return keptPosition ?? live
+    }
+}
+
+/// The track a play loads after a failed load (crossfade, both platforms): the active track when
+/// there is one; with none (the first load failed), the track that failed, retried; nil when
+/// neither is in the queue. The standard backends follow the same rule (FailedLoadRule.play).
+func indexToPlayAfterFailedLoad(currentIndex: Int, failedIndex: Int?, count: Int) -> Int? {
+    if (0..<count).contains(currentIndex) { return currentIndex }
+    guard let failedIndex = failedIndex, (0..<count).contains(failedIndex) else { return nil }
+    return failedIndex
 }

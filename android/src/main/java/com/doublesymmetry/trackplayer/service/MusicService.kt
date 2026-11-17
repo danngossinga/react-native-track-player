@@ -57,11 +57,7 @@ class MusicService : HeadlessJsTaskService() {
         val ownerScope: CoroutineScope,
         val productAdmission: SharedFlowAdmissionGate,
         val mediaSessionControl: KotlinAudioMediaSessionControl
-    ) {
-        /** Whether the player's move to an item is reported (its backend's FailedLoadRule). */
-        @Volatile
-        var reportsItemMove: (Any?) -> Boolean = { true }
-    }
+    )
 
     private var player: QueuedAudioPlayer? = null
     private var standardPlayerBinding: StandardPlayerBinding? = null
@@ -521,12 +517,18 @@ class MusicService : HeadlessJsTaskService() {
                         activateStandardPlayerBinding(binding, canonicalPlaybackState).join()
                     },
                     // The stall rule on the standard player's loads (stallTimeoutMs, prepareTimeoutMs).
-                    onActiveTrackCorrected = { index, lastIndex ->
-                        // A failed track does not stay the active one (iOS): the app and the
-                        // notification follow the track the rule reports.
+                    onActiveTrackChanged = { index, lastIndex, lastItem, lastPositionMs ->
+                        // A track is reported once it loaded, never one that failed to load (as
+                        // the crossfade path): both events, and the notification follows it.
                         if (isActivePlayer(binding.player, binding.identity)) {
-                            emitPlaybackTrackChangedEvents(index, lastIndex, 0.0)
+                            emitPlaybackTrackChangedEvents(index, lastIndex, lastPositionMs.toSeconds(), lastItem?.track)
                             index?.let(::updateNotificationMetadataForIndex)
+                        }
+                    },
+                    onLoadFailed = { activeIndex ->
+                        // The notification showed the track that failed: back to the active one.
+                        if (isActivePlayer(binding.player, binding.identity)) {
+                            activeIndex?.let(::updateNotificationMetadataForIndex)
                         }
                     },
                     loadWatch = StandardLoadWatch(
@@ -534,10 +536,7 @@ class MusicService : HeadlessJsTaskService() {
                         totalTimeoutMs = { prepareTimeout.milliseconds }
                     ),
                     initiallyAuthoritative = initiallyAuthoritative
-                ).also { backend ->
-                    binding.reportsItemMove = backend::reportsItemMove
-                    binding.ownerScope.launch { backend.superviseLoads() }
-                }
+                ).also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }
             }
             PlaybackBackendType.PING_PONG -> {
                 val eventAdmission = SharedFlowAdmissionGate()
@@ -1552,15 +1551,9 @@ class MusicService : HeadlessJsTaskService() {
         ownerScope.collectWithAdmission(source.event.audioItemTransition, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
             if (useOrchestratedCrossfade()) return@collectWithAdmission
-            // After a play that reloaded the previous track (a failed load), the app has it already.
-            val reports = standardPlayerBinding?.takeIf { binding -> binding.player === source }?.reportsItemMove
-            if (it !is AudioItemTransitionReason.REPEAT && reports?.invoke(source.currentItem) != false) {
-                emitPlaybackTrackChangedEvents(
-                    source.currentIndex,
-                    source.previousIndex,
-                    (it?.oldPosition ?: 0).toSeconds()
-                )
-            }
+            // The standard backend reports the active track itself, once it loaded
+            // (KotlinAudioPlaybackBackend, FailedLoadRule): a track that fails to load is never
+            // reported, as on the crossfade path and iOS.
         }
 
         ownerScope.collectWithAdmission(source.event.onTimedMetadata, admission) {

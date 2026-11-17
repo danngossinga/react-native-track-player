@@ -175,6 +175,9 @@ final class IOSPlaybackOrchestrator {
     private let standbyPreparationInvocationQueue = DispatchQueue.main
     private let crossfadeEventDeliveryQueue = DispatchQueue.main
     private(set) var state: IOSPlaybackOrchestratorState = .idle
+    /// The track whose load failed last (nil after a load succeeded): with no active track, the
+    /// next play retries it (`indexToPlayAfterFailedLoad`), as Android.
+    private var failedLoadTrack: Track?
     private(set) var currentIndex: Int = -1
     private(set) var playWhenReady: Bool = false
     private(set) var volume: Float = 1
@@ -538,7 +541,18 @@ final class IOSPlaybackOrchestrator {
             completion?(.success(()))
         case .error:
             guard queue.indices.contains(currentIndex) else {
-                completion?(.failure(makeError("player_error", "The orchestrator is in an error state.")))
+                // No active track (the first load failed): the play retries the track that
+                // failed, as Android and the standard backends (FailedLoadRule).
+                guard let retry = indexToPlayAfterFailedLoad(
+                    currentIndex: currentIndex,
+                    failedIndex: failedLoadTrack.flatMap { failed in queue.firstIndex { $0 === failed } },
+                    count: queue.count
+                ) else {
+                    completion?(.failure(makeError("player_error", "The orchestrator is in an error state.")))
+                    return
+                }
+                IOSPlaybackLog.log("play retries the failed load index=\(retry)")
+                loadIndex(retry, position: 0, autoPlay: true, completion: completion)
                 return
             }
             let resumePosition = resumePositionForCurrentIndex()
@@ -1108,6 +1122,7 @@ final class IOSPlaybackOrchestrator {
                 if autoPlay {
                     guard self.operationRegistry.performIfCurrent(ticket, perform: {
                         self.currentIndex = index
+                        self.failedLoadTrack = nil
                         self.checkpoint(position: position, reason: "load")
                         self.playWhenReady = true
                         self.activeEngine.setVolume(self.volume)
@@ -1155,6 +1170,7 @@ final class IOSPlaybackOrchestrator {
                 } else {
                     guard self.operationRegistry.complete(ticket, perform: {
                         self.currentIndex = index
+                        self.failedLoadTrack = nil
                         self.checkpoint(position: position, reason: "load")
                         self.playWhenReady = false
                         self.state = .paused
@@ -1176,6 +1192,7 @@ final class IOSPlaybackOrchestrator {
             case .failure(let error):
                 guard self.operationRegistry.complete(ticket, perform: {
                     self.state = .error
+                    self.failedLoadTrack = track
                     self.operationRegistry.performAfterCurrentMutation {
                         self.emitStateIfNeeded()
                         self.refreshNowPlaying()

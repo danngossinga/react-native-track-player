@@ -1,225 +1,333 @@
 {
-  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule). Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded; when a load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the error is reported; the next play loads that previous track. Items are named. Events: 'load' the player moves to an item (a standard player reports it: 'report' true or false, whether the app is told), 'ready' the item is ready (playing or with media), 'fail' its load fails, 'play' the next play, 'command' another command (skip to the same track, seek, stop) acting on the player's own track. 'active' is the active track after the step (null: none); 'report' on ready, fail and command is the active-track change a standard player reports (absent: none; null: to no track); on play, 'reload' is the item it loads first (null: it plays the current one).",
+  "comment": "Shared by the Android JVM tests and the iOS XCTests (FailedLoadRule); both crossfade orchestrators follow the same rule. Chosen alignment (iOS crossfade's loadIndex): a track becomes the active one once it loaded, and only then is it reported (active-track change, deprecated track-changed event, lock screen); while it loads and after its load fails (a give-up at stallTimeoutMs or the total limit, or a player error) the previous track stays active (none when there was none) and the failed track is never reported as active. The next play loads the previous track again or, when there was none, retries the track that failed. Items are named. Events: 'load' the player moves to an item ('report': whether the move is reported at once: only the first item of a new queue, which a standard player selects when the queue is set, before any load); 'ready' the item is ready (playing or with media); 'fail' its load fails; 'play' the next play ('reload': the item it loads first, null: it plays the current one); 'command' another command (a seek, a stop) on the player's own track; 'reset' the queue replaced or cleared. After each step, 'active' is the track that loaded last and 'reported' the track the app was last told (null: none). 'report' on ready, fail and command is the change reported then, 'to' (null: no track) from 'from'; no 'report' key: none.",
   "scenarios": [
     {
-      "id": "LOAD-01 a skip whose load fails keeps the previous track, and play reloads it",
+      "id": "LOAD-01 a skip whose load fails is never reported; play reloads the previous track",
       "steps": [
         {
           "event": "load",
           "item": "A",
+          "report": true,
           "active": null,
-          "report": true
+          "reported": "A"
         },
         {
           "event": "ready",
-          "active": "A"
+          "active": "A",
+          "reported": "A"
         },
         {
           "event": "load",
           "item": "B",
+          "report": false,
           "active": "A",
-          "report": true
+          "reported": "A"
         },
         {
           "event": "fail",
           "active": "A",
-          "report": "A"
+          "reported": "A"
         },
         {
           "event": "play",
+          "reload": "A",
           "active": "A",
-          "reload": "A"
+          "reported": "A"
         },
         {
           "event": "load",
           "item": "A",
           "report": false,
-          "active": "A"
+          "active": "A",
+          "reported": "A"
         },
         {
           "event": "ready",
-          "active": "A"
+          "active": "A",
+          "reported": "A"
         }
       ]
     },
     {
-      "id": "LOAD-02 a load that succeeds makes its track active",
+      "id": "LOAD-02 a load that succeeds is reported once it loaded",
       "steps": [
         {
           "event": "load",
           "item": "A",
+          "report": true,
           "active": null,
-          "report": true
+          "reported": "A"
         },
         {
           "event": "ready",
-          "active": "A"
+          "active": "A",
+          "reported": "A"
         },
         {
           "event": "load",
           "item": "B",
-          "active": "A",
-          "report": true
-        },
-        {
-          "event": "ready",
-          "active": "B"
-        }
-      ]
-    },
-    {
-      "id": "LOAD-03 a first load that fails leaves no active track",
-      "steps": [
-        {
-          "event": "load",
-          "item": "A",
-          "active": null,
-          "report": true
-        },
-        {
-          "event": "fail",
-          "active": null,
-          "report": null
-        },
-        {
-          "event": "play",
-          "active": null,
-          "reload": null
-        }
-      ]
-    },
-    {
-      "id": "LOAD-04 an error on a track that had loaded keeps it active (no revert)",
-      "steps": [
-        {
-          "event": "load",
-          "item": "A",
-          "active": null,
-          "report": true
-        },
-        {
-          "event": "ready",
-          "active": "A"
-        },
-        {
-          "event": "fail",
-          "active": "A"
-        },
-        {
-          "event": "play",
-          "active": "A",
-          "reload": null
-        }
-      ]
-    },
-    {
-      "id": "LOAD-05 a retry that fails again keeps the previous track",
-      "steps": [
-        {
-          "event": "load",
-          "item": "A",
-          "active": null,
-          "report": true
-        },
-        {
-          "event": "ready",
-          "active": "A"
-        },
-        {
-          "event": "load",
-          "item": "B",
-          "active": "A",
-          "report": true
-        },
-        {
-          "event": "fail",
-          "active": "A",
-          "report": "A"
-        },
-        {
-          "event": "play",
-          "active": "A",
-          "reload": "A"
-        },
-        {
-          "event": "load",
-          "item": "A",
           "report": false,
-          "active": "A"
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "B",
+            "from": "A"
+          },
+          "active": "B",
+          "reported": "B"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-03 the selected first track fails: no active track, and play retries it",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "active": null,
+          "reported": "A"
         },
         {
           "event": "fail",
-          "active": "A"
+          "report": {
+            "to": null,
+            "from": "A"
+          },
+          "active": null,
+          "reported": null
         },
         {
           "event": "play",
+          "reload": "A",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "A",
+            "from": null
+          },
           "active": "A",
-          "reload": null
-        },
-        {
-          "event": "ready",
-          "active": "A"
+          "reported": "A"
         }
       ]
     },
     {
-      "id": "LOAD-06 a command after a revert reports the player's own track",
+      "id": "LOAD-04 an error on a track that had loaded keeps it active",
       "steps": [
         {
           "event": "load",
           "item": "A",
           "report": true,
-          "active": null
+          "active": null,
+          "reported": "A"
         },
         {
           "event": "ready",
-          "active": "A"
-        },
-        {
-          "event": "load",
-          "item": "B",
-          "report": true,
-          "active": "A"
+          "active": "A",
+          "reported": "A"
         },
         {
           "event": "fail",
-          "report": "A",
-          "active": "A"
-        },
-        {
-          "event": "command",
-          "report": "B",
-          "active": "A"
-        },
-        {
-          "event": "ready",
-          "active": "B"
-        }
-      ]
-    },
-    {
-      "id": "LOAD-07 a first load that fails, then a play that loads it, reports it",
-      "steps": [
-        {
-          "event": "load",
-          "item": "A",
-          "report": true,
-          "active": null
-        },
-        {
-          "event": "fail",
-          "report": null,
-          "active": null
+          "active": "A",
+          "reported": "A"
         },
         {
           "event": "play",
           "reload": null,
-          "active": null
+          "active": "A",
+          "reported": "A"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-05 a reload that fails again keeps the previous track",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "active": null,
+          "reported": "A"
         },
         {
           "event": "ready",
-          "report": "A",
-          "active": "A"
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "play",
+          "reload": "A",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "A",
+          "report": false,
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "play",
+          "reload": null,
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "active": "A",
+          "reported": "A"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-06 a command on the failed track: reported once it loads",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "fail",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "command",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "B",
+            "from": "A"
+          },
+          "active": "B",
+          "reported": "B"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-07 a new queue: its first track is selected and reported at once",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "reset",
+          "active": null,
+          "reported": null
+        },
+        {
+          "event": "load",
+          "item": "C",
+          "report": true,
+          "active": null,
+          "reported": "C"
+        },
+        {
+          "event": "ready",
+          "active": "C",
+          "reported": "C"
+        }
+      ]
+    },
+    {
+      "id": "LOAD-08 natural advances: reported when ready, a failed one never",
+      "steps": [
+        {
+          "event": "load",
+          "item": "A",
+          "report": true,
+          "active": null,
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "load",
+          "item": "B",
+          "report": false,
+          "active": "A",
+          "reported": "A"
+        },
+        {
+          "event": "ready",
+          "report": {
+            "to": "B",
+            "from": "A"
+          },
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "load",
+          "item": "C",
+          "report": false,
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "fail",
+          "active": "B",
+          "reported": "B"
+        },
+        {
+          "event": "play",
+          "reload": "B",
+          "active": "B",
+          "reported": "B"
         }
       ]
     }

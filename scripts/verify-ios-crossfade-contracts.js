@@ -671,19 +671,29 @@ assert(
 // leaves the player in error (its rejection is the report).
 {
   const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
-  const poll = section(backendSource, 'private func pollLoads() {', 'private func giveUp(');
-  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
+  const poll = section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func followLoad(');
+  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, keptPosition: Double? = nil) {', '\n    }\n');
+  const driver = section(facade, 'final class StandardLoadDriver {', '\n}\n');
   const gaveUp = section(player, 'func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
   const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
   assert(
-    poll.includes('if !isAuthoritative || issuedSeek != nil || !pendingSeeks.isEmpty || hostFailure != nil {') &&
+    poll.includes('guard isAuthoritative, !disposed, hostFailure == nil, !idleWithoutActiveTrack else {') &&
       poll.includes('phase: standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition),') &&
-      poll.includes('code: standardPrepareTimeoutCode') &&
+      poll.includes('ownedElsewhere: issuedSeek != nil || !pendingSeeks.isEmpty') &&
+      section(backendSource, 'private func giveUpLoad(', '\n    }\n').includes('code: standardPrepareTimeoutCode') &&
+      // Event-driven (SwiftAudioEx's state events), one timer only while a load is watched, at an
+      // interval from the settings; no fixed poll.
+      backendSource.includes('player.event.stateChange.addListener(stateListener) { [weak self] _ in\n                DispatchQueue.main.async { self?.loadDriver?.poke() }') &&
+      driver.includes('guard !stopped, let delay = watch.nextCheckInMs() else { return }') &&
+      facade.includes('return max(1, stallTimeoutMs / 10)') &&
+      !backendSource.includes('stallCheckIntervalMs') &&
+      // A failed seek keeps its target as the position.
+      backendSource.includes('report: false,\n                    keptPosition: request.position') &&
+      backendSource.includes('return giveUpState?.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
       giveUp.includes('player.stop()') &&
       backendSource.includes('if hostFailure != nil { return .error }') &&
       backendSource.includes('return hostFailure ?? iosPlaybackErrorSnapshot(from: player.playbackError)') &&
-      (backendSource.match(/clearHostFailure\(\)/g) || []).length === 13 &&
       section(backendSource, 'let wait = StallWaitDriver(', 'request.wait = wait').includes('failure: IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),\n                    report: false') &&
       player.includes('prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },\n                onLoadGaveUp:') &&
       gaveUp.includes('emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: State.error, error: failure))') &&
@@ -701,13 +711,19 @@ assert(
   const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
   assert(
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")') &&
-      backendSource.includes('if failedLoads.isReverted { return indexOfItem(failedLoads.active) ?? -1 }') &&
-      section(backendSource, 'private func pollLoads() {', 'private func giveUp(').includes('followLoad(observed)') &&
-      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n').includes('if report { revertFailedLoad() }') &&
-      backendSource.includes('loadActiveTrackAfterFailedLoad()\n            requested.request(true)\n            player.play()') &&
-      player.includes('func handleStandardActiveTrackCorrected(source: QueuedAudioPlayer, index: Int?, lastIndex: Int?) {') &&
-      player.includes('backend.identity === source, !backend.reportsItemMove(item) {') &&
-      !/failedLoads\.command\(\)\n/.test(backendSource),
+      backendSource.includes('if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {\n            return indexOfItem(failedLoads.reported) ?? -1') &&
+      section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func giveUpLoad(').includes('followLoad(observed)') &&
+      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, keptPosition: Double? = nil) {', '\n    }\n').includes('if report { failLoadedTrack() }') &&
+      backendSource.includes('loadActiveTrackAfterFailedLoad()\n            reloadAtKeptPosition(kept)\n            requested.request(true)\n            player.play()') &&
+      // A track is reported once it loaded (deferred), both events, and the lock screen points
+      // back to the active track after a failed load.
+      player.includes('!backend.itemMoved(item, lastPosition: lastPosition ?? 0) {') &&
+      player.includes('func handleStandardActiveTrackChanged(source: QueuedAudioPlayer, index: Int?, lastTrack: Track?, lastIndex: Int?, lastPosition: Double) {') &&
+      section(player, 'private func emitStandardActiveTrackChanged(', '\n    }\n').includes('emit(event: EventType.PlaybackTrackChanged, body: b)') &&
+      section(player, 'func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {', '\n    }\n').includes('Metadata.update(for: source, with: track.toObject())') &&
+      // The crossfade play after a failed first load retries the track that failed (Android too).
+      section(orchestrator, '        case .error:', '        }\n        refreshNowPlaying()').includes('indexToPlayAfterFailedLoad(') &&
+      read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed()'),
     'The iOS standard player must keep the previous track active after a failed load, as crossfade.'
   );
 }

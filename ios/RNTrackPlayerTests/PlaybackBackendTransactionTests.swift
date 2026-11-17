@@ -177,7 +177,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             .appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(contentsOf: url)) as? [String: Any])
         let scenarios = try XCTUnwrap(root["scenarios"] as? [[String: Any]])
-        XCTAssertEqual(scenarios.count, 7)
+        XCTAssertEqual(scenarios.count, 8)
         for scenario in scenarios {
             let id = scenario["id"] as? String ?? "?"
             var items: [String: NSObject] = [:]
@@ -190,17 +190,21 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             let rule = FailedLoadRule()
             for (index, step) in try XCTUnwrap(scenario["steps"] as? [[String: Any]]).enumerated() {
                 let at = "\(id) step \(index)"
-                // A report expected (absent: none), and to which track (null: none).
-                let expected: FailedLoadRule.Report? = step.keys.contains("report") ? FailedLoadRule.Report(to: identity(step["report"])) : nil
+                // The change expected (no key: none), to and from which track (null: none).
+                let expected = (step["report"] as? [String: Any]).map {
+                    FailedLoadRule.Report(to: identity($0["to"]), from: identity($0["from"]))
+                }
                 switch step["event"] as? String ?? "" {
                 case "load": XCTAssertEqual(rule.moved(identity(step["item"])), step["report"] as? Bool, at)
                 case "ready": XCTAssertEqual(rule.ready(), expected, at)
                 case "fail": XCTAssertEqual(rule.failed(), expected, at)
                 case "command": XCTAssertEqual(rule.command(), expected, at)
                 case "play": XCTAssertEqual(rule.play(), identity(step["reload"]), at)
+                case "reset": rule.reset()
                 default: XCTFail("unknown event in \(at)")
                 }
-                XCTAssertEqual(rule.active, identity(step["active"]), at)
+                XCTAssertEqual(rule.active, identity(step["active"]), "\(at) active")
+                XCTAssertEqual(rule.reported, identity(step["reported"]), "\(at) reported")
             }
         }
     }
@@ -214,9 +218,91 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let a = NSObject()
         let b = NSObject()
 
-        func observe(_ item: NSObject?, _ phase: StandardLoadPhase, buffered: Double = 0) -> StallVerdict? {
-            return watch.check(StandardLoadObservation(item: item.map(ObjectIdentifier.init), phase: phase, readings: [buffered]))
+        func observe(_ item: NSObject?, _ phase: StandardLoadPhase, buffered: Double = 0, owned: Bool = false) -> StallVerdict? {
+            return watch.check(StandardLoadObservation(item: item.map(ObjectIdentifier.init), phase: phase, readings: [buffered], ownedElsewhere: owned))
         }
+    }
+
+    func testAPlayAfterAFailedFirstLoadRetriesTheTrackThatFailed() {
+        // The crossfade rule on both platforms (Android: startTrackAt of failedLoadIndex), as the
+        // standard backends' FailedLoadRule (LOAD-03): the active track when there is one, else
+        // the track that failed, retried.
+        XCTAssertEqual(indexToPlayAfterFailedLoad(currentIndex: 1, failedIndex: 2, count: 3), 1)
+        XCTAssertEqual(indexToPlayAfterFailedLoad(currentIndex: -1, failedIndex: 2, count: 3), 2)
+        XCTAssertNil(indexToPlayAfterFailedLoad(currentIndex: -1, failedIndex: nil, count: 3))
+        XCTAssertNil(indexToPlayAfterFailedLoad(currentIndex: -1, failedIndex: 5, count: 3))
+    }
+
+    func testAFailedStandardSeekKeepsItsTargetAsThePosition() {
+        // SwiftAudioEx's stop resets its position to 0; the backend reports the seek's target,
+        // as a failed crossfade seek and Android's standard player (ExoPlayer keeps it).
+        let failed = StandardGiveUp(failure: "standard_seek_timeout", keptPosition: 20)
+        XCTAssertEqual(failed.position(live: 0), 20)
+        let load = StandardGiveUp<String>(failure: "crossfade_prepare_timeout", keptPosition: nil)
+        XCTAssertEqual(load.position(live: 3), 3)
+    }
+
+    func testStandardLoadARebufferAfterASeekThatWasCancelledIsNotALoad() {
+        // Same as Android's StandardLoadWatchTest.aRebufferAfterASeekThatWasCancelledIsNotALoad.
+        let h = LoadWatchHarness()
+        _ = h.observe(h.a, .ready)
+        XCTAssertNil(h.observe(h.a, .loading, owned: true))
+        XCTAssertNil(h.observe(h.a, .loading))
+        h.now = 30
+        XCTAssertNil(h.observe(h.a, .loading))
+        // While the seek owns it, nothing is given up, however long it takes (its own limits).
+        XCTAssertNil(h.observe(h.b, .loading, owned: true))
+        h.now = 60
+        XCTAssertNil(h.observe(h.b, .loading, owned: true))
+        XCTAssertNil(h.observe(h.b, .loading))
+        h.now = 70
+        XCTAssertEqual(h.observe(h.b, .loading), .stalled)
+    }
+
+    func testStandardLoadTheNextCheckIsAtTheGiveUpOrATenthOfTheStallTimeoutAndNoneWithoutALoad() {
+        let h = LoadWatchHarness()
+        XCTAssertNil(h.watch.nextCheckInMs())
+        _ = h.observe(h.a, .loading)
+        XCTAssertEqual(h.watch.nextCheckInMs(), 1_000)
+        h.now = 9.5
+        _ = h.observe(h.a, .loading)
+        XCTAssertEqual(h.watch.nextCheckInMs(), 500)
+        h.stallMs = 2_000
+        _ = h.observe(h.b, .loading)
+        XCTAssertEqual(h.watch.nextCheckInMs(), 200)
+        _ = h.observe(h.b, .ready)
+        XCTAssertNil(h.watch.nextCheckInMs())
+        XCTAssertEqual(standardLoadSampleIntervalMs(5), 1)
+    }
+
+    func testStandardLoadDriverSetsOneTimerOnlyWhileALoadIsWatchedAndGivesUpAtIt() {
+        let h = LoadWatchHarness()
+        var phase = StandardLoadPhase.ready
+        var delays: [Int] = []
+        var pending: (() -> Void)?
+        var verdicts: [StallVerdict] = []
+        let driver = StandardLoadDriver(
+            watch: h.watch,
+            observe: { StandardLoadObservation(item: ObjectIdentifier(h.a), phase: phase, readings: [0]) },
+            giveUp: { verdicts.append($0) },
+            schedule: { delay, work in delays.append(delay); pending = work; return DispatchWorkItem {} }
+        )
+        driver.poke()
+        XCTAssertFalse(driver.isScheduled, "a ready item: no timer")
+        phase = .idle
+        driver.poke()
+        phase = .loading
+        driver.poke()
+        XCTAssertTrue(driver.isScheduled)
+        XCTAssertEqual(delays, [1_000])
+        // Nothing progresses: the timer fires every second, then at the give-up.
+        for _ in 0..<10 {
+            h.now += Double(delays.last!) / 1000
+            pending?()
+        }
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertFalse(driver.isScheduled, "no load watched after a give-up: no timer")
+        driver.stop()
     }
 
     func testStandardLoadAnItemLoadingThatNeverWasReadyGivesUpAtTheStallTimeout() {

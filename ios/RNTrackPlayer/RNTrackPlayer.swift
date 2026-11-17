@@ -535,8 +535,11 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onLoadGaveUp: { [weak self] source, failure, report in
                     self?.handleStandardLoadGaveUp(source: source, failure: failure, report: report)
                 },
-                onActiveTrackCorrected: { [weak self] source, index, lastIndex in
-                    self?.handleStandardActiveTrackCorrected(source: source, index: index, lastIndex: lastIndex)
+                onActiveTrackChanged: { [weak self] source, index, lastTrack, lastIndex, lastPosition in
+                    self?.handleStandardActiveTrackChanged(source: source, index: index, lastTrack: lastTrack, lastIndex: lastIndex, lastPosition: lastPosition)
+                },
+                onLoadFailed: { [weak self] source, activeIndex in
+                    self?.handleStandardLoadFailed(source: source, activeIndex: activeIndex)
                 },
                 automaticallyUpdateNowPlayingInfo: { [weak self] in
                     self?.autoUpdateNowPlayingInfo ?? true
@@ -1988,26 +1991,62 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
     }
 
-    /// The standard player's active track as FailedLoadRule reports it: after a failed load the
-    /// previous track again (none when there was none; lastIndex: the failed track), as on the
-    /// crossfade path; then the player's own track after a command. Same event as Android's.
-    func handleStandardActiveTrackCorrected(source: QueuedAudioPlayer, index: Int?, lastIndex: Int?) {
+    /// The standard player's active track as FailedLoadRule reports it: once the track loaded,
+    /// never a track that failed to load (as the crossfade path); both events, as when the
+    /// player reports its item itself. Same events as Android's standard player.
+    func handleStandardActiveTrackChanged(source: QueuedAudioPlayer, index: Int?, lastTrack: Track?, lastIndex: Int?, lastPosition: Double) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
-        var body: Dictionary<String, Any> = ["lastPosition": 0]
-        if let index = index, source.items.indices.contains(index), let track = source.items[index] as? Track {
-            body["index"] = index
-            body["track"] = track.toObject()
+        let track = index.flatMap { source.items.indices.contains($0) ? source.items[$0] as? Track : nil }
+        emitStandardActiveTrackChanged(index: index, track: track, lastIndex: lastIndex, lastTrack: lastTrack, lastPosition: lastPosition)
+    }
+
+    /// A standard load failed: the lock screen showed the track that failed (SwiftAudioEx sets it
+    /// at the load); it shows the active one again (none: unchanged), as Android's notification.
+    func handleStandardLoadFailed(source: QueuedAudioPlayer, activeIndex: Int?) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source),
+              let index = activeIndex, source.items.indices.contains(index),
+              let track = source.items[index] as? Track else { return }
+        Metadata.update(for: source, with: track.toObject())
+    }
+
+    private func emitStandardActiveTrackChanged(index: Int?, track: Track?, lastIndex: Int?, lastTrack: Track?, lastPosition: Double) {
+        var a: Dictionary<String, Any> = ["lastPosition": lastPosition]
+        if let lastIndex = lastIndex {
+            a["lastIndex"] = lastIndex
         }
-        if let failedIndex = lastIndex, source.items.indices.contains(failedIndex), let failed = source.items[failedIndex] as? Track {
-            body["lastIndex"] = failedIndex
-            body["lastTrack"] = failed.toObject()
+        if let lastTrack = lastTrack?.toObject() {
+            a["lastTrack"] = lastTrack
         }
-        emit(event: EventType.PlaybackActiveTrackChanged, body: body)
+        if let index = index {
+            a["index"] = index
+        }
+        if let track = track?.toObject() {
+            a["track"] = track
+        }
+        emit(event: EventType.PlaybackActiveTrackChanged, body: a)
+
+        // deprecated:
+        var b: Dictionary<String, Any> = ["position": lastPosition]
+        if let lastIndex = lastIndex {
+            b["lastIndex"] = lastIndex
+        }
+        if let index = index {
+            b["nextTrack"] = index
+        }
+        emit(event: EventType.PlaybackTrackChanged, body: b)
     }
 
     func handleAudioPlayerFailed(source: QueuedAudioPlayer, error: Error?) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
-        emit(event: EventType.PlaybackError, body: ["error": error?.localizedDescription])
+        // The code and message, as Android's standard player and the crossfade path send them
+        // (`error` kept for apps that read it).
+        var body: [String: Any] = ["error": error?.localizedDescription as Any]
+        if let snapshot = iosPlaybackErrorSnapshot(from: source.playbackError) {
+            body.merge(snapshot.dictionary) { _, new in new }
+        } else if let message = error?.localizedDescription {
+            body["message"] = message
+        }
+        emit(event: EventType.PlaybackError, body: body)
     }
 
     func handleAudioPlayerCurrentItemChange(
@@ -2022,12 +2061,6 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
 
         if pendingStandardIdleTrackActivation?.source == ObjectIdentifier(source) {
             pendingStandardIdleTrackActivation?.emittedByPhysicalPlayer = true
-        }
-
-        // After a play that reloaded the previous track (a failed load), the app has it already.
-        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
-           backend.identity === source, !backend.reportsItemMove(item) {
-            return
         }
 
         let eventKey = standardActiveTrackEventKey(source: source, item: item, index: index)
@@ -2056,33 +2089,20 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         }
         refreshRemoteCommandAvailability(kind: .standard, sourcePlayer: source)
 
-        var a: Dictionary<String, Any> = ["lastPosition": lastPosition ?? 0]
-        if let lastIndex = lastIndex {
-            a["lastIndex"] = lastIndex
+        // The standard backend reports a track once it loaded (FailedLoadRule), never one that
+        // fails to load, as the crossfade path and Android: only a new queue's first track now.
+        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
+           backend.identity === source,
+           !backend.itemMoved(item, lastPosition: lastPosition ?? 0) {
+            return
         }
-
-        if let lastTrack = (lastItem as? Track)?.toObject() {
-            a["lastTrack"] = lastTrack
-        }
-
-        if let index = index {
-            a["index"] = index
-        }
-
-        if let track = (item as? Track)?.toObject() {
-            a["track"] = track
-        }
-        emit(event: EventType.PlaybackActiveTrackChanged, body: a)
-
-        // deprecated:
-        var b: Dictionary<String, Any> = ["position": lastPosition ?? 0]
-        if let lastIndex = lastIndex {
-            b["lastIndex"] = lastIndex
-        }
-        if let index = index {
-            b["nextTrack"] = index
-        }
-        emit(event: EventType.PlaybackTrackChanged, body: b)
+        emitStandardActiveTrackChanged(
+            index: index,
+            track: item as? Track,
+            lastIndex: lastIndex,
+            lastTrack: lastItem as? Track,
+            lastPosition: lastPosition ?? 0
+        )
     }
 
     func handleAudioPlayerSecondElapse(source: QueuedAudioPlayer, seconds: Double) {

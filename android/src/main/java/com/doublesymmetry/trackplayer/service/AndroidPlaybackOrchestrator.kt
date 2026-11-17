@@ -152,6 +152,12 @@ internal class AndroidPlaybackOrchestrator private constructor(
     var currentIndex: Int = -1
         private set
 
+    /**
+     * The track whose load failed last (null after a load succeeded): with no
+     * active track, the next play retries it ([indexToPlayAfterFailedLoad]), as iOS.
+     */
+    private var failedLoadItem: TrackAudioItem? = null
+
     var playWhenReady: Boolean = false
         private set
 
@@ -397,6 +403,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             prepareActiveOrFail(item, 0L, ticket)
             ticket.ensureActive()
             currentIndex = 0
+            failedLoadItem = null
             activeEngine.setVolume(if (playWhenReady) volume else 0f)
             delegate.onActiveTrackChanged(0, null, 0L)
             delegate.onNowPlayingChanged(0)
@@ -444,7 +451,15 @@ internal class AndroidPlaybackOrchestrator private constructor(
             return@withPlaybackOperation
         }
         if (currentIndex !in queue.indices) {
-            startTrackAt(0, 0L, emitTrackChange = true, oldPositionMs = 0L, ticket = ticket)
+            // No active track: from an error (the first load failed), the play retries the track
+            // that failed, as iOS and the standard backends (FailedLoadRule); else the first one.
+            val index = if (state == AndroidPlaybackOrchestratorState.ERROR) {
+                indexToPlayAfterFailedLoad(currentIndex, queue.indexOfFirst { it === failedLoadItem }.takeIf { it >= 0 }, queue.size)
+                    ?: throw RejectionException("The orchestrator is in an error state.", "player_error")
+            } else {
+                0
+            }
+            startTrackAt(index, 0L, emitTrackChange = true, oldPositionMs = 0L, ticket = ticket)
             return@withPlaybackOperation
         }
         if (state == AndroidPlaybackOrchestratorState.ENDED) {
@@ -1019,6 +1034,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
         // As iOS's loadIndex: the track becomes the active one once it loaded. A load that fails
         // (or is cancelled) leaves the previous track active, so the next play reloads that one.
         currentIndex = index
+        failedLoadItem = null
         if (emitTrackChange) {
             delegate.onActiveTrackChanged(index, previousIndex, oldPositionMs)
         }
@@ -1083,6 +1099,7 @@ internal class AndroidPlaybackOrchestrator private constructor(
             // A track that fails to load (a stall, a player error) leaves the player in an error
             // state, not loading forever. A newer command that took over says otherwise.
             ticket?.ensureActive()
+            failedLoadItem = item
             setState(AndroidPlaybackOrchestratorState.ERROR)
             throw error
         }
