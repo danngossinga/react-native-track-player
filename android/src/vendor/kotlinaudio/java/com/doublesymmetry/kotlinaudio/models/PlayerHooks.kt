@@ -3,6 +3,7 @@ package com.doublesymmetry.kotlinaudio.models
 import com.google.android.exoplayer2.ExoPlayer
 import com.google.android.exoplayer2.upstream.DataSource
 import com.google.android.exoplayer2.upstream.DefaultHttpDataSource
+import com.google.android.exoplayer2.upstream.TransferListener
 
 /**
  * Fork addition (react-native-track-player, see VENDORED.md): lets the host configure what
@@ -22,5 +23,10 @@ class PlayerHooks(
      * host holds one focus for every player, requested at the user's play, and pauses and resumes
      * itself (one rule for every backend).
      */
-    val hostOwnsAudioFocus: Boolean = false
+    val hostOwnsAudioFocus: Boolean = false,
+    /**
+     * Told of every media request's bytes (segments, chunks, a progressive file), not of
+     * playlists, manifests or keys: the host's measure of a load's progress. Null: none.
+     */
+    val mediaTransferListener: TransferListener? = null
 )

@@ -136,6 +136,9 @@ internal class AutoTransitionCounter : com.google.android.exoplayer2.analytics.A
  * after the seek (the track played to its end: repeat-one, or the next track began) completes
  * it, as iOS's native seek completes. Main thread.
  */
+/** The code of a standard seek that gives up (no progress, or over its limit). */
+internal const val STANDARD_SEEK_TIMEOUT_CODE = "standard_seek_timeout"
+
 internal class StandardSeekGate(
     private val timeoutMs: () -> Long,
     private val stallTimeoutMs: () -> Long,
@@ -153,6 +156,10 @@ internal class StandardSeekGate(
         val slackMs = pollIntervalMs
         return positionMs >= targetMs - slackMs && positionMs <= targetMs + playedMs + slackMs
     }
+
+    /** A seek is being waited for (it owns the player's loading until it ends). */
+    val isWaiting: Boolean
+        get() = current != null
 
     /** Ends the seek in progress, if any (`standard_seek_cancelled`). */
     fun cancel(reason: String) {
@@ -214,7 +221,7 @@ internal class StandardSeekGate(
             throw RejectionException(
                 if (verdict == StallVerdict.STALLED) "The native seek made no progress for ${stallTimeoutMs()} ms."
                 else "The native seek did not complete within ${timeoutMs()} ms.",
-                "standard_seek_timeout"
+                STANDARD_SEEK_TIMEOUT_CODE
             )
         }
     }
@@ -329,6 +336,8 @@ internal class StandardPlayerAnalytics(
     var player: com.google.android.exoplayer2.Player? = null
         private set
     val transitions = AutoTransitionCounter()
+    /** The bytes the player downloads (its HTTP sources count them): a load's progress. */
+    val loadedBytes = LoadedBytes()
 
     init {
         addListener(transitions)

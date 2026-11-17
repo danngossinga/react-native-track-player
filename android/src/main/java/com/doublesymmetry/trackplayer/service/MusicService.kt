@@ -516,8 +516,13 @@ class MusicService : HeadlessJsTaskService() {
                         }
                         activateStandardPlayerBinding(binding, canonicalPlaybackState).join()
                     },
+                    // The stall rule on the standard player's loads (stallTimeoutMs, prepareTimeoutMs).
+                    loadWatch = StandardLoadWatch(
+                        stallTimeoutMs = { stallTimeout.milliseconds },
+                        totalTimeoutMs = { prepareTimeout.milliseconds }
+                    ),
                     initiallyAuthoritative = initiallyAuthoritative
-                )
+                ).also { backend -> binding.ownerScope.launch { backend.superviseLoads() } }
             }
             PlaybackBackendType.PING_PONG -> {
                 val eventAdmission = SharedFlowAdmissionGate()
@@ -657,6 +662,8 @@ class MusicService : HeadlessJsTaskService() {
             configureStandardExoPlayer(builder, this@MusicService, { initialBitrateEstimate.bitsPerSecond }, analytics)
         },
         httpDataSourceFactory = standardHttpDataSourceFactory({ stallTimeout.milliseconds }),
+        // Only media bytes are a load's progress (playlists and keys are not), as on the crossfade path.
+        mediaTransferListener = analytics.loadedBytes,
         hostOwnsAudioFocus = true
     )
 
@@ -1655,9 +1662,7 @@ class MusicService : HeadlessJsTaskService() {
         if (error?.message != null) {
             bundle.putString("message", error.message)
         }
-        if (error?.code != null) {
-            bundle.putString("code", "android-" + error.code)
-        }
+        error?.let(::standardPlaybackErrorCode)?.let { bundle.putString("code", it) }
         return bundle
     }
 

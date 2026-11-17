@@ -67,6 +67,7 @@ import com.google.android.exoplayer2.source.MediaSource
 import com.google.android.exoplayer2.source.ProgressiveMediaSource
 import com.google.android.exoplayer2.source.dash.DashMediaSource
 import com.google.android.exoplayer2.source.dash.DefaultDashChunkSource
+import com.google.android.exoplayer2.source.hls.HlsDataSourceFactory
 import com.google.android.exoplayer2.source.hls.HlsMediaSource
 import com.google.android.exoplayer2.source.smoothstreaming.DefaultSsChunkSource
 import com.google.android.exoplayer2.source.smoothstreaming.SsMediaSource
@@ -419,6 +420,19 @@ abstract class BaseAudioPlayer internal constructor(
         exoPlayer.stop()
     }
 
+    /**
+     * Fork: the host gave up on the item's load or seek (no progress for its stall timeout): the
+     * player stops loading at once, as [stop], and is in the error state with [error], as after an
+     * ExoPlayer error; [report] also emits it as a playback error. A prepare loads the item again.
+     */
+    fun failLoad(error: PlaybackError, report: Boolean) {
+        exoPlayer.playWhenReady = false
+        exoPlayer.stop()
+        playbackError = error
+        if (report) playerEventHolder.updatePlaybackError(error)
+        playerState = AudioPlayerState.ERROR
+    }
+
     @CallSuper
     open fun clear() {
         exoPlayer.clearMediaItems()
@@ -494,26 +508,33 @@ abstract class BaseAudioPlayer internal constructor(
             }
         }
 
+        // Fork: media requests (not playlists, manifests or keys) report their bytes to the host.
+        val mediaFactory: DataSource.Factory = hooks.mediaTransferListener?.let { listener ->
+            DataSource.Factory { factory.createDataSource().also { it.addTransferListener(listener) } }
+        } ?: factory
+
         return when (audioItem.type) {
-            MediaType.DASH -> createDashSource(mediaItem, factory)
-            MediaType.HLS -> createHlsSource(mediaItem, factory)
-            MediaType.SMOOTH_STREAMING -> createSsSource(mediaItem, factory)
-            else -> createProgressiveSource(mediaItem, factory)
+            MediaType.DASH -> createDashSource(mediaItem, factory, mediaFactory)
+            MediaType.HLS -> createHlsSource(mediaItem, factory, mediaFactory)
+            MediaType.SMOOTH_STREAMING -> createSsSource(mediaItem, factory, mediaFactory)
+            else -> createProgressiveSource(mediaItem, mediaFactory)
         }
     }
 
-    private fun createDashSource(mediaItem: MediaItem, factory: DataSource.Factory?): MediaSource {
-        return DashMediaSource.Factory(DefaultDashChunkSource.Factory(factory!!), factory)
+    private fun createDashSource(mediaItem: MediaItem, factory: DataSource.Factory, mediaFactory: DataSource.Factory): MediaSource {
+        return DashMediaSource.Factory(DefaultDashChunkSource.Factory(mediaFactory), factory)
             .createMediaSource(mediaItem)
     }
 
-    private fun createHlsSource(mediaItem: MediaItem, factory: DataSource.Factory?): MediaSource {
-        return HlsMediaSource.Factory(factory!!)
+    private fun createHlsSource(mediaItem: MediaItem, factory: DataSource.Factory, mediaFactory: DataSource.Factory): MediaSource {
+        return HlsMediaSource.Factory(HlsDataSourceFactory { dataType ->
+            (if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()
+        })
             .createMediaSource(mediaItem)
     }
 
-    private fun createSsSource(mediaItem: MediaItem, factory: DataSource.Factory?): MediaSource {
-        return SsMediaSource.Factory(DefaultSsChunkSource.Factory(factory!!), factory)
+    private fun createSsSource(mediaItem: MediaItem, factory: DataSource.Factory, mediaFactory: DataSource.Factory): MediaSource {
+        return SsMediaSource.Factory(DefaultSsChunkSource.Factory(mediaFactory), factory)
             .createMediaSource(mediaItem)
     }
 

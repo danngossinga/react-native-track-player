@@ -439,7 +439,7 @@ assert(
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, PLAY_START_TIMEOUT_KEY, playStartTimeout)') &&
     section(musicService, 'private fun applyTimeouts(options: Bundle?)', '@MainThread').includes('applyTimeout(options, STANDARD_SEEK_TIMEOUT_KEY, standardSeekTimeout)') &&
     musicService.includes('seekGate = StandardSeekGate(\n                        timeoutMs = { standardSeekTimeout.milliseconds },\n                        stallTimeoutMs = { stallTimeout.milliseconds }') &&
-    standardBackend.includes('override suspend fun seekTo(positionMs: Long) = seekGate.seek(seekPlayer, positionMs)') &&
+    standardBackend.includes('    override suspend fun seekTo(positionMs: Long) {\n        try {\n            seekGate.seek(seekPlayer, positionMs)') &&
     read('android/src/main/java/com/doublesymmetry/trackplayer/service/PlaybackBackendRuntime.kt').includes('    if (item != null && player.kotlinAudioState == AudioPlayerState.STOPPED) player.prepare()\n    if (item != null) player.seekTo(positionMs)\n    await(positionMs, item) { player.seekObservation() }') &&
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
@@ -823,5 +823,40 @@ assert(
     .includes('state != AndroidPlaybackOrchestratorState.PRELOADING_NEXT'),
   'The Android end monitor must also act while the next track preloads, as iOS.'
 );
+
+// The standard player's loads follow the stall rule (no command waits for them): a load that
+// makes no progress for stallTimeoutMs (media bytes and buffered media; playlists and keys are
+// not progress) or exceeds prepareTimeoutMs stops loading and reports crossfade_prepare_timeout
+// with the error state, as a crossfade advance. A stalled standard seek stops loading and leaves
+// the player in error (its rejection is the report). Pinned behaviour: robolectric-tests
+// StandardPlayerHlsTest (real ExoPlayer).
+{
+  const watchSource = read('android/src/main/java/com/doublesymmetry/trackplayer/service/StandardLoadWatch.kt');
+  const vendored = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
+  const hlsTest = read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardPlayerHlsTest.kt');
+  const supervise = section(standardBackend, 'suspend fun superviseLoads() {', 'private fun giveUpLoad(');
+  const giveUp = section(standardBackend, 'private fun giveUpLoad(', '\n    }\n');
+  const failLoad = section(vendored, 'fun failLoad(error: PlaybackError, report: Boolean) {', '\n    }\n');
+  assert(
+    watchSource.includes('internal const val PREPARE_TIMEOUT_CODE = "crossfade_prepare_timeout"') &&
+      supervise.includes('if (!isAuthoritative || disposed || playerReleased || seekGate.isWaiting) {') &&
+      supervise.includes('standardLoadObservation(exo, player.currentItem, analytics()?.loadedBytes)') &&
+      giveUp.includes('androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")') &&
+      giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),\n            report = true') &&
+      failLoad.includes('exoPlayer.stop()') && failLoad.includes('playerState = AudioPlayerState.ERROR') &&
+      failLoad.includes('if (report) playerEventHolder.updatePlaybackError(error)') &&
+      vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
+      standardHooks.includes('mediaTransferListener = analytics.loadedBytes,') &&
+      musicService.includes('totalTimeoutMs = { prepareTimeout.milliseconds }') &&
+      musicService.includes('.also { backend -> binding.ownerScope.launch { backend.superviseLoads() } }') &&
+      section(standardBackend, 'override suspend fun seekTo(positionMs: Long) {', '\n    }\n').includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)') &&
+      read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardLoadWatch.kt",') &&
+      ['aStalledStandardLoadGivesUpAtTheStallTimeoutAndStopsLoading', 'aStalledStandardLoadWhileATrackPlaysGivesUpAtTheStallTimeout',
+        'aStalledNaturalAdvanceGivesUpAtTheStallTimeout', 'aRetryAfterAGiveUpThatStallsAgainGivesUpAgain']
+        .every((t) => hlsTest.includes(`fun ${t}()`)) &&
+      hlsTest.includes('gaveUpAt - loadAt < STALL_TIMEOUT_MS + GIVE_UP_SLACK_MS'),
+    'The Android standard player must give up a load with no progress at stallTimeoutMs, as crossfade.'
+  );
+}
 
 console.log('Android crossfade contracts OK');

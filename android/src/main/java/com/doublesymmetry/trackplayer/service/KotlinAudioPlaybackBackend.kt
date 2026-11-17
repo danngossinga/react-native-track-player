@@ -1,6 +1,7 @@
 package com.doublesymmetry.trackplayer.service
 
 import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
+import com.doublesymmetry.kotlinaudio.models.PlaybackError
 import com.doublesymmetry.kotlinaudio.models.QueuedPlayerOptions
 import com.doublesymmetry.kotlinaudio.models.RepeatMode
 import com.doublesymmetry.kotlinaudio.players.QueuedAudioPlayer
@@ -153,6 +154,8 @@ internal class KotlinAudioPlaybackBackend(
     private val analytics: () -> StandardPlayerAnalytics? = { null },
     /** The app's `backendSwitchPositionToleranceMs`, read at every restore. */
     private val positionToleranceMs: () -> Long = { DEFAULT_BACKEND_SWITCH_POSITION_TOLERANCE_MS },
+    /** Gives up the loads that make no progress ([superviseLoads]); null: none (tests). */
+    private val loadWatch: StandardLoadWatch? = null,
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -173,7 +176,7 @@ internal class KotlinAudioPlaybackBackend(
         get() = player.playbackError?.let { error ->
             AndroidPlaybackErrorSnapshot(
                 message = error.message,
-                code = error.code?.let { "android-$it" }
+                code = standardPlaybackErrorCode(error)
             )
         }
     override val playWhenReady: Boolean
@@ -357,7 +360,52 @@ internal class KotlinAudioPlaybackBackend(
         seekGate.cancel("pause")
         player.pause()
     }
-    override suspend fun seekTo(positionMs: Long) = seekGate.seek(seekPlayer, positionMs)
+    override suspend fun seekTo(positionMs: Long) {
+        try {
+            seekGate.seek(seekPlayer, positionMs)
+        } catch (error: RejectionException) {
+            // As a crossfade seek that gives up: the player stops loading and is in error (the
+            // rejection is the report: no playback error on top of it).
+            if (error.code == STANDARD_SEEK_TIMEOUT_CODE) {
+                androidXfadeLog("standard load abandoned (seek ${error.message}) positionMs=${player.position}")
+                player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)
+            }
+            throw error
+        }
+    }
+
+    /**
+     * Runs the stall rule on this player's loads while it lives (the caller's scope, main thread):
+     * only while it is the authoritative backend (a candidate's readiness is
+     * [StandardPlaybackReadinessGate]'s) and no seek waits (the seek owns its loading, and gives up
+     * by its own limits). A load that gives up stops the player, which goes to the error state and
+     * reports the error, as a crossfade advance that fails.
+     */
+    suspend fun superviseLoads() {
+        val watch = loadWatch ?: return
+        watch.supervise(
+            observe = {
+                val exo = analytics()?.player
+                if (!isAuthoritative || disposed || playerReleased || seekGate.isWaiting) {
+                    standardLoadObservation(exo, null, null)
+                } else {
+                    standardLoadObservation(exo, player.currentItem, analytics()?.loadedBytes)
+                }
+            },
+            giveUp = { verdict -> giveUpLoad(verdict) }
+        )
+    }
+
+    private fun giveUpLoad(verdict: StallVerdict) {
+        val stallMs = loadWatch?.lastStallTimeoutMs ?: 0L
+        val totalMs = loadWatch?.lastTotalTimeoutMs ?: 0L
+        val reason = if (verdict == StallVerdict.STALLED) "no progress for ${stallMs}ms" else "over the ${totalMs}ms limit"
+        androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")
+        player.failLoad(
+            PlaybackError(PREPARE_TIMEOUT_CODE, standardLoadGiveUpMessage(verdict, stallMs, totalMs), fromHost = true),
+            report = true
+        )
+    }
 
     /** ExoPlayer's own state (masked at once by seekTo), not KotlinAudio's (a message later). */
     private val seekPlayer = object : StandardSeekPlayer {
@@ -532,3 +580,10 @@ internal class KotlinAudioPlaybackBackend(
 internal fun sameAudioItems(lhs: List<TrackAudioItem>, rhs: List<TrackAudioItem>): Boolean {
     return lhs.size == rhs.size && lhs.indices.all { lhs[it] === rhs[it] }
 }
+
+/**
+ * The code an app sees for the standard player's error: the host's own code as is (a give-up,
+ * [com.doublesymmetry.kotlinaudio.models.PlaybackError.fromHost]), ExoPlayer's prefixed `android-`.
+ */
+internal fun standardPlaybackErrorCode(error: com.doublesymmetry.kotlinaudio.models.PlaybackError): String? =
+    if (error.fromHost) error.code else error.code?.let { "android-$it" }

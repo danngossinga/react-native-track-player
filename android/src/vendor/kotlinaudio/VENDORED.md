@@ -43,5 +43,12 @@ section 4(b)); line numbers below include that notice.
     `configureHttp` block, given to `hooks.httpDataSourceFactory` when set (the host's factory
     builds each request with the current `stallTimeoutMs` as its connect and read timeouts), else
     applied to a plain `DefaultHttpDataSource.Factory` as upstream.
+  - `:422-434` `failLoad(error, report)` (new): the host's load watch (`StandardLoadWatch`) and
+    seek wait give up on a load or seek with no progress for `stallTimeoutMs`, as the crossfade
+    path does: the player stops loading at once and goes to the error state with the host's error
+    (reported as a playback error for a load no command waits for).
+- `models/PlaybackError.kt`: `:1-4` the notice; `:10-11` `fromHost` (new, default false): the
+  error's code is the host's own (`crossfade_prepare_timeout`, `standard_seek_timeout`), emitted
+  without the `android-` prefix of ExoPlayer's codes.
 - `players/QueuedAudioPlayer.kt`: `:1-4` the notice; `:21-23` constructor parameter `hooks`,
   passed to `BaseAudioPlayer`.
