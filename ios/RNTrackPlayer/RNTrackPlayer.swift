@@ -533,8 +533,8 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 stallTimeoutMs: { [weak self] in self?.stallTimeout.milliseconds ?? stallTimeoutDefaultMs },
                 // The stall rule on its loads, with the load limit (prepareTimeoutMs).
                 prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },
-                onLoadGaveUp: { [weak self] source, failure, report in
-                    self?.handleStandardLoadGaveUp(source: source, failure: failure, report: report)
+                onLoadGaveUp: { [weak self] source, report in
+                    self?.handleStandardLoadGaveUp(source: source, report: report)
                 },
                 onActiveTrackChanged: { [weak self] source, index, lastTrack, lastIndex, lastPosition in
                     self?.handleStandardActiveTrackChanged(source: source, index: index, lastTrack: lastTrack, lastIndex: lastIndex, lastPosition: lastPosition)
@@ -1982,13 +1982,14 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     }
 
     /// A standard load or seek given up (no progress for stallTimeoutMs, or over its limit): the
-    /// error state with the error, and for a load (no command waits for it) a playback error with
-    /// the code and message a crossfade advance sends. Same events as Android's standard player.
-    func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {
+    /// events StandardGiveUpReport lists (the error state with the error, and for a load no command
+    /// waits for a playback error with the code and message a crossfade advance sends). Same
+    /// events as Android's standard player.
+    func handleStandardLoadGaveUp(source: QueuedAudioPlayer, report: StandardGiveUpReport) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
-        emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: State.error, error: failure))
-        if report {
-            emit(event: EventType.PlaybackError, body: failure.dictionary)
+        for event in report.events {
+            guard let type = EventType(rawValue: event.name) else { continue }
+            emit(event: type, body: event.body)
         }
     }
 

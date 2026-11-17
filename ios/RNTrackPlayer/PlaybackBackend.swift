@@ -1585,7 +1585,7 @@ struct StandardLoadObservation {
     /// candidate backend).
     let item: ObjectIdentifier?
     let phase: StandardLoadPhase
-    /// Its progress: the buffered position (the only one SwiftAudioEx exposes).
+    /// Its progress: the load's bytes (`StandardLoadBytes`) and the buffered position.
     let readings: [Double]
     /// Another wait owns the player's loading now (a seek): not watched, but whether the item was
     /// ready is kept, so buffering once that wait ended is a rebuffer, not a load.
@@ -1619,6 +1619,15 @@ final class StandardLoadWatch {
     }
 
     var isWatching: Bool { return watch != nil }
+
+    /// Whether `check` would start watching a new load with `observed` (its readings aside): an
+    /// item loading, not ready since it was loaded and not the one watched, with no other owner.
+    /// The caller starts that load's progress (`StandardLoadBytes.startLoad`) before reading it,
+    /// as Android's `onLoadStart`.
+    func startsLoad(_ observed: StandardLoadObservation) -> Bool {
+        guard let item = observed.item, observed.phase == .loading, !observed.ownedElsewhere else { return false }
+        return readyItem != item && (watch == nil || watchedItem != item)
+    }
 
     /// Takes one observation: the verdict that ends a load the caller must give up, else nil.
     func check(_ observed: StandardLoadObservation) -> StallVerdict? {
@@ -2006,4 +2015,223 @@ final class StandardCommandLoad {
 /// Android: the same rule (`standardCommandLoadMustStart`).
 func standardCommandLoadMustStart(targetLoaded: Bool, stateRawValue: String) -> Bool {
     return !targetLoaded && ["idle", "stopped", "failed"].contains(stateRawValue)
+}
+
+/// A playback error as the app receives it: its message and code.
+struct IOSPlaybackErrorSnapshot: Equatable {
+    let message: String?
+    let code: String?
+
+    var dictionary: Dictionary<String, Any> {
+        var body: Dictionary<String, Any> = [:]
+        if let message = message {
+            body["message"] = message
+        }
+        if let code = code {
+            body["code"] = code
+        }
+        return body
+    }
+}
+
+/// What the app receives for a standard load or seek given up, the same events as Android's
+/// standard player: the error state with the failure, then a playback error with its code and
+/// message when no command reports it (a load no command waits for: a natural advance, a play).
+struct StandardGiveUpReport {
+    let failure: IOSPlaybackErrorSnapshot
+    let reportsPlaybackError: Bool
+
+    /// The events in order, by name (`EventType`'s raw value) with their body.
+    var events: [(name: String, body: [String: Any])] {
+        var events: [(name: String, body: [String: Any])] = [
+            (name: "playback-state", body: ["state": "error", "error": failure.dictionary])
+        ]
+        if reportsPlaybackError {
+            events.append((name: "playback-error", body: failure.dictionary))
+        }
+        return events
+    }
+}
+
+/// The standard player's give-ups, a load or a seek with no progress for `stallTimeoutMs` or over
+/// its limit, as the crossfade path and Android's standard player: the player stops loading (the
+/// caller's `stop`, given the report to emit) and is in error with the failure until the next
+/// command (`clear`); a failed seek keeps its target as the position. A load a command waits for
+/// (skip, next, previous, load) is reported by that command's rejection with the same code and
+/// message, not also as a playback error. Main.
+final class StandardGiveUps {
+    private var state: StandardGiveUp<IOSPlaybackErrorSnapshot>?
+
+    /// The failure the player is in (nil: none).
+    var failure: IOSPlaybackErrorSnapshot? { return state?.failure }
+
+    /// The position to report: a failed seek's target, else the player's own.
+    func position(live: Double) -> Double {
+        return state?.position(live: live) ?? live
+    }
+
+    /// The load of `item` gave up with `verdict`: `stop` ends it (and emits the report), then a
+    /// command waiting for it ends rejected with `crossfade_prepare_timeout`.
+    func loadGaveUp(
+        _ verdict: StallVerdict,
+        stallTimeoutMs: Int,
+        totalTimeoutMs: Int,
+        item: ObjectIdentifier?,
+        commandLoads: StandardCommandLoad,
+        stop: (StandardGiveUpReport) -> Void
+    ) {
+        let message = standardLoadGiveUpMessage(verdict, stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: totalTimeoutMs)
+        let failure = IOSPlaybackErrorSnapshot(message: message, code: standardPrepareTimeoutCode)
+        state = StandardGiveUp(failure: failure, keptPosition: nil)
+        stop(StandardGiveUpReport(failure: failure, reportsPlaybackError: !commandLoads.waits(for: item)))
+        commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)
+    }
+
+    /// A seek to `keptPosition` gave up with `failure`: its rejection is the report (no playback
+    /// error); its target stays the position.
+    func seekGaveUp(_ failure: IOSPlaybackErrorSnapshot, keptPosition: Double, stop: (StandardGiveUpReport) -> Void) {
+        state = StandardGiveUp(failure: failure, keptPosition: keptPosition)
+        stop(StandardGiveUpReport(failure: failure, reportsPlaybackError: false))
+    }
+
+    /// A command: the player is no longer in that error. Returns the position a failed seek kept,
+    /// for a play or retry to load the track there.
+    @discardableResult
+    func clear() -> Double? {
+        let kept = state?.keptPosition
+        state = nil
+        return kept
+    }
+
+    /// Out of the error state, a failed seek's target stays the position until the track loads.
+    func keep(_ kept: Double?) {
+        state = kept.map { StandardGiveUp(failure: nil, keptPosition: $0) }
+    }
+}
+
+/// Where SwiftAudioEx's AVPlayer item is: `.unavailable` when the player does not have the
+/// expected layout, else its current item (nil: none).
+enum StandardPlayerItemLookup {
+    case unavailable
+    case item(AVPlayerItem?)
+}
+
+/// The AVPlayerItem a SwiftAudioEx player plays. SwiftAudioEx 1.1.0 keeps it private
+/// (`AudioPlayer.wrapper` → `AVPlayerWrapper.avPlayer`), so it is read by reflection: the exact
+/// item from its creation, which AVFoundation fills the access log of before its first
+/// `AVPlayerItemNewAccessLogEntry` notification. `.unavailable` with another layout (a SwiftAudioEx
+/// update): the load then binds its item from that notification (`StandardLoadBytes.loggedItem`).
+func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {
+    var mirror: Mirror? = Mirror(reflecting: player)
+    while let current = mirror {
+        if let wrapper = current.children.first(where: { $0.label == "wrapper" })?.value {
+            guard let avPlayer = Mirror(reflecting: wrapper).children.first(where: { $0.label == "avPlayer" })?.value as? AVPlayer else {
+                return .unavailable
+            }
+            return .item(avPlayer.currentItem)
+        }
+        mirror = current.superclassMirror
+    }
+    return .unavailable
+}
+
+/// The URL SwiftAudioEx gives a track's asset (its `load(from:type:)`): a file path for a file
+/// track, else the URL string.
+func standardAssetURL(source: String, isFile: Bool) -> URL? {
+    return isFile ? URL(fileURLWithPath: source) : URL(string: source)
+}
+
+/// The bytes each access-log entry of `item` (an AVPlayerItem) reports transferred.
+func standardAccessLogBytes(_ item: AnyObject) -> [Int64] {
+    return (item as? AVPlayerItem)?.accessLog()?.events.map { $0.numberOfBytesTransferred } ?? []
+}
+
+/// The standard player's load progress from AVFoundation's access log, the closest to Android's
+/// `LoadedBytes` that AVFoundation shows (measured on the iOS 26 simulator with SwiftAudioEx 1.1.0
+/// and a local server sending slowly):
+/// - Nothing is observable before SwiftAudioEx creates the AVPlayerItem, once the asset's
+///   `playable` key loaded (a progressive file's first range requests; an HLS master and media
+///   playlist): no item, no access log, no loaded range.
+/// - The access log counts media only: an HLS entry appears once the first segment has
+///   completely arrived, with that segment's bytes (playlist bytes are not counted), and grows
+///   per completed segment; a progressive file's entry exists from the item's creation (with the
+///   asset's first requests, `numberOfMediaRequests` > 0 from the start) and grows with every
+///   chunk. `AVPlayerItemNewAccessLogEntry` comes only at playback start or a completed
+///   segment, and the log grows without it: the load is read at each check.
+/// So a load's progress is: one when its item appears (the asset's playable stage done; for HLS,
+/// its playlists arrived, the progress Android counts in playlist bytes before the first segment
+/// request), then every byte of its item's access log (media, which Android counts always).
+///
+/// Progress belongs to one load (Android: `startLoad`): its item is the player's own current item
+/// first seen after the load started (`playerItem`) or, when the player's item cannot be read, the
+/// first item of the load's URL that posts an access-log entry (`loggedItem`); never an item an
+/// earlier load had, so a previous item's late entries do not count. Main.
+final class StandardLoadBytes {
+    private final class Earlier {
+        weak var item: AnyObject?
+        init(_ item: AnyObject) { self.item = item }
+    }
+
+    private var url: URL?
+    private weak var item: AnyObject?
+    private var itemBytes: Int64 = 0
+    private var earlier: [Earlier] = []
+    /// The progress of the loads so far: grows with each load's item and bytes.
+    private(set) var progress: Double = 0
+
+    /// A new load of the track whose asset is at `url`.
+    func startLoad(url: URL?) {
+        if let item = item { earlier.append(Earlier(item)) }
+        earlier.removeAll { $0.item == nil }
+        item = nil
+        itemBytes = 0
+        self.url = url
+    }
+
+    /// The player's own current item (`standardPlayerItem`): the load's item when no earlier load
+    /// had it (a reload within the load replaces it).
+    func playerItem(_ candidate: AnyObject?) {
+        guard let candidate = candidate, candidate !== item, !hadEarlier(candidate) else { return }
+        bind(candidate)
+    }
+
+    /// An item posted an access-log entry for `url`: the load's item when the load has none yet,
+    /// it is for the load's URL and no earlier load had it. Returns whether it is the load's item.
+    @discardableResult
+    func loggedItem(_ candidate: AnyObject, url: URL?) -> Bool {
+        if candidate === item { return true }
+        guard item == nil, let url = url, url == self.url, !hadEarlier(candidate) else { return false }
+        bind(candidate)
+        return true
+    }
+
+    /// Whether an event of `candidate` (an access-log or error entry, a failure) is this load's,
+    /// to check the load at once: the player's own item when it can be read, else the load's.
+    func isLoadEvent(_ candidate: AnyObject, url: URL?, player: StandardPlayerItemLookup) -> Bool {
+        if case let .item(current) = player { return current != nil && current === candidate }
+        return loggedItem(candidate, url: url)
+    }
+
+    /// The progress after reading the load's item's access log (`entries`: bytes per entry,
+    /// negative when unknown).
+    func read(_ entries: (AnyObject) -> [Int64]) -> Double {
+        guard let item = item else { return progress }
+        let total = entries(item).reduce(Int64(0)) { $0 + max(0, $1) }
+        if total > itemBytes {
+            progress += Double(total - itemBytes)
+            itemBytes = total
+        }
+        return progress
+    }
+
+    private func hadEarlier(_ candidate: AnyObject) -> Bool {
+        return earlier.contains { $0.item === candidate }
+    }
+
+    private func bind(_ candidate: AnyObject) {
+        if let item = item { earlier.append(Earlier(item)) }
+        item = candidate
+        itemBytes = 0
+        progress += 1
+    }
 }

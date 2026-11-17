@@ -367,6 +367,174 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(h.observe(h.a, .loading), .stalled)
     }
 
+    // A standard load's progress from its item's access log (StandardLoadBytes), as Android's
+    // LoadedBytes counts a load's bytes: read as the backend's observeLoad reads it.
+
+    private final class LoadBytesHarness {
+        let watch = LoadWatchHarness()
+        let bytes = StandardLoadBytes()
+        let url = URL(string: "https://media.example/a.m3u8")
+        /// The player's current AVPlayerItem (nil: none yet).
+        var playerItem: NSObject?
+        /// The bytes per access-log entry of each item.
+        var logs: [ObjectIdentifier: [Int64]] = [:]
+        var buffered = 0.0
+
+        func observe(_ phase: StandardLoadPhase = .loading) -> StallVerdict? {
+            let item = ObjectIdentifier(watch.a)
+            if watch.watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [])) {
+                bytes.startLoad(url: url)
+            }
+            bytes.playerItem(playerItem)
+            let progress = bytes.read { [unowned self] in self.logs[ObjectIdentifier($0)] ?? [] }
+            return watch.watch.check(StandardLoadObservation(item: item, phase: phase, readings: [progress, buffered]))
+        }
+    }
+
+    func testStandardLoadBytesArrivingKeepALoadGoingWhileItsBufferedPositionStandsStill() {
+        // A progressive file arriving slowly: its access log grows with every chunk while the
+        // buffered position stays put (measured on the simulator); Android counts those bytes too.
+        let h = LoadBytesHarness()
+        let item = NSObject()
+        h.playerItem = item
+        XCTAssertNil(h.observe())
+        var sent: Int64 = 0
+        while h.watch.now < 55 {
+            h.watch.now += 5
+            sent += 100
+            h.logs[ObjectIdentifier(item)] = [sent]
+            XCTAssertNil(h.observe(), "bytes arrived at \(h.watch.now) s")
+        }
+        h.watch.now += 4
+        XCTAssertNil(h.observe())
+        h.watch.now = 60
+        XCTAssertEqual(h.observe(), .capExceeded, "the total limit still applies")
+        // The bytes stop: the next load stalls at the stall timeout.
+        let next = LoadBytesHarness()
+        next.playerItem = item
+        next.logs[ObjectIdentifier(item)] = [sent]
+        XCTAssertNil(next.observe())
+        next.watch.now = 10
+        XCTAssertEqual(next.observe(), .stalled)
+    }
+
+    func testStandardLoadBytesTheItemAppearingIsProgressAndUnknownBytesCountAsNothing() {
+        // SwiftAudioEx creates the item once the asset's playable stage is done (an HLS stream's
+        // playlists arrived): its appearance is progress, as Android counts playlist bytes.
+        let h = LoadBytesHarness()
+        XCTAssertNil(h.observe())
+        h.watch.now = 9
+        let item = NSObject()
+        h.playerItem = item
+        XCTAssertNil(h.observe())
+        h.watch.now = 18
+        XCTAssertNil(h.observe(), "the item appeared at 9 s")
+        h.watch.now = 19
+        XCTAssertEqual(h.observe(), .stalled)
+        // A negative count is unknown: nothing, and not a loss of the other entries' bytes.
+        let bytes = StandardLoadBytes()
+        bytes.startLoad(url: nil)
+        bytes.playerItem(item)
+        XCTAssertEqual(bytes.read { _ in [50] }, 51)
+        XCTAssertEqual(bytes.read { _ in [-1, 60] }, 61)
+        XCTAssertEqual(bytes.read { _ in [-1] }, 61, "a log that reads lower is no progress")
+    }
+
+    func testStandardLoadBytesALoadCountsOnlyItsOwnItem() {
+        // Progress belongs to one load (Android: LoadedBytes.startLoad): a retry of the same track
+        // (same URL, a new item) never counts the previous item's late entries.
+        let bytes = StandardLoadBytes()
+        let url = URL(string: "https://media.example/a.mp3")
+        let old = NSObject()
+        let new = NSObject()
+        var logs: [ObjectIdentifier: [Int64]] = [ObjectIdentifier(old): [100]]
+        let entries: (AnyObject) -> [Int64] = { logs[ObjectIdentifier($0)] ?? [] }
+        bytes.startLoad(url: url)
+        bytes.playerItem(old)
+        XCTAssertEqual(bytes.read(entries), 101)
+        bytes.startLoad(url: url)
+        // The previous item, still the player's or posting a late entry: not this load's.
+        bytes.playerItem(old)
+        XCTAssertFalse(bytes.loggedItem(old, url: url))
+        XCTAssertFalse(bytes.isLoadEvent(old, url: url, player: .unavailable))
+        logs[ObjectIdentifier(old)] = [500]
+        XCTAssertEqual(bytes.read(entries), 101)
+        // The load's own item: one for its appearance, then its bytes.
+        bytes.playerItem(new)
+        logs[ObjectIdentifier(new)] = [40]
+        XCTAssertEqual(bytes.read(entries), 142)
+        // SwiftAudioEx reloading within the load (a new item): that one counts from its start.
+        let reloaded = NSObject()
+        bytes.playerItem(reloaded)
+        logs[ObjectIdentifier(reloaded)] = [10]
+        logs[ObjectIdentifier(new)] = [400]
+        XCTAssertEqual(bytes.read(entries), 153)
+    }
+
+    func testStandardLoadBytesWithoutThePlayersItemTheLoadTakesTheFirstLoggedItemOfItsURL() {
+        // When SwiftAudioEx's AVPlayer cannot be read, an access-log entry's item is the load's when
+        // it is for the load's URL (built as SwiftAudioEx builds it); other players' items (a
+        // crossfade engine's) and other tracks' are not.
+        let url = standardAssetURL(source: "https://media.example/a.m3u8", isFile: false)
+        XCTAssertEqual(url, URL(string: "https://media.example/a.m3u8"))
+        XCTAssertEqual(standardAssetURL(source: "/var/a.mp3", isFile: true), URL(fileURLWithPath: "/var/a.mp3"))
+        let bytes = StandardLoadBytes()
+        bytes.startLoad(url: url)
+        let other = NSObject()
+        let mine = NSObject()
+        let late = NSObject()
+        XCTAssertFalse(bytes.loggedItem(other, url: URL(string: "https://media.example/b.m3u8")))
+        XCTAssertFalse(bytes.loggedItem(other, url: nil))
+        XCTAssertTrue(bytes.loggedItem(mine, url: url))
+        XCTAssertFalse(bytes.loggedItem(late, url: url), "the load has its item")
+        XCTAssertTrue(bytes.isLoadEvent(mine, url: url, player: .unavailable))
+        XCTAssertFalse(bytes.isLoadEvent(late, url: url, player: .unavailable))
+        XCTAssertEqual(bytes.read { _ in [7] }, 8)
+        // With the player's item read, only its events check the load.
+        let current = AVPlayerItem(url: URL(string: "https://media.example/a.m3u8")!)
+        XCTAssertTrue(bytes.isLoadEvent(current, url: url, player: .item(current)))
+        XCTAssertFalse(bytes.isLoadEvent(mine, url: url, player: .item(current)))
+        XCTAssertFalse(bytes.isLoadEvent(mine, url: url, player: .item(nil)))
+        XCTAssertEqual(standardAccessLogBytes(current), [], "no access log before it loads")
+    }
+
+    func testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper() {
+        // SwiftAudioEx 1.1.0's layout: QueuedAudioPlayer ← AudioPlayer.wrapper (an
+        // AVPlayerWrapperProtocol) → AVPlayerWrapper.avPlayer. Checked on the real SwiftAudioEx
+        // 1.1.0 in the simulator as well (the item from its creation, before any notification).
+        let player = FakeQueuedAudioPlayer()
+        guard case .item(nil) = standardPlayerItem(of: player) else {
+            return XCTFail("no item yet")
+        }
+        let item = AVPlayerItem(url: URL(string: "https://media.example/a.mp3")!)
+        player.avPlayer.replaceCurrentItem(with: item)
+        guard case let .item(read) = standardPlayerItem(of: player) else {
+            return XCTFail("the wrapper's player is read")
+        }
+        XCTAssertTrue(read === item)
+        guard case .unavailable = standardPlayerItem(of: NSObject()) else {
+            return XCTFail("another layout: unavailable")
+        }
+    }
+
+    func testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching() {
+        let h = LoadWatchHarness()
+        func observed(_ item: NSObject?, _ phase: StandardLoadPhase, owned: Bool = false) -> StandardLoadObservation {
+            return StandardLoadObservation(item: item.map(ObjectIdentifier.init), phase: phase, readings: [0], ownedElsewhere: owned)
+        }
+        XCTAssertTrue(h.watch.startsLoad(observed(h.a, .loading)))
+        _ = h.watch.check(observed(h.a, .loading))
+        XCTAssertFalse(h.watch.startsLoad(observed(h.a, .loading)), "watched already")
+        XCTAssertTrue(h.watch.startsLoad(observed(h.b, .loading)), "another item")
+        XCTAssertFalse(h.watch.startsLoad(observed(h.b, .loading, owned: true)), "a seek owns it")
+        XCTAssertFalse(h.watch.startsLoad(observed(nil, .loading)))
+        XCTAssertFalse(h.watch.startsLoad(observed(h.b, .ready)))
+        _ = h.watch.check(observed(h.a, .ready))
+        XCTAssertFalse(h.watch.startsLoad(observed(h.a, .loading)), "a rebuffer after ready is not a load")
+        _ = h.watch.check(observed(h.a, .idle))
+        XCTAssertTrue(h.watch.startsLoad(observed(h.a, .loading)), "a retry after a stop")
+    }
+
     // A standard command's wait for its track's load (the crossfade rule), with FailedLoadRule as
     // StandardPlaybackBackend feeds them; the same cases as Android's StandardCommandLoadTest.
 
@@ -486,6 +654,82 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     func testStandardCommandLoadCodesAreTheCrossfadePaths() {
         XCTAssertEqual(standardPrepareTimeoutCode, "crossfade_prepare_timeout")
         XCTAssertEqual(standardLoadErrorCode, "crossfade_engine_error")
+    }
+
+    // A standard give-up as StandardPlaybackBackend applies it and RNTrackPlayer emits it
+    // (StandardGiveUps, StandardGiveUpReport.events): the same events as Android.
+
+    func testStandardGiveUpOfALoadNoCommandWaitsForIsAnErrorStateAndAPlaybackError() {
+        let giveUps = StandardGiveUps()
+        let loads = StandardCommandLoad()
+        let track = NSObject()
+        var reports: [StandardGiveUpReport] = []
+        giveUps.loadGaveUp(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000, item: ObjectIdentifier(track), commandLoads: loads) {
+            reports.append($0)
+        }
+        let failure: [String: Any] = ["code": "crossfade_prepare_timeout", "message": "The track did not become ready (no progress for 10000 ms)."]
+        XCTAssertEqual(reports.count, 1, "stopped once")
+        let events = reports.first?.events ?? []
+        XCTAssertEqual(events.map { $0.name }, ["playback-state", "playback-error"])
+        XCTAssertEqual(events.first.map { $0.body as NSDictionary }, ["state": "error", "error": failure] as NSDictionary)
+        XCTAssertEqual(events.last.map { $0.body as NSDictionary }, failure as NSDictionary)
+        XCTAssertEqual(giveUps.failure, IOSPlaybackErrorSnapshot(message: "The track did not become ready (no progress for 10000 ms).", code: "crossfade_prepare_timeout"))
+        XCTAssertEqual(giveUps.position(live: 4), 4)
+    }
+
+    func testStandardGiveUpOfALoadACommandWaitsForRejectsItAndIsNoPlaybackError() {
+        let giveUps = StandardGiveUps()
+        let loads = StandardCommandLoad()
+        let track = NSObject()
+        var order: [String] = []
+        var outcomes: [StandardCommandLoadOutcome] = []
+        var reports: [StandardGiveUpReport] = []
+        loads.begin(target: ObjectIdentifier(track), active: nil, reported: nil) {
+            outcomes.append($0)
+            order.append("command")
+        }
+        giveUps.loadGaveUp(.capExceeded, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000, item: ObjectIdentifier(track), commandLoads: loads) {
+            reports.append($0)
+            order.append("stop")
+        }
+        XCTAssertEqual(reports.first?.events.map { $0.name }, ["playback-state"], "the rejection is the report")
+        XCTAssertEqual(outcomes, [.failed(code: "crossfade_prepare_timeout", message: "The track did not become ready (over the 60000 ms limit).")])
+        XCTAssertEqual(order, ["stop", "command"], "the player stops before the command ends")
+        XCTAssertNotNil(giveUps.failure, "in error until the next command")
+        XCTAssertFalse(loads.reportsFailure(of: ObjectIdentifier(track)), "a later failure of it is reported again")
+    }
+
+    func testStandardGiveUpOfASeekKeepsItsTargetAndIsNoPlaybackError() {
+        let giveUps = StandardGiveUps()
+        var reports: [StandardGiveUpReport] = []
+        let failure = IOSPlaybackErrorSnapshot(message: "The native seek made no progress for 10000 ms.", code: "standard_seek_timeout")
+        giveUps.seekGaveUp(failure, keptPosition: 42) { reports.append($0) }
+        XCTAssertEqual(reports.count, 1)
+        let events = reports.first?.events ?? []
+        XCTAssertEqual(events.map { $0.name }, ["playback-state"])
+        XCTAssertEqual(events.first.map { $0.body as NSDictionary }, ["state": "error", "error": failure.dictionary] as NSDictionary)
+        XCTAssertEqual(giveUps.failure, failure)
+        XCTAssertEqual(giveUps.position(live: 0), 42, "SwiftAudioEx's stop reset its own position")
+    }
+
+    func testStandardGiveUpTheNextCommandClearsTheError() {
+        let giveUps = StandardGiveUps()
+        let loads = StandardCommandLoad()
+        let track = NSObject()
+        giveUps.loadGaveUp(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000, item: ObjectIdentifier(track), commandLoads: loads) { _ in }
+        XCTAssertNil(giveUps.clear(), "a load keeps no position")
+        XCTAssertNil(giveUps.failure)
+        XCTAssertEqual(giveUps.position(live: 3), 3)
+        // A play or retry after a failed seek reloads at its target, then the live position.
+        giveUps.seekGaveUp(IOSPlaybackErrorSnapshot(message: "m", code: "standard_seek_timeout"), keptPosition: 42) { _ in }
+        XCTAssertEqual(giveUps.clear(), 42)
+        XCTAssertNil(giveUps.failure)
+        XCTAssertEqual(giveUps.position(live: 0), 0)
+        // A stop or pause: out of the error, the target stays the position until the track loads.
+        giveUps.seekGaveUp(IOSPlaybackErrorSnapshot(message: "m", code: "standard_seek_timeout"), keptPosition: 42) { _ in }
+        giveUps.keep(giveUps.clear())
+        XCTAssertNil(giveUps.failure)
+        XCTAssertEqual(giveUps.position(live: 0), 42)
     }
 
     func testStandardLoadWithNoItemOrAnotherOwnerNothingIsWatched() {
@@ -2705,4 +2949,20 @@ private final class TransactionBarrier {
         inFlight -= 1
         lock.unlock()
     }
+}
+
+/// SwiftAudioEx 1.1.0's layout around its AVPlayer (AudioPlayer.wrapper → AVPlayerWrapper.avPlayer).
+private protocol FakeAVPlayerWrapperProtocol: AnyObject {}
+
+private final class FakeAVPlayerWrapper: FakeAVPlayerWrapperProtocol {
+    var avPlayer = AVPlayer()
+}
+
+private class FakeAudioPlayer {
+    let wrapper: FakeAVPlayerWrapperProtocol = FakeAVPlayerWrapper()
+    var avPlayer: AVPlayer { return (wrapper as! FakeAVPlayerWrapper).avPlayer }
+}
+
+private final class FakeQueuedAudioPlayer: FakeAudioPlayer {
+    var items: [String] = []
 }

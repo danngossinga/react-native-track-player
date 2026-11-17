@@ -226,7 +226,7 @@ assert(
 );
 assert(
   standardBackend.includes('var publicPlaybackError: IOSPlaybackErrorSnapshot? { get }') &&
-    standardBackend.includes('struct IOSPlaybackErrorSnapshot: Equatable') &&
+    facade.includes('struct IOSPlaybackErrorSnapshot: Equatable') &&
     standardBackend.includes('func iosPlaybackErrorSnapshot(') &&
     pingPongBackend.includes('var publicPlaybackError: IOSPlaybackErrorSnapshot? { return nil }') &&
     player.includes('error: $0.publicPlaybackError') &&
@@ -666,7 +666,8 @@ assert(
 );
 
 // The standard player's loads follow the stall rule, as the crossfade path and Android's standard
-// player: a load with no progress for stallTimeoutMs (buffered media) or over prepareTimeoutMs
+// player: a load with no progress for stallTimeoutMs (its item's access-log bytes, its item
+// appearing, buffered media) or over prepareTimeoutMs
 // stops loading (SwiftAudioEx stop: the item leaves the AVPlayer), is in error and reports
 // crossfade_prepare_timeout as a PlaybackError (a skip or load waiting for it rejects with it
 // instead); a stalled seek stops loading and
@@ -674,38 +675,67 @@ assert(
 {
   const backendSource = read('ios/RNTrackPlayer/StandardPlaybackBackend.swift');
   const poll = section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func followLoad(');
-  const giveUp = section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, failsLoad: Bool, keptPosition: Double? = nil) {', '\n    }\n');
+  const giveUp = section(backendSource, 'private func stopAfterGiveUp(log: String, report: StandardGiveUpReport, failsLoad: Bool) {', '\n    }\n');
+  const giveUpLoad = section(backendSource, 'private func giveUpLoad(', '\n    }\n');
   const driver = section(facade, 'final class StandardLoadDriver {', '\n}\n');
-  const gaveUp = section(player, 'func handleStandardLoadGaveUp(source: QueuedAudioPlayer, failure: IOSPlaybackErrorSnapshot, report: Bool) {', '\n    }\n');
+  const gaveUp = section(player, 'func handleStandardLoadGaveUp(source: QueuedAudioPlayer, report: StandardGiveUpReport) {', '\n    }\n');
+  const eventTypes = read('ios/RNTrackPlayer/Utils/EventType.swift');
   const tests = read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift');
   assert(
-    poll.includes('guard isAuthoritative, !disposed, hostFailure == nil, !idleWithoutActiveTrack else {') &&
-      poll.includes('phase: standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition),') &&
-      poll.includes('ownedElsewhere: issuedSeek != nil || !pendingSeeks.isEmpty') &&
-      section(backendSource, 'private func giveUpLoad(', '\n    }\n').includes('code: standardPrepareTimeoutCode') &&
+    poll.includes('guard isAuthoritative, !disposed, hostFailure == nil, !idleWithoutActiveTrack, let watch = loadWatch else {') &&
+      poll.includes('let phase = standardLoadPhase(stateRawValue: player.playerState.rawValue, bufferedPosition: player.bufferedPosition)') &&
+      poll.includes('let ownedElsewhere = issuedSeek != nil || !pendingSeeks.isEmpty') &&
+      // A load's progress (StandardLoadBytes, tested): started per load before its first reading,
+      // its item read from SwiftAudioEx's AVPlayer, its access-log bytes with the buffered position.
+      poll.includes('if watch.startsLoad(StandardLoadObservation(item: item, phase: phase, readings: [], ownedElsewhere: ownedElsewhere)) {\n            loadBytes.startLoad(url: currentAssetURL())') &&
+      poll.includes('if case let .item(current) = standardPlayerItem(of: player) {\n            loadBytes.playerItem(current)') &&
+      poll.includes('readings: [loadBytes.read(standardAccessLogBytes), player.bufferedPosition],') &&
+      section(backendSource, 'private func currentAssetURL() -> URL? {', '\n    }\n').includes('return standardAssetURL(source: track.getSourceUrl(), isFile: track.getSourceType() == .file)') &&
+      // AVFoundation's item events check the load at once when they are its item's.
+      backendSource.includes('itemObservers = [.AVPlayerItemNewAccessLogEntry, .AVPlayerItemNewErrorLogEntry, .AVPlayerItemFailedToPlayToEndTime].map { name in') &&
+      backendSource.includes('DispatchQueue.main.async { self?.itemEvent(item) }') &&
+      section(backendSource, 'private func itemEvent(_ item: AVPlayerItem) {', '\n    }\n').includes('if loadBytes.isLoadEvent(item, url: url, player: standardPlayerItem(of: player)) {\n            loadDriver?.poke()') &&
+      backendSource.includes('itemObservers.forEach { NotificationCenter.default.removeObserver($0) }') &&
+      // The give-up's decisions are StandardGiveUps' (tested): the backend only stops and emits.
+      giveUpLoad.includes('giveUps.loadGaveUp(') &&
+      giveUpLoad.includes('commandLoads: commandLoads\n        ) { report in\n            stopAfterGiveUp(log: "load \\(reason)", report: report, failsLoad: true)') &&
       // Event-driven (SwiftAudioEx's state events), one timer only while a load is watched, at an
       // interval from the settings; no fixed poll.
       backendSource.includes('player.event.stateChange.addListener(stateListener) { [weak self] _ in\n                DispatchQueue.main.async { self?.loadDriver?.poke() }') &&
       driver.includes('guard !stopped, let delay = watch.nextCheckInMs() else { return }') &&
       facade.includes('return max(1, stallTimeoutMs / 10)') &&
       !backendSource.includes('stallCheckIntervalMs') &&
-      // A failed seek keeps its target as the position.
-      backendSource.includes('report: false,\n                    failsLoad: false,\n                    keptPosition: request.position') &&
-      // A load a command waits for fails the load (FailedLoadRule) but is reported by the
-      // command's rejection, not a playback error (as the crossfade path and Android).
-      section(backendSource, 'private func giveUpLoad(', '\n    }\n').includes('report: !commandLoads.waits(for: item),\n            failsLoad: true') &&
-      backendSource.includes('return giveUpState?.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)') &&
+      // A failed seek keeps its target as the position, with no playback error.
+      (backendSource.match(/giveUps\.seekGaveUp\(/g) || []).length === 2 &&
+      (backendSource.match(/keptPosition: request\.position\n/g) || []).length === 2 &&
+      (backendSource.match(/report: report, failsLoad: false\)/g) || []).length === 2 &&
+      backendSource.includes('return giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime)') &&
+      backendSource.includes('return giveUps.clear()') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
-      giveUp.includes('player.stop()') &&
+      giveUp.includes('player.stop()\n        onLoadGaveUp(player, report)') &&
       backendSource.includes('if hostFailure != nil { return .error }') &&
       backendSource.includes('return hostFailure ?? iosPlaybackErrorSnapshot(from: player.playbackError)') &&
-      section(backendSource, 'let wait = StallWaitDriver(', 'request.wait = wait').includes('failure: IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),\n                    report: false') &&
-      player.includes('prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },\n                onLoadGaveUp:') &&
-      gaveUp.includes('emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: State.error, error: failure))') &&
-      gaveUp.includes('emit(event: EventType.PlaybackError, body: failure.dictionary)') &&
+      section(backendSource, 'let wait = StallWaitDriver(', 'request.wait = wait').includes('IOSPlaybackErrorSnapshot(message: message, code: "standard_seek_timeout"),') &&
+      player.includes('prepareTimeoutMs: { [weak self] in self?.prepareTimeout.milliseconds ?? prepareTimeoutDefaultMs },\n                onLoadGaveUp: { [weak self] source, report in\n                    self?.handleStandardLoadGaveUp(source: source, report: report)') &&
+      // RNTrackPlayer emits StandardGiveUpReport's events (tested) by EventType's raw values.
+      gaveUp.includes('for event in report.events {\n            guard let type = EventType(rawValue: event.name) else { continue }\n            emit(event: type, body: event.body)') &&
+      eventTypes.includes('case PlaybackError = "playback-error"') &&
+      eventTypes.includes('case PlaybackState = "playback-state"') &&
+      section(facade, 'struct StandardGiveUpReport {', '\n}\n').includes('(name: "playback-state", body: ["state": "error", "error": failure.dictionary])') &&
+      read('ios/RNTrackPlayer/Models/State.swift').includes('case none, ready, playing, paused, stopped, buffering, loading, error, ended') &&
       facade.includes('let standardPrepareTimeoutCode = "crossfade_prepare_timeout"') &&
       ['testStandardLoadAnItemLoadingThatNeverWasReadyGivesUpAtTheStallTimeout', 'testStandardLoadARebufferAfterReadyIsNotALoad',
-        'testStandardLoadARetryAfterAStopOrAFailureIsANewLoad', 'testStandardLoadPhaseCountsAnItemReadyOnlyOnceItPlaysOrHasMedia']
+        'testStandardLoadARetryAfterAStopOrAFailureIsANewLoad', 'testStandardLoadPhaseCountsAnItemReadyOnlyOnceItPlaysOrHasMedia',
+        'testStandardLoadBytesArrivingKeepALoadGoingWhileItsBufferedPositionStandsStill',
+        'testStandardLoadBytesTheItemAppearingIsProgressAndUnknownBytesCountAsNothing',
+        'testStandardLoadBytesALoadCountsOnlyItsOwnItem',
+        'testStandardLoadBytesWithoutThePlayersItemTheLoadTakesTheFirstLoggedItemOfItsURL',
+        'testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper',
+        'testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching',
+        'testStandardGiveUpOfALoadNoCommandWaitsForIsAnErrorStateAndAPlaybackError',
+        'testStandardGiveUpOfALoadACommandWaitsForRejectsItAndIsNoPlaybackError',
+        'testStandardGiveUpOfASeekKeepsItsTargetAndIsNoPlaybackError',
+        'testStandardGiveUpTheNextCommandClearsTheError']
         .every((t) => tests.includes(`func ${t}()`)),
     'The iOS standard player must give up a load with no progress at stallTimeoutMs, as crossfade and Android.'
   );
@@ -718,7 +748,7 @@ assert(
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('appendingPathComponent("scripts/fixtures/failed-load-scenarios.json")') &&
       backendSource.includes('if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {\n            return indexOfItem(failedLoads.reported) ?? -1') &&
       section(backendSource, 'private func observeLoad() -> StandardLoadObservation {', 'private func giveUpLoad(').includes('followLoad(observed)') &&
-      section(backendSource, 'private func giveUp(log: String, failure: IOSPlaybackErrorSnapshot, report: Bool, failsLoad: Bool, keptPosition: Double? = nil) {', '\n    }\n').includes('if failsLoad { failLoadedTrack() }') &&
+      section(backendSource, 'private func stopAfterGiveUp(log: String, report: StandardGiveUpReport, failsLoad: Bool) {', '\n    }\n').includes('if failsLoad { failLoadedTrack() }') &&
       backendSource.includes('loadActiveTrackAfterFailedLoad()\n            reloadAtKeptPosition(kept)\n            requested.request(true)\n            player.play()') &&
       // A track is reported once it loaded (deferred), both events, and the lock screen points
       // back to the active track after a failed load.
@@ -764,7 +794,7 @@ assert(
       section(standardBackend, 'private func waitForCommandLoad(', '\n    }\n').includes('if wait != nil, standardCommandLoadMustStart(targetLoaded: false, stateRawValue: player.playerState.rawValue) {\n            player.reload(startFromCurrentTime: false)') &&
       section(standardBackend, 'func play() throws {', '\n    }\n').includes('commandLoads.failureCleared()') &&
       section(standardBackend, 'func retry() {', '\n    }\n').includes('onMain { commandLoads.failureCleared() }') &&
-      section(standardBackend, 'private func giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)') &&
+      section(facade, 'func loadGaveUp(', '\n    }\n').includes('commandLoads.failed(item, code: standardPrepareTimeoutCode, message: message, reportedByPlayer: false)') &&
       section(standardBackend, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('commandLoads.cancel()') &&
       ['func stop() {', 'func replaceQueue(_ tracks: [Track]) throws {', 'func clearQueue() {', 'func dispose() throws {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('commandLoads.cancel()')) &&
