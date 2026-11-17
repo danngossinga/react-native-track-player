@@ -71,6 +71,17 @@ Added fork surface:
   fixed 8 s (the standard KotlinAudio player keeps 8 s). A new value applies to the next wait at once. Left out, the current
   value is kept. Other options left out of an `updateOptions` call (capabilities,
   progress interval…) are reset, so pass it together with your usual options.
+  Progress on Android is media data; an HLS track's playlists and keys count too
+  until its first segment is asked for (a slow proxy answering the playlists
+  does not fail a healthy track), and not after it (the playlists the player
+  reloads when it falls back to another rendition after a failed segment are
+  not progress). On iOS the stage that loads the playlists (before the asset is
+  playable) has no progress signal, so only `prepareTimeoutMs` ends it; after
+  it, progress is buffered media and the item's transferred bytes, which
+  AVFoundation does not split between playlists and media. Checked on an
+  Android emulator: a crossfade load whose segment never comes gives up at
+  `stallTimeoutMs` (10.0–10.4 s at the default) and stops the player's
+  background retries; a longer wait seen by the app comes from its own calls.
   A crossfade load or seek that gives up stops loading at once (Android stops the
   player, iOS removes the item: no request is retried in the background) and
   leaves the player in an error state; the next play loads the track again. When

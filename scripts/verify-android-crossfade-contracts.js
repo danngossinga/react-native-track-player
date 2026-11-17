@@ -549,6 +549,15 @@ assert(
       fields.includes('mediaDataSourceFactory = mediaDataSourceFactory'),
     'Android engine waits must count media bytes only, not playlist or key reloads.'
   );
+  // Until the track's first segment is asked for, playlists and keys are its only progress.
+  assert(
+    fields.includes('if (!mediaRequested.get()) bytesLoaded.addAndGet(bytesTransferred.toLong())') &&
+      fields.includes('override fun onTransferInitializing(source: DataSource, dataSpec: DataSpec, isNetwork: Boolean) {\n                mediaRequested.set(true)') &&
+      section(engineSource, 'override suspend fun prepare(', 'override fun play(rate: Float)').includes('mediaRequested.set(false)') &&
+      read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/CrossfadeEngineHlsTest.kt')
+        .includes('fun slowPlaylistsBeforeTheFirstSegmentDoNotMakeAHealthyTrackGiveUp()'),
+    'Android engine waits must count playlists and keys as progress until the first segment is asked for.'
+  );
 }
 
 // A track that ends while the next one preloads advances (iOS acts in preloadingNext too).
