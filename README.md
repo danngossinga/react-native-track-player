@@ -159,7 +159,7 @@ Added fork surface:
   (no progress for `stallTimeoutMs`, or over `standardSeekTimeoutMs`),
   `standard_seek_cancelled` (a newer seek, a skip, pause, stop, load or another
   track took over) and `standard_seek_unavailable` (the track it acts on failed
-  to load, a player error); the crossfade backend uses `crossfade_seek_timeout`,
+  to load, a player error, or the queue is empty); the crossfade backend uses `crossfade_seek_timeout`,
   `crossfade_prepare_timeout` or `crossfade_engine_error` (the track had to load
   again and failed) and `cancelled`. iOS sent all of them as `seek_failed`
   before; it still does for `standard_seek_invalid_position` (a position that is
@@ -195,8 +195,17 @@ Added fork surface:
   next, load, retry) starts the first track, reported once it loaded, never at
   once, as crossfade's play with no active track (before: the cancelled track went
   on loading and became active; the play's track was reported at once, then none
-  again when it failed). A backend switch that restores no active track is the
-  same. Nothing of the cancelled track loads after that,
+  again when it failed). On iOS a queue change there may still send one request
+  (SwiftAudioEx's add starts loading a new queue's first item, or the next one
+  when the current item left; the backend stops it at once, which cancels the
+  asset's loading); Android sends none. A backend switch that restores no active
+  track is the same, and its state stays none (`IDLE`) through queue changes on
+  both platforms: the restore loads nothing (iOS may send that one request for
+  the queue's first item) and no state event contradicts what the app reads
+  (before: on Android the restore loaded the first track, and a new queue or the
+  removal of the player's item loaded a track and emitted its loading and ready
+  states while the app read `IDLE` with no active track; on iOS the restore
+  loaded the first item and a queue change then read stopped). Nothing of the cancelled track loads after that,
   not even a playlist: Android's standard backend releases its source (ExoPlayer
   would keep it prepared while it is in the queue, and an HLS source would fetch
   its primary media playlist); on iOS SwiftAudioEx cancels the asset's loading.
@@ -225,7 +234,11 @@ Added fork surface:
   2026-11-17): after a failed load the player goes back to the active track; the
   seek acts there and then plays when playback was requested before the failure,
   as crossfade's seek after a failed skip (a pause after the failure ends that
-  request), a stop stops there; on the standard backend while another track loads
+  request); on the standard backend the player waits paused at the active track
+  until the seek is done, then plays, and several seeks in a row (a scrubber
+  drag) keep that request: it plays once the latest one is done, on both
+  platforms (one explicit state, `StandardSeekResume`; before: iOS stayed paused
+  after a second seek, Android played while the seek ran); a stop stops there; on the standard backend while another track loads
   (a natural advance, which the seek or stop cancels, as crossfade's cancelled
   operation) it goes back paused, and the next play plays it (before: the seek
   acted on the track that failed and, when it failed too, the next play loaded
@@ -237,6 +250,23 @@ Added fork surface:
   selected when the queue is set). After a failed load the lock screen and the
   notification show the active track again. A failed seek keeps its target as the
   position on both backends and platforms.
+- Remaining gaps of the standard backend's failure handling (the same on both
+  platforms unless said otherwise): play-when-ready during a give-up's error
+  reads false (the give-up's stop ends the player's request; the backend keeps it
+  for the next seek), where crossfade's failure keeps it true; a seek after a
+  seek that gave up acts on the active track and stays paused (the give-up's
+  error is on the track already active, not a failed load), where crossfade's
+  seek plays as requested; on iOS a queue change with no active track may send
+  one request (above). Known limits, unchanged by this branch: the race of a
+  failed state already delivered (or dropped by its token) before a later
+  non-failed one, which can hold a failure in iOS's `StandardFailureOrder`, has no
+  test; iOS's reload at a kept position after a failed seek and its deferred seek
+  after a cancel (`reloadAtKeptPosition`, `seekPlayer(to:)`) do not mark a seek in
+  the item's progress (`noteSeek`), so their bytes read as a load's; a seek during
+  a natural advance (LOAD-17) has a Robolectric test with a real ExoPlayer but no
+  test on a device or emulator; the Robolectric tests run without MusicService's
+  media session connector (a stub), so what a media controller sees there is not
+  tested.
 - On the standard backend, while a track loads (and after its load failed) every
   reader agrees with the active track: `getProgress`/`useProgress` and the
   progress events give the active track's last position, duration and buffered

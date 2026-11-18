@@ -60,7 +60,7 @@ on the backend, the same on Android and iOS:
 | ------- | ---- | ---- |
 | standard | `standard_seek_timeout` | no progress for `stallTimeoutMs`, or over `standardSeekTimeoutMs`; the player stops loading and is in an error state |
 | standard | `standard_seek_cancelled` | a newer seek, a skip, pause, stop, load or another track took over |
-| standard | `standard_seek_unavailable` | the track it acts on failed to load (a player error) |
+| standard | `standard_seek_unavailable` | the queue is empty (no track to seek in), or the track it acts on failed to load (a player error) |
 | crossfade | `crossfade_seek_timeout` | the seek made no progress, or went over its limit |
 | crossfade | `crossfade_prepare_timeout`, `crossfade_engine_error` | the track had to load again and failed |
 | crossfade | `cancelled` | a newer command took over |
@@ -72,7 +72,10 @@ the active track, paused (a cancelled operation, as crossfade's). A seek (and a 
 the active track, the one `getActiveTrack()` and the progress report, as crossfade's (owner
 decision, 2026-11-17): after a failed load the player goes back to the active track, the seek
 acts there and then plays when playback was requested before the failure, as crossfade's seek
-after a failed skip (a pause after the failure ends that request); on the standard backend while
+after a failed skip (a pause after the failure ends that request). On the standard backend the
+player waits paused at the active track until the seek is done, then plays; several seeks in a
+row (a scrubber drag) keep that request and the player plays once the latest one is done (both
+platforms). On the standard backend while
 another track loads (a natural advance, which the seek cancels) it goes back paused (before: it
 acted on the track that failed). With no active track the seek resolves and does nothing, as
 crossfade's (a cancel left none, or a backend switch restored none; before:
