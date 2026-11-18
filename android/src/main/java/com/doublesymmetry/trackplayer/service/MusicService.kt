@@ -1491,7 +1491,12 @@ class MusicService : HeadlessJsTaskService() {
             foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)
         }
 
-        fun shouldStopForeground(): Boolean = foreground.release(::isForegroundService) != StandardForegroundRule.Release.NONE
+        // What PlayerNotificationManager's ongoing flag reads now (getOngoing: buffering or ready and
+        // play-when-ready, of the session player): a post whose POSTED is not collected yet.
+        fun notificationOngoingNow(): Boolean = source.sessionPlayer.let {
+            (it.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING || it.playbackState == com.google.android.exoplayer2.Player.STATE_READY) && it.playWhenReady
+        }
+        fun shouldStopForeground(): Boolean = foreground.release(ongoingNow = ::notificationOngoingNow, isForegroundService = ::isForegroundService) != StandardForegroundRule.Release.NONE
 
         fun observeNotification() = ownerScope.collectWithAdmission(source.event.notificationStateChange, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
@@ -1515,7 +1520,7 @@ class MusicService : HeadlessJsTaskService() {
                             // being immediately destroyed once the player finishes playing media.
                         ownerScope.launch {
                             delay(stopForegroundGracePeriod.toLong() * 1000)
-                            val release = foreground.release(::isForegroundService)
+                            val release = foreground.release(ongoingNow = ::notificationOngoingNow, isForegroundService = ::isForegroundService)
                             if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {
                                 // KEEP_NOTIFICATION (an error while the app reads the request true):
                                 // the foreground goes, the notification stays, as crossfade's surface.

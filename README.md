@@ -296,7 +296,10 @@ Added fork surface:
     `stopForeground(true)` no longer removes it, and the player keeps its
     items after a stop, so ExoPlayer's notification manager keeps it posted
     (before: it stayed after a stop that followed a pause or a kept error).
-    The lock screen (iOS) shows
+    A paused skip or load to a track that loads, after a stop or an error,
+    leaves a paused track: its notification stays and the foreground service
+    goes, as crossfade's surface (its loading states, with no play request,
+    count as paused). The lock screen (iOS) shows
     rate 0 in the error and while a seek holds the player, as crossfade's
     (`nowPlayingPlaybackRate` is 0 outside playing): no change there;
   - a backend switch carries the request the app reads (a kept one: `true`)
@@ -341,6 +344,14 @@ Added fork surface:
     at the end of the grace period (`stopForegroundGracePeriod`, as for any
     state that lets it go), crossfade's surface at once. Pending the owner's
     confirmation;
+  - Android's stop: the standard backend removes the notification at the end
+    of the grace period, crossfade's at once (older than this branch).
+    Pending the owner's confirmation;
+  - Android's notification after a stop that removed it: ExoPlayer's
+    notification manager still counts it as shown, so a later update (new
+    options, metadata, artwork, an added track) posts it again; the standard
+    backend removes it again at the grace period's end, crossfade's shows it
+    again and keeps it. Pending the owner's confirmation;
   - removing a track that is not the active one (the one that failed, say)
     keeps the request, as crossfade's queue change that keeps the active
     track, except that crossfade's ends it when the change interrupts an
@@ -357,7 +368,10 @@ Added fork surface:
   player has it (Android: `true` while it was playing), where crossfade's ends
   it; and Android rejects a switch from crossfade to standard with no active
   track while crossfade keeps the request (the standard target accepts an idle
-  snapshot only without a request; iOS accepts it and drops the request).
+  snapshot only without a request; iOS accepts it and drops the request); and
+  iOS's next with no active track jumps to the first track with
+  `playWhenReady: false` (its `kept`, never true there), forcing the player's
+  request off, where Android's leaves the player's own request.
   Known limits, unchanged by this branch: the race of a failed state already
   delivered (or dropped by its token) before a later non-failed one, which can
   hold a failure in iOS's `StandardFailureOrder`, has no test; iOS's reload at a

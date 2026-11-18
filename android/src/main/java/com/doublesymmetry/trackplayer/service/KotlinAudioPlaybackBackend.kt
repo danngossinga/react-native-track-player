@@ -234,7 +234,9 @@ internal class StandardReportedSink(
  * ([playRequested], read live: the request the app reads) the foreground goes and the
  * notification stays, as crossfade's surface in ERROR (stopForegroundButKeepNotification); once
  * the request ended (a pause) the error removes it, and so does a stop, as crossfade's stop
- * (surface.hide()). Based on Pocket Casts' PlaybackService (MusicService.setupForegrounding).
+ * (surface.hide()). A load with no play request (a paused skip or load) counts as paused: a
+ * paused track keeps its notification, as crossfade's surface (a stop or an error before it no
+ * longer removes it). Based on Pocket Casts' PlaybackService (MusicService.setupForegrounding).
  */
 internal class StandardForegroundRule(
     /** The play request the app reads (the backend's playWhenReady, a failure's kept one included). */
@@ -264,10 +266,14 @@ internal class StandardForegroundRule(
         this.ongoing = ongoing
     }
 
-    /** What happens to the foreground service now ([isForegroundService]: whether it is one). */
-    fun release(isForegroundService: () -> Boolean): Release {
+    /**
+     * What happens to the foreground service now ([isForegroundService]: whether it is one;
+     * [ongoingNow]: whether the notification the player would post now is ongoing, read live, for a
+     * post whose [notificationPosted] has not come yet).
+     */
+    fun release(ongoingNow: () -> Boolean = { false }, isForegroundService: () -> Boolean): Release {
         val state = settled
-        if (ongoing || state == null) return Release.NONE
+        if (ongoing || state == null || ongoingNow()) return Release.NONE
         val removes = state in REMOVABLE_STATES && !(state == AudioPlayerState.ERROR && playRequested())
         return when {
             removes -> Release.REMOVE_NOTIFICATION
@@ -278,9 +284,14 @@ internal class StandardForegroundRule(
 
     fun stateChanged(state: AudioPlayerState) {
         stateCount++
-        if (state in LOADING_STATES) return
+        // A load with the request (playing, a held seek) keeps the last state: its notification is
+        // ongoing. One with no request is a paused track: it counts as PAUSED (no PAUSED comes).
+        val counted = if (state in LOADING_STATES) {
+            if (playRequested()) return
+            AudioPlayerState.PAUSED
+        } else state
         // The initial idle state is skipped: only a state after another counts.
-        settled = state.takeIf { stateCount > 1 && it in BACKGROUNDABLE_STATES }
+        settled = counted.takeIf { stateCount > 1 && it in BACKGROUNDABLE_STATES }
     }
 
     private companion object {

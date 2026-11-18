@@ -289,6 +289,73 @@ class StandardBackendHlsTest {
     // notification stays (crossfade's surface keeps it in ERROR); a pause ends the request with no
     // state change (the error stays), and the error then removes the notification, as before the
     // failure handling (crossfade's keeps it in every ERROR: a remaining difference, README).
+    // Twelfth round (review 11, blocking; probes ZPROBE-A, ZPROBE-B): a paused skip to a track that
+    // loads, after a stop or after a give-up's error that a pause ended, leaves a paused track: its
+    // notification stays, as crossfade's surface keeps a paused track's, and the foreground goes
+    // (no PAUSED comes from a paused load: its loading states count as paused). Before: the rule
+    // kept the stop's or the error's removal, and MusicService cancelled the paused track's
+    // notification at the grace period's end.
+    @Test
+    fun aPausedSkipToATrackThatLoadsAfterAStopOrAnErrorKeepsItsNotification() {
+        for (after in listOf("stop", "give-up and pause")) {
+            val backed = backed()
+            val playable = { server(LADDER, segmentCount = 8, stalledFrom = 8) }
+            backed.backend.add(listOf(item(playable(), 1L), item(server(LADDER), 2L), item(playable(), 3L)))
+            command { backed.backend.play() }
+            awaitTrue("$after: A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+            val target = if (after == "stop") {
+                backed.backend.stop()
+                2
+            } else {
+                assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+                pump(STALL_TIMEOUT_MS / 3)
+                backed.backend.pause()
+                2
+            }
+            pump(STALL_TIMEOUT_MS / 3)
+            backed.foreground.notificationPosted(ongoingOf(backed.player.sessionPlayer))
+            assertEquals("$after: removable before the skip", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { false })
+            assertNull("$after: the paused skip loads its track", command { backed.backend.skip(target) })
+            pump(STALL_TIMEOUT_MS / 3)
+            assertEquals("$after: on the track", target, backed.backend.currentIndex)
+            assertFalse("$after: paused", backed.backend.playWhenReady)
+            backed.foreground.notificationPosted(ongoingOf(backed.player.sessionPlayer))
+            assertEquals("$after: the paused track's notification stays", StandardForegroundRule.Release.NONE, backed.foreground.release { false })
+            assertEquals("$after: the foreground goes, the notification stays", StandardForegroundRule.Release.KEEP_NOTIFICATION, backed.foreground.release { true })
+        }
+    }
+
+    // Twelfth round (review 11, nits): the rule by its states alone (no player): what each state that
+    // lets the foreground go does, with and without the request the app reads, and a notification
+    // posted ongoing whose POSTED has not come yet ([ongoingNow]).
+    @Test
+    fun theForegroundRuleReleasesByTheStateAndTheRequestTheAppReads() {
+        var requested = false
+        fun rule(vararg states: AudioPlayerState) = StandardForegroundRule { requested }.also { r ->
+            states.forEach(r::stateChanged)
+            r.notificationPosted(false)
+        }
+        val playing = AudioPlayerState.PLAYING
+        for (state in listOf(AudioPlayerState.IDLE, AudioPlayerState.STOPPED, AudioPlayerState.ERROR)) {
+            assertEquals("$state removes", StandardForegroundRule.Release.REMOVE_NOTIFICATION, rule(playing, state).release { false })
+        }
+        for (state in listOf(AudioPlayerState.PAUSED, AudioPlayerState.ENDED)) {
+            assertEquals("$state keeps", StandardForegroundRule.Release.KEEP_NOTIFICATION, rule(playing, state).release { true })
+            assertEquals("$state: nothing outside the foreground", StandardForegroundRule.Release.NONE, rule(playing, state).release { false })
+        }
+        assertEquals("the initial state does not count", StandardForegroundRule.Release.NONE, rule(AudioPlayerState.IDLE).release { true })
+        assertEquals("playing: stays", StandardForegroundRule.Release.NONE, rule(AudioPlayerState.STOPPED, playing).release { true })
+        requested = true
+        assertEquals("an error with the request: keeps", StandardForegroundRule.Release.KEEP_NOTIFICATION, rule(playing, AudioPlayerState.ERROR).release { true })
+        val loadingWithRequest = rule(playing, AudioPlayerState.STOPPED, AudioPlayerState.BUFFERING)
+        requested = false
+        assertEquals("a load with the request keeps the stop's state", StandardForegroundRule.Release.REMOVE_NOTIFICATION, loadingWithRequest.release { false })
+        for (state in listOf(AudioPlayerState.LOADING, AudioPlayerState.BUFFERING, AudioPlayerState.READY)) {
+            assertEquals("a paused $state counts as paused", StandardForegroundRule.Release.KEEP_NOTIFICATION, rule(playing, AudioPlayerState.STOPPED, state).release { true })
+        }
+        assertEquals("ongoing now: nothing", StandardForegroundRule.Release.NONE, rule(playing, AudioPlayerState.STOPPED).release({ true }, { true }))
+    }
+
     @Test
     fun theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseOrStopEndedIt() {
         val backed = backed()
@@ -328,6 +395,7 @@ class StandardBackendHlsTest {
         kept.backend.stop()
         pump(STALL_TIMEOUT_MS / 3)
         assertEquals(AudioPlayerState.STOPPED, kept.backend.playbackState)
+        assertFalse("the stop ends the kept request (review 11, ZPROBE-C)", kept.backend.playWhenReady)
         kept.foreground.notificationPosted(ongoingOf(kept.player.sessionPlayer))
         assertEquals("stopped after KEEP: removed (cancelled, no longer the foreground's)", StandardForegroundRule.Release.REMOVE_NOTIFICATION, kept.foreground.release { false })
     }

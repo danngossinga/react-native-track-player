@@ -520,12 +520,16 @@ assert(
     musicService.includes('foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)') &&
     musicService.includes('if (standardBackendOf(identity)?.playWhenReady ?: source.playWhenReady) {\n                            startForegroundIfNecessary()') &&
     musicService.includes('foreground.notificationPosted(it.ongoing)') &&
-    musicService.includes('fun shouldStopForeground(): Boolean = foreground.release(::isForegroundService) != StandardForegroundRule.Release.NONE') &&
+    musicService.includes('fun shouldStopForeground(): Boolean = foreground.release(ongoingNow = ::notificationOngoingNow, isForegroundService = ::isForegroundService) != StandardForegroundRule.Release.NONE') &&
+    musicService.includes('(it.playbackState == com.google.android.exoplayer2.Player.STATE_BUFFERING || it.playbackState == com.google.android.exoplayer2.Player.STATE_READY) && it.playWhenReady') &&
     // Tenth round (review 9, blocking): the rule reads the request the app reads, live; its
     // KEEP_NOTIFICATION (a failure's error with the request kept) leaves the foreground and keeps
     // the notification, as crossfade's surface in ERROR (tested on the rule in Robolectric).
     musicService.includes('val foreground = StandardForegroundRule { standardBackendOf(identity)?.playWhenReady ?: created.playWhenReady }') &&
-    musicService.includes('val release = foreground.release(::isForegroundService)\n                            if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {') &&
+    // Review 11 (V3, V4): the grace period's end in this order, the one cancel only after the
+    // re-check, after stopForeground and only for REMOVE_NOTIFICATION.
+    (musicService.match(/NotificationManagerCompat\.from\(this@MusicService\)\.cancel\(/g) || []).length === 1 &&
+    /delay\(stopForegroundGracePeriod\.toLong\(\) \* 1000\)\n {28}val release = foreground\.release\(ongoingNow = ::notificationOngoingNow, isForegroundService = ::isForegroundService\)\n {28}if \(isActivePlayer\(source, identity\) && release != StandardForegroundRule\.Release\.NONE\) \{\n(?: {32}\/\/[^\n]*\n)* {32}@Suppress\("DEPRECATION"\)\n {32}stopForeground\(release == StandardForegroundRule\.Release\.REMOVE_NOTIFICATION\)\n {32}if \(release == StandardForegroundRule\.Release\.REMOVE_NOTIFICATION\) \{\n(?: {36}\/\/[^\n]*\n)* {36}notificationId\?\.let \{ NotificationManagerCompat\.from\(this@MusicService\)\.cancel\(it\) \}\n {32}\}\n {32}Timber\.d\("Notification has been stopped"\)/.test(musicService) &&
     musicService.includes('stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)') &&
     // Eleventh round (review 10, blocking): REMOVE also cancels the notification (one a KEEP or a
     // pause left is no longer the foreground's: stopForeground(true) cancels nothing then), as
@@ -1181,7 +1185,7 @@ assert(
       ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases', 'whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError',
         'afterAFailureTheMediaSessionTheNotificationAndTheForegroundReadTheRequestTheAppReads', 'anEmptyQueueOrTheRemovalOfEveryTrackWhileAFailureKeepsTheRequestEndsItAndTellsTheApp',
         'aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer', 'aBackendSwitchWhileAFailureKeepsTheRequestCarriesItAndTheNewBackendPlaysTheActiveTrack',
-        'theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseOrStopEndedIt', 'aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse']
+        'theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseOrStopEndedIt', 'aPausedSkipToATrackThatLoadsAfterAStopOrAnErrorKeepsItsNotification', 'theForegroundRuleReleasesByTheStateAndTheRequestTheAppReads', 'aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse']
         .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)),
     'The Android media session and notification must read the reported track while another loads, as iOS\'s lock screen.'
   );
