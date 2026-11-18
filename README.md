@@ -107,9 +107,13 @@ Added fork surface:
   the pin, run `scripts/verify-swiftaudioex-layout.sh`: it builds the real
   SwiftAudioEx sources (from the CocoaPods cache, or `SWIFTAUDIOEX_SOURCES`) with
   `PlaybackBackend.swift` for Mac Catalyst and checks that `standardPlayerItem`
-  reads a real `QueuedAudioPlayer`'s item (without the sources it prints SKIPPED;
-  CI runs only the XCTest on a fake of that layout, as the test target cannot
-  build SwiftAudioEx).
+  reads a real `QueuedAudioPlayer`'s item (without the sources it prints SKIPPED,
+  or fails with `SWIFTAUDIOEX_REQUIRED=1`). CI runs it on every pull request
+  (`.github/workflows/ios-backend.yml`, job `swiftaudioex-layout`): it clones
+  SwiftAudioEx's `1.1.0` tag from GitHub, checks its sources against a content
+  hash taken from the CocoaPods download of 1.1.0 (the spec records no
+  commit), and runs the guard with `SWIFTAUDIOEX_REQUIRED=1`; the XCTest also
+  checks a fake of that layout, as the test target cannot build SwiftAudioEx.
   (Before, the iOS standard backend also applied `stallTimeoutMs` from the
   start of the load, so a playlist slower than it failed the track.) What
   AVFoundation shows while an HLS segment arrives was measured on the iOS 26.5

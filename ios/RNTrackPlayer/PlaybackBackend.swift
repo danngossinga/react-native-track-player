@@ -3216,7 +3216,8 @@ enum StandardPlayerItemLookup {
 /// Reading this private layout is an owner decision (2026-11-17), accepted with the podspec pinned
 /// to exactly SwiftAudioEx 1.1.0 (`s.dependency "SwiftAudioEx", "1.1.0"`). Guards:
 /// scripts/verify-swiftaudioex-layout.sh runs this function against a real 1.1.0 QueuedAudioPlayer
-/// (Mac Catalyst, where the 1.1.0 sources are); testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper
+/// (Mac Catalyst, where the 1.1.0 sources are; in CI on the cloned 1.1.0 tag, no SKIPPED allowed:
+/// ios-backend.yml's swiftaudioex-layout job); testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper
 /// against the layout's fake (CI); verify-ios-crossfade-contracts.js pins the podspec.
 func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {
     var mirror: Mirror? = Mirror(reflecting: player)

@@ -1079,7 +1079,16 @@ assert(
       section(facade, 'func standardPlayerItem(of player: AnyObject) -> StandardPlayerItemLookup {', '\n}\n').includes('$0.label == "avPlayer"') &&
       facade.includes('/// Reading this private layout is an owner decision (2026-11-17), accepted with the podspec pinned') &&
       read('scripts/verify-swiftaudioex-layout.sh').includes('"$root/ios/RNTrackPlayer/PlaybackBackend.swift" "$root/scripts/swiftaudioex-layout-guard/main.swift"') &&
-      read('scripts/swiftaudioex-layout-guard/main.swift').includes('let player = QueuedAudioPlayer()'),
+      read('scripts/swiftaudioex-layout-guard/main.swift').includes('let player = QueuedAudioPlayer()') &&
+      // CI runs that guard on the cloned 1.1.0 tag (its sources pinned by content), with no
+      // SKIPPED allowed.
+      section(read('scripts/verify-swiftaudioex-layout.sh'), 'skip() {', '\n}\n').includes('if [[ "${SWIFTAUDIOEX_REQUIRED:-}" == "1" ]]; then\n    echo "FAIL (SWIFTAUDIOEX_REQUIRED=1): $1"\n    exit 1') &&
+      (read('scripts/verify-swiftaudioex-layout.sh').match(/^\s*skip "/gm) || []).length === 2 &&
+      !/SKIPPED[^\n]*\n\s*exit 0/.test(read('scripts/verify-swiftaudioex-layout.sh').replace(/skip\(\) \{[\s\S]*?\n\}\n/, '')) &&
+      section(read('.github/workflows/ios-backend.yml'), '  swiftaudioex-layout:', 'scripts/verify-swiftaudioex-layout.sh').includes("SWIFTAUDIOEX_REQUIRED: '1'") &&
+      read('.github/workflows/ios-backend.yml').includes('git clone --quiet --depth 1 --branch "$SWIFTAUDIOEX_TAG" https://github.com/DoubleSymmetry/SwiftAudioEx.git') &&
+      read('.github/workflows/ios-backend.yml').includes('SWIFTAUDIOEX_TAG: 1.1.0\n') &&
+      read('.github/workflows/ios-backend.yml').includes('run: SWIFTAUDIOEX_SOURCES="$RUNNER_TEMP/SwiftAudioEx/Sources/SwiftAudioEx" scripts/verify-swiftaudioex-layout.sh'),
     'iOS must pin SwiftAudioEx to exactly 1.1.0 while it reads its private layout (owner decision, 2026-11-17).'
   );
 }

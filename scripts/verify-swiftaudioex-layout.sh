@@ -9,9 +9,21 @@
 # alone; its fake-layout test, testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper,
 # runs in CI), so this runs where the 1.1.0 sources are: $SWIFTAUDIOEX_SOURCES, the CocoaPods
 # cache, or an installed example/ios/Pods. Without them it prints SKIPPED and exits 0 (nothing is
-# downloaded). Usage: scripts/verify-swiftaudioex-layout.sh
+# downloaded), unless SWIFTAUDIOEX_REQUIRED=1 (CI: .github/workflows/ios-backend.yml clones the
+# 1.1.0 tag), which turns every SKIPPED into a failure.
+# Usage: [SWIFTAUDIOEX_SOURCES=<dir>] [SWIFTAUDIOEX_REQUIRED=1] scripts/verify-swiftaudioex-layout.sh
 set -euo pipefail
 root=$(cd "$(dirname "$0")/.." && pwd)
+
+# Exits 0 with SKIPPED, or fails when SWIFTAUDIOEX_REQUIRED=1.
+skip() {
+  if [[ "${SWIFTAUDIOEX_REQUIRED:-}" == "1" ]]; then
+    echo "FAIL (SWIFTAUDIOEX_REQUIRED=1): $1"
+    exit 1
+  fi
+  echo "SKIPPED: $1"
+  exit 0
+}
 
 pin=$(grep -E '^\s*s\.dependency "SwiftAudioEx"' "$root/react-native-track-player.podspec" || true)
 if [[ "$pin" != *'s.dependency "SwiftAudioEx", "1.1.0"' ]]; then
@@ -34,12 +46,10 @@ if [[ -z "$sources" ]]; then
   done
 fi
 if [[ -z "$sources" || ! -d "$sources" ]]; then
-  echo "SKIPPED: no SwiftAudioEx 1.1.0 sources (set SWIFTAUDIOEX_SOURCES, or run pod install for the example)"
-  exit 0
+  skip "no SwiftAudioEx 1.1.0 sources (set SWIFTAUDIOEX_SOURCES, or run pod install for the example)"
 fi
 if [[ "$(uname)" != "Darwin" ]]; then
-  echo "SKIPPED: needs macOS (Mac Catalyst)"
-  exit 0
+  skip "needs macOS (Mac Catalyst)"
 fi
 
 build=$(mktemp -d)

@@ -81,3 +81,37 @@ jobs:
           path: artifacts/
           if-no-files-found: error
           retention-days: 14
+
+  # Owner decision, 2026-11-17: the standard backend reads SwiftAudioEx 1.1.0's private layout
+  # (standardPlayerItem). The XCTest target cannot build SwiftAudioEx, so this job builds the real
+  # 1.1.0 sources with PlaybackBackend.swift for Mac Catalyst (scripts/verify-swiftaudioex-layout.sh),
+  # with no SKIPPED allowed.
+  swiftaudioex-layout:
+    runs-on: macos-26
+    timeout-minutes: 15
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      # SwiftAudioEx 1.1.0's CocoaPods spec: git https://github.com/DoubleSymmetry/SwiftAudioEx.git,
+      # tag 1.1.0 (it records no commit). The sources are pinned by content instead: the SHA-256 of
+      # `shasum -a 256` over every file of Sources/SwiftAudioEx in sorted path order, computed
+      # from the CocoaPods download of 1.1.0. A moved tag or other sources fail the job.
+      SWIFTAUDIOEX_TAG: 1.1.0
+      SWIFTAUDIOEX_SOURCES_SHA256: a310da6ee8ab72e71d7569653c1510c2c059906318505447f690d9c0c818259a
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Fetch SwiftAudioEx 1.1.0 and check its sources
+        run: |
+          set -euo pipefail
+          git clone --quiet --depth 1 --branch "$SWIFTAUDIOEX_TAG" https://github.com/DoubleSymmetry/SwiftAudioEx.git "$RUNNER_TEMP/SwiftAudioEx"
+          echo "SwiftAudioEx $SWIFTAUDIOEX_TAG commit: $(git -C "$RUNNER_TEMP/SwiftAudioEx" rev-parse HEAD)"
+          actual=$(cd "$RUNNER_TEMP/SwiftAudioEx" && find Sources/SwiftAudioEx -type f | LC_ALL=C sort | xargs shasum -a 256 | shasum -a 256 | cut -d ' ' -f 1)
+          if [ "$actual" != "$SWIFTAUDIOEX_SOURCES_SHA256" ]; then
+            echo "SwiftAudioEx $SWIFTAUDIOEX_TAG sources differ from the pinned ones ($actual)"
+            exit 1
+          fi
+      - name: Guard SwiftAudioEx 1.1.0's private layout
+        env:
+          SWIFTAUDIOEX_REQUIRED: '1'
+        run: SWIFTAUDIOEX_SOURCES="$RUNNER_TEMP/SwiftAudioEx/Sources/SwiftAudioEx" scripts/verify-swiftaudioex-layout.sh
