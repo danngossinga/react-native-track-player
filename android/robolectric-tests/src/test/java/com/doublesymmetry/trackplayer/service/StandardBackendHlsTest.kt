@@ -184,9 +184,11 @@ class StandardBackendHlsTest {
         )
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
         assertEquals(PlaybackStateCompat.STATE_PLAYING, sessionStateOf(session))
-        // A pause while a seek holds the player sends no player event: the session is told at once.
+        // A pause while a seek holds the player sends no player event: the session is told at once,
+        // by the pause itself (the seek runs as the app runs it: its cancelled end, which would
+        // look at the player again, comes a message later).
         assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
-        val heldSeek = launchCommand { backed.backend.seekTo(PLAYED_MS) }
+        val heldSeek = launchCommand(kotlinx.coroutines.Dispatchers.Main) { backed.backend.seekTo(PLAYED_MS) }
         shadowOf(Looper.getMainLooper()).idle()
         assertNull("the seek holds the player", heldSeek())
         assertEquals(AudioPlayerState.LOADING, backed.backend.playbackState)
