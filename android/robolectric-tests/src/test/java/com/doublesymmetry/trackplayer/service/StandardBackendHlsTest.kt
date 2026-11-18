@@ -247,29 +247,41 @@ class StandardBackendHlsTest {
 
     @Test
     fun aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer() {
-        val a = slowServer()
-        val backed = backed()
-        backed.backend.add(listOf(item(a, 1L), item(server(LADDER), 2L)))
-        command { backed.backend.play() }
-        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
-        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
-        assertNull(command { backed.backend.play() })
-        awaitTrue("A plays again") { backed.player.playerState == AudioPlayerState.PLAYING }
-        pump(STALL_TIMEOUT_MS)
-        val seen = mutableSetOf<AudioPlayerState>()
-        val beforeSeek = backed.events.size
-        val seek = launchCommand { backed.backend.seekTo(LOADABLE_TARGET_MS + 10_000L) }
-        val deadline = monotonicNowMs() + AWAIT_MS
-        while (seek() == null && monotonicNowMs() < deadline) {
-            shadowOf(Looper.getMainLooper()).idle()
-            seen += backed.backend.playbackState
-            Thread.sleep(CLOCK_TICK_MS)
+        // Eleventh round (review 10, item 2, ZPROBE12): a new queue takes the request over as
+        // well (replaceQueue's hand-over; without it the seek on the new queue's track held it).
+        for (op in listOf("play", "setQueue")) {
+            val a = slowServer()
+            val backed = backed()
+            backed.backend.add(listOf(item(a, 1L), item(server(LADDER), 2L)))
+            command { backed.backend.play() }
+            awaitTrue("$op: A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+            assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+            if (op == "play") {
+                assertNull(command { backed.backend.play() })
+            } else {
+                pump(STALL_TIMEOUT_MS / 3)
+                backed.backend.replaceQueue(listOf(item(slowServer(), 5L), item(server(LADDER), 6L)))
+            }
+            awaitTrue("$op: plays again") { backed.player.playerState == AudioPlayerState.PLAYING }
+            pump(STALL_TIMEOUT_MS)
+            val seen = mutableSetOf<AudioPlayerState>()
+            val beforeSeek = backed.events.size
+            val seek = launchCommand { backed.backend.seekTo(LOADABLE_TARGET_MS + 10_000L) }
+            val deadline = monotonicNowMs() + AWAIT_MS
+            while (seek() == null && monotonicNowMs() < deadline) {
+                shadowOf(Looper.getMainLooper()).idle()
+                seen += backed.backend.playbackState
+                Thread.sleep(CLOCK_TICK_MS)
+            }
+            assertNull(seek()!!.exceptionOrNull())
+            pump(STALL_TIMEOUT_MS)
+            assertFalse("$op: never LOADING (the seek of a playing track does not hold it): $seen", AudioPlayerState.LOADING in seen)
+            assertFalse("$op: no LOADING sent: ${backed.events.drop(beforeSeek)}", "state:LOADING" in backed.events.drop(beforeSeek))
+            awaitTrue("$op: plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+            // The request is the player's own: a pause ends it (no kept one left).
+            backed.backend.pause()
+            assertFalse("$op: paused", backed.backend.playWhenReady)
         }
-        assertNull(seek()!!.exceptionOrNull())
-        pump(STALL_TIMEOUT_MS)
-        assertFalse("never LOADING (the seek of a playing track does not hold it): $seen", AudioPlayerState.LOADING in seen)
-        assertFalse("no LOADING sent: ${backed.events.drop(beforeSeek)}", "state:LOADING" in backed.events.drop(beforeSeek))
-        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
     }
 
     // Tenth round (review 9, blocking): the foreground rule reads the request the app reads at
@@ -278,7 +290,7 @@ class StandardBackendHlsTest {
     // state change (the error stays), and the error then removes the notification, as before the
     // failure handling (crossfade's keeps it in every ERROR: a remaining difference, README).
     @Test
-    fun theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseEndedIt() {
+    fun theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseOrStopEndedIt() {
         val backed = backed()
         backed.backend.add(listOf(item(slowServer(), 1L), item(server(LADDER), 2L)))
         command { backed.backend.play() }
@@ -297,6 +309,27 @@ class StandardBackendHlsTest {
         backed.foreground.notificationPosted(ongoingOf(session))
         assertEquals("ended: the error removes it, read at once", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { true })
         assertEquals("and so with the foreground already gone", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { false })
+        // Eleventh round (review 10, blocking): a stop after it removes the notification too (the
+        // foreground already gone: MusicService cancels it, as crossfade's stop, surface.hide()).
+        backed.backend.stop()
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals(AudioPlayerState.STOPPED, backed.backend.playbackState)
+        backed.foreground.notificationPosted(ongoingOf(session))
+        assertEquals("stopped: removed", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { false })
+        // A stop straight from the kept error (the notification KEEP left) removes it as well.
+        val kept = backed()
+        kept.backend.add(listOf(item(slowServer(), 1L), item(server(LADDER), 2L)))
+        command { kept.backend.play() }
+        awaitTrue("A plays") { kept.player.playerState == AudioPlayerState.PLAYING && kept.player.position >= PLAYED_MS }
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { kept.backend.skip(1) } as RejectionException).code)
+        pump(STALL_TIMEOUT_MS / 3)
+        kept.foreground.notificationPosted(ongoingOf(kept.player.sessionPlayer))
+        assertEquals("kept: the notification stays", StandardForegroundRule.Release.KEEP_NOTIFICATION, kept.foreground.release { true })
+        kept.backend.stop()
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals(AudioPlayerState.STOPPED, kept.backend.playbackState)
+        kept.foreground.notificationPosted(ongoingOf(kept.player.sessionPlayer))
+        assertEquals("stopped after KEEP: removed (cancelled, no longer the foreground's)", StandardForegroundRule.Release.REMOVE_NOTIFICATION, kept.foreground.release { false })
     }
 
     // Tenth round (review 9, item 2; reviewer probe ZPROBE6): a command that takes a failure's

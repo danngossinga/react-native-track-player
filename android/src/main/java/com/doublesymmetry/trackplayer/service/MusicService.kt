@@ -14,6 +14,7 @@ import android.os.IBinder
 import android.support.v4.media.RatingCompat
 import androidx.annotation.MainThread
 import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.NotificationCompat.PRIORITY_LOW
 import androidx.localbroadcastmanager.content.LocalBroadcastManager
 import com.doublesymmetry.kotlinaudio.models.*
@@ -1516,12 +1517,19 @@ class MusicService : HeadlessJsTaskService() {
                             delay(stopForegroundGracePeriod.toLong() * 1000)
                             val release = foreground.release(::isForegroundService)
                             if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {
-                                // KEEP_NOTIFICATION (a failure's error with its request kept): the
-                                // foreground goes, the notification stays, as crossfade's surface
-                                // (its STOP_FOREGROUND_DETACH; here still the service's, so a later
-                                // stop's stopForeground(true) removes it, as after a pause).
+                                // KEEP_NOTIFICATION (an error while the app reads the request true):
+                                // the foreground goes, the notification stays, as crossfade's surface.
                                 @Suppress("DEPRECATION")
                                 stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)
+                                if (release == StandardForegroundRule.Release.REMOVE_NOTIFICATION) {
+                                    // A notification an earlier stopForeground(false) left (a KEEP, a
+                                    // pause) is no longer the foreground one: stopForeground(true)
+                                    // cancels nothing then (ActiveServices cancels only while in the
+                                    // foreground), and KotlinAudio's stop keeps the items, so
+                                    // ExoPlayer's notification manager keeps it posted. Cancelled
+                                    // here, as crossfade's surface.hide() cancels it.
+                                    notificationId?.let { NotificationManagerCompat.from(this@MusicService).cancel(it) }
+                                }
                                 Timber.d("Notification has been stopped")
                             }
                         }

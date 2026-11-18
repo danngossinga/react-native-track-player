@@ -233,8 +233,8 @@ internal class StandardReportedSink(
  * foreground of the seek that followed). In a failure's error while its request is kept
  * ([playRequested], read live: the request the app reads) the foreground goes and the
  * notification stays, as crossfade's surface in ERROR (stopForegroundButKeepNotification); once
- * the request ended (a pause) the error removes it, as before. Based on Pocket Casts'
- * PlaybackService (MusicService.setupForegrounding).
+ * the request ended (a pause) the error removes it, and so does a stop, as crossfade's stop
+ * (surface.hide()). Based on Pocket Casts' PlaybackService (MusicService.setupForegrounding).
  */
 internal class StandardForegroundRule(
     /** The play request the app reads (the backend's playWhenReady, a failure's kept one included). */
@@ -246,7 +246,10 @@ internal class StandardForegroundRule(
         NONE,
         /** It goes; the notification stays (MusicService: stopForeground(false)). */
         KEEP_NOTIFICATION,
-        /** It goes with its notification (stopForeground(true)). */
+        /**
+         * It goes with its notification (stopForeground(true)), which MusicService also cancels: one
+         * an earlier [KEEP_NOTIFICATION] or pause left is no longer the foreground service's.
+         */
         REMOVE_NOTIFICATION
     }
 

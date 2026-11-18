@@ -899,6 +899,8 @@ assert(
       // Item 7: next takes the request over before the idle's branch, as Android's skipToNext.
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('let kept = takeOverRequest()\n            cancelPendingSeeks()\n            if activity.isIdle {') &&
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)') &&
+      // Review 10, item 4: as Android's next, the idle branch sets a kept request in every branch.
+      section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)\n                    } else if kept {\n                        player.playWhenReady = true\n                    }') &&
       // Item 4: the take-over's module request is the coordinator's (tested:
       // testStandardLoadCoordinatorATakenOverRequestIsTheModulesAndAGiveUpOfTheNewTrackKeepsIt);
       // RNTrackPlayer emits a reading change through StandardReadingSink (tested through the fake

@@ -272,7 +272,9 @@ Added fork surface:
     queue and the removal of the active track (or of every track), as
     crossfade's queue change without the active track: the getter, the
     `PlaybackPlayWhenReadyChanged` event and the media session read `false`
-    at once (before: an empty queue ended it with no event, a removal kept it);
+    at once (before: an empty queue ended it with no event, a removal kept it).
+    The end at an empty queue or a removal is pending the owner's
+    confirmation;
   - the media session and notification (Android) read the request and the
     state the app reads, as crossfade's media surface: play-when-ready `true`
     after the failure, the session buffering while a seek holds the player (not
@@ -288,14 +290,21 @@ Added fork surface:
     notification, as crossfade's surface in its error (before: it removed
     the notification while the app read playing). Once a pause ended the
     request, the error removes the notification at the grace period's end,
-    as before. The lock screen (iOS) shows
+    as before, and a stop removes it at the grace period's end, as crossfade's
+    stop (which removes it at once). The notification is cancelled outright:
+    once the foreground service left it (after a pause, or kept in the error)
+    `stopForeground(true)` no longer removes it, and the player keeps its
+    items after a stop, so ExoPlayer's notification manager keeps it posted
+    (before: it stayed after a stop that followed a pause or a kept error).
+    The lock screen (iOS) shows
     rate 0 in the error and while a seek holds the player, as crossfade's
     (`nowPlayingPlaybackRate` is 0 outside playing): no change there;
   - a backend switch carries the request the app reads (a kept one: `true`)
     and the active track at its position, as crossfade's snapshot; the new
     backend plays that track (before: the player's own `false`, and on
-    Android the player's own item, the track that failed). A switch that
-    rolls back leaves the request kept and the player stopped or held.
+    Android the player's own item, the track that failed); pending the
+    owner's confirmation (the active track, not the player's own). A switch
+    that rolls back leaves the request kept and the player stopped or held.
 - Remaining differences of the standard backend's failure handling from
   crossfade's (the same on both platforms unless said otherwise), each
   pending the owner's confirmation:
@@ -325,9 +334,9 @@ Added fork surface:
     agrees). Closing it needs a change to the vendored notification manager
     (owner's choice); pending the owner's confirmation;
   - Android's notification in an error once the request ended (a pause in
-    the give-up's error): the standard backend removes it at the grace
-    period's end; crossfade's keeps it in every error. Pending the owner's
-    confirmation;
+    the give-up's error): the standard backend removes it (cancels it) at the
+    grace period's end; crossfade's keeps it in every error, until its stop.
+    Pending the owner's confirmation;
   - Android's foreground service in an error: the standard backend leaves it
     at the end of the grace period (`stopForegroundGracePeriod`, as for any
     state that lets it go), crossfade's surface at once. Pending the owner's

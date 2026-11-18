@@ -527,6 +527,11 @@ assert(
     musicService.includes('val foreground = StandardForegroundRule { standardBackendOf(identity)?.playWhenReady ?: created.playWhenReady }') &&
     musicService.includes('val release = foreground.release(::isForegroundService)\n                            if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {') &&
     musicService.includes('stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)') &&
+    // Eleventh round (review 10, blocking): REMOVE also cancels the notification (one a KEEP or a
+    // pause left is no longer the foreground's: stopForeground(true) cancels nothing then), as
+    // crossfade's surface.hide().
+    musicService.includes('if (release == StandardForegroundRule.Release.REMOVE_NOTIFICATION) {') &&
+    musicService.includes('notificationId?.let { NotificationManagerCompat.from(this@MusicService).cancel(it) }') &&
     !musicService.includes('removeWhenNotOngoing') &&
     // Its reactivateAfterRollback (no production caller) rolls back as cancelHandoffQuiescence, as
     // iOS's: never the carried request (activateAfterCommit would play it).
@@ -1176,7 +1181,7 @@ assert(
       ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases', 'whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError',
         'afterAFailureTheMediaSessionTheNotificationAndTheForegroundReadTheRequestTheAppReads', 'anEmptyQueueOrTheRemovalOfEveryTrackWhileAFailureKeepsTheRequestEndsItAndTellsTheApp',
         'aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer', 'aBackendSwitchWhileAFailureKeepsTheRequestCarriesItAndTheNewBackendPlaysTheActiveTrack',
-        'theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseEndedIt', 'aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse']
+        'theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseOrStopEndedIt', 'aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse']
         .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)),
     'The Android media session and notification must read the reported track while another loads, as iOS\'s lock screen.'
   );
