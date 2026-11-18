@@ -528,6 +528,10 @@ assert(
     musicService.includes('val release = foreground.release(::isForegroundService)\n                            if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {') &&
     musicService.includes('stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)') &&
     !musicService.includes('removeWhenNotOngoing') &&
+    // Its reactivateAfterRollback (no production caller) rolls back as cancelHandoffQuiescence, as
+    // iOS's: never the carried request (activateAfterCommit would play it).
+    section(standardBackend, 'override suspend fun reactivateAfterRollback(snapshot: PlaybackBackendSnapshot) {', '\n    }\n').includes('cancelHandoffQuiescence(snapshot)\n        resumeControlSurface(snapshot)') &&
+    !section(standardBackend, 'override suspend fun reactivateAfterRollback(snapshot: PlaybackBackendSnapshot) {', '\n    }\n').includes('activateAfterCommit(snapshot)') &&
     musicService.includes('setupForegrounding(created, identity, ownerScope, productAdmission, foreground)') &&
     !/stopForegroundWhenNotOngoing|removeNotificationWhenNotOngoing/.test(musicService) &&
     !/playRequestedAtGiveUp|keepsPlaying/.test(standardBackend) &&
@@ -1171,7 +1175,8 @@ assert(
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt",') &&
       ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases', 'whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError',
         'afterAFailureTheMediaSessionTheNotificationAndTheForegroundReadTheRequestTheAppReads', 'anEmptyQueueOrTheRemovalOfEveryTrackWhileAFailureKeepsTheRequestEndsItAndTellsTheApp',
-        'aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer', 'aBackendSwitchWhileAFailureKeepsTheRequestCarriesItAndTheNewBackendPlaysTheActiveTrack']
+        'aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer', 'aBackendSwitchWhileAFailureKeepsTheRequestCarriesItAndTheNewBackendPlaysTheActiveTrack',
+        'theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseEndedIt', 'aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse']
         .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)),
     'The Android media session and notification must read the reported track while another loads, as iOS\'s lock screen.'
   );

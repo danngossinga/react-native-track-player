@@ -281,13 +281,14 @@ Added fork surface:
     service stays (as crossfade's), and the end of the error's grace period
     no longer lets it go while the notification is ongoing (before: they read
     the player's own `false`, the session showed paused and the foreground
-    service could go while the app read playing). In the give-up's error with
-    the request kept, the end of the grace period (`stopForegroundGracePeriod`)
-    ends the foreground service and keeps the notification, as crossfade's
-    surface in its error (before: it removed the notification while the app
-    read playing); crossfade's leaves the foreground at once, with no grace
-    period. Once a pause ended the request, the error removes the
-    notification at the grace period's end, as before. The lock screen (iOS) shows
+    service could go while the app read playing). In an error while the app
+    reads the request `true` (a give-up's kept request, or ExoPlayer's own
+    error, which keeps its play-when-ready), the end of the grace period
+    (`stopForegroundGracePeriod`) ends the foreground service and keeps the
+    notification, as crossfade's surface in its error (before: it removed
+    the notification while the app read playing). Once a pause ended the
+    request, the error removes the notification at the grace period's end,
+    as before. The lock screen (iOS) shows
     rate 0 in the error and while a seek holds the player, as crossfade's
     (`nowPlayingPlaybackRate` is 0 outside playing): no change there;
   - a backend switch carries the request the app reads (a kept one: `true`)
@@ -326,6 +327,10 @@ Added fork surface:
   - Android's notification in an error once the request ended (a pause in
     the give-up's error): the standard backend removes it at the grace
     period's end; crossfade's keeps it in every error. Pending the owner's
+    confirmation;
+  - Android's foreground service in an error: the standard backend leaves it
+    at the end of the grace period (`stopForegroundGracePeriod`, as for any
+    state that lets it go), crossfade's surface at once. Pending the owner's
     confirmation;
   - removing a track that is not the active one (the one that failed, say)
     keeps the request, as crossfade's queue change that keeps the active

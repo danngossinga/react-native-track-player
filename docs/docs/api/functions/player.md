@@ -75,8 +75,8 @@ acts there and then plays when playback was requested before the failure, as cro
 after a failed skip. After a failed load the play request stays (`getPlayWhenReady()` and its
 event read `true`) until a pause, stop or clear, an empty new queue or the removal of the active
 track, as crossfade's; on Android the media session and the notification read it too, and in the
-give-up's error the notification stays while the request is kept (the foreground service goes
-after the grace period, as crossfade's). On the
+error the notification stays while the request reads `true` (the foreground service goes after
+the grace period; crossfade's at once). On the
 standard backend the
 player waits paused until the seek is done, then plays, and the state reads `loading` meanwhile
 (crossfade's seek state); several seeks in a row (a scrubber drag) keep that request and the

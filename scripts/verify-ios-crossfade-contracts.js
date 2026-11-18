@@ -961,7 +961,8 @@ assert(
         'testStandardLoadCoordinatorARestoredIdleEmitsOnlyNoneAndStaysOneAcrossQueueChanges',
         'testStandardSeekAndLoadLimitsAreIndependent',
         'testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads',
-        'testStandardCommandLoadResultIsTheCommandsResolution']
+        'testStandardCommandLoadResultIsTheCommandsResolution',
+        'testStandardLoadCoordinatorOnlyTheActiveTracksRemovalEndsTheRequestAndAnEmptyNewQueueEndsItAnotherTakesItOver']
         .every((t) => tests.includes(`func ${t}()`)),
     'The iOS standard player must give up a load with no progress at stallTimeoutMs, as crossfade and Android.'
   );

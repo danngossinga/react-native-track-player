@@ -331,12 +331,21 @@ class StandardBackendHlsTest {
                 assertTrue("$name: kept", backed.backend.playWhenReady)
                 val from = reads.size
                 val eventsFrom = backed.playWhenReadyEvents.size
-                val result = launchCommand(kotlinx.coroutines.Dispatchers.Main) {
+                val result: () -> Result<Unit>? = if (op == "setQueue") {
+                    // Synchronous (as MusicModule's setQueue on the main thread): the session is told
+                    // when it returns, before any posted player event, that the error ended.
+                    backed.backend.replaceQueue(listOf(item(c, 3L), item(a, 1L)))
+                    if (!fromSeek) {
+                        assertTrue("$name: told at once", reads.size > from)
+                        assertEquals("$name: told at once that the error ended: ${reads.drop(from)}", PlaybackStateCompat.STATE_BUFFERING, reads.last().second)
+                    }
+                    val done: () -> Result<Unit>? = { Result.success(Unit) }
+                    done
+                } else launchCommand(kotlinx.coroutines.Dispatchers.Main) {
                     when (op) {
                         "next" -> backed.backend.skipToNext()
                         "skip0" -> backed.backend.skip(0)
-                        "load" -> backed.backend.load(item(c, 9L))
-                        else -> backed.backend.replaceQueue(listOf(item(c, 3L), item(a, 1L)))
+                        else -> backed.backend.load(item(c, 9L))
                     }
                 }
                 val appRead = mutableListOf<Boolean>()
@@ -2041,6 +2050,12 @@ class StandardBackendHlsTest {
         assertFalse("no command waits for the load", backed.backend.reportsPlayerErrorThroughCommand())
         val emitted = backed.events.drop(before).filter { it == "state:ERROR" || it.startsWith("error:") }
         assertEquals(listOf("state:ERROR", "error:parsing-manifest-malformed"), emitted)
+        // Tenth round (review 9, blocking): the foreground rule reads the request the app reads; in
+        // ExoPlayer's own error play-when-ready stays true, so the notification stays as well, as
+        // crossfade's surface in every error (before: removed after the grace period).
+        assertTrue("the app reads the request", backed.backend.playWhenReady)
+        backed.foreground.notificationPosted(ongoingOf(backed.player.sessionPlayer))
+        assertEquals(StandardForegroundRule.Release.KEEP_NOTIFICATION, backed.foreground.release { true })
     }
 
     @Test
