@@ -72,16 +72,19 @@ the active track, paused (a cancelled operation, as crossfade's). A seek (and a 
 the active track, the one `getActiveTrack()` and the progress report, as crossfade's (owner
 decision, 2026-11-17): after a failed load the player goes back to the active track, the seek
 acts there and then plays when playback was requested before the failure, as crossfade's seek
-after a failed skip (a pause after the failure ends that request). On the standard backend the
-player waits paused at the active track until the seek is done, then plays; several seeks in a
-row (a scrubber drag) keep that request and the player plays once the latest one is done (both
-platforms). On the standard backend while
-another track loads (a natural advance, which the seek cancels) it goes back paused (before: it
-acted on the track that failed). With no active track the seek resolves and does nothing, as
-crossfade's (a cancel left none, or a backend switch restored none; before:
+after a failed skip. After a failed load the play request stays (`getPlayWhenReady()` and its
+event read `true`) until a pause, stop or clear, as crossfade's. On the standard backend the
+player waits paused until the seek is done, then plays, and the state reads `loading` meanwhile
+(crossfade's seek state); several seeks in a row (a scrubber drag) keep that request and the
+player plays once the latest one is done; the same on the track the player is on (a seek after
+a seek that gave up); the latest seek that fails keeps the request; a skip, next, previous,
+load, new queue, play or retry takes it over and plays its track (both platforms). On the
+standard backend while another track loads (a natural advance, which the seek cancels) it goes
+back paused (before: it acted on the track that failed). With no active track the seek resolves
+and does nothing, as crossfade's (a cancel left none, or a backend switch restored none; before:
 `standard_seek_unavailable`), except after the first track failed to load: then the seek retries
-the track that failed (owner decision, 2026-11-17; crossfade does nothing there); when it fails as
-well, the next play retries it again.
+the track that failed (owner decision, 2026-11-17; crossfade does nothing there), and plays once
+done when the play request was kept; when it fails as well, the next play retries it again.
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |

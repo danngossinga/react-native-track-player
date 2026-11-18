@@ -233,40 +233,72 @@ Added fork surface:
   (`getActiveTrack` and its position), as crossfade's (owner decision,
   2026-11-17): after a failed load the player goes back to the active track; the
   seek acts there and then plays when playback was requested before the failure,
-  as crossfade's seek after a failed skip (a pause after the failure ends that
-  request); on the standard backend the player waits paused at the active track
-  until the seek is done, then plays, and several seeks in a row (a scrubber
-  drag) keep that request: it plays once the latest one is done, on both
-  platforms (one explicit state, `StandardSeekResume`; before: iOS stayed paused
-  after a second seek, Android played while the seek ran); a stop stops there; on the standard backend while another track loads
-  (a natural advance, which the seek or stop cancels, as crossfade's cancelled
-  operation) it goes back paused, and the next play plays it (before: the seek
-  acted on the track that failed and, when it failed too, the next play loaded
-  the previous track; then: the seek after a failed load left it paused). With no
-  active track after the first load failed, a seek retries the track that failed
-  (crossfade's seek does nothing there); when it fails again, the next play
-  retries that track. A skip or next to the track that failed loads it
-  again. The standard backend reports a new queue's first track at once (it is
-  selected when the queue is set). After a failed load the lock screen and the
-  notification show the active track again. A failed seek keeps its target as the
-  position on both backends and platforms.
-- Remaining gaps of the standard backend's failure handling (the same on both
-  platforms unless said otherwise): play-when-ready during a give-up's error
-  reads false (the give-up's stop ends the player's request; the backend keeps it
-  for the next seek), where crossfade's failure keeps it true; a seek after a
-  seek that gave up acts on the active track and stays paused (the give-up's
-  error is on the track already active, not a failed load), where crossfade's
-  seek plays as requested; on iOS a queue change with no active track may send
-  one request (above). Known limits, unchanged by this branch: the race of a
-  failed state already delivered (or dropped by its token) before a later
-  non-failed one, which can hold a failure in iOS's `StandardFailureOrder`, has no
-  test; iOS's reload at a kept position after a failed seek and its deferred seek
-  after a cancel (`reloadAtKeptPosition`, `seekPlayer(to:)`) do not mark a seek in
-  the item's progress (`noteSeek`), so their bytes read as a load's; a seek during
-  a natural advance (LOAD-17) has a Robolectric test with a real ExoPlayer but no
-  test on a device or emulator; the Robolectric tests run without MusicService's
-  media session connector (a stub), so what a media controller sees there is not
-  tested.
+  as crossfade's seek after a failed skip; a stop stops there; on the standard
+  backend while another track loads (a natural advance, which the seek or stop
+  cancels, as crossfade's cancelled operation) it goes back paused, and the next
+  play plays it (before: the seek acted on the track that failed and, when it
+  failed too, the next play loaded the previous track; then: the seek after a
+  failed load left it paused). With no active track after the first load failed,
+  a seek retries the track that failed (crossfade's seek does nothing there);
+  when it fails again, the next play retries that track. A skip or next to the
+  track that failed loads it again. The standard backend reports a new queue's
+  first track at once (it is selected when the queue is set). After a failed
+  load the lock screen and the notification show the active track again. A
+  failed seek keeps its target as the position on both backends and platforms.
+- After a failed load (a give-up or a player error) the play request stays, as
+  crossfade's failure keeps playWhenReady, until a pause, a stop or a clear
+  (`reset`): `getPlayWhenReady`, `usePlayWhenReady` and the
+  `PlaybackPlayWhenReadyChanged` events read `true` on both backends and
+  platforms, though the standard player itself is stopped or waits paused (one
+  explicit state, `StandardSeekResume`; before: `false` from a give-up on, and
+  while a seek after the failure waited), so `useIsPlaying` reads not playing in
+  the error state and buffering during play while a seek holds the player, as
+  crossfade's. On the standard backend:
+  - a seek holds the player paused until it is done, then plays; several seeks
+    in a row (a scrubber drag) keep that request and the player plays once the
+    latest one is done. While the seek holds it the state reads `loading`
+    (crossfade's state during a seek), in `getPlaybackState`, `usePlaybackState`
+    and the `PlaybackState` events, never `paused` or `ready`;
+  - this also holds on the track the player is on: a seek after a seek that gave
+    up, after a give-up of the playing track, or (with no active track) the seek
+    that retries the first track that gave up, plays once done (before: it
+    stayed paused);
+  - the latest seek that fails does not play and keeps the request: the next
+    seek that succeeds, a play or a retry plays;
+  - a skip, next, previous, load, new queue, play or retry takes the request
+    over: its track plays once loaded (before: during the seek they ended the
+    request and the track stayed paused; Android played before 98748a0). A
+    clear ends it, as crossfade's clear (its stop).
+- Remaining differences of the standard backend's failure handling from
+  crossfade's (the same on both platforms unless said otherwise):
+  - crossfade's `load` and a `setQueue` without the active track end the play
+    request in every case (iOS: `load` does not play; both: a queue without
+    the current track stops); the standard backend's `load` and new queue keep
+    the player's request in every case, so after a failure they play (above).
+    This difference is older than the failure handling (owner question);
+  - a play while a seek holds the player starts it at once; crossfade's play
+    during a seek waits for the seek's end;
+  - removing the active track while the request is kept does not end it (a
+    seek in progress ends cancelled and the request stays); crossfade's queue
+    change without the active track ends it;
+  - a backend switch while the request is kept carries the player's own
+    play-when-ready (`false`), so the new backend starts paused;
+  - with no active track after the first load failed, the seek retries the
+    track (owner decision, LOAD-14); crossfade's seek does nothing there;
+  - on iOS a queue change with no active track may send one request (above).
+  Known limits, unchanged by this branch: the race of a failed state already
+  delivered (or dropped by its token) before a later non-failed one, which can
+  hold a failure in iOS's `StandardFailureOrder`, has no test; iOS's reload at a
+  kept position after a failed seek and its deferred seek after a cancel
+  (`reloadAtKeptPosition`, `seekPlayer(to:)`) do not mark a seek in the item's
+  progress (`noteSeek`), so their bytes read as a load's; a seek during a natural
+  advance (LOAD-17) has a Robolectric test with a real ExoPlayer but no test on a
+  device or emulator; the Robolectric tests run without MusicService's media
+  session connector (a stub), so what a media controller sees there is not
+  tested; on iOS the standard backend has no XCTest with a real SwiftAudioEx
+  player: which command takes the request over is tested in
+  `StandardLoadCoordinator`, and its use in the commands (the jump's
+  play-when-ready) is pinned by `verify-ios-crossfade-contracts.js` only.
 - On the standard backend, while a track loads (and after its load failed) every
   reader agrees with the active track: `getProgress`/`useProgress` and the
   progress events give the active track's last position, duration and buffered
