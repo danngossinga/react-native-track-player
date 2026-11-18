@@ -486,7 +486,10 @@ assert(
     // backend of a switch hands the carried request to its player (activateAfterCommit).
     (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 5 &&
     (standardBackend.match(/seekResume\.handedToPlayer\(\)/g) || []).length === 7 &&
-    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('val kept = items.isNotEmpty() && seekResume.handedToPlayer()\n        reporting {\n            if (items.isEmpty()) seekResume.paused()') &&
+    // Tenth round (review 9, item 2): a new queue hands the kept request over only once the
+    // player's own is set, after the clear and the add (the session never reads false meanwhile).
+    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('            queueStore.replaceWith(items)\n        }\n        if (takesOver) seekResume.handedToPlayer()\n') &&
+    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('val kept = takesOver && seekResume.requestsPlay\n        reporting {\n            if (items.isEmpty()) seekResume.paused()') &&
     section(standardBackend, 'private fun activeTrackRemoved() {', '\n    }\n').includes('reporting { seekResume.paused() }') &&
     section(standardBackend, 'private fun reportRemovedTrack(', '\n    }\n').includes('activeTrackRemoved()') &&
     section(standardBackend, 'override fun remove(indexes: List<Int>) {', '\n    }\n').includes('activeTrackRemoved()\n            forgetReportedTrack()') &&
@@ -517,8 +520,14 @@ assert(
     musicService.includes('foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)') &&
     musicService.includes('if (standardBackendOf(identity)?.playWhenReady ?: source.playWhenReady) {\n                            startForegroundIfNecessary()') &&
     musicService.includes('foreground.notificationPosted(it.ongoing)') &&
-    musicService.includes('fun shouldStopForeground(): Boolean = foreground.stopsForeground(::isForegroundService)') &&
-    musicService.includes('stopForeground(foreground.removeWhenNotOngoing)') &&
+    musicService.includes('fun shouldStopForeground(): Boolean = foreground.release(::isForegroundService) != StandardForegroundRule.Release.NONE') &&
+    // Tenth round (review 9, blocking): the rule reads the request the app reads, live; its
+    // KEEP_NOTIFICATION (a failure's error with the request kept) leaves the foreground and keeps
+    // the notification, as crossfade's surface in ERROR (tested on the rule in Robolectric).
+    musicService.includes('val foreground = StandardForegroundRule { standardBackendOf(identity)?.playWhenReady ?: created.playWhenReady }') &&
+    musicService.includes('val release = foreground.release(::isForegroundService)\n                            if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {') &&
+    musicService.includes('stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)') &&
+    !musicService.includes('removeWhenNotOngoing') &&
     musicService.includes('setupForegrounding(created, identity, ownerScope, productAdmission, foreground)') &&
     !/stopForegroundWhenNotOngoing|removeNotificationWhenNotOngoing/.test(musicService) &&
     !/playRequestedAtGiveUp|keepsPlaying/.test(standardBackend) &&
@@ -1075,7 +1084,7 @@ assert(
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
       section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)') &&
       ['override fun stop() {\n        reporting {\n            seekResume.paused()\n            val cancelledWait = commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        // A failure\'s kept request plays the new queue\'s first track (as a skip\'s). Not reported:',
-        '        val kept = items.isNotEmpty() && seekResume.handedToPlayer()\n        reporting {\n            if (items.isEmpty()) seekResume.paused()\n            commandLoads.cancel()',
+        '        val kept = takesOver && seekResume.requestsPlay\n        reporting {\n            if (items.isEmpty()) seekResume.paused()\n            commandLoads.cancel()',
         'override fun clearQueue() {\n        reporting {\n            // As crossfade\'s clear (its stop): the request a failure kept ends.\n            seekResume.paused()\n            commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
       playbackErrors.includes('if (standardBackendOf(identity)?.reportsPlayerErrorThroughCommand() == true) return@collectWithAdmission') &&
       musicService.includes('(playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend)?.takeIf { it.identity === identity }') &&

@@ -172,7 +172,9 @@ class MusicService : HeadlessJsTaskService() {
             (created.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
             observeRemoteActions(created, identity, ownerScope)
             observeEvents(created, identity, ownerScope, productAdmission)
-            val foreground = StandardForegroundRule()
+            // The request the app reads, live (rule 13): a failure's kept one keeps the notification
+            // of its error, as crossfade's surface.
+            val foreground = StandardForegroundRule { standardBackendOf(identity)?.playWhenReady ?: created.playWhenReady }
             setupForegrounding(created, identity, ownerScope, productAdmission, foreground)
             StandardPlayerBinding(
                 created,
@@ -1488,7 +1490,7 @@ class MusicService : HeadlessJsTaskService() {
             foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)
         }
 
-        fun shouldStopForeground(): Boolean = foreground.stopsForeground(::isForegroundService)
+        fun shouldStopForeground(): Boolean = foreground.release(::isForegroundService) != StandardForegroundRule.Release.NONE
 
         fun observeNotification() = ownerScope.collectWithAdmission(source.event.notificationStateChange, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
@@ -1512,9 +1514,14 @@ class MusicService : HeadlessJsTaskService() {
                             // being immediately destroyed once the player finishes playing media.
                         ownerScope.launch {
                             delay(stopForegroundGracePeriod.toLong() * 1000)
-                            if (isActivePlayer(source, identity) && shouldStopForeground()) {
+                            val release = foreground.release(::isForegroundService)
+                            if (isActivePlayer(source, identity) && release != StandardForegroundRule.Release.NONE) {
+                                // KEEP_NOTIFICATION (a failure's error with its request kept): the
+                                // foreground goes, the notification stays, as crossfade's surface
+                                // (its STOP_FOREGROUND_DETACH; here still the service's, so a later
+                                // stop's stopForeground(true) removes it, as after a pause).
                                 @Suppress("DEPRECATION")
-                                stopForeground(foreground.removeWhenNotOngoing)
+                                stopForeground(release == StandardForegroundRule.Release.REMOVE_NOTIFICATION)
                                 Timber.d("Notification has been stopped")
                             }
                         }

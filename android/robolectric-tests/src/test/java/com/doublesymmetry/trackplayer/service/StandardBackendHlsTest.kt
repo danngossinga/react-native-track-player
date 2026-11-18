@@ -20,6 +20,7 @@ import kotlinx.coroutines.launch
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -146,7 +147,16 @@ class StandardBackendHlsTest {
         assertEquals("the session's state is the error", PlaybackStateCompat.STATE_ERROR, sessionStateOf(session))
         assertFalse("not ongoing in the error, as crossfade's surface (no foreground in ERROR)", ongoingOf(session))
         backed.foreground.notificationPosted(ongoingOf(session))
-        assertTrue("the foreground goes after the error's grace period, as before", backed.foreground.stopsForeground { true })
+        // Tenth round (review 9, blocking): with the request kept, the error's grace period ends
+        // the foreground and keeps the notification, as crossfade's surface in ERROR
+        // (stopForegroundButKeepNotification). Before: the error removed the notification
+        // (stopForeground(true)) while the app read playing.
+        assertEquals(
+            "the foreground goes after the error's grace period, the notification stays, as crossfade's",
+            StandardForegroundRule.Release.KEEP_NOTIFICATION,
+            backed.foreground.release { true }
+        )
+        assertEquals("no longer a foreground service: nothing to do", StandardForegroundRule.Release.NONE, backed.foreground.release { false })
         // The remaining difference (README): ExoPlayer shows play for a stopped player whatever
         // its play-when-ready; crossfade's notification shows pause in its error.
         assertTrue(com.google.android.exoplayer2.util.Util.shouldShowPlayButton(session))
@@ -170,7 +180,7 @@ class StandardBackendHlsTest {
                 assertTrue("ongoing: the foreground stays, as crossfade's", ongoingOf(session))
                 assertFalse("the notification's action is pause", com.google.android.exoplayer2.util.Util.shouldShowPlayButton(session))
                 backed.foreground.notificationPosted(ongoingOf(session))
-                assertFalse("the error's grace period does not end the seek's foreground", backed.foreground.stopsForeground { true })
+                assertEquals("the error's grace period does not end the seek's foreground", StandardForegroundRule.Release.NONE, backed.foreground.release { true })
             }
             Thread.sleep(CLOCK_TICK_MS)
         }
@@ -262,6 +272,90 @@ class StandardBackendHlsTest {
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
     }
 
+    // Tenth round (review 9, blocking): the foreground rule reads the request the app reads at
+    // the moment it decides (rule 13): in the give-up's error with the request kept the
+    // notification stays (crossfade's surface keeps it in ERROR); a pause ends the request with no
+    // state change (the error stays), and the error then removes the notification, as before the
+    // failure handling (crossfade's keeps it in every ERROR: a remaining difference, README).
+    @Test
+    fun theErrorKeepsTheNotificationWhileTheRequestIsKeptAndRemovesItOnceAPauseEndedIt() {
+        val backed = backed()
+        backed.backend.add(listOf(item(slowServer(), 1L), item(server(LADDER), 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val session = backed.player.sessionPlayer as ReportedSessionPlayer
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals(AudioPlayerState.ERROR, backed.backend.playbackState)
+        assertTrue(backed.backend.playWhenReady)
+        backed.foreground.notificationPosted(ongoingOf(session))
+        assertEquals("kept: the notification stays", StandardForegroundRule.Release.KEEP_NOTIFICATION, backed.foreground.release { true })
+        backed.backend.pause()
+        pump(STALL_TIMEOUT_MS / 3)
+        assertEquals("the pause leaves the error", AudioPlayerState.ERROR, backed.backend.playbackState)
+        assertFalse(backed.backend.playWhenReady)
+        backed.foreground.notificationPosted(ongoingOf(session))
+        assertEquals("ended: the error removes it, read at once", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { true })
+        assertEquals("and so with the foreground already gone", StandardForegroundRule.Release.REMOVE_NOTIFICATION, backed.foreground.release { false })
+    }
+
+    // Tenth round (review 9, item 2; reviewer probe ZPROBE6): a command that takes a failure's
+    // kept request over (next, skip, load, a new queue), from the give-up's error and from a seek
+    // holding the player, never shows the media session false while the app reads true (rule 13).
+    // Before: a new queue handed the request over before the clear and the add, and the session,
+    // told at once by the reported track's release, read (false, error) or (false, paused).
+    @Test
+    fun aCommandTakingTheKeptRequestOverNeverShowsTheSessionFalse() {
+        for (op in listOf("next", "skip0", "load", "setQueue")) {
+            for (fromSeek in listOf(false, true)) {
+                val name = "$op fromSeek=$fromSeek"
+                val a = slowServer()
+                val c = server(LADDER, segmentCount = 8, stalledFrom = 8)
+                val backed = backed()
+                backed.backend.add(listOf(item(a, 1L), item(server(LADDER), 2L), item(c, 3L)))
+                command { backed.backend.play() }
+                awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+                val session = backed.player.sessionPlayer as ReportedSessionPlayer
+                val reads = java.util.Collections.synchronizedList(mutableListOf<Pair<Boolean, Int>>())
+                session.addListener(object : com.google.android.exoplayer2.Player.Listener {
+                    override fun onEvents(player: com.google.android.exoplayer2.Player, events: com.google.android.exoplayer2.Player.Events) {
+                        reads += player.playWhenReady to sessionStateOf(player)
+                    }
+                })
+                assertEquals(name, PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+                if (fromSeek) {
+                    launchCommand(kotlinx.coroutines.Dispatchers.Main) { backed.backend.seekTo(PLAYED_MS) }
+                    shadowOf(Looper.getMainLooper()).idle()
+                    assertEquals("$name: held", AudioPlayerState.LOADING, backed.backend.playbackState)
+                }
+                assertTrue("$name: kept", backed.backend.playWhenReady)
+                val from = reads.size
+                val eventsFrom = backed.playWhenReadyEvents.size
+                val result = launchCommand(kotlinx.coroutines.Dispatchers.Main) {
+                    when (op) {
+                        "next" -> backed.backend.skipToNext()
+                        "skip0" -> backed.backend.skip(0)
+                        "load" -> backed.backend.load(item(c, 9L))
+                        else -> backed.backend.replaceQueue(listOf(item(c, 3L), item(a, 1L)))
+                    }
+                }
+                val appRead = mutableListOf<Boolean>()
+                val until = monotonicNowMs() + 4_000
+                while (monotonicNowMs() < until) {
+                    shadowOf(Looper.getMainLooper()).idle()
+                    appRead += backed.backend.playWhenReady
+                    Thread.sleep(CLOCK_TICK_MS)
+                }
+                assertNotNull("$name: the command ended", result())
+                val told = reads.drop(from)
+                assertTrue("$name: the session was told: $told", told.isNotEmpty())
+                assertFalse("$name: the app reads true throughout", false in appRead)
+                assertFalse("$name: no false event", false in backed.playWhenReadyEvents.drop(eventsFrom))
+                assertEquals("$name: the session never reads false: $told", emptyList<Pair<Boolean, Int>>(), told.filter { !it.first })
+            }
+        }
+    }
+
     // Ninth round (review 8, item 5): a backend switch while a failure keeps the request carries
     // the request the app reads (true), as crossfade's snapshot carries its playWhenReady, and the
     // active track (A, at its position), as iOS; the new backend hands it to its player, which
@@ -281,10 +375,16 @@ class StandardBackendHlsTest {
         pump(STALL_TIMEOUT_MS / 3)
         assertTrue(source.backend.playWhenReady)
         val exo = source.analytics.player!!
+        // A's position as the app reads it (the reported track's, as the player left it); the
+        // player itself is on the failed B (tenth round, review 9, item 4: V1, liveProgress, dies).
+        val aPositionMs = source.backend.positionMs
+        assertTrue("A had played: $aPositionMs", aPositionMs >= PLAYED_MS)
+        assertTrue("the player's own item is another: ${exo.currentPosition}", kotlin.math.abs(exo.currentPosition - aPositionMs) > CAPTURE_LAG_MS)
         var snapshot: PlaybackBackendSnapshot? = null
         assertNull(command { snapshot = source.backend.beginHandoffQuiescence() })
         assertTrue("the request the app reads is carried", snapshot!!.playWhenReady)
         assertEquals("the active track A, not the failed B", 0, snapshot!!.activeIndex)
+        assertEquals("at A's position, as the app reads it", aPositionMs, snapshot!!.positionMs)
         // Rolled back: as it was.
         assertNull(command { source.backend.cancelHandoffQuiescence(snapshot!!) })
         pump(STALL_TIMEOUT_MS)
@@ -294,6 +394,7 @@ class StandardBackendHlsTest {
         assertTrue("still kept", source.backend.playWhenReady)
         // Switched: the new backend plays A.
         assertNull(command { snapshot = source.backend.beginHandoffQuiescence() })
+        assertEquals("still at A's position", aPositionMs, snapshot!!.positionMs)
         val target = backed(candidateQueue = items)
         assertNull(command {
             target.backend.prepareSilently(snapshot!!)
@@ -1988,9 +2089,9 @@ class StandardBackendHlsTest {
         val nowPlayingShown = mutableListOf<Pair<Int?, Boolean>>()
         /** When the load under test began (a command; the stalled request may go out earlier). */
         var loadStartedAtMs = 0L
-        /** MusicService's foreground rule for this player (setupForegrounding). */
-        val foreground = StandardForegroundRule()
-        val backend = KotlinAudioPlaybackBackend(
+        /** MusicService's foreground rule for this player (setupForegrounding), fed the request the app reads. */
+        val foreground: StandardForegroundRule = StandardForegroundRule { backend.playWhenReady }
+        val backend: KotlinAudioPlaybackBackend = KotlinAudioPlaybackBackend(
             player,
             Any(),
             AndroidTrackQueue().apply { candidateQueue?.let(::replaceWith) },

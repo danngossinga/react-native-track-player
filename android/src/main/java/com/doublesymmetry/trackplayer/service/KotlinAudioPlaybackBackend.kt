@@ -230,17 +230,29 @@ internal class StandardReportedSink(
  * notification is ongoing (ReportedSessionPlayer: buffering, play-when-ready), as crossfade's
  * surface stays in the foreground while it loads with playWhenReady. Only a notification that is
  * still not ongoing lets it go (a grace period's end after a give-up's error does not end the
- * foreground of the seek that followed). Based on Pocket Casts' PlaybackService
- * (MusicService.setupForegrounding).
+ * foreground of the seek that followed). In a failure's error while its request is kept
+ * ([playRequested], read live: the request the app reads) the foreground goes and the
+ * notification stays, as crossfade's surface in ERROR (stopForegroundButKeepNotification); once
+ * the request ended (a pause) the error removes it, as before. Based on Pocket Casts'
+ * PlaybackService (MusicService.setupForegrounding).
  */
-internal class StandardForegroundRule {
-    /** The notification, once not ongoing, lets the foreground service go. */
-    var stopWhenNotOngoing = false
-        private set
-    /** ...and removes the notification. */
-    var removeWhenNotOngoing = false
-        private set
+internal class StandardForegroundRule(
+    /** The play request the app reads (the backend's playWhenReady, a failure's kept one included). */
+    private val playRequested: () -> Boolean = { false }
+) {
+    /** What a notification that is not ongoing does to the foreground service. */
+    enum class Release {
+        /** Nothing: it stays (or is not one). */
+        NONE,
+        /** It goes; the notification stays (MusicService: stopForeground(false)). */
+        KEEP_NOTIFICATION,
+        /** It goes with its notification (stopForeground(true)). */
+        REMOVE_NOTIFICATION
+    }
+
     private var stateCount = 0
+    /** The last state that lets the foreground go (null: none, or the initial idle state). */
+    private var settled: AudioPlayerState? = null
     /** Whether the notification last posted is ongoing. */
     private var ongoing = false
 
@@ -249,16 +261,23 @@ internal class StandardForegroundRule {
         this.ongoing = ongoing
     }
 
-    /** Whether the foreground service goes now ([isForegroundService]: whether it is one). */
-    fun stopsForeground(isForegroundService: () -> Boolean): Boolean =
-        !ongoing && stopWhenNotOngoing && (removeWhenNotOngoing || isForegroundService())
+    /** What happens to the foreground service now ([isForegroundService]: whether it is one). */
+    fun release(isForegroundService: () -> Boolean): Release {
+        val state = settled
+        if (ongoing || state == null) return Release.NONE
+        val removes = state in REMOVABLE_STATES && !(state == AudioPlayerState.ERROR && playRequested())
+        return when {
+            removes -> Release.REMOVE_NOTIFICATION
+            isForegroundService() -> Release.KEEP_NOTIFICATION
+            else -> Release.NONE
+        }
+    }
 
     fun stateChanged(state: AudioPlayerState) {
         stateCount++
         if (state in LOADING_STATES) return
         // The initial idle state is skipped: only a state after another counts.
-        stopWhenNotOngoing = stateCount > 1 && state in BACKGROUNDABLE_STATES
-        removeWhenNotOngoing = stopWhenNotOngoing && state in REMOVABLE_STATES
+        settled = state.takeIf { stateCount > 1 && it in BACKGROUNDABLE_STATES }
     }
 
     private companion object {
@@ -1105,7 +1124,10 @@ internal class KotlinAudioPlaybackBackend(
         // true throughout; the new track's states are the player's events). An empty queue has
         // no track to play: the request ends, reported (as crossfade's setQueue with no active
         // track, and a clear), so the getter and the event agree (rule 13).
-        val kept = items.isNotEmpty() && seekResume.handedToPlayer()
+        // Handed over only once the player's own request is set (below): the session reads the
+        // kept one meanwhile, never false (forgetReportedTrack and the clear tell it at once).
+        val takesOver = items.isNotEmpty()
+        val kept = takesOver && seekResume.requestsPlay
         reporting {
             if (items.isEmpty()) seekResume.paused()
             commandLoads.cancel()
@@ -1122,9 +1144,10 @@ internal class KotlinAudioPlaybackBackend(
             }
             logicalPlaybackState.onQueueSizeChanged(items.size)
             queueStore.replaceWith(items)
-            // The new queue ended a give-up's error: the media session is told.
-            analytics()?.sessionPlayer?.refresh()
         }
+        if (takesOver) seekResume.handedToPlayer()
+        // The new queue ended a give-up's error, the request is the player's: the session is told.
+        analytics()?.sessionPlayer?.refresh()
     }
 
     override fun clearQueue() {
