@@ -203,6 +203,77 @@ internal class KotlinAudioLogicalPlaybackStateSidecar {
         if (activity.isIdle) 0L else physicalBufferedMs
 }
 
+/**
+ * What MusicService does with what the standard backend reports with no event of the player's
+ * ([KotlinAudioPlaybackBackend]'s onReportedChanged: a failure's kept request, a seek holding the
+ * player paused): the state event, the foreground rule's state, the play-when-ready event. One
+ * function the service and the tests share (iOS: `StandardReadingEvents`).
+ */
+internal class StandardReportedSink(
+    private val emitState: (AudioPlayerState) -> Unit,
+    private val emitPlayWhenReady: (Boolean) -> Unit,
+    private val foreground: StandardForegroundRule
+) {
+    fun changed(playWhenReady: Boolean?, state: AudioPlayerState?) {
+        state?.let {
+            emitState(it)
+            foreground.stateChanged(it)
+        }
+        playWhenReady?.let(emitPlayWhenReady)
+    }
+}
+
+/**
+ * When MusicService lets the standard player's foreground service go, fed the state the app reads
+ * ([KotlinAudioPlaybackBackend.reportedStateOf] of the player's events, and [StandardReportedSink]):
+ * a seek holding the player paused reads LOADING, not the paused player's PAUSED, and its
+ * notification is ongoing (ReportedSessionPlayer: buffering, play-when-ready), as crossfade's
+ * surface stays in the foreground while it loads with playWhenReady. Only a notification that is
+ * still not ongoing lets it go (a grace period's end after a give-up's error does not end the
+ * foreground of the seek that followed). Based on Pocket Casts' PlaybackService
+ * (MusicService.setupForegrounding).
+ */
+internal class StandardForegroundRule {
+    /** The notification, once not ongoing, lets the foreground service go. */
+    var stopWhenNotOngoing = false
+        private set
+    /** ...and removes the notification. */
+    var removeWhenNotOngoing = false
+        private set
+    private var stateCount = 0
+    /** Whether the notification last posted is ongoing. */
+    private var ongoing = false
+
+    /** The notification was posted ([ongoing]: PlayerNotificationManager's ongoing flag). */
+    fun notificationPosted(ongoing: Boolean) {
+        this.ongoing = ongoing
+    }
+
+    /** Whether the foreground service goes now ([isForegroundService]: whether it is one). */
+    fun stopsForeground(isForegroundService: () -> Boolean): Boolean =
+        !ongoing && stopWhenNotOngoing && (removeWhenNotOngoing || isForegroundService())
+
+    fun stateChanged(state: AudioPlayerState) {
+        stateCount++
+        if (state in LOADING_STATES) return
+        // The initial idle state is skipped: only a state after another counts.
+        stopWhenNotOngoing = stateCount > 1 && state in BACKGROUNDABLE_STATES
+        removeWhenNotOngoing = stopWhenNotOngoing && state in REMOVABLE_STATES
+    }
+
+    private companion object {
+        val BACKGROUNDABLE_STATES = setOf(
+            AudioPlayerState.IDLE,
+            AudioPlayerState.ENDED,
+            AudioPlayerState.STOPPED,
+            AudioPlayerState.ERROR,
+            AudioPlayerState.PAUSED
+        )
+        val REMOVABLE_STATES = setOf(AudioPlayerState.IDLE, AudioPlayerState.STOPPED, AudioPlayerState.ERROR)
+        val LOADING_STATES = setOf(AudioPlayerState.LOADING, AudioPlayerState.READY, AudioPlayerState.BUFFERING)
+    }
+}
+
 internal class KotlinAudioPlaybackBackend(
     private val player: QueuedAudioPlayer,
     override val identity: Any,
@@ -339,6 +410,9 @@ internal class KotlinAudioPlaybackBackend(
                         stateAfter.takeIf { it != stateBefore }
                     )
                 }
+                // The media session and the notification read the same values
+                // (ReportedSessionPlayer.requestKept, seekHolds): told at once.
+                analytics()?.sessionPlayer?.refresh()
             }
         }
     }
@@ -372,13 +446,15 @@ internal class KotlinAudioPlaybackBackend(
         val queue = player.items.map { it as TrackAudioItem }
         queueStore.replaceWith(queue)
         queueState.captureAuthoritative(queue)
-        val index = logicalPlaybackState.activeIndex(player.currentIndex, queue.size)
+        // The active track the app reads and its position (rule 13), as iOS: while another track
+        // loads or after its load failed, the reported one at its last position (before: the
+        // player's own item, which a switch then loaded, and the carried request played).
+        val index = currentIndex.takeIf { it in queue.indices }
         return PlaybackBackendSnapshot(
             queueIds = queue.map { it.track.queueId.toString() },
             activeIndex = index,
             activeTrackId = index?.let { queue[it].track.queueId.toString() },
-            // The player's own item and its position (index and position of the same track).
-            positionMs = liveProgress().positionMs.coerceAtLeast(0L),
+            positionMs = reportedProgress().positionMs.coerceAtLeast(0L),
             playWhenReady = playWhenReady,
             volume = player.volume,
             rate = player.playbackSpeed,
@@ -451,9 +527,16 @@ internal class KotlinAudioPlaybackBackend(
         }
     }
 
+    /** The player's own play-when-ready before [beginHandoffQuiescence], for its rollback. */
+    private var quiescedPlayerPlayWhenReady: Boolean? = null
+
     override suspend fun beginHandoffQuiescence(): PlaybackBackendSnapshot {
         settleActiveTransition()
-        val logicalPlayWhenReady = player.playWhenReady
+        // The request the app reads goes to the new backend (a failure's kept one included, as
+        // crossfade's snapshot carries its playWhenReady; before: the player's own, false); the
+        // new backend hands it to its player (activateAfterCommit). iOS: the same.
+        val logicalPlayWhenReady = playWhenReady
+        quiescedPlayerPlayWhenReady = player.playWhenReady
         val logicalVolume = player.volume
         player.volume = 0f
         player.playWhenReady = false
@@ -466,9 +549,13 @@ internal class KotlinAudioPlaybackBackend(
 
     override suspend fun cancelHandoffQuiescence(snapshot: PlaybackBackendSnapshot) {
         if (disposed || playerReleased) return
+        // Back as it was: the player's own request, not the carried one (a kept request stays
+        // kept, StandardSeekResume unchanged: a stopped or held player does not start).
+        val playerPlayWhenReady = quiescedPlayerPlayWhenReady ?: snapshot.playWhenReady
+        quiescedPlayerPlayWhenReady = null
         player.volume = snapshot.volume
-        player.playWhenReady = snapshot.playWhenReady
-        if (snapshot.playWhenReady) player.play() else player.pause()
+        player.playWhenReady = playerPlayWhenReady
+        if (playerPlayWhenReady) player.play() else player.pause()
     }
 
     override suspend fun stopAndMute() {
@@ -511,6 +598,9 @@ internal class KotlinAudioPlaybackBackend(
 
     override suspend fun activateAfterCommit(snapshot: PlaybackBackendSnapshot) {
         player.volume = snapshot.volume
+        // The hand-off: the carried request (the previous backend's, a failure's kept one
+        // included) is this player's own from now on (a new backend keeps nothing:
+        // StandardSeekResume NONE), so it plays the restored track.
         player.playWhenReady = snapshot.playWhenReady
         if (snapshot.playWhenReady) {
             logicalPlaybackState.activate()
@@ -626,6 +716,12 @@ internal class KotlinAudioPlaybackBackend(
         collector.sessionPlayer?.let { session ->
             session.reportedIndex = { reportedIndex().takeIf { it >= 0 } }
             session.hostError = ::hostSessionError
+            // The play request and the state the app reads (StandardSeekResume, rule 13).
+            session.requestKept = { !logicalPlaybackState.isIdle && seekResume.requestsPlay }
+            session.seekHolds = {
+                seekResume.kind == StandardSeekResume.Kind.RESUMES_AFTER_SEEK &&
+                    playbackState == AudioPlayerState.LOADING
+            }
         }
         collector.addListener(object : com.google.android.exoplayer2.analytics.AnalyticsListener {
             // The seek and readiness waits look at every player event (they only sample the
@@ -803,8 +899,18 @@ internal class KotlinAudioPlaybackBackend(
     private fun reportRemovedTrack(before: List<Any?>) {
         val reported = failedLoads.reported ?: return
         if (indexOfItem(reported) != null) return
+        activeTrackRemoved()
         val lastIndex = before.indexOfFirst { it === reported }.takeIf { it >= 0 }
         failedLoads.removed(reported)?.let { report(it, lastIndex) }
+    }
+
+    /**
+     * The active track left the queue: the request a failure kept ends, reported, as crossfade's
+     * queue change without the active track (its playWhenReady false); iOS: the same
+     * (StandardLoadCoordinator.activeTrackRemoved).
+     */
+    private fun activeTrackRemoved() {
+        reporting { seekResume.paused() }
     }
 
     /**
@@ -946,7 +1052,13 @@ internal class KotlinAudioPlaybackBackend(
         val before = player.items.toList()
         player.remove(indexes)
         cancelCommandLoadOfRemovedTrack()
-        if (player.items.isEmpty()) forgetReportedTrack() else reportRemovedTrack(before)
+        if (player.items.isEmpty()) {
+            // Every track left, the active one with them.
+            activeTrackRemoved()
+            forgetReportedTrack()
+        } else {
+            reportRemovedTrack(before)
+        }
         logicalPlaybackState.onQueueSizeChanged(player.items.size)
         queueStore.replaceWith(player.items.map { it as TrackAudioItem })
     }
@@ -990,9 +1102,12 @@ internal class KotlinAudioPlaybackBackend(
     override fun replaceQueue(items: List<TrackAudioItem>) {
         // A failure's kept request plays the new queue's first track (as a skip's). Not reported:
         // the player's own request is set at once (a command that takes the request over reads
-        // true throughout; the new track's states are the player's events).
-        val kept = seekResume.handedToPlayer()
+        // true throughout; the new track's states are the player's events). An empty queue has
+        // no track to play: the request ends, reported (as crossfade's setQueue with no active
+        // track, and a clear), so the getter and the event agree (rule 13).
+        val kept = items.isNotEmpty() && seekResume.handedToPlayer()
         reporting {
+            if (items.isEmpty()) seekResume.paused()
             commandLoads.cancel()
             forgetReportedTrack()
             player.clear()

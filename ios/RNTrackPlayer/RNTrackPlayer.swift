@@ -2214,13 +2214,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     /// failure's kept request, a seek holding the player paused: StandardSeekResume). As Android.
     func handleStandardReadingChanged(source: QueuedAudioPlayer, playWhenReady: Bool?, state: State?) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
-        if let state = state {
-            let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
-            emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state, error: backend?.publicPlaybackError))
-        }
-        if let playWhenReady = playWhenReady {
-            emit(event: EventType.PlaybackPlayWhenReadyChanged, body: ["playWhenReady": playWhenReady])
-        }
+        let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
+        StandardReadingSink(
+            emitState: { [weak self] raw in
+                guard let self = self, let state = State(rawValue: raw) else { return }
+                self.emit(event: EventType.PlaybackState, body: self.getPlaybackStateBodyKeyValues(state: state, error: backend?.publicPlaybackError))
+            },
+            emitPlayWhenReady: { [weak self] playWhenReady in
+                self?.emit(event: EventType.PlaybackPlayWhenReadyChanged, body: ["playWhenReady": playWhenReady])
+            }
+        ).changed(playWhenReady: playWhenReady, state: state?.rawValue)
     }
 
     // MARK: - IOSPlaybackOrchestratorDelegate

@@ -481,8 +481,20 @@ assert(
     // A pause, a stop and a clear (crossfade's stop) end a failure's kept request; every command
     // that loads a track takes it over and plays (eighth round: StandardBackendHlsTest
     // .aSkipNextPreviousOrLoadDuringASeekAfterAFailedSkip*, aNewQueueDuringASeekAfterAFailedSkip*).
-    (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 3 &&
+    // Ninth round (review 8): an empty queue and the active track's removal end it too
+    // (aNewQueueDuringASeekAfterAFailedSkip*, anEmptyQueueOrTheRemovalOfEveryTrack*); the new
+    // backend of a switch hands the carried request to its player (activateAfterCommit).
+    (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 5 &&
     (standardBackend.match(/seekResume\.handedToPlayer\(\)/g) || []).length === 7 &&
+    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('val kept = items.isNotEmpty() && seekResume.handedToPlayer()\n        reporting {\n            if (items.isEmpty()) seekResume.paused()') &&
+    section(standardBackend, 'private fun activeTrackRemoved() {', '\n    }\n').includes('reporting { seekResume.paused() }') &&
+    section(standardBackend, 'private fun reportRemovedTrack(', '\n    }\n').includes('activeTrackRemoved()') &&
+    section(standardBackend, 'override fun remove(indexes: List<Int>) {', '\n    }\n').includes('activeTrackRemoved()\n            forgetReportedTrack()') &&
+    section(standardBackend, 'override suspend fun activateAfterCommit(', '\n    }\n').includes('// StandardSeekResume NONE), so it plays the restored track.\n        player.playWhenReady = snapshot.playWhenReady') &&
+    section(standardBackend, 'override suspend fun beginHandoffQuiescence(', '\n    }\n').includes('val logicalPlayWhenReady = playWhenReady\n        quiescedPlayerPlayWhenReady = player.playWhenReady') &&
+    section(standardBackend, 'override suspend fun cancelHandoffQuiescence(', '\n    }\n').includes('val playerPlayWhenReady = quiescedPlayerPlayWhenReady ?: snapshot.playWhenReady') &&
+    section(standardBackend, 'override suspend fun snapshot(', '\n    }\n').includes('val index = currentIndex.takeIf { it in queue.indices }') &&
+    section(standardBackend, 'override suspend fun snapshot(', '\n    }\n').includes('positionMs = reportedProgress().positionMs.coerceAtLeast(0L)') &&
     section(standardBackend, 'override fun clearQueue() {', '\n    }\n').includes('seekResume.paused()') &&
     section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun skipToNext()').includes('player.jumpToItem(index)\n            if (kept) player.playWhenReady = true') &&
     section(standardBackend, 'override suspend fun skipToNext() {', 'private suspend fun moveToNext()').includes('moveToNext()\n        if (kept) player.playWhenReady = true') &&
@@ -495,7 +507,20 @@ assert(
     standardBackend.includes('get() = seekResume.reportedState(logicalPlaybackState.playbackState(player.playerState))') &&
     musicService.includes('getPlayerStateBundle(standardBackendOf(identity)?.reportedStateOf(it) ?: it)') &&
     musicService.includes('putBoolean("playWhenReady", standardBackendOf(identity)?.reportedPlayWhenReadyOf(it.playWhenReady) ?: it.playWhenReady)') &&
-    section(musicService, 'onReportedChanged = { playWhenReady, state ->', 'initiallyAuthoritative = initiallyAuthoritative').includes('emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED') &&
+    // Ninth round (review 8): MusicService's glue, which the Robolectric build does not compile
+    // (the sink and the foreground rule it uses are tested there): the reported changes go
+    // through the shared sink, the foreground rule reads the reported state and play request.
+    section(musicService, 'onReportedChanged = StandardReportedSink(', 'initiallyAuthoritative = initiallyAuthoritative').includes('emitState = { emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it)) },') &&
+    section(musicService, 'onReportedChanged = StandardReportedSink(', 'initiallyAuthoritative = initiallyAuthoritative').includes('emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, Bundle().apply { putBoolean("playWhenReady", it) })') &&
+    section(musicService, 'onReportedChanged = StandardReportedSink(', 'initiallyAuthoritative = initiallyAuthoritative').includes('foreground = binding.foreground') &&
+    section(musicService, 'onReportedChanged = StandardReportedSink(', 'initiallyAuthoritative = initiallyAuthoritative').includes('sink.changed(playWhenReady, state)') &&
+    musicService.includes('foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)') &&
+    musicService.includes('if (standardBackendOf(identity)?.playWhenReady ?: source.playWhenReady) {\n                            startForegroundIfNecessary()') &&
+    musicService.includes('foreground.notificationPosted(it.ongoing)') &&
+    musicService.includes('fun shouldStopForeground(): Boolean = foreground.stopsForeground(::isForegroundService)') &&
+    musicService.includes('stopForeground(foreground.removeWhenNotOngoing)') &&
+    musicService.includes('setupForegrounding(created, identity, ownerScope, productAdmission, foreground)') &&
+    !/stopForegroundWhenNotOngoing|removeNotificationWhenNotOngoing/.test(musicService) &&
     !/playRequestedAtGiveUp|keepsPlaying/.test(standardBackend) &&
     standardBackend.includes('                player.releaseSource(cancelled)\n') &&
     standardBackend.includes('            StandardCancelledLoad.StopsInIdle -> {\n                player.stop()\n                logicalPlaybackState.enterIdle(player.items.size)') &&
@@ -1050,7 +1075,7 @@ assert(
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
       section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)') &&
       ['override fun stop() {\n        reporting {\n            seekResume.paused()\n            val cancelledWait = commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        // A failure\'s kept request plays the new queue\'s first track (as a skip\'s). Not reported:',
-        '        val kept = seekResume.handedToPlayer()\n        reporting {\n            commandLoads.cancel()',
+        '        val kept = items.isNotEmpty() && seekResume.handedToPlayer()\n        reporting {\n            if (items.isEmpty()) seekResume.paused()\n            commandLoads.cancel()',
         'override fun clearQueue() {\n        reporting {\n            // As crossfade\'s clear (its stop): the request a failure kept ends.\n            seekResume.paused()\n            commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
       playbackErrors.includes('if (standardBackendOf(identity)?.reportsPlayerErrorThroughCommand() == true) return@collectWithAdmission') &&
       musicService.includes('(playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend)?.takeIf { it.identity === identity }') &&
@@ -1087,8 +1112,9 @@ assert(
       section(musicService, 'private suspend fun progressUpdateEvent(): Bundle? {', '\n    }\n').includes('putInt(TRACK_KEY, backend.currentIndex)') &&
       standardBackend.includes('override val positionMs: Long\n        get() = reportedProgress().positionMs') &&
       standardBackend.includes('progress.left(player.items.getOrNull(oldPosition.mediaItemIndex), oldPosition.positionMs)') &&
-      // A backend switch's snapshot pairs the player's own index with its own position.
-      standardBackend.includes('positionMs = liveProgress().positionMs.coerceAtLeast(0L),'),
+      // A backend switch's snapshot carries the active track the app reads and its position
+      // (ninth round, review 8: as iOS; before: the player's own index and position).
+      standardBackend.includes('positionMs = reportedProgress().positionMs.coerceAtLeast(0L),'),
     'Android standard readers (progress, events, notification) must agree with the reported active track while another loads, as iOS.'
   );
 }
@@ -1105,7 +1131,7 @@ assert(
   const sessionPlayer = read('android/src/main/java/com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt');
   const vendored = read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/BaseAudioPlayer.kt');
   assert(
-    sessionPlayer.includes('val flags = FlagSet.Builder().add(Player.EVENT_IS_PLAYING_CHANGED)\n        if (indexChanged) flags.add(Player.EVENT_POSITION_DISCONTINUITY)') &&
+    sessionPlayer.includes('val flags = FlagSet.Builder().add(Player.EVENT_IS_PLAYING_CHANGED)\n        if (now.index != before.index) flags.add(Player.EVENT_POSITION_DISCONTINUITY)') &&
       // Held, the current item is the reported track's (the active queue item), and a give-up's
       // error is the player's (STATE_ERROR), read live (fifth review, F4; StandardBackendHlsTest
       // .whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError).
@@ -1114,10 +1140,18 @@ assert(
       section(standardBackend, 'fun startLoadWatch(handler: android.os.Handler) {', 'collector.addListener(').includes('session.reportedIndex = { reportedIndex().takeIf { it >= 0 } }\n            session.hostError = ::hostSessionError') &&
       ['override fun stop() {', 'override fun clearQueue() {', 'override fun replaceQueue(items: List<TrackAudioItem>) {'].every((start) =>
         section(standardBackend, start, '\n    }\n').includes('analytics()?.sessionPlayer?.refresh()')) &&
-      // Play-when-ready stays the player's: PlayerNotificationManager's ongoing flag (buffering or
-      // ready, and play-when-ready) drives MusicService's foreground service.
-      !sessionPlayer.includes('override fun getPlayWhenReady()') &&
-      musicService.includes('if (it.ongoing) {\n                        if (source.playWhenReady) {\n                            startForegroundIfNecessary()') &&
+      // Ninth round (review 8, blocking 1): play-when-ready and the state are the ones the app
+      // reads (a failure's kept request, a seek's hold: STATE_BUFFERING), as crossfade's surface;
+      // PlayerNotificationManager's ongoing flag (buffering or ready, and play-when-ready) drives
+      // MusicService's foreground service, told at once of a change (reporting's refresh).
+      // StandardBackendHlsTest.afterAFailureTheMediaSessionTheNotificationAndTheForegroundReadTheRequestTheAppReads.
+      sessionPlayer.includes('override fun getPlayWhenReady(): Boolean = super.getPlayWhenReady() || requestKept()') &&
+      sessionPlayer.includes('override fun getPlaybackState(): Int = if (seekHolds()) Player.STATE_BUFFERING else super.getPlaybackState()') &&
+      sessionPlayer.includes('if (now.playWhenReady != before.playWhenReady) flags.add(Player.EVENT_PLAY_WHEN_READY_CHANGED)') &&
+      sessionPlayer.includes('if (now.state != before.state) flags.add(Player.EVENT_PLAYBACK_STATE_CHANGED)') &&
+      section(standardBackend, 'fun startLoadWatch(handler: android.os.Handler) {', 'collector.addListener(').includes('session.requestKept = { !logicalPlaybackState.isIdle && seekResume.requestsPlay }') &&
+      section(standardBackend, 'private inline fun <T> reporting(', '\n    }\n').includes('analytics()?.sessionPlayer?.refresh()') &&
+      musicService.includes('if (it.ongoing) {\n                        // The play request the app reads') &&
       sessionPlayer.includes('listeners.toList().forEach { it.onEvents(this, events) }') &&
       standardHooks.includes('sessionPlayer = { player -> ReportedSessionPlayer(player).also { analytics.sessionPlayer = it } }') &&
       musicService.includes('standardPlayerHooks(this@MusicService, analytics, { initialBitrateEstimate.bitsPerSecond }, { stallTimeout.milliseconds })') &&
@@ -1126,7 +1160,9 @@ assert(
       vendored.includes('notificationManager.getMediaMetadataCompat()') &&
       section(standardBackend, 'private fun followNowPlaying() {', '\n    }\n').includes('analytics()?.sessionPlayer?.hold(if (nowPlaying.isHeld) reportedProgress() else null)\n        change?.let { onNowPlaying(indexOfItem(it.item), it.held) }') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/ReportedSessionPlayer.kt",') &&
-      ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases', 'whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError']
+      ['whileATrackLoadsTheMediaSessionAndTheNotificationReadTheReportedTrack', 'theSessionPlayerTellsItsListenersAtOnceWhenItHoldsAndReleases', 'whileATrackLoadsTheMediaSessionsCurrentItemIsTheReportedTrackAndAGiveUpIsItsError',
+        'afterAFailureTheMediaSessionTheNotificationAndTheForegroundReadTheRequestTheAppReads', 'anEmptyQueueOrTheRemovalOfEveryTrackWhileAFailureKeepsTheRequestEndsItAndTellsTheApp',
+        'aPlainSeekAfterThePlayThatTookAFailuresRequestOverNeverHoldsThePlayer', 'aBackendSwitchWhileAFailureKeepsTheRequestCarriesItAndTheNewBackendPlaysTheActiveTrack']
         .every((t) => read('android/robolectric-tests/src/test/java/com/doublesymmetry/trackplayer/service/StandardBackendHlsTest.kt').includes(`fun ${t}()`)),
     'The Android media session and notification must read the reported track while another loads, as iOS\'s lock screen.'
   );

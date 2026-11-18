@@ -589,7 +589,14 @@ assert(
     // The module's request follows every playWhenReady it sets (restore, a cancelled handoff,
     // the activation after a switch).
     section(standardBackend, '    func restore(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = false\n            requested.request(false)\n            player.pause()') &&
-    section(standardBackend, '    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = snapshot.playWhenReady\n            requested.request(snapshot.playWhenReady)') &&
+    // Ninth round (review 8, item 5): the rollback restores SwiftAudioEx's own request, not the
+    // carried one (a kept request stays kept); the switch carries the request the app reads, and
+    // the new backend hands it to its player. As Android
+    // (StandardBackendHlsTest.aBackendSwitchWhileAFailureKeepsTheRequestCarriesIt*), whose
+    // behaviour XCTest cannot reach here (no real SwiftAudioEx in the tests).
+    section(standardBackend, '    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            let playerPlayWhenReady = quiescedPlayerPlayWhenReady ?? snapshot.playWhenReady\n            quiescedPlayerPlayWhenReady = nil\n            player.playWhenReady = playerPlayWhenReady\n            requested.request(playerPlayWhenReady)') &&
+    section(standardBackend, '    func beginHandoffQuiescence() throws -> PlaybackBackendSnapshot {', '    func ').includes('            let intendedPlayWhenReady = publicPlayWhenReady\n            quiescedPlayerPlayWhenReady = player.playWhenReady') &&
+    section(standardBackend, '    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {', '    func ').includes('        // StandardSeekResume none), so it plays the restored track. As Android.\n        player.playWhenReady = !activity.isIdle && snapshot.playWhenReady\n        requested.request(player.playWhenReady)') &&
     section(standardBackend, '    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {', '    func ').includes('        player.playWhenReady = !activity.isIdle && snapshot.playWhenReady\n        requested.request(player.playWhenReady)') &&
     // The crossfade engine gives up at once with crossfade_engine_error when the player fails.
     engine.includes('                if let failure = self.player.currentItem?.error ?? self.player.error,\n                   self.player.currentItem?.status == .failed || self.player.status == .failed {\n                    DispatchQueue.main.async {\n                        guard self.generation == generation, !didComplete else { return }\n                        self.state = .failed\n                        finish(.failure(NSError(') &&
@@ -878,6 +885,26 @@ assert(
       section(backendSource, '    func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {', '    func skip(to index: Int, initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {').includes('player.load(item: track, playWhenReady: takeOverRequest() ? true : nil)') &&
       section(backendSource, '    func replaceQueue(_ tracks: [Track]) throws {', '    func clearQueue() {').includes('try player.add(items: tracks, playWhenReady: kept && !activity.isIdle && !tracks.isEmpty ? true : nil)') &&
       section(backendSource, '    func clearQueue() {', '    func load(_ track: Track, completion: @escaping (Result<Int, Error>) -> Void) {').includes('loads.queueCleared()') &&
+      // Ninth round (review 8, items 2 and 6): an empty queue and the active track's removal end
+      // the request, reported (StandardLoadCoordinator.activeTrackRemoved, tested:
+      // testStandardLoadCoordinatorTheActiveTracksRemovalOrAnEmptyQueueEndsTheRequest; Android:
+      // anEmptyQueueOrTheRemovalOfEveryTrack*, aNewQueueDuringASeekAfterAFailedSkip*).
+      section(backendSource, '    func replaceQueue(_ tracks: [Track]) throws {', '    func clearQueue() {').includes('if tracks.isEmpty {\n                loads.activeTrackRemoved()\n                kept = false\n            } else {\n                kept = takeOverRequest()\n            }') &&
+      section(backendSource, '    func remove(at indexes: [Int]) throws {', '    func move(from: Int, to: Int) throws {').includes('loads.activeTrackRemoved()\n                move(.queueEmptied)') &&
+      section(backendSource, '    private func reportRemovedTrack(_ before: [AudioItem]) {', '\n    }\n').includes('loads.activeTrackRemoved()') &&
+      (backendSource.match(/loads\.activeTrackRemoved\(\)/g) || []).length === 3 &&
+      // Item 7: next takes the request over before the idle's branch, as Android's skipToNext.
+      section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('let kept = takeOverRequest()\n            cancelPendingSeeks()\n            if activity.isIdle {') &&
+      section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)') &&
+      // Item 4: the take-over's module request is the coordinator's (tested:
+      // testStandardLoadCoordinatorATakenOverRequestIsTheModulesAndAGiveUpOfTheNewTrackKeepsIt);
+      // RNTrackPlayer emits a reading change through StandardReadingSink (tested through the fake
+      // player's emitReading).
+      section(backendSource, '    private func takeOverRequest() -> Bool {', '\n    }\n').includes('return loads.commandTakesRequest()') &&
+      section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('StandardReadingSink(') &&
+      section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('self.emit(event: EventType.PlaybackState, body: self.getPlaybackStateBodyKeyValues(state: state, error: backend?.publicPlaybackError))') &&
+      section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('self?.emit(event: EventType.PlaybackPlayWhenReadyChanged, body: ["playWhenReady": playWhenReady])') &&
+      section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('.changed(playWhenReady: playWhenReady, state: state?.rawValue)') &&
       (backendSource.match(/takeOverRequest\(\)/g) || []).length === 7 &&
       (backendSource.match(/loads\.commandTakesRequest\(\)/g) || []).length === 3 &&
       backendSource.includes('interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady || loads.seekResume.requestsPlay, stateRawValue: playbackState.rawValue)') &&

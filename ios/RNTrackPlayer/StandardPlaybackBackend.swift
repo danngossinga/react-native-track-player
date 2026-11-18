@@ -645,6 +645,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     /// path's queue change); the player's next track is reported once it loaded. As Android.
     private func reportRemovedTrack(_ before: [AudioItem]) {
         guard let reported = failedLoads.reported, indexOfItem(reported) == nil else { return }
+        // The request a failure kept ends (StandardLoadCoordinator.activeTrackRemoved), as Android.
+        loads.activeTrackRemoved()
         let lastIndex = before.firstIndex { ObjectIdentifier($0 as AnyObject) == reported }
         let lastTrack = lastIndex.flatMap { before[$0] as? Track }
         if let change = failedLoads.removed(reported) { report(change, lastIndex: .some(lastIndex), lastTrack: lastTrack) }
@@ -1031,7 +1033,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func beginHandoffQuiescence() throws -> PlaybackBackendSnapshot {
         return try performPlaybackBackendOnMainSync {
             cancelPendingSeeks()
-            let intendedPlayWhenReady = player.playWhenReady
+            // The request the app reads goes to the new backend (a failure's kept one included, as
+            // crossfade's snapshot carries its playWhenReady; before: SwiftAudioEx's own, false);
+            // the new backend hands it to its player (activateAfterCommit). As Android.
+            let intendedPlayWhenReady = publicPlayWhenReady
+            quiescedPlayerPlayWhenReady = player.playWhenReady
             let intendedVolume = player.volume
             player.volume = 0
             player.pause()
@@ -1042,11 +1048,18 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         }
     }
 
+    /// SwiftAudioEx's own play-when-ready before `beginHandoffQuiescence`, for its rollback.
+    private var quiescedPlayerPlayWhenReady: Bool?
+
     func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {
         try performPlaybackBackendOnMainSync {
-            player.playWhenReady = snapshot.playWhenReady
-            requested.request(snapshot.playWhenReady)
-            if snapshot.playWhenReady {
+            // Back as it was: SwiftAudioEx's own request, not the carried one (a kept request
+            // stays kept: a stopped or held player does not start). As Android.
+            let playerPlayWhenReady = quiescedPlayerPlayWhenReady ?? snapshot.playWhenReady
+            quiescedPlayerPlayWhenReady = nil
+            player.playWhenReady = playerPlayWhenReady
+            requested.request(playerPlayWhenReady)
+            if playerPlayWhenReady {
                 player.play()
             } else {
                 player.pause()
@@ -1103,6 +1116,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
+        // The hand-off: the carried request (the previous backend's, a failure's kept one
+        // included) is this player's own from now on (a new backend keeps nothing:
+        // StandardSeekResume none), so it plays the restored track. As Android.
         player.playWhenReady = !activity.isIdle && snapshot.playWhenReady
         requested.request(player.playWhenReady)
         if player.playWhenReady {
@@ -1198,6 +1214,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             cancelCommandLoadOfRemovedTrack()
             if player.items.isEmpty {
+                // Every track left, the active one with them.
+                loads.activeTrackRemoved()
                 move(.queueEmptied)
                 failedLoads.reset()
             } else {
@@ -1232,7 +1250,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             failedLoads.reset()
             cancelPendingSeeks()
             // A failure's kept request plays the new queue's first track (as a skip's), as Android.
-            let kept = takeOverRequest()
+            // An empty queue has no track to play: the request ends, reported (as crossfade's
+            // setQueue with no active track, and a clear), so the getter and the event agree.
+            let kept: Bool
+            if tracks.isEmpty {
+                loads.activeTrackRemoved()
+                kept = false
+            } else {
+                kept = takeOverRequest()
+            }
             player.clear()
             try player.add(items: tracks, playWhenReady: kept && !activity.isIdle && !tracks.isEmpty ? true : nil)
             if tracks.isEmpty { move(.queueEmptied) }
@@ -1317,13 +1343,18 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         onMain {
             clearHostFailure()
             commandLoads.cancel()
+            // Taken over before the idle's branch, as Android's skipToNext (a failure's request is
+            // never kept in the idle: every way into it ends it, so the idle's next stays paused).
+            let kept = takeOverRequest()
             cancelPendingSeeks()
             if activity.isIdle {
                 beginIdleTrackActivationIfNeeded(true)
                 do {
                     move(.activated)
                     if player.currentIndex != 0 {
-                        try player.jumpToItem(atIndex: 0, playWhenReady: false)
+                        try player.jumpToItem(atIndex: 0, playWhenReady: kept)
+                    } else if kept {
+                        player.playWhenReady = true
                     }
                     publishIdleTrackActivationIfNeeded(true)
                     finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
@@ -1334,7 +1365,6 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 }
                 return
             }
-            let kept = takeOverRequest()
             // After a failed load, next is relative to the active (previous) track, as Android.
             if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active + 1 < player.items.count {
                 failedLoads.skipped()
@@ -1476,9 +1506,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     /// (`StandardLoadCoordinator.commandTakesRequest`): whether it plays because of it; the
     /// module's request (what an ended interruption resumes) is then play.
     private func takeOverRequest() -> Bool {
-        let kept = loads.commandTakesRequest()
-        if kept { requested.request(true) }
-        return kept
+        return loads.commandTakesRequest()
     }
 
     private func publishIdleTrackActivationIfNeeded(_ wasIdle: Bool) {

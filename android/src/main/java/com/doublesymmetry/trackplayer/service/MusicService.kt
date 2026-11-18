@@ -56,7 +56,9 @@ class MusicService : HeadlessJsTaskService() {
         val ownerJob: Job,
         val ownerScope: CoroutineScope,
         val productAdmission: SharedFlowAdmissionGate,
-        val mediaSessionControl: KotlinAudioMediaSessionControl
+        val mediaSessionControl: KotlinAudioMediaSessionControl,
+        /** When the foreground service goes, fed the state the app reads (setupForegrounding). */
+        val foreground: StandardForegroundRule
     )
 
     private var player: QueuedAudioPlayer? = null
@@ -170,14 +172,16 @@ class MusicService : HeadlessJsTaskService() {
             (created.playerOptions as? QueuedPlayerOptions)?.repeatMode = configuredRepeatMode
             observeRemoteActions(created, identity, ownerScope)
             observeEvents(created, identity, ownerScope, productAdmission)
-            setupForegrounding(created, identity, ownerScope, productAdmission)
+            val foreground = StandardForegroundRule()
+            setupForegrounding(created, identity, ownerScope, productAdmission, foreground)
             StandardPlayerBinding(
                 created,
                 identity,
                 ownerJob,
                 ownerScope,
                 productAdmission,
-                mediaSessionControl
+                mediaSessionControl,
+                foreground
             )
         } catch (error: Exception) {
             ownerJob.cancel()
@@ -545,12 +549,19 @@ class MusicService : HeadlessJsTaskService() {
                         onLoadStart = { standardAnalytics[binding.player]?.startLoad() }
                     ),
                     // A failure's kept play request or a seek holding the player paused changed
-                    // what the app reads with no event of the player's (StandardSeekResume).
-                    onReportedChanged = { playWhenReady, state ->
-                        if (isActivePlayer(binding.player, binding.identity) && !useOrchestratedCrossfade()) {
-                            state?.let { emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it)) }
-                            playWhenReady?.let {
-                                emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, Bundle().apply { putBoolean("playWhenReady", it) })
+                    // what the app reads with no event of the player's (StandardSeekResume): the
+                    // events and the foreground rule (the backend tells the media session and the
+                    // notification itself: ReportedSessionPlayer.refresh).
+                    onReportedChanged = StandardReportedSink(
+                        emitState = { emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it)) },
+                        emitPlayWhenReady = {
+                            emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, Bundle().apply { putBoolean("playWhenReady", it) })
+                        },
+                        foreground = binding.foreground
+                    ).let { sink ->
+                        { playWhenReady: Boolean?, state: AudioPlayerState? ->
+                            if (isActivePlayer(binding.player, binding.identity) && !useOrchestratedCrossfade()) {
+                                sink.changed(playWhenReady, state)
                             }
                         }
                     },
@@ -1426,13 +1437,12 @@ class MusicService : HeadlessJsTaskService() {
         source: QueuedAudioPlayer,
         identity: Any,
         ownerScope: CoroutineScope,
-        admission: SharedFlowAdmissionGate
+        admission: SharedFlowAdmissionGate,
+        foreground: StandardForegroundRule
     ) {
         // Implementation based on https://github.com/Automattic/pocket-casts-android/blob/ee8da0c095560ef64a82d3a31464491b8d713104/modules/services/repositories/src/main/java/au/com/shiftyjelly/pocketcasts/repositories/playback/PlaybackService.kt#L218
         var notificationId: Int? = null
         var notification: Notification? = null
-        var stopForegroundWhenNotOngoing = false
-        var removeNotificationWhenNotOngoing = false
 
         fun startForegroundIfNecessary() {
             if (isForegroundService()) {
@@ -1470,38 +1480,15 @@ class MusicService : HeadlessJsTaskService() {
             }
         }
 
-        val backgroundableStates = listOf(
-            AudioPlayerState.IDLE,
-            AudioPlayerState.ENDED,
-            AudioPlayerState.STOPPED,
-            AudioPlayerState.ERROR,
-            AudioPlayerState.PAUSED
-        )
-        val removableStates = listOf(
-            AudioPlayerState.IDLE,
-            AudioPlayerState.STOPPED,
-            AudioPlayerState.ERROR
-        )
-        val loadingStates = listOf(
-            AudioPlayerState.LOADING,
-            AudioPlayerState.READY,
-            AudioPlayerState.BUFFERING
-        )
-        var stateCount = 0
-
+        // The state the app reads (rule 13): LOADING while a seek holds the player paused, as
+        // crossfade's surface stays in the foreground then; the changes with no player event come
+        // through StandardReportedSink.
         fun observeForegrounding() = ownerScope.collectWithAdmission(source.event.stateChange, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
-            stateCount++
-            if (it in loadingStates) return@collectWithAdmission
-            // Skip initial idle state, since we are only interested when
-            // state becomes idle after not being idle
-            stopForegroundWhenNotOngoing = stateCount > 1 && it in backgroundableStates
-            removeNotificationWhenNotOngoing = stopForegroundWhenNotOngoing && it in removableStates
+            foreground.stateChanged(standardBackendOf(identity)?.reportedStateOf(it) ?: it)
         }
 
-        fun shouldStopForeground(): Boolean {
-            return stopForegroundWhenNotOngoing && (removeNotificationWhenNotOngoing || isForegroundService())
-        }
+        fun shouldStopForeground(): Boolean = foreground.stopsForeground(::isForegroundService)
 
         fun observeNotification() = ownerScope.collectWithAdmission(source.event.notificationStateChange, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
@@ -1510,8 +1497,11 @@ class MusicService : HeadlessJsTaskService() {
                     Timber.d("notification posted with id=%s, ongoing=%s", it.notificationId, it.ongoing)
                     notificationId = it.notificationId;
                     notification = it.notification;
+                    foreground.notificationPosted(it.ongoing)
                     if (it.ongoing) {
-                        if (source.playWhenReady) {
+                        // The play request the app reads (a failure's kept one included), as the
+                        // notification's ongoing flag (ReportedSessionPlayer).
+                        if (standardBackendOf(identity)?.playWhenReady ?: source.playWhenReady) {
                             startForegroundIfNecessary()
                         }
                     } else if (shouldStopForeground()) {
@@ -1524,7 +1514,7 @@ class MusicService : HeadlessJsTaskService() {
                             delay(stopForegroundGracePeriod.toLong() * 1000)
                             if (isActivePlayer(source, identity) && shouldStopForeground()) {
                                 @Suppress("DEPRECATION")
-                                stopForeground(removeNotificationWhenNotOngoing)
+                                stopForeground(foreground.removeWhenNotOngoing)
                                 Timber.d("Notification has been stopped")
                             }
                         }

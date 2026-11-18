@@ -2771,6 +2771,19 @@ struct StandardReading: Equatable {
     }
 }
 
+/// What RNTrackPlayer emits when what the app reads of the standard player changed with no event
+/// of SwiftAudioEx's (`StandardLoadPlayer.emitReading`): the state event, then the play-when-ready
+/// one. One function RNTrackPlayer and the tests share. As Android's `StandardReportedSink`.
+struct StandardReadingSink {
+    let emitState: (String) -> Void
+    let emitPlayWhenReady: (Bool) -> Void
+
+    func changed(playWhenReady: Bool?, state: String?) {
+        if let state = state { emitState(state) }
+        if let playWhenReady = playWhenReady { emitPlayWhenReady(playWhenReady) }
+    }
+}
+
 /// Whether the standard player has an active track: one explicit state (rule 12, ADR 0042 form 3),
 /// moved only by `after`. The same states and moves as Android's `StandardActivity`
 /// (KotlinAudioPlaybackBackend.kt).
@@ -3051,11 +3064,23 @@ final class StandardLoadCoordinator {
     func commandTakesRequest() -> Bool {
         // Not reported: the command sets the module's own request at once (SwiftAudioEx's), so the
         // app reads true throughout; the new track's states are SwiftAudioEx's events. As Android.
-        return seekResume.handedToPlayer()
+        let kept = seekResume.handedToPlayer()
+        // The module's request (RequestedPlayback) is play: what an ended interruption resumes,
+        // and what a give-up of the new track keeps (gaveUp reads it). Android: the player's own
+        // play-when-ready, set by the command.
+        if kept { player?.requestPlayback(true) }
+        return kept
     }
 
     /// A clear, crossfade's stop: the request a failure kept ends. As Android.
     func queueCleared() {
+        reporting { seekResume.paused() }
+    }
+
+    /// The active track left the queue (removed, or an empty new queue): the request a failure
+    /// kept ends, reported, as crossfade's queue change without the active track (its
+    /// playWhenReady false). As Android (KotlinAudioPlaybackBackend.activeTrackRemoved).
+    func activeTrackRemoved() {
         reporting { seekResume.paused() }
     }
 

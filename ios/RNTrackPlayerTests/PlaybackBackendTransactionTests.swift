@@ -1463,11 +1463,14 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         func reading(_ kind: StandardSeekResume.Kind) -> StandardReading {
             return StandardReading(idle: isIdle, playerPlayWhenReady: requested ?? false, playerState: playerState, kind: kind)
         }
-        /// What the app was told with no event of SwiftAudioEx's, in order.
+        /// What the app was told with no event of SwiftAudioEx's, in order: through the sink
+        /// RNTrackPlayer emits with (handleStandardReadingChanged).
         var readings: [String] = []
         func emitReading(playWhenReady: Bool?, state: String?) {
-            if let state = state { readings.append("state \(state)") }
-            if let playWhenReady = playWhenReady { readings.append("playWhenReady \(playWhenReady)") }
+            StandardReadingSink(
+                emitState: { [unowned self] in self.readings.append("state \($0)") },
+                emitPlayWhenReady: { [unowned self] in self.readings.append("playWhenReady \($0)") }
+            ).changed(playWhenReady: playWhenReady, state: state)
         }
     }
 
@@ -2071,7 +2074,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     func testStandardLoadCoordinatorACommandThatLoadsATrackTakesAFailuresRequestOver() {
         // Eighth round (review 7, blocking 1; Android:
         // aSkipNextPreviousOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack,
-        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAClearEndsTheRequestAndARemovalKeepsIt): after a
+        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAClearOrARemovalOfTheActiveTrackEndsTheRequest): after a
         // failure the module's request stays, as crossfade's, until a pause or stop. A skip, next,
         // previous, load or new queue (StandardPlaybackBackend.takeOverRequest) issued while a
         // seek holds the player paused, or in a give-up's error, takes it over and plays its track
@@ -2105,6 +2108,68 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         let n = CoordinatorHarness()
         n.player.requested = true
         XCTAssertFalse(n.loads.commandTakesRequest())
+    }
+
+    func testStandardLoadCoordinatorTheActiveTracksRemovalOrAnEmptyQueueEndsTheRequest() {
+        // Ninth round (review 8, items 2 and 6; Android:
+        // anEmptyQueueOrTheRemovalOfEveryTrackWhileAFailureKeepsTheRequestEndsItAndTellsTheApp,
+        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAClearOrARemovalOfTheActiveTrackEndsTheRequest):
+        // the active track's removal, or an empty new queue (StandardPlaybackBackend.remove,
+        // replaceQueue, reportRemovedTrack call activeTrackRemoved), ends a failure's kept request,
+        // as crossfade's queue change without the active track; the app is told at once, so the
+        // getter and the event agree (before: an empty queue dropped it silently, a removal kept
+        // it). A seek it holds then plays nothing.
+        for (name, seeking) in [("in the give-up's error", false), ("while a seek holds the player", true)] {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            h.player.requested = true
+            h.player.playerState = "playing"
+            h.loads.waitForCommandLoad { _ in }
+            h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+            h.player.playerState = "error"
+            if seeking {
+                XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in }, name)
+                h.player.playerState = "buffering"
+            }
+            XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "\(name): kept")
+            let seek = h.loads.latestSeek
+            h.player.readings.removeAll()
+            h.loads.activeTrackRemoved()
+            XCTAssertEqual(h.player.readings, seeking ? ["state buffering", "playWhenReady false"] : ["playWhenReady false"], name)
+            XCTAssertFalse(h.player.reading(h.loads.seekResume.kind).playWhenReady, name)
+            XCTAssertEqual(h.loads.seekResume.kind, .none, name)
+            if seeking {
+                h.player.calls.removeAll()
+                h.loads.seekFinished(seek, succeeded: true)
+                XCTAssertFalse(h.player.calls.contains("resume"), "\(name): \(h.player.calls)")
+            }
+        }
+    }
+
+    func testStandardLoadCoordinatorATakenOverRequestIsTheModulesAndAGiveUpOfTheNewTrackKeepsIt() {
+        // Ninth round (review 8, item 4, R-I10): a command that takes a failure's kept request
+        // over makes the module's request (RequestedPlayback) play: what an ended interruption
+        // resumes, and what a give-up of the command's track reads, so that give-up keeps the
+        // request too, as crossfade's (Android: the player's own play-when-ready, set by the
+        // command). Before (StandardPlaybackBackend.takeOverRequest) the backend set it, untested.
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.player.requested = true
+        h.loads.waitForCommandLoad { _ in }
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertEqual(h.player.requested, false, "the give-up's stop ended the module's request")
+        XCTAssertTrue(h.loads.commandTakesRequest())
+        XCTAssertEqual(h.player.requested, true, "the module's request is play again")
+        XCTAssertTrue(h.player.calls.contains("request play"), "\(h.player.calls)")
+        // The command's track gives up too: the request stays.
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertEqual(h.loads.seekResume.kind, .keptAfterFailure)
+        XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "the second give-up keeps the request")
+        // Nothing kept: the module's request is left as it is.
+        let n = CoordinatorHarness()
+        n.player.requested = false
+        XCTAssertFalse(n.loads.commandTakesRequest())
+        XCTAssertEqual(n.player.requested, false)
     }
 
     func testStandardLoadCoordinatorASeekAfterAFailureReadsPlayingAndLoading() {
