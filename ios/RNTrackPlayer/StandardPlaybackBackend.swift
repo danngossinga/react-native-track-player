@@ -644,12 +644,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     /// The reported track left the queue: no active track, reported at once (as the crossfade
     /// path's queue change); the player's next track is reported once it loaded. As Android.
     private func reportRemovedTrack(_ before: [AudioItem]) {
-        guard let reported = failedLoads.reported, indexOfItem(reported) == nil else { return }
-        // The request a failure kept ends (StandardLoadCoordinator.activeTrackRemoved), as Android.
-        loads.activeTrackRemoved()
-        let lastIndex = before.firstIndex { ObjectIdentifier($0 as AnyObject) == reported }
+        // Whether the active track left, and the request a failure kept with it:
+        // StandardLoadCoordinator.tracksRemoved (tested), as Android.
+        guard let removal = loads.tracksRemoved(stillQueued: { indexOfItem($0) != nil }) else { return }
+        let lastIndex = before.firstIndex { ObjectIdentifier($0 as AnyObject) == removal.track }
         let lastTrack = lastIndex.flatMap { before[$0] as? Track }
-        if let change = failedLoads.removed(reported) { report(change, lastIndex: .some(lastIndex), lastTrack: lastTrack) }
+        if let change = removal.report { report(change, lastIndex: .some(lastIndex), lastTrack: lastTrack) }
     }
 
     /// The player moved to `item` (its current-item event, with the last track's position):
@@ -1252,13 +1252,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // A failure's kept request plays the new queue's first track (as a skip's), as Android.
             // An empty queue has no track to play: the request ends, reported (as crossfade's
             // setQueue with no active track, and a clear), so the getter and the event agree.
-            let kept: Bool
-            if tracks.isEmpty {
-                loads.activeTrackRemoved()
-                kept = false
-            } else {
-                kept = takeOverRequest()
-            }
+            // StandardLoadCoordinator.queueReplaced, tested.
+            let kept = loads.queueReplaced(isEmpty: tracks.isEmpty)
             player.clear()
             try player.add(items: tracks, playWhenReady: kept && !activity.isIdle && !tracks.isEmpty ? true : nil)
             if tracks.isEmpty { move(.queueEmptied) }
@@ -1353,8 +1348,6 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                     move(.activated)
                     if player.currentIndex != 0 {
                         try player.jumpToItem(atIndex: 0, playWhenReady: kept)
-                    } else if kept {
-                        player.playWhenReady = true
                     }
                     publishIdleTrackActivationIfNeeded(true)
                     finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)

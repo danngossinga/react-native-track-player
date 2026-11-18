@@ -631,10 +631,14 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override suspend fun reactivateAfterRollback(snapshot: PlaybackBackendSnapshot) {
+        // No production caller (the facade rolls back with cancelHandoffQuiescence); aligned with
+        // it, as iOS: back as it was, the player's own request (a kept one stays kept), not the
+        // carried one, which activateAfterCommit would play.
         isAuthoritative = true
         queueStore.replaceWith(queueState.rollback())
         onCommitted(player)
-        activateAfterCommit(snapshot)
+        cancelHandoffQuiescence(snapshot)
+        resumeControlSurface(snapshot)
     }
 
     override suspend fun play() {

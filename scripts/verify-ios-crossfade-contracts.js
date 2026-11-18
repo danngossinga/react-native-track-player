@@ -889,10 +889,13 @@ assert(
       // the request, reported (StandardLoadCoordinator.activeTrackRemoved, tested:
       // testStandardLoadCoordinatorTheActiveTracksRemovalOrAnEmptyQueueEndsTheRequest; Android:
       // anEmptyQueueOrTheRemovalOfEveryTrack*, aNewQueueDuringASeekAfterAFailedSkip*).
-      section(backendSource, '    func replaceQueue(_ tracks: [Track]) throws {', '    func clearQueue() {').includes('if tracks.isEmpty {\n                loads.activeTrackRemoved()\n                kept = false\n            } else {\n                kept = takeOverRequest()\n            }') &&
+      section(backendSource, '    func replaceQueue(_ tracks: [Track]) throws {', '    func clearQueue() {').includes('let kept = loads.queueReplaced(isEmpty: tracks.isEmpty)') &&
       section(backendSource, '    func remove(at indexes: [Int]) throws {', '    func move(from: Int, to: Int) throws {').includes('loads.activeTrackRemoved()\n                move(.queueEmptied)') &&
-      section(backendSource, '    private func reportRemovedTrack(_ before: [AudioItem]) {', '\n    }\n').includes('loads.activeTrackRemoved()') &&
-      (backendSource.match(/loads\.activeTrackRemoved\(\)/g) || []).length === 3 &&
+      // Tenth round (review 9, item 3): which removal ends the kept request is the coordinator's
+      // (StandardLoadCoordinator.tracksRemoved, tested); the backend asks it with no guard of its own.
+      section(backendSource, '    private func reportRemovedTrack(_ before: [AudioItem]) {', '\n    }\n').includes('guard let removal = loads.tracksRemoved(stillQueued: { indexOfItem($0) != nil }) else { return }') &&
+      !section(backendSource, '    private func reportRemovedTrack(_ before: [AudioItem]) {', '\n    }\n').includes('failedLoads') &&
+      (backendSource.match(/loads\.activeTrackRemoved\(\)/g) || []).length === 1 &&
       // Item 7: next takes the request over before the idle's branch, as Android's skipToNext.
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('let kept = takeOverRequest()\n            cancelPendingSeeks()\n            if activity.isIdle {') &&
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)') &&
@@ -905,7 +908,8 @@ assert(
       section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('self.emit(event: EventType.PlaybackState, body: self.getPlaybackStateBodyKeyValues(state: state, error: backend?.publicPlaybackError))') &&
       section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('self?.emit(event: EventType.PlaybackPlayWhenReadyChanged, body: ["playWhenReady": playWhenReady])') &&
       section(player, 'func handleStandardReadingChanged(', '\n    }\n').includes('.changed(playWhenReady: playWhenReady, state: state?.rawValue)') &&
-      (backendSource.match(/takeOverRequest\(\)/g) || []).length === 7 &&
+      (backendSource.match(/takeOverRequest\(\)/g) || []).length === 6 &&
+      section(backendSource, "    func replaceQueue(_ tracks: [Track]) throws {", "    func clearQueue() {").includes("let kept = loads.queueReplaced(isEmpty: tracks.isEmpty)") &&
       (backendSource.match(/loads\.commandTakesRequest\(\)/g) || []).length === 3 &&
       backendSource.includes('interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady || loads.seekResume.requestsPlay, stateRawValue: playbackState.rawValue)') &&
       backendSource.includes('func emitsPlayerState(_ stateRawValue: String) -> Bool {\n        return loads.emitsPlayerState(stateRawValue)') &&

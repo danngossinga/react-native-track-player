@@ -2146,6 +2146,53 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
     }
 
+    func testStandardLoadCoordinatorOnlyTheActiveTracksRemovalEndsTheRequestAndAnEmptyNewQueueEndsItAnotherTakesItOver() {
+        // Tenth round (review 9, item 3): which removal ends a failure's kept request is the
+        // coordinator's (tracksRemoved; StandardPlaybackBackend.reportRemovedTrack asks it with no
+        // guard of its own), and so is a new queue's (queueReplaced): before, both decisions were
+        // the backend's, pinned by text only (a reordering mutant survived every test). As Android
+        // (aNewQueueDuringASeekAfterAFailedSkip*, anEmptyQueueOrTheRemovalOfEveryTrack*).
+        func failed() -> CoordinatorHarness {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            h.player.requested = true
+            h.player.playerState = "playing"
+            h.loads.waitForCommandLoad { _ in }
+            h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+            h.player.playerState = "error"
+            XCTAssertEqual(h.loads.failedLoads.reported, h.ia, "A stays the active track")
+            XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "kept")
+            h.player.readings.removeAll()
+            return h
+        }
+        // The failed B leaves, A stays: the request and the active track stay, nothing is told.
+        let other = failed()
+        XCTAssertNil(other.loads.tracksRemoved(stillQueued: { $0 == other.ia }))
+        XCTAssertEqual(other.loads.seekResume.kind, .keptAfterFailure, "a removal of another track keeps the request")
+        XCTAssertTrue(other.player.reading(other.loads.seekResume.kind).playWhenReady)
+        XCTAssertEqual(other.player.readings, [])
+        XCTAssertEqual(other.loads.failedLoads.reported, other.ia)
+        // A, the active track, leaves: the request ends, told at once, and A is no longer active.
+        let active = failed()
+        let removal = active.loads.tracksRemoved(stillQueued: { $0 == active.ib })
+        XCTAssertEqual(removal?.track, active.ia)
+        XCTAssertNotNil(removal?.report, "no active track any more: reported")
+        XCTAssertNil(active.loads.failedLoads.reported)
+        XCTAssertEqual(active.loads.seekResume.kind, .none)
+        XCTAssertEqual(active.player.readings, ["playWhenReady false"])
+        // An empty new queue ends the request, told; a new queue with tracks takes it over (plays).
+        let empty = failed()
+        XCTAssertFalse(empty.loads.queueReplaced(isEmpty: true))
+        XCTAssertEqual(empty.loads.seekResume.kind, .none)
+        XCTAssertEqual(empty.player.readings, ["playWhenReady false"])
+        XCTAssertEqual(empty.player.requested, false)
+        let full = failed()
+        XCTAssertTrue(full.loads.queueReplaced(isEmpty: false), "its first track plays")
+        XCTAssertEqual(full.loads.seekResume.kind, .none)
+        XCTAssertEqual(full.player.requested, true, "the module's request is play")
+        XCTAssertEqual(full.player.readings, [], "true throughout: nothing to tell")
+    }
+
     func testStandardLoadCoordinatorATakenOverRequestIsTheModulesAndAGiveUpOfTheNewTrackKeepsIt() {
         // Ninth round (review 8, item 4, R-I10): a command that takes a failure's kept request
         // over makes the module's request (RequestedPlayback) play: what an ended interruption

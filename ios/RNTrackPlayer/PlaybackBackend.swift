@@ -3084,6 +3084,29 @@ final class StandardLoadCoordinator {
         reporting { seekResume.paused() }
     }
 
+    /// A new queue (StandardPlaybackBackend.replaceQueue): an empty one has no track to play, so
+    /// the request a failure kept ends (`activeTrackRemoved`); another takes it over
+    /// (`commandTakesRequest`). Returns whether its first track plays because of it. As Android.
+    func queueReplaced(isEmpty: Bool) -> Bool {
+        if isEmpty {
+            activeTrackRemoved()
+            return false
+        }
+        return commandTakesRequest()
+    }
+
+    /// Tracks left the queue (not every one: `stillQueued` says whether a track is still in it).
+    /// The decision of which removal ends the kept request, here so the tests run it: only when the
+    /// reported (active) track left does the request a failure kept end (`activeTrackRemoved`),
+    /// then the active track is gone (`FailedLoadRule.removed`); returns that track and the report.
+    /// A removal of another track (the one that failed, say) keeps both. As Android
+    /// (KotlinAudioPlaybackBackend.reportRemovedTrack).
+    func tracksRemoved(stillQueued: (ObjectIdentifier) -> Bool) -> (track: ObjectIdentifier, report: FailedLoadRule.Report?)? {
+        guard let reported = failedLoads.reported, !stillQueued(reported) else { return nil }
+        activeTrackRemoved()
+        return (reported, failedLoads.removed(reported))
+    }
+
     init(player: StandardLoadPlayer, watched: Bool) {
         self.player = player
         self.watched = watched
