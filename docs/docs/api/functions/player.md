@@ -73,7 +73,9 @@ the active track, the one `getActiveTrack()` and the progress report, as crossfa
 decision, 2026-11-17): after a failed load the player goes back to the active track, the seek
 acts there and then plays when playback was requested before the failure, as crossfade's seek
 after a failed skip. After a failed load the play request stays (`getPlayWhenReady()` and its
-event read `true`) until a pause, stop or clear, as crossfade's. On the standard backend the
+event read `true`) until a pause, stop or clear, an empty new queue or the removal of the active
+track, as crossfade's; on Android the media session and the notification read it too. On the
+standard backend the
 player waits paused until the seek is done, then plays, and the state reads `loading` meanwhile
 (crossfade's seek state); several seeks in a row (a scrubber drag) keep that request and the
 player plays once the latest one is done; the same on the track the player is on (a seek after
@@ -84,7 +86,8 @@ back paused (before: it acted on the track that failed). With no active track th
 and does nothing, as crossfade's (a cancel left none, or a backend switch restored none; before:
 `standard_seek_unavailable`), except after the first track failed to load: then the seek retries
 the track that failed (owner decision, 2026-11-17; crossfade does nothing there), and plays once
-done when the play request was kept; when it fails as well, the next play retries it again.
+done when the play request was kept (pending the owner's confirmation, with the other differences
+the README lists); when it fails as well, the next play retries it again.
 
 | Param   | Type     | Description             |
 | ------- | -------- | ----------------------- |

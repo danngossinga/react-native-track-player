@@ -268,33 +268,58 @@ Added fork surface:
   - a skip, next, previous, load, new queue, play or retry takes the request
     over: its track plays once loaded (before: during the seek they ended the
     request and the track stayed paused; Android played before 98748a0). A
-    clear ends it, as crossfade's clear (its stop).
+    clear ends it, as crossfade's clear (its stop), and so do an empty new
+    queue and the removal of the active track (or of every track), as
+    crossfade's queue change without the active track: the getter, the
+    `PlaybackPlayWhenReadyChanged` event and the media session read `false`
+    at once (before: an empty queue ended it with no event, a removal kept it);
+  - the media session and notification (Android) read the request and the
+    state the app reads, as crossfade's media surface: play-when-ready `true`
+    after the failure, the session buffering while a seek holds the player (not
+    paused, not playing), the error state in the give-up's error; the
+    notification is ongoing while a seek holds the player, so the foreground
+    service stays (as crossfade's), and the end of the error's grace period
+    no longer lets it go while the notification is ongoing (before: they read
+    the player's own `false`, the session showed paused and the foreground
+    service could go while the app read playing). The lock screen (iOS) shows
+    rate 0 in the error and while a seek holds the player, as crossfade's
+    (`nowPlayingPlaybackRate` is 0 outside playing): no change there;
+  - a backend switch carries the request the app reads (a kept one: `true`)
+    and the active track at its position, as crossfade's snapshot; the new
+    backend plays that track (before: the player's own `false`, and on
+    Android the player's own item, the track that failed). A switch that
+    rolls back leaves the request kept and the player stopped or held.
 - Remaining differences of the standard backend's failure handling from
-  crossfade's (the same on both platforms unless said otherwise):
+  crossfade's (the same on both platforms unless said otherwise). The first
+  four are pending the owner's confirmation:
   - crossfade's `load` (on iOS always: it loads paused; on Android when the
     track is not in the queue, or when it cancels a seek) and a `setQueue`
     without the active track end the play request; the standard backend's
     `load` and new queue keep the player's request, so after a failure they
-    play (above). This difference is older than the failure handling (owner
-    question);
+    play (above). This difference is older than the failure handling;
+    pending the owner's confirmation;
   - several seeks in a row: crossfade's newer seek cancels the older one, whose
     cancelled operation ends the play request, so a scrubber drag after a
     failure ends paused; the standard backend plays once the latest seek is
-    done (sixth review);
-  - the media session and notification (Android) and the lock screen (iOS)
-    read the standard player's own play-when-ready: paused from a give-up on
-    and while a seek holds the player, though the app reads the request kept
-    (owner question; Android's foreground service follows the player's own
-    value, unchanged);
-  - a play while a seek holds the player starts it at once; crossfade's play
-    during a seek waits for the seek's end;
-  - removing the active track while the request is kept does not end it (a
-    seek in progress ends cancelled and the request stays); crossfade's queue
-    change without the active track ends it;
-  - a backend switch while the request is kept carries the player's own
-    play-when-ready (`false`), so the new backend starts paused;
+    done (sixth review); pending the owner's confirmation;
   - with no active track after the first load failed, the seek retries the
-    track (owner decision, LOAD-14); crossfade's seek does nothing there;
+    track (owner decision, LOAD-14) and, when playback was requested, plays
+    once done; crossfade's seek does nothing there; pending the owner's
+    confirmation;
+  - a play while a seek holds the player starts it at once; crossfade's play
+    during a seek waits for the seek's end; pending the owner's confirmation;
+  - Android's notification shows a play action in a give-up's error, where
+    crossfade's shows pause: ExoPlayer's notification shows play for a stopped
+    player whatever its play-when-ready, and the state that would show pause
+    (buffering or ready) would also make it ongoing (foreground), which
+    crossfade's error is not. The media session (its state: error), the
+    foreground service and the app agree with crossfade's (Android 13 and
+    later build their media controls from the media session's state, which
+    agrees). Closing it needs a change to the vendored notification manager
+    (owner's choice);
+  - removing a track that is not the active one (the one that failed, say)
+    keeps the request; with no active track (the first load failed) only an
+    empty queue ends it;
   - on iOS a queue change with no active track may send one request (above).
   Known limits, unchanged by this branch: the race of a failed state already
   delivered (or dropped by its token) before a later non-failed one, which can
@@ -304,11 +329,19 @@ Added fork surface:
   progress (`noteSeek`), so their bytes read as a load's; a seek during a natural
   advance (LOAD-17) has a Robolectric test with a real ExoPlayer but no test on a
   device or emulator; the Robolectric tests run without MusicService's media
-  session connector (a stub), so what a media controller sees there is not
-  tested; on iOS the standard backend has no XCTest with a real SwiftAudioEx
-  player: which command takes the request over is tested in
-  `StandardLoadCoordinator`, and its use in the commands (the jump's
-  play-when-ready) is pinned by `verify-ios-crossfade-contracts.js` only.
+  session connector (a stub): what a media controller sees is tested by what
+  ExoPlayer 2.19.0's connector and notification read of the session player
+  (their rules, read with javap), and MusicService's glue (its foreground
+  service, which the Robolectric build does not compile) by the shared
+  `StandardReportedSink` and `StandardForegroundRule` the tests drive and by
+  `verify-android-crossfade-contracts.js`; on iOS the standard backend has no
+  XCTest with a real SwiftAudioEx player: which command takes the request
+  over, the module's request it sets, and the end of the request at an empty
+  queue or a removal are tested in `StandardLoadCoordinator`, the reading
+  events through `StandardReadingSink`; their use in the commands (the
+  jump's play-when-ready, a play's hand-off, the backend switch's carried
+  request and its rollback) is pinned by `verify-ios-crossfade-contracts.js`
+  only (Android tests the same behaviour with a real ExoPlayer).
 - On the standard backend, while a track loads (and after its load failed) every
   reader agrees with the active track: `getProgress`/`useProgress` and the
   progress events give the active track's last position, duration and buffered
@@ -318,7 +351,7 @@ Added fork surface:
   (Android) also show the active track's last position, duration and buffered
   position, not playing (before, Android's media session and notification read the
   loading track's position and duration from the player). Android keeps the
-  player's play-when-ready there (the notification's ongoing flag keeps the
+  play-when-ready the app reads there (the notification's ongoing flag keeps the
   foreground service), so its session shows buffering at that position, speed 0,
   where iOS shows the lock screen paused (rate 0). Android's media session also
   has the active track as its current item (its active queue item, next and
