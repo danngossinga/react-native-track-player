@@ -899,8 +899,9 @@ assert(
       // Item 7: next takes the request over before the idle's branch, as Android's skipToNext.
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('let kept = takeOverRequest()\n            cancelPendingSeeks()\n            if activity.isIdle {') &&
       section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)') &&
-      // Review 11, item 4: a kept request is never idle (asserted); no unreachable branch.
-      section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('assert(!kept, "a failure\'s kept request in the idle")\n                    if player.currentIndex != 0 {\n                        try player.jumpToItem(atIndex: 0, playWhenReady: kept)\n                    }\n') &&
+      // Review 12: as Android's next, a kept request is set in every branch (also in Release);
+      // reaching it in the idle is a bug (assertionFailure in debug).
+      section(backendSource, '    func skipToNext(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {', '    func skipToPrevious(').includes('try player.jumpToItem(atIndex: 0, playWhenReady: kept)\n                    } else if kept {\n                        assertionFailure("a failure\'s kept request in the idle")\n                        player.playWhenReady = true\n                    }') &&
       // Item 4: the take-over's module request is the coordinator's (tested:
       // testStandardLoadCoordinatorATakenOverRequestIsTheModulesAndAGiveUpOfTheNewTrackKeepsIt);
       // RNTrackPlayer emits a reading change through StandardReadingSink (tested through the fake

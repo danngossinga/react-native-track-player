@@ -1346,11 +1346,13 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 beginIdleTrackActivationIfNeeded(true)
                 do {
                     move(.activated)
-                    // A kept request is never idle: every way into the idle ends it (Android's
-                    // next would set it in every branch; here no branch needs it).
-                    assert(!kept, "a failure's kept request in the idle")
+                    // As Android's next, which sets a kept request in every branch. A kept request
+                    // is never idle (every way into the idle ends it): reaching it is a bug.
                     if player.currentIndex != 0 {
                         try player.jumpToItem(atIndex: 0, playWhenReady: kept)
+                    } else if kept {
+                        assertionFailure("a failure's kept request in the idle")
+                        player.playWhenReady = true
                     }
                     publishIdleTrackActivationIfNeeded(true)
                     finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)

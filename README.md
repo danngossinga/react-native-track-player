@@ -371,7 +371,10 @@ Added fork surface:
   snapshot only without a request; iOS accepts it and drops the request); and
   iOS's next with no active track jumps to the first track with
   `playWhenReady: false` (its `kept`, never true there), forcing the player's
-  request off, where Android's leaves the player's own request.
+  request off, where Android's leaves the player's own request; and Android's
+  notification after the removal of every track: the standard backend removes
+  it, where crossfade's appears to keep a notification with an empty title
+  (crossfade's side from reading its code only, not run).
   Known limits, unchanged by this branch: the race of a failed state already
   delivered (or dropped by its token) before a later non-failed one, which can
   hold a failure in iOS's `StandardFailureOrder`, has no test; iOS's reload at a
