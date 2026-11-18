@@ -53,6 +53,10 @@ internal class HlsTestServer(
     @Volatile
     var recovered = false
 
+    /** Once set, the master playlist is broken (a player error at the next load). */
+    @Volatile
+    var broken = false
+
     private val released = CountDownLatch(1)
     private val socket = ServerSocket(0, 50, InetAddress.getByName("127.0.0.1"))
     private val pool = Executors.newCachedThreadPool()
@@ -128,7 +132,7 @@ internal class HlsTestServer(
                     }
                     path == "/master.m3u8" -> {
                         Thread.sleep(playlistDelayMs)
-                        respond(connection, (masterBody ?: masterPlaylist()).toByteArray(), PLAYLIST_TYPE)
+                        respond(connection, (if (broken) "not a playlist" else masterBody ?: masterPlaylist()).toByteArray(), PLAYLIST_TYPE)
                     }
                     path.endsWith("/index.m3u8") -> {
                         Thread.sleep(playlistDelayMs)

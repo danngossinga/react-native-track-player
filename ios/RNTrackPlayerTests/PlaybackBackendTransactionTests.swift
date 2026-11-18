@@ -1457,6 +1457,18 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             calls.append("idle")
             isIdle = true
         }
+        /// The state without a seek's hold (the backend's: an error, none, or SwiftAudioEx's;
+        /// `State.rawValue`).
+        var playerState = "ready"
+        func reading(_ kind: StandardSeekResume.Kind) -> StandardReading {
+            return StandardReading(idle: isIdle, playerPlayWhenReady: requested ?? false, playerState: playerState, kind: kind)
+        }
+        /// What the app was told with no event of SwiftAudioEx's, in order.
+        var readings: [String] = []
+        func emitReading(playWhenReady: Bool?, state: String?) {
+            if let state = state { readings.append("state \(state)") }
+            if let playWhenReady = playWhenReady { readings.append("playWhenReady \(playWhenReady)") }
+        }
     }
 
     private final class CoordinatorHarness {
@@ -1902,6 +1914,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
             XCTAssertEqual(h.player.calls, ["request pause", "jump A paused"], "\(name): back to A, paused until the seek is done")
             h.loads.seekFinished(h.loads.latestSeek, succeeded: succeeded)
             XCTAssertEqual(h.player.calls.last == "resume", resumes, "\(name): \(h.player.calls)")
+            // A failed latest seek keeps a request that was there (crossfade's failure keeps it).
+            XCTAssertEqual(h.loads.seekResume.kind == .keptAfterFailure, !succeeded && requestedBefore && !pauseAfter, name)
         }
         // A seek that cancels a waiting skip (crossfade's cancelled operation) stays paused.
         let c = CoordinatorHarness()
@@ -1980,55 +1994,202 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         // table). Sixth review, I6: a seek that cancelled a command's wait stays paused even after a
         // failure (unreachable from the backends today: every command that waits clears a failed
         // load first, FailedLoadRule.skipped, and a failure of the waited load settles the wait).
-        let kinds: [StandardSeekResume.Kind] = [.none, .keptByGiveUp, .resumesAfterSeek]
+        // Eighth round: a failure's request stays (the app reads play-when-ready true) until a
+        // pause or stop, or the next command that loads a track takes it over; a seek on the
+        // player's track with that request plays once done (a seek after a seek that gave up); the
+        // latest seek that fails keeps it.
+        let kinds: [StandardSeekResume.Kind] = [.none, .keptAfterFailure, .resumesAfterSeek]
         func machine(_ kind: StandardSeekResume.Kind) -> StandardSeekResume {
             let m = StandardSeekResume()
             switch kind {
             case .none: break
-            case .keptByGiveUp: m.gaveUp(playing: true)
+            case .keptAfterFailure: m.gaveUp(playing: true)
             case .resumesAfterSeek:
-                m.seekBegan(returnsToActiveTrack: true, afterFailedLoad: true, cancelledWait: false, inGiveUp: false, playerPlaying: true)
+                m.seekBegan(returnsToActiveTrack: true, afterFailedLoad: true, cancelledWait: false, playerPlaying: true)
             }
             XCTAssertEqual(m.kind, kind)
             return m
         }
-        // gaveUp(playing): kept when playing or when a seek was to resume.
-        XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); m.gaveUp(playing: true); return m.kind }, [.keptByGiveUp, .keptByGiveUp, .keptByGiveUp])
-        XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); m.gaveUp(playing: false); return m.kind }, [.none, .none, .keptByGiveUp])
+        XCTAssertEqual(kinds.map { machine($0).requestsPlay }, [false, true, true])
+        XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); m.gaveUp(playing: true); return m.kind }, [.keptAfterFailure, .keptAfterFailure, .keptAfterFailure])
+        XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); m.gaveUp(playing: false); return m.kind }, [.none, .keptAfterFailure, .keptAfterFailure])
         XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); m.paused(); return m.kind }, [.none, .none, .none])
-        // seekBegan: (returns, afterFailed, cancelledWait, inGiveUp, playerPlaying) -> after each kind.
-        let table: [((Bool, Bool, Bool, Bool, Bool), [StandardSeekResume.Kind])] = [
-            ((true, true, false, true, false), [.none, .resumesAfterSeek, .none]),
-            ((true, true, false, false, true), [.resumesAfterSeek, .resumesAfterSeek, .resumesAfterSeek]),
-            ((true, true, false, false, false), [.none, .none, .resumesAfterSeek]),
-            ((true, false, false, false, true), [.none, .none, .none]),
-            ((true, true, true, true, true), [.none, .none, .none]),
-            ((true, true, true, false, true), [.none, .none, .none]),
-            ((false, false, false, false, true), [.none, .none, .resumesAfterSeek]),
-            ((false, true, false, true, true), [.none, .none, .resumesAfterSeek]),
+        XCTAssertEqual(kinds.map { machine($0).handedToPlayer() }, [false, true, true])
+        XCTAssertEqual(kinds.map { k -> StandardSeekResume.Kind in let m = machine(k); _ = m.handedToPlayer(); return m.kind }, [.none, .none, .none])
+        // seekBegan: (returns, afterFailed, cancelledWait, playerPlaying) -> after each kind.
+        let table: [((Bool, Bool, Bool, Bool), [StandardSeekResume.Kind])] = [
+            ((true, true, false, false), [.none, .resumesAfterSeek, .resumesAfterSeek]),
+            ((true, true, false, true), [.resumesAfterSeek, .resumesAfterSeek, .resumesAfterSeek]),
+            ((true, false, false, true), [.none, .none, .none]),
+            ((true, false, false, false), [.none, .none, .none]),
+            ((true, true, true, true), [.none, .none, .none]),
+            ((false, false, true, true), [.none, .none, .none]),
+            ((false, false, false, true), [.none, .resumesAfterSeek, .resumesAfterSeek]),
+            ((false, false, false, false), [.none, .resumesAfterSeek, .resumesAfterSeek]),
+            ((false, true, false, true), [.none, .resumesAfterSeek, .resumesAfterSeek]),
         ]
         for (input, after) in table {
             let got = kinds.map { k -> StandardSeekResume.Kind in
                 let m = machine(k)
-                m.seekBegan(returnsToActiveTrack: input.0, afterFailedLoad: input.1, cancelledWait: input.2, inGiveUp: input.3, playerPlaying: input.4)
+                m.seekBegan(returnsToActiveTrack: input.0, afterFailedLoad: input.1, cancelledWait: input.2, playerPlaying: input.3)
                 return m.kind
             }
             XCTAssertEqual(got, after, "\(input)")
         }
-        // seekEnded: only the latest seek, only once, only when it succeeded.
+        // seekEnded: only the latest seek, only once; one that failed keeps the request.
         let m = machine(.resumesAfterSeek)
-        let first = m.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, inGiveUp: false, playerPlaying: false)
-        let second = m.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, inGiveUp: false, playerPlaying: false)
+        let first = m.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, playerPlaying: false)
+        let second = m.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, playerPlaying: false)
+        XCTAssertEqual(m.latestSeek, second, "the token's one source")
         XCTAssertFalse(m.seekEnded(first, succeeded: true), "an older seek")
         XCTAssertEqual(m.kind, .resumesAfterSeek)
         XCTAssertTrue(m.seekEnded(second, succeeded: true))
+        XCTAssertEqual(m.kind, .none)
         XCTAssertFalse(m.seekEnded(second, succeeded: true), "once")
         let failed = machine(.resumesAfterSeek)
-        XCTAssertFalse(failed.seekEnded(failed.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, inGiveUp: false, playerPlaying: false), succeeded: false))
-        XCTAssertEqual(failed.kind, .none)
-        let kept = machine(.keptByGiveUp)
+        XCTAssertFalse(failed.seekEnded(failed.seekBegan(returnsToActiveTrack: false, afterFailedLoad: false, cancelledWait: false, playerPlaying: false), succeeded: false))
+        XCTAssertEqual(failed.kind, .keptAfterFailure, "the latest seek failed: the request stays")
+        let kept = machine(.keptAfterFailure)
         XCTAssertFalse(kept.seekEnded(0, succeeded: true))
-        XCTAssertEqual(kept.kind, .keptByGiveUp, "a give-up's request waits for the next seek")
+        XCTAssertEqual(kept.kind, .keptAfterFailure, "a failure's request waits for the next seek or command")
+        // While a seek holds the player paused the app reads loading, as crossfade's seek.
+        // State.rawValue (the core target has no SwiftAudioEx): every State the app can read.
+        let held = ["loading", "buffering", "ready", "paused"]
+        let passed = ["none", "playing", "stopped", "error", "ended"]
+        for kind in kinds {
+            let m = machine(kind)
+            for state in held { XCTAssertEqual(m.reportedState(state), kind == .resumesAfterSeek ? "loading" : state, "\(kind) \(state)") }
+            for state in passed { XCTAssertEqual(m.reportedState(state), state, "\(kind) \(state)") }
+        }
+        // What the app reads: the module's request or a failure's kept one; none in the idle.
+        XCTAssertTrue(StandardReading(idle: false, playerPlayWhenReady: false, playerState: "paused", kind: .resumesAfterSeek) == StandardReading(idle: false, playerPlayWhenReady: true, playerState: "loading", kind: .none))
+        XCTAssertFalse(StandardReading(idle: true, playerPlayWhenReady: true, playerState: "none", kind: .keptAfterFailure).playWhenReady)
+        XCTAssertTrue(StandardReading(idle: false, playerPlayWhenReady: false, playerState: "error", kind: .keptAfterFailure).playWhenReady)
+        XCTAssertFalse(StandardReading(idle: false, playerPlayWhenReady: false, playerState: "paused", kind: .none).playWhenReady)
+    }
+
+    func testStandardLoadCoordinatorACommandThatLoadsATrackTakesAFailuresRequestOver() {
+        // Eighth round (review 7, blocking 1; Android:
+        // aSkipNextOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack,
+        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAndAClearEndsTheRequest): after a
+        // failure the module's request stays, as crossfade's, until a pause or stop. A skip, next,
+        // previous, load or new queue (StandardPlaybackBackend.takeOverRequest) issued while a
+        // seek holds the player paused, or in a give-up's error, takes it over and plays its track
+        // (as crossfade's skip); the cancelled seek's end then plays nothing. A pause or a clear
+        // ends the request first.
+        for (name, seeking, pauseFirst, clearFirst, plays) in [
+            ("during the seek", true, false, false, true),
+            ("in the give-up's error", false, false, false, true),
+            ("after a pause", true, true, false, false),
+            ("after a clear", true, false, true, false),
+        ] {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            h.player.requested = true
+            h.loads.waitForCommandLoad { _ in }
+            h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+            XCTAssertEqual(h.player.requested, false, "\(name): the give-up stopped SwiftAudioEx's request")
+            XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "\(name): the app reads the request kept")
+            if seeking { XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") }, name) }
+            let seek = h.loads.latestSeek
+            if pauseFirst { h.loads.pause() }
+            if clearFirst { h.loads.queueCleared() }
+            XCTAssertEqual(h.loads.commandTakesRequest(), plays, name)
+            XCTAssertEqual(h.loads.seekResume.kind, .none, "\(name): the module's own request is the request again")
+            h.player.calls.removeAll()
+            // The skip cancels the seek (cancelPendingSeeks): its end plays nothing.
+            if seeking { h.loads.seekFinished(seek, succeeded: false) }
+            XCTAssertFalse(h.player.calls.contains("resume"), "\(name): \(h.player.calls)")
+        }
+        // Nothing failed: nothing to take over.
+        let n = CoordinatorHarness()
+        n.player.requested = true
+        XCTAssertFalse(n.loads.commandTakesRequest())
+    }
+
+    func testStandardLoadCoordinatorASeekAfterAFailureReadsPlayingAndLoading() {
+        // Eighth round (review 7, item 2; Android:
+        // aSeekAfterASkipThatGaveUpReadsPlayingAndLoadingWhileItHoldsThePlayerPaused): from the
+        // give-up on, the app reads play-when-ready true (crossfade's failure keeps it) though
+        // SwiftAudioEx's is false; while the seek holds the player paused it reads loading
+        // (crossfade's seek state), never paused; it is told at once of what changed with no event
+        // of SwiftAudioEx's (a pause of the held player).
+        let h = CoordinatorHarness()
+        h.skipFromAToB()
+        h.player.requested = true
+        h.player.playerState = "playing"
+        h.loads.waitForCommandLoad { _ in }
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        h.player.playerState = "error"
+        XCTAssertEqual(h.player.readings, ["playWhenReady true"], "the give-up's stop ended SwiftAudioEx's request, not the app's")
+        XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
+        for state in ["loading", "buffering", "ready", "paused"] {
+            h.player.playerState = state
+            let reading = h.player.reading(h.loads.seekResume.kind)
+            XCTAssertEqual(reading, StandardReading(idle: false, playerPlayWhenReady: true, playerState: "loading", kind: .none), state)
+        }
+        XCTAssertEqual(h.player.requested, false, "SwiftAudioEx waits paused")
+        h.player.readings.removeAll()
+        h.loads.pause()
+        XCTAssertEqual(h.player.readings, ["state paused", "playWhenReady false"], "the pause of the held player is told at once")
+        // The latest seek that succeeds plays; the app is told the hold ended.
+        let p = CoordinatorHarness()
+        p.skipFromAToB()
+        p.player.requested = true
+        p.loads.waitForCommandLoad { _ in }
+        p.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertTrue(p.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
+        p.player.playerState = "ready"
+        p.player.readings.removeAll()
+        p.loads.seekFinished(p.loads.latestSeek, succeeded: true)
+        XCTAssertEqual(p.player.calls.last, "resume")
+        XCTAssertEqual(p.player.readings, ["state ready"], "the request reads true throughout")
+    }
+
+    func testStandardLoadCoordinatorAFailedSeekKeepsTheRequestAndTheNextSeekPlays() {
+        // Eighth round (review 7, items 4 and 5; Android:
+        // aFailedLatestSeekAfterAFailedSkipDoesNotPlayAndKeepsTheRequest,
+        // aSeekThatGivesUpWhileASeekHoldsThePlayerKeepsTheRequestAndTheNextSeekPlays,
+        // theNextCommandEndsTheErrorASeekLoadsTheTrackAgainAtItsTarget): the latest seek after a
+        // failed skip fails, or gives up on A while it holds the player paused (SwiftAudioEx's
+        // request false): nothing plays, the request stays, and the next seek, on A (the player's
+        // track, no move), plays once done, as crossfade's seek after a failure.
+        for failure in ["fails", "gives up"] {
+            let h = CoordinatorHarness()
+            h.skipFromAToB()
+            h.player.requested = true
+            h.loads.waitForCommandLoad { _ in }
+            h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+            XCTAssertTrue(h.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") }, failure)
+            if failure == "gives up" {
+                h.loads.seekTimedOut(issued: true, track: h.ia, message: "The native seek made no progress for 10000 ms.", keptPosition: 30)
+            }
+            h.player.calls.removeAll()
+            h.loads.seekFinished(h.loads.latestSeek, succeeded: false)
+            XCTAssertFalse(h.player.calls.contains("resume"), "\(failure): the failed seek does not play")
+            XCTAssertEqual(h.loads.seekResume.kind, .keptAfterFailure, failure)
+            XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "\(failure): the request stays")
+            h.player.calls.removeAll()
+            XCTAssertTrue(h.loads.beginSeek(to: 31) { _ in XCTFail("the seek goes on") }, failure)
+            XCTAssertEqual(h.player.currentLoadItem, h.ia, "\(failure): on A")
+            XCTAssertFalse(h.player.calls.contains("jump A paused"), "\(failure): no move")
+            h.loads.seekFinished(h.loads.latestSeek, succeeded: true)
+            XCTAssertEqual(h.player.calls.last, "resume", "\(failure): the next seek plays once done")
+        }
+        // A seek that gives up while playing on the active track (no failed skip): the request
+        // stays and the next seek plays once done (before: it stayed paused).
+        let g = CoordinatorHarness()
+        g.loads.failedLoads.adopted(g.ia)
+        g.player.currentLoadItem = g.ia
+        g.player.requested = true
+        XCTAssertTrue(g.loads.beginSeek(to: 30) { _ in XCTFail("the seek goes on") })
+        XCTAssertEqual(g.loads.seekResume.kind, .none, "a seek while playing plays through")
+        g.loads.seekTimedOut(issued: true, track: g.ia, message: "The native seek made no progress for 10000 ms.", keptPosition: 30)
+        XCTAssertEqual(g.player.requested, false)
+        XCTAssertEqual(g.loads.seekResume.kind, .keptAfterFailure)
+        XCTAssertTrue(g.loads.beginSeek(to: 5) { _ in XCTFail("the seek goes on") })
+        g.loads.seekFinished(g.loads.latestSeek, succeeded: true)
+        XCTAssertEqual(g.player.calls.last, "resume")
     }
 
     func testStandardLoadCoordinatorARestoredIdleEmitsOnlyNoneAndStaysOneAcrossQueueChanges() {

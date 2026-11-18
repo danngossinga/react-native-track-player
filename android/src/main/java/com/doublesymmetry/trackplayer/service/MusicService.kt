@@ -544,6 +544,16 @@ class MusicService : HeadlessJsTaskService() {
                         totalTimeoutMs = { prepareTimeout.milliseconds },
                         onLoadStart = { standardAnalytics[binding.player]?.startLoad() }
                     ),
+                    // A failure's kept play request or a seek holding the player paused changed
+                    // what the app reads with no event of the player's (StandardSeekResume).
+                    onReportedChanged = { playWhenReady, state ->
+                        if (isActivePlayer(binding.player, binding.identity) && !useOrchestratedCrossfade()) {
+                            state?.let { emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it)) }
+                            playWhenReady?.let {
+                                emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, Bundle().apply { putBoolean("playWhenReady", it) })
+                            }
+                        }
+                    },
                     initiallyAuthoritative = initiallyAuthoritative
                 ).also { backend -> backend.startLoadWatch(android.os.Handler(android.os.Looper.getMainLooper())) }
             }
@@ -1528,6 +1538,10 @@ class MusicService : HeadlessJsTaskService() {
         observeNotification()
     }
 
+    /** The current backend when it is the standard one of the player [identity] names. */
+    private fun standardBackendOf(identity: Any): KotlinAudioPlaybackBackend? =
+        (playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend)?.takeIf { it.identity === identity }
+
     @MainThread
     private fun observeEvents(
         source: QueuedAudioPlayer,
@@ -1538,7 +1552,9 @@ class MusicService : HeadlessJsTaskService() {
         ownerScope.collectWithAdmission(source.event.stateChange, admission) {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
             if (useOrchestratedCrossfade()) return@collectWithAdmission
-            emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(it))
+            // The standard backend's reading: LOADING while a seek holds the player paused
+            // (StandardSeekResume), as crossfade's seek.
+            emit(MusicEvents.PLAYBACK_STATE, getPlayerStateBundle(standardBackendOf(identity)?.reportedStateOf(it) ?: it))
 
             if (it == AudioPlayerState.ENDED && source.nextItem == null) {
                 emitQueueEndedEvent()
@@ -1596,7 +1612,9 @@ class MusicService : HeadlessJsTaskService() {
             if (!isActivePlayer(source, identity)) return@collectWithAdmission
             if (useOrchestratedCrossfade()) return@collectWithAdmission
             Bundle().apply {
-                putBoolean("playWhenReady", it.playWhenReady)
+                // The standard backend's reading: a failure keeps the play request, as crossfade's
+                // (StandardSeekResume), though the player is held paused.
+                putBoolean("playWhenReady", standardBackendOf(identity)?.reportedPlayWhenReadyOf(it.playWhenReady) ?: it.playWhenReady)
                 emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED, this)
             }
         }
@@ -1606,8 +1624,7 @@ class MusicService : HeadlessJsTaskService() {
             if (useOrchestratedCrossfade()) return@collectWithAdmission
             // A load a command (skip, next, previous, load) waits for reports its failure by the
             // command's rejection, as the crossfade path: no playback error on top of it.
-            val standard = playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend
-            if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission
+            if (standardBackendOf(identity)?.reportsPlayerErrorThroughCommand() == true) return@collectWithAdmission
             emit(MusicEvents.PLAYBACK_ERROR, getPlaybackErrorBundle())
         }
     }

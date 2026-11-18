@@ -545,6 +545,9 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
                 onLoadGaveUp: { [weak self] source, report in
                     self?.handleStandardLoadGaveUp(source: source, report: report)
                 },
+                onReadingChanged: { [weak self] source, playWhenReady, state in
+                    self?.handleStandardReadingChanged(source: source, playWhenReady: playWhenReady, state: state)
+                },
                 onActiveTrackChanged: { [weak self] source, index, lastTrack, lastIndex, lastPosition in
                     self?.handleStandardActiveTrackChanged(source: source, index: index, lastTrack: lastTrack, lastIndex: lastIndex, lastPosition: lastPosition)
                 },
@@ -1956,14 +1959,16 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         // A load or seek given up stopped the player: it is in error (handleStandardLoadGaveUp
         // emitted it), not stopped (StandardLoadCoordinator.emitsPlayerState, tested).
-        if let backend = playbackBackendFacade?.currentBackend as? StandardPlaybackBackend,
-           backend.identity === source, !backend.emitsPlayerState(state.rawValue) {
+        let standard = (playbackBackendFacade?.currentBackend as? StandardPlaybackBackend).flatMap { $0.identity === source ? $0 : nil }
+        if let backend = standard, !backend.emitsPlayerState(state.rawValue) {
             return
         }
+        // The standard backend's reading: loading while a seek holds the player paused
+        // (StandardSeekResume), as crossfade's seek.
         emit(
             event: EventType.PlaybackState,
             body: getPlaybackStateBodyKeyValues(
-                state: state,
+                state: standard?.reportedState(of: state) ?? State.fromPlayerState(state: state),
                 error: iosPlaybackErrorSnapshot(from: source.playbackError)
             )
         )
@@ -2194,12 +2199,28 @@ public class RNTrackPlayer: RCTEventEmitter, AudioSessionControllerDelegate, IOS
     func handlePlayWhenReadyChange(source: QueuedAudioPlayer, playWhenReady: Bool) {
         guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
         configureAudioSession();
+        // The standard backend's reading: a failure keeps the play request, as crossfade's
+        // (StandardSeekResume), though the player is held paused.
+        let standard = (playbackBackendFacade?.currentBackend as? StandardPlaybackBackend).flatMap { $0.identity === source ? $0 : nil }
         emit(
             event: EventType.PlaybackPlayWhenReadyChanged,
             body: [
-                "playWhenReady": playWhenReady
+                "playWhenReady": standard?.reportedPlayWhenReady(of: playWhenReady) ?? playWhenReady
             ]
         )
+    }
+
+    /// What the app reads of the standard player changed with no event of SwiftAudioEx's (a
+    /// failure's kept request, a seek holding the player paused: StandardSeekResume). As Android.
+    func handleStandardReadingChanged(source: QueuedAudioPlayer, playWhenReady: Bool?, state: State?) {
+        guard playbackBackendAuthority.isAuthoritative(.standard, identity: source) else { return }
+        if let state = state {
+            let backend = playbackBackendFacade?.currentBackend as? IOSPlaybackBackendRouting
+            emit(event: EventType.PlaybackState, body: getPlaybackStateBodyKeyValues(state: state, error: backend?.publicPlaybackError))
+        }
+        if let playWhenReady = playWhenReady {
+            emit(event: EventType.PlaybackPlayWhenReadyChanged, body: ["playWhenReady": playWhenReady])
+        }
     }
 
     // MARK: - IOSPlaybackOrchestratorDelegate

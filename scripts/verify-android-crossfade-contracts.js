@@ -450,24 +450,24 @@ assert(
     // With no active track (a cancel with none reported stopped the load, a restore with none):
     // the seek resolves and does nothing, as crossfade's; the player's own item does not load
     // (StandardBackendHlsTest.aSeekCancellingASkipWithNoActiveTrack...).
-    section(standardBackend, 'val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n', 'seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->').includes('if (logicalPlaybackState.isIdle) {\n            seekResume.seekEnded(seek, succeeded = false)\n            seekGate.cancel("seek")\n            return\n        }') &&
+    section(standardBackend, 'val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n', 'seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->').includes('if (logicalPlaybackState.isIdle) {\n            reporting { seekResume.seekEnded(seek, succeeded = false) }\n            seekGate.cancel("seek")\n            return\n        }') &&
     // A restore with no active track loads nothing (sixth review, 2; StandardBackendHlsTest
     // .aRestoreWithNoActiveTrackAndTheQueueChangesAfterItLoadNothing).
     section(standardBackend, 'override suspend fun restore(snapshot: PlaybackBackendSnapshot) {', '\n    }\n').includes('if (idle) player.addWithoutPreparing(queue, null) else player.add(queue)') &&
     // A queue change loads nothing but a new queue's first track (crossfade's queue change; the
     // logical idle, a stop or a failure stay as they are: StandardBackendHlsTest.*WithNoActiveTrack*).
     section(standardBackend, 'override fun add(items: List<TrackAudioItem>, atIndex: Int?) {', '\n    }\n').includes('        if (player.items.isEmpty()) {\n            if (atIndex == null) player.add(items) else player.add(items, atIndex)\n        } else {\n            player.addWithoutPreparing(items, atIndex)\n        }') &&
-    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('if (logicalPlaybackState.isIdle) player.addWithoutPreparing(items, null) else player.add(items)') &&
+    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('            if (logicalPlaybackState.isIdle) {\n                player.addWithoutPreparing(items, null)\n            } else {\n                player.add(items)') &&
     section(read('android/src/vendor/kotlinaudio/java/com/doublesymmetry/kotlinaudio/players/QueuedAudioPlayer.kt'), 'fun addWithoutPreparing(items: List<AudioItem>, atIndex: Int?) {', '\n    }\n').indexOf('prepare') < 0 &&
     // A seek that gives up, or finds its track failed to load, leaves that track failed: the next
     // play loads the active track (FailedLoadRule; StandardBackendHlsTest's seek-after-failed-skip tests).
-    standardBackend.includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)\n                // Its track failed (again): the next play loads the active track, as after a failed\n                // load (FailedLoadRule.failed changes nothing on the loaded track).\n                failLoadedTrack()') &&
+    standardBackend.includes('player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)\n                }\n                // Its track failed (again): the next play loads the active track, as after a failed\n                // load (FailedLoadRule.failed changes nothing on the loaded track).\n                failLoadedTrack()') &&
     standardBackend.includes('if (error.code == STANDARD_SEEK_UNAVAILABLE_CODE && player.currentItem != null) failLoadedTrack()') &&
     // A seek, pause or stop that cancels a waiting skip or load goes back to the reported track,
     // releasing the cancelled track's source, or with none reported stops in idle (crossfade's
     // cancelled operation; standardCancelledLoad).
     standardBackend.includes('leaveCancelledLoad(commandLoads.cancel(), positionMs = null)\n        player.pause()') &&
-    standardBackend.includes('leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)\n        player.stop()') &&
+    standardBackend.includes('leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)\n            player.stop()') &&
     standardBackend.includes('val left = standardCancelledLoad(cancelledWait, player.currentItem, failedLoads.reported, actsOnReportedTrack)\n        when (left) {') &&
     // Paused; after a failed load the latest seek plays once done, as requested before the
     // failure (crossfade's; StandardSeekResume, one explicit state, the same as iOS's:
@@ -475,10 +475,27 @@ assert(
     // .aSeekAfterASkipThat*, aSeekAfterAGiveUp*, severalSeeksAfterASkipThatGaveUp*,
     // aSeekDuringANaturalAdvance*).
     standardBackend.includes('                player.jumpToItem(index, playWhenReady = false)\n                player.seek(position, TimeUnit.MILLISECONDS)\n                // Its source is released') &&
-    standardBackend.includes('        val afterFailedLoad = failedLoads.phase is FailedLoadRule.Phase.Failed\n        val inGiveUp = isInGiveUp()\n        val playerPlaying = player.playWhenReady\n        failedLoads.command()\n        val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n        val seek = seekResume.seekBegan(') &&
+    standardBackend.includes('        val afterFailedLoad = failedLoads.phase is FailedLoadRule.Phase.Failed\n        val playerPlaying = player.playWhenReady\n        failedLoads.command()\n        val seek = reporting {\n            val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)\n            seekResume.seekBegan(') &&
     standardBackend.includes('if (seekResume.seekEnded(seek, succeeded) && !disposed && !playerReleased) player.play()') &&
-    (standardBackend.match(/seekResume\.gaveUp\(playing = player\.playWhenReady\)\n {8,16}player\.failLoad\(/g) || []).length === 2 &&
-    (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 2 &&
+    (standardBackend.match(/seekResume\.gaveUp\(playing = player\.playWhenReady\)\n {8,20}player\.failLoad\(/g) || []).length === 2 &&
+    // A pause, a stop and a clear (crossfade's stop) end a failure's kept request; every command
+    // that loads a track takes it over and plays (eighth round: StandardBackendHlsTest
+    // .aSkipNextOrLoadDuringASeekAfterAFailedSkip*, aNewQueueDuringASeekAfterAFailedSkip*).
+    (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 3 &&
+    (standardBackend.match(/seekResume\.handedToPlayer\(\)/g) || []).length === 7 &&
+    section(standardBackend, 'override fun clearQueue() {', '\n    }\n').includes('seekResume.paused()') &&
+    section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun skipToNext()').includes('player.jumpToItem(index)\n            if (kept) player.playWhenReady = true') &&
+    section(standardBackend, 'override suspend fun skipToNext() {', 'private suspend fun moveToNext()').includes('moveToNext()\n        if (kept) player.playWhenReady = true') &&
+    section(standardBackend, 'override suspend fun skipToPrevious() {', 'private fun moveToPrevious()').includes('moveToPrevious()\n        if (kept) player.playWhenReady = true') &&
+    section(standardBackend, 'override suspend fun load(item: TrackAudioItem) {', '\n    }\n').includes('player.load(item)\n            if (kept) player.playWhenReady = true') &&
+    section(standardBackend, 'override fun replaceQueue(items: List<TrackAudioItem>) {', '\n    }\n').includes('if (kept && items.isNotEmpty()) player.playWhenReady = true') &&
+    // What the app reads: a failure's kept request, LOADING while a seek holds the player paused
+    // (crossfade's seek), in the getters and in every event MusicService emits.
+    standardBackend.includes('get() = logicalPlaybackState.playWhenReady(player.playWhenReady || seekResume.requestsPlay)') &&
+    standardBackend.includes('get() = seekResume.reportedState(logicalPlaybackState.playbackState(player.playerState))') &&
+    musicService.includes('getPlayerStateBundle(standardBackendOf(identity)?.reportedStateOf(it) ?: it)') &&
+    musicService.includes('putBoolean("playWhenReady", standardBackendOf(identity)?.reportedPlayWhenReadyOf(it.playWhenReady) ?: it.playWhenReady)') &&
+    section(musicService, 'onReportedChanged = { playWhenReady, state ->', 'initiallyAuthoritative = initiallyAuthoritative').includes('emit(MusicEvents.PLAYBACK_PLAY_WHEN_READY_CHANGED') &&
     !/playRequestedAtGiveUp|keepsPlaying/.test(standardBackend) &&
     standardBackend.includes('                player.releaseSource(cancelled)\n') &&
     standardBackend.includes('            StandardCancelledLoad.StopsInIdle -> {\n                player.stop()\n                logicalPlaybackState.enterIdle(player.items.size)') &&
@@ -487,7 +504,7 @@ assert(
     // A skip ends a seek in progress at once (standard_seek_cancelled), as on iOS.
     (section(standardBackend, 'override suspend fun skip(index: Int) {', 'override suspend fun seekBy(').match(/seekGate\.cancel\("skip"\)/g) || []).length === 3 &&
     // So do a pause, a stop, a load and a relative seek (iOS: cancelPendingSeeks).
-    ['seekGate.cancel("pause")\n        // As crossfade\'s pause', 'seekGate.cancel("stop")\n        // As crossfade\'s stop',
+    ['seekGate.cancel("pause")\n        // As crossfade\'s pause', 'seekGate.cancel("stop")\n            // As crossfade\'s stop',
       'seekGate.cancel("load")\n        runActivatingOperation('].every((s) => standardBackend.includes(s)) &&
     // seekBy is a waited seek with the same limits, as on iOS, relative to the position the app
     // reads (the reported track's while another loads: StandardBackendHlsTest.aSeekByDuringASkipsLoad...).
@@ -917,7 +934,7 @@ assert(
       giveUp.includes('androidXfadeLog("standard load abandoned (load $reason) positionMs=${player.position}")') &&
       giveUp.includes('val message = standardLoadGiveUpMessage(verdict, stallMs, totalMs)') &&
       // Reported as a playback error only when no command waits for the load (its rejection reports it).
-      giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),\n            report = !commandLoads.waitsFor(item)') &&
+      giveUp.includes('PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),\n                report = !commandLoads.waitsFor(item)') &&
       failLoad.includes('exoPlayer.stop()') && failLoad.includes('playerState = AudioPlayerState.ERROR') &&
       failLoad.includes('if (report) playerEventHolder.updatePlaybackError(error)') &&
       vendored.includes('(if (dataType == C.DATA_TYPE_MEDIA) mediaFactory else factory).createDataSource()') &&
@@ -982,8 +999,8 @@ assert(
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('failLoadedTrack()') &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('if (failedLoads.moved(item)) report(FailedLoadRule.Report(item, from))') &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('failedLoads.ready()?.let(::report)') &&
-      section(standardBackend, 'override suspend fun play() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.play()') &&
-      section(standardBackend, 'override suspend fun retry() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            player.prepare()') &&
+      section(standardBackend, 'override suspend fun play() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            // The player\'s request is the request again (a failure\'s kept one included).\n            seekResume.handedToPlayer()\n            player.play()') &&
+      section(standardBackend, 'override suspend fun retry() {', '\n    }\n').includes('loadActiveTrackAfterFailedLoad()\n            // A failure\'s kept request plays the track the retry loads.\n            if (seekResume.handedToPlayer()) player.playWhenReady = true\n            player.prepare()') &&
       musicService.includes('emitPlaybackTrackChangedEvents(index, lastIndex, lastPositionMs.toSeconds(), lastItem?.track)\n                            index?.let(::updateNotificationMetadataForIndex)') &&
       musicService.includes('activeIndex?.let(::updateNotificationMetadataForIndex)') &&
       // KotlinAudio's own item transition no longer reports the active track (the backend does).
@@ -1032,9 +1049,11 @@ assert(
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('commandLoads.ruleSettled(failedLoads.active, failedLoads.reported)') &&
       section(standardBackend, 'private fun followLoad(', '\n    }\n').includes('STANDARD_LOAD_ERROR_CODE,') &&
       section(standardBackend, 'private fun giveUpLoad(', '\n    }\n').includes('commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)') &&
-      ['override fun stop() {\n        seekResume.paused()\n        val cancelledWait = commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        commandLoads.cancel()',
-        'override fun clearQueue() {\n        commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
-      playbackErrors.includes('if (standard?.identity === identity && standard.reportsPlayerErrorThroughCommand()) return@collectWithAdmission') &&
+      ['override fun stop() {\n        reporting {\n            seekResume.paused()\n            val cancelledWait = commandLoads.cancel()', 'override fun replaceQueue(items: List<TrackAudioItem>) {\n        // A failure\'s kept request plays the new queue\'s first track (as a skip\'s). Not reported:',
+        '        val kept = seekResume.handedToPlayer()\n        reporting {\n            commandLoads.cancel()',
+        'override fun clearQueue() {\n        reporting {\n            // As crossfade\'s clear (its stop): the request a failure kept ends.\n            seekResume.paused()\n            commandLoads.cancel()', 'disposed = true\n        commandLoads.cancel()'].every((pin) => standardBackend.includes(pin)) &&
+      playbackErrors.includes('if (standardBackendOf(identity)?.reportsPlayerErrorThroughCommand() == true) return@collectWithAdmission') &&
+      musicService.includes('(playbackBackendFacade?.currentBackend() as? KotlinAudioPlaybackBackend)?.takeIf { it.identity === identity }') &&
       read('android/robolectric-tests/build.gradle.kts').includes('"com/doublesymmetry/trackplayer/service/StandardCommandLoad.kt",') &&
       ['aSkipAfterSettingTheQueueResolvesOnceTheTargetLoadedAndIsTheActiveTrack', 'aSkipToTheFirstTrackOfANewQueueResolvesOnceItLoaded',
         'aLoadIntoAnEmptyQueueResolvesOnceTheTrackLoaded', 'aSkipToATrackThatFailsToLoadRejectsWithTheEngineErrorAndThePreviousTrackStaysActive',

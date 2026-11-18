@@ -366,6 +366,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     /// Told when a load or seek was given up (the player stopped loading and is in error), with
     /// the events to emit.
     private let onLoadGaveUp: (QueuedAudioPlayer, StandardGiveUpReport) -> Void
+    /// What the app reads changed with no event of SwiftAudioEx's (`StandardSeekResume`: a
+    /// failure's kept request, a seek holding the player paused): the new play-when-ready and
+    /// state, each nil when unchanged. SwiftAudioEx's own events are mapped by
+    /// `reportedPlayWhenReady(of:)` and `reportedState(of:)`.
+    private let onReadingChanged: (QueuedAudioPlayer, Bool?, State?) -> Void
     /// The load sequences (PlaybackBackend.swift, tested): this backend is its player
     /// (`StandardLoadPlayer`). Set in init, before any event.
     private var loads: StandardLoadCoordinator!
@@ -411,6 +416,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         /// The app's `prepareTimeoutMs`: a load's total limit. Nil: loads are not watched.
         prepareTimeoutMs: (() -> Int)? = nil,
         onLoadGaveUp: @escaping (QueuedAudioPlayer, StandardGiveUpReport) -> Void = { _, _ in },
+        onReadingChanged: @escaping (QueuedAudioPlayer, Bool?, State?) -> Void = { _, _, _ in },
         onActiveTrackChanged: @escaping (QueuedAudioPlayer, Int?, Track?, Int?, Double) -> Void = { _, _, _, _, _ in },
         onLoadFailed: @escaping (QueuedAudioPlayer, Int?) -> Void = { _, _ in },
         onNowPlaying: @escaping (QueuedAudioPlayer, Int?, Bool) -> Void = { _, _, _ in },
@@ -441,6 +447,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         self.stallTimeoutMs = stallTimeoutMs
         self.loadWatch = prepareTimeoutMs.map { StandardLoadWatch(stallTimeoutMs: stallTimeoutMs, totalTimeoutMs: $0) }
         self.onLoadGaveUp = onLoadGaveUp
+        self.onReadingChanged = onReadingChanged
         self.onActiveTrackChanged = onActiveTrackChanged
         self.onLoadFailed = onLoadFailed
         self.onNowPlaying = onNowPlaying
@@ -857,7 +864,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         DispatchQueue.main.async { [weak self] in self?.loadDriver?.poke() }
     }
 
-    var playbackState: State {
+    /// As crossfade: a failure keeps the play request and a seek after it reads loading while it
+    /// holds the player paused (`StandardSeekResume`, rule 13: every reader and event agree).
+    var playbackState: State { return State(rawValue: reading(loads.seekResume.kind).state) ?? playerReadingState }
+    /// The state without a seek's hold: a give-up's error, none in a restored idle, or SwiftAudioEx's.
+    private var playerReadingState: State {
         if hostFailure != nil { return .error }
         return activity == .idle ? .none : State.fromPlayerState(state: player.playerState)
     }
@@ -895,13 +906,24 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
-    var publicPlayWhenReady: Bool { return !activity.isIdle && player.playWhenReady }
+    var publicPlayWhenReady: Bool { return reading(loads.seekResume.kind).playWhenReady }
+    /// The play-when-ready event the app gets for SwiftAudioEx's own `playWhenReady` event.
+    func reportedPlayWhenReady(of playerPlayWhenReady: Bool) -> Bool {
+        return playerPlayWhenReady || loads.seekResume.requestsPlay
+    }
+    /// The state event the app gets for SwiftAudioEx's own `state` event.
+    func reportedState(of state: AVPlayerWrapperState) -> State {
+        let physical = State.fromPlayerState(state: state)
+        return State(rawValue: loads.seekResume.reportedState(physical.rawValue)) ?? physical
+    }
     /// The module's last request, not SwiftAudioEx's own pause at the interruption (see
     /// RequestedPlayback).
     /// Read on main, where the player and `requested` change.
     var interruptionIsPlaying: Bool {
         return onMain {
-            interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady, stateRawValue: playbackState.rawValue)
+            // A failure's kept request is the module's too (StandardSeekResume), as Android's
+            // interruption reads the backend's playWhenReady.
+            interruptionCountsAsPlaying(playWhenReady: requested.playWhenReady || loads.seekResume.requestsPlay, stateRawValue: playbackState.rawValue)
         }
     }
     /// SwiftAudioEx's own playWhenReady: the one a load or skip starts the audio with. Read on main.
@@ -1111,6 +1133,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             selectFirstTrackIfIdle(wasIdle)
             // A failed seek's target is its own track's: not the active track's the play loads.
             if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
+            // The module's request is the request again (a failure's kept one included).
+            _ = loads.commandTakesRequest()
             requested.request(true)
             player.play()
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1206,8 +1230,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // A new queue: its first track is a new selection.
             failedLoads.reset()
             cancelPendingSeeks()
+            // A failure's kept request plays the new queue's first track (as a skip's), as Android.
+            let kept = takeOverRequest()
             player.clear()
-            try player.add(items: tracks)
+            try player.add(items: tracks, playWhenReady: kept && !activity.isIdle && !tracks.isEmpty ? true : nil)
             if tracks.isEmpty { move(.queueEmptied) }
             // With no active track a new queue has none either and loads nothing, as crossfade's
             // setQueue with no active track (SwiftAudioEx loaded its first item: stopped).
@@ -1217,6 +1243,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func clearQueue() {
         onMain {
+            // As crossfade's clear (its stop): the request a failure kept ends, as Android.
+            loads.queueCleared()
             clearHostFailure()
             commandLoads.cancel()
             failedLoads.reset()
@@ -1236,7 +1264,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             beginIdleTrackActivationIfNeeded(wasIdle)
             if wasIdle { move(.activated) }
             selectFirstTrackIfIdle(wasIdle)
-            player.load(item: track)
+            // A failure's kept request plays the loaded track (as a skip's), as Android.
+            player.load(item: track, playWhenReady: takeOverRequest() ? true : nil)
             publishIdleTrackActivationIfNeeded(wasIdle)
             // As crossfade's load: once the track loaded, or with its failure.
             waitForCommandLoad { [weak self] result in
@@ -1257,10 +1286,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 }
                 commandLoads.cancel()
                 cancelPendingSeeks()
+                // As crossfade's skip (wasPlaying read before it cancels a seek): a failure's kept
+                // request plays the new track (seventh review, 1), as Android.
+                let kept = takeOverRequest()
                 if wasIdle { move(.activated) }
                 let sameIndex = player.currentIndex == index
                 if !sameIndex {
-                    try player.jumpToItem(atIndex: index, playWhenReady: player.playWhenReady)
+                    try player.jumpToItem(atIndex: index, playWhenReady: player.playWhenReady || kept)
+                } else if kept {
+                    player.playWhenReady = true
                 }
                 publishIdleTrackActivationIfNeeded(wasIdle)
                 // As crossfade's skip: once the track loaded, then the requested seek (jumpToItem
@@ -1299,13 +1333,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 }
                 return
             }
+            let kept = takeOverRequest()
             // After a failed load, next is relative to the active (previous) track, as Android.
             if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active + 1 < player.items.count {
                 failedLoads.skipped()
-                try? player.jumpToItem(atIndex: active + 1, playWhenReady: player.playWhenReady)
+                try? player.jumpToItem(atIndex: active + 1, playWhenReady: player.playWhenReady || kept)
             } else {
                 failedLoads.skipped()
                 player.next()
+                if kept { player.playWhenReady = true }
             }
             finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
         }
@@ -1323,12 +1359,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             commandLoads.cancel()
             cancelPendingSeeks()
             clearHostFailure()
+            let kept = takeOverRequest()
             if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)), let active = indexOfItem(failedLoads.reported), active - 1 >= 0 {
                 failedLoads.skipped()
-                try? player.jumpToItem(atIndex: active - 1, playWhenReady: player.playWhenReady)
+                try? player.jumpToItem(atIndex: active - 1, playWhenReady: player.playWhenReady || kept)
             } else {
                 failedLoads.skipped()
                 player.previous()
+                if kept { player.playWhenReady = true }
             }
             finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
         }
@@ -1367,6 +1405,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             selectFirstTrackIfIdle(wasIdle)
             // A failed seek's target is its own track's: not the active track's the play loads.
             if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
+            _ = loads.commandTakesRequest()
             player.playWhenReady = value
             requested.request(value)
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1400,6 +1439,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         } else {
             player.reload(startFromCurrentTime: true)
         }
+        // A failure's kept request plays the track the retry loads, as Android.
+        if onMain({ takeOverRequest() }) { onMain { player.playWhenReady = true } }
         publishIdleTrackActivationIfNeeded(wasIdle)
     }
     func setRepeatMode(_ rawValue: Int) {
@@ -1428,6 +1469,15 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             code: "crossfade_disabled",
             message: "The standard playback backend does not own a crossfade engine."
         )))
+    }
+
+    /// A command that loads a track takes a failure's kept request over
+    /// (`StandardLoadCoordinator.commandTakesRequest`): whether it plays because of it; the
+    /// module's request (what an ended interruption resumes) is then play.
+    private func takeOverRequest() -> Bool {
+        let kept = loads.commandTakesRequest()
+        if kept { requested.request(true) }
+        return kept
     }
 
     private func publishIdleTrackActivationIfNeeded(_ wasIdle: Bool) {
@@ -1487,6 +1537,10 @@ extension StandardPlaybackBackend: StandardLoadPlayer {
         guard !player.items.isEmpty else { return }
         move(.cancelled)
     }
+    func reading(_ kind: StandardSeekResume.Kind) -> StandardReading {
+        return StandardReading(idle: activity.isIdle, playerPlayWhenReady: player.playWhenReady, playerState: playerReadingState.rawValue, kind: kind)
+    }
+    func emitReading(playWhenReady: Bool?, state: String?) { onReadingChanged(player, playWhenReady, state.flatMap(State.init(rawValue:))) }
     func logFailedLoad(active: ObjectIdentifier?) {
         IOSPlaybackLog.log("standard load failed index=\(player.currentIndex) activeIndex=\(indexOfItem(active).map(String.init) ?? "none")")
     }

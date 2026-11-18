@@ -104,7 +104,11 @@ internal enum class StandardActivity {
         // Back to idle; an idle state stays as it is.
         StandardActivityEvent.ActivationRolledBack -> if (this == ACTIVE) IDLE else this
         StandardActivityEvent.QueueEmptied -> ACTIVE
-        // A restored idle stays one (its state IDLE), as iOS's queue change there.
+        // A restored idle stays one (its state IDLE), as iOS's queue change there. Unreachable on
+        // Android (seventh review): Cancelled comes only from a cancel that stops in the idle
+        // (leaveCancelledLoad, StopsInIdle), which needs a command waiting, and that command
+        // activated the player first; kept so both platforms have the same table (iOS reaches it
+        // through a queue change in a restored idle, StandardLoadCoordinator.queueChanged).
         StandardActivityEvent.Cancelled -> if (this == IDLE) IDLE else IDLE_FOLLOWING_PLAYER
     }
 }
@@ -235,6 +239,13 @@ internal class KotlinAudioPlaybackBackend(
      * player's own item), and whether the player's own updates are held (another track loads).
      */
     private val onNowPlaying: (index: Int?, held: Boolean) -> Unit = { _, _ -> },
+    /**
+     * What the app reads changed with no event of the player's ([StandardSeekResume]: a failure's
+     * kept request, a seek holding the player paused): the new play-when-ready and state, each
+     * null when unchanged. The player's own events are mapped by [reportedPlayWhenReadyOf] and
+     * [reportedStateOf].
+     */
+    private val onReportedChanged: (playWhenReady: Boolean?, state: AudioPlayerState?) -> Unit = { _, _ -> },
     initiallyAuthoritative: Boolean = false
 ) : AndroidPlaybackBackendRouting {
     override val type = PlaybackBackendType.STANDARD
@@ -280,8 +291,10 @@ internal class KotlinAudioPlaybackBackend(
 
     /** The track the app was told is active (-1: none, or it left the queue). */
     private fun reportedIndex(): Int = indexOfItem(failedLoads.reported) ?: -1
+    // As crossfade: a failure keeps the play request and a seek after it reads LOADING while it
+    // holds the player paused ([StandardSeekResume], rule 13: every reader and event agree).
     override val playbackState: AudioPlayerState
-        get() = logicalPlaybackState.playbackState(player.playerState)
+        get() = seekResume.reportedState(logicalPlaybackState.playbackState(player.playerState))
     override val playbackError: AndroidPlaybackErrorSnapshot?
         get() = player.playbackError?.let { error ->
             AndroidPlaybackErrorSnapshot(
@@ -290,7 +303,45 @@ internal class KotlinAudioPlaybackBackend(
             )
         }
     override val playWhenReady: Boolean
-        get() = logicalPlaybackState.playWhenReady(player.playWhenReady)
+        get() = logicalPlaybackState.playWhenReady(player.playWhenReady || seekResume.requestsPlay)
+
+    /** The play-when-ready event the app gets for the player's own [playerPlayWhenReady] event. */
+    fun reportedPlayWhenReadyOf(playerPlayWhenReady: Boolean): Boolean = playerPlayWhenReady || seekResume.requestsPlay
+
+    /** The state event the app gets for the player's own [playerState] event. */
+    fun reportedStateOf(playerState: AudioPlayerState): AudioPlayerState = seekResume.reportedState(playerState)
+
+    /**
+     * Runs [block], which may move [seekResume]; what the app reads that changed by that move is
+     * published at once ([onReportedChanged]): the player may send no event (a pause of a player
+     * a seek already holds paused). The player's own changes come with its own events (mapped by
+     * [reportedPlayWhenReadyOf], [reportedStateOf]), not here. A command that takes a failure's
+     * request over ([StandardSeekResume.handedToPlayer]) is not reported: it sets the player's own
+     * request at once, so the app reads true throughout. iOS: StandardLoadCoordinator.reporting.
+     */
+    private inline fun <T> reporting(block: () -> T): T {
+        val kindBefore = seekResume.kind
+        try {
+            return block()
+        } finally {
+            val kindAfter = seekResume.kind
+            if (kindAfter != kindBefore) {
+                val idle = logicalPlaybackState.isIdle
+                val physical = logicalPlaybackState.playbackState(player.playerState)
+                val playerPlayWhenReady = player.playWhenReady
+                val playWhenReadyBefore = !idle && (playerPlayWhenReady || StandardSeekResume.requestsPlay(kindBefore))
+                val playWhenReadyAfter = !idle && (playerPlayWhenReady || StandardSeekResume.requestsPlay(kindAfter))
+                val stateBefore = StandardSeekResume.reportedState(kindBefore, physical)
+                val stateAfter = StandardSeekResume.reportedState(kindAfter, physical)
+                if (playWhenReadyAfter != playWhenReadyBefore || stateAfter != stateBefore) {
+                    onReportedChanged(
+                        playWhenReadyAfter.takeIf { it != playWhenReadyBefore },
+                        stateAfter.takeIf { it != stateBefore }
+                    )
+                }
+            }
+        }
+    }
     // The reported track's progress, as currentIndex (rule 13): while another track loads, the
     // reported one's as the player left it (ReportedTrackProgress).
     override val positionMs: Long
@@ -483,11 +534,13 @@ internal class KotlinAudioPlaybackBackend(
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             loadActiveTrackAfterFailedLoad()
+            // The player's request is the request again (a failure's kept one included).
+            seekResume.handedToPlayer()
             player.play()
         }
     }
-    override fun pause() {
-        // A pause ends the play request a give-up or a seek after a failed load kept.
+    override fun pause() = reporting {
+        // A pause ends the play request a failure kept, and a seek holding the player paused.
         seekResume.paused()
         // As iOS (cancelPendingSeeks): a pause, stop, load or relative seek ends a seek in progress.
         seekGate.cancel("pause")
@@ -506,23 +559,26 @@ internal class KotlinAudioPlaybackBackend(
         // The player goes back paused and plays once the latest seek is done, as iOS (SwiftAudioEx
         // issues a seek once the item loaded); any number of seeks in a row (a scrubber drag) keep
         // that request ([StandardSeekResume]).
+        // A failure kept the request (a give-up's error, a failed seek, a seek in progress): the
+        // seek holds the player paused and plays once done, also on the track the player is on
+        // (a seek after a seek that gave up, as crossfade's seek after a failure).
         val afterFailedLoad = failedLoads.phase is FailedLoadRule.Phase.Failed
-        val inGiveUp = isInGiveUp()
         val playerPlaying = player.playWhenReady
         failedLoads.command()
-        val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)
-        val seek = seekResume.seekBegan(
-            returnsToActiveTrack = left is StandardCancelledLoad.ReturnsTo,
-            afterFailedLoad = afterFailedLoad,
-            cancelledWait = cancelledWait,
-            inGiveUp = inGiveUp,
-            playerPlaying = playerPlaying
-        )
+        val seek = reporting {
+            val left = leaveCancelledLoad(cancelledWait, positionMs, actsOnReportedTrack = true)
+            seekResume.seekBegan(
+                returnsToActiveTrack = left is StandardCancelledLoad.ReturnsTo,
+                afterFailedLoad = afterFailedLoad,
+                cancelledWait = cancelledWait,
+                playerPlaying = playerPlaying
+            )
+        }
         // No active track (none reported when the cancel stopped the load, or a logical idle):
         // nothing to seek in, nothing loads, and the seek resolves, as crossfade's seek with no
         // active track (nothing to resume either).
         if (logicalPlaybackState.isIdle) {
-            seekResume.seekEnded(seek, succeeded = false)
+            reporting { seekResume.seekEnded(seek, succeeded = false) }
             seekGate.cancel("seek")
             return
         }
@@ -531,8 +587,10 @@ internal class KotlinAudioPlaybackBackend(
             // As a crossfade seek that gives up: the player stops loading and is in error.
             seekGate.seekOrGiveUp(seekPlayer, positionMs) { error ->
                 androidXfadeLog("standard load abandoned (seek ${error.message}) positionMs=${player.position}")
-                seekResume.gaveUp(playing = player.playWhenReady)
-                player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)
+                reporting {
+                    seekResume.gaveUp(playing = player.playWhenReady)
+                    player.failLoad(PlaybackError(error.code, error.message, fromHost = true), report = false)
+                }
                 // Its track failed (again): the next play loads the active track, as after a failed
                 // load (FailedLoadRule.failed changes nothing on the loaded track).
                 failLoadedTrack()
@@ -543,9 +601,11 @@ internal class KotlinAudioPlaybackBackend(
             if (error.code == STANDARD_SEEK_UNAVAILABLE_CODE && player.currentItem != null) failLoadedTrack()
             throw error
         } finally {
-            // After a failed load the latest seek plays once done, as requested (iOS:
-            // StandardLoadCoordinator.seekFinished).
-            if (seekResume.seekEnded(seek, succeeded) && !disposed && !playerReleased) player.play()
+            // After a failure the latest seek plays once done, as requested; one that failed keeps
+            // the request (iOS: StandardLoadCoordinator.seekFinished).
+            reporting {
+                if (seekResume.seekEnded(seek, succeeded) && !disposed && !playerReleased) player.play()
+            }
             // The seek no longer owns the loading: the load watch looks again at once.
             loadDriver?.poke()
         }
@@ -628,9 +688,10 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     /**
-     * Whether playback resumes after a failed load ([StandardSeekResume]: kept by a give-up
-     * ([giveUpLoad], a seek's), whose stop ends ExoPlayer's play-when-ready; resumed once the
-     * latest seek is done). A pause or stop ends it. iOS: the same, in StandardLoadCoordinator.
+     * The play request a failure keeps ([StandardSeekResume]: kept by a give-up ([giveUpLoad], a
+     * seek's), whose stop ends ExoPlayer's play-when-ready, or a failed resuming seek; resumed once
+     * the latest seek is done, or by the next command that loads a track). A pause or stop ends
+     * it. iOS: the same, in StandardLoadCoordinator.
      */
     private val seekResume = StandardSeekResume()
 
@@ -801,11 +862,13 @@ internal class KotlinAudioPlaybackBackend(
         val message = standardLoadGiveUpMessage(verdict, stallMs, totalMs)
         // A load a command waits for is reported by its rejection; one no command waits for (a
         // natural advance, a play) as a playback error, as the crossfade path.
-        seekResume.gaveUp(playing = player.playWhenReady)
-        player.failLoad(
-            PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),
-            report = !commandLoads.waitsFor(item)
-        )
+        reporting {
+            seekResume.gaveUp(playing = player.playWhenReady)
+            player.failLoad(
+                PlaybackError(PREPARE_TIMEOUT_CODE, message, fromHost = true),
+                report = !commandLoads.waitsFor(item)
+            )
+        }
         failLoadedTrack()
         commandLoads.failed(item, PREPARE_TIMEOUT_CODE, message, reportedByPlayer = false)
     }
@@ -925,36 +988,54 @@ internal class KotlinAudioPlaybackBackend(
     }
 
     override fun replaceQueue(items: List<TrackAudioItem>) {
-        commandLoads.cancel()
-        forgetReportedTrack()
-        player.clear()
-        // With no active track (the logical idle) a new queue has none either and loads nothing,
-        // as crossfade's setQueue with no active track: the next play, skip or load selects one.
-        // Otherwise its first track is selected (LOAD-07).
-        if (logicalPlaybackState.isIdle) player.addWithoutPreparing(items, null) else player.add(items)
-        logicalPlaybackState.onQueueSizeChanged(items.size)
-        queueStore.replaceWith(items)
-        // The new queue ended a give-up's error: the media session is told.
-        analytics()?.sessionPlayer?.refresh()
+        // A failure's kept request plays the new queue's first track (as a skip's). Not reported:
+        // the player's own request is set at once (a command that takes the request over reads
+        // true throughout; the new track's states are the player's events).
+        val kept = seekResume.handedToPlayer()
+        reporting {
+            commandLoads.cancel()
+            forgetReportedTrack()
+            player.clear()
+            // With no active track (the logical idle) a new queue has none either and loads nothing,
+            // as crossfade's setQueue with no active track: the next play, skip or load selects one.
+            // Otherwise its first track is selected (LOAD-07).
+            if (logicalPlaybackState.isIdle) {
+                player.addWithoutPreparing(items, null)
+            } else {
+                player.add(items)
+                if (kept && items.isNotEmpty()) player.playWhenReady = true
+            }
+            logicalPlaybackState.onQueueSizeChanged(items.size)
+            queueStore.replaceWith(items)
+            // The new queue ended a give-up's error: the media session is told.
+            analytics()?.sessionPlayer?.refresh()
+        }
     }
 
     override fun clearQueue() {
-        commandLoads.cancel()
-        forgetReportedTrack()
-        player.clear()
-        logicalPlaybackState.onQueueCleared()
-        queueStore.clear()
-        // Clearing the queue ended a give-up's error: the media session is told.
-        analytics()?.sessionPlayer?.refresh()
+        reporting {
+            // As crossfade's clear (its stop): the request a failure kept ends.
+            seekResume.paused()
+            commandLoads.cancel()
+            forgetReportedTrack()
+            player.clear()
+            logicalPlaybackState.onQueueCleared()
+            queueStore.clear()
+            // Clearing the queue ended a give-up's error: the media session is told.
+            analytics()?.sessionPlayer?.refresh()
+        }
     }
 
     override suspend fun load(item: TrackAudioItem) {
         commandLoads.cancel()
         failedLoads.skipped()
+        // A failure's kept request plays the loaded track (as a skip's).
+        val kept = seekResume.handedToPlayer()
         seekGate.cancel("load")
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             player.load(item)
+            if (kept) player.playWhenReady = true
             queueStore.replaceWith(player.items.map { it as TrackAudioItem })
         }
         awaitCommandLoad()
@@ -965,16 +1046,24 @@ internal class KotlinAudioPlaybackBackend(
             throw IndexOutOfBoundsException("The track index is out of bounds: $index")
         }
         commandLoads.cancel()
+        // As crossfade's skip (wasPlaying read before it cancels a seek): a failure's kept
+        // request plays the new track (seventh review, 1).
+        val kept = seekResume.handedToPlayer()
         seekGate.cancel("skip")
         failedLoads.skipped()
         runActivatingOperation(
             publishLogicalActivation = index == player.currentIndex
-        ) { _ -> player.jumpToItem(index) }
+        ) { _ ->
+            player.jumpToItem(index)
+            if (kept) player.playWhenReady = true
+        }
         awaitCommandLoad()
     }
     override suspend fun skipToNext() {
         commandLoads.cancel()
+        val kept = seekResume.handedToPlayer()
         moveToNext()
+        if (kept) player.playWhenReady = true
         awaitCommandLoad()
     }
     private suspend fun moveToNext() {
@@ -1004,7 +1093,9 @@ internal class KotlinAudioPlaybackBackend(
     override suspend fun skipToPrevious() {
         if (logicalPlaybackState.shouldIgnorePrevious()) return
         commandLoads.cancel()
+        val kept = seekResume.handedToPlayer()
         moveToPrevious()
+        if (kept) player.playWhenReady = true
         awaitCommandLoad()
     }
     private fun moveToPrevious() {
@@ -1028,20 +1119,24 @@ internal class KotlinAudioPlaybackBackend(
         runActivatingOperation(publishLogicalActivation = true) { wasIdle ->
             if (wasIdle) selectFirstPhysicalItemIfNeeded()
             loadActiveTrackAfterFailedLoad()
+            // A failure's kept request plays the track the retry loads.
+            if (seekResume.handedToPlayer()) player.playWhenReady = true
             player.prepare()
         }
     }
     override fun stop() {
-        seekResume.paused()
-        val cancelledWait = commandLoads.cancel()
-        failedLoads.command()
-        seekGate.cancel("stop")
-        // As crossfade's stop: a skip or load still waiting does not take effect, and after a
-        // failed skip the player stops on the active track (owner decision, 2026-11-17, LOAD-06).
-        leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)
-        player.stop()
-        // The stop ended a give-up's error: the media session is told (no player event follows).
-        analytics()?.sessionPlayer?.refresh()
+        reporting {
+            seekResume.paused()
+            val cancelledWait = commandLoads.cancel()
+            failedLoads.command()
+            seekGate.cancel("stop")
+            // As crossfade's stop: a skip or load still waiting does not take effect, and after a
+            // failed skip the player stops on the active track (owner decision, 2026-11-17, LOAD-06).
+            leaveCancelledLoad(cancelledWait, positionMs = null, actsOnReportedTrack = true)
+            player.stop()
+            // The stop ended a give-up's error: the media session is told (no player event follows).
+            analytics()?.sessionPlayer?.refresh()
+        }
     }
     override fun setVolume(value: Float) { player.volume = value }
     override fun setRate(value: Float) { player.playbackSpeed = value }

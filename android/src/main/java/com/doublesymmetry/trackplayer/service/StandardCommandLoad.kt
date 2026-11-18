@@ -1,5 +1,6 @@
 package com.doublesymmetry.trackplayer.service
 
+import com.doublesymmetry.kotlinaudio.models.AudioPlayerState
 import com.google.android.exoplayer2.Player
 
 /** The message of a standard command's wait that a newer command ended (iOS: the same). */
@@ -170,22 +171,25 @@ internal fun standardCommandLoadMustStart(targetLoaded: Boolean, exoState: Int):
     !targetLoaded && exoState == Player.STATE_IDLE
 
 /**
- * Whether playback resumes after a load failed: one explicit state (rule 12, ADR 0042 form 3),
- * moved only by its events; the same states, events and moves as iOS's `StandardSeekResume`
- * (PlaybackBackend.swift).
+ * The module's play request after a load failed, and whether a seek holds the player paused: one
+ * explicit state (rule 12, ADR 0042 form 3), moved only by its events; the same states, events and
+ * moves as iOS's `StandardSeekResume` (PlaybackBackend.swift). The reference is crossfade's: its
+ * failure keeps playWhenReady until a pause or stop, and its seek after a failed skip plays.
  *
- * - [Kind.NONE]: nothing to resume.
- * - [Kind.KEPT_BY_GIVE_UP]: a give-up stopped the player (its stop ends the player's own request)
- *   while playback was requested: a seek after it plays, as crossfade's seek after a failed skip.
- * - [Kind.RESUMES_AFTER_SEEK]: a seek went back to the active track after a failed load, playback
- *   requested: the player waits paused and plays once the latest seek completed (any number of
- *   seeks in a row: a scrubber drag), as crossfade's seek after a failed skip.
+ * - [Kind.NONE]: no request kept; the player's own play-when-ready is the request.
+ * - [Kind.KEPT_AFTER_FAILURE]: a failure (a give-up, whose stop ends the player's own
+ *   play-when-ready, or a resuming seek that failed) stopped the player while playback was
+ *   requested: the request stays (the app reads play-when-ready true), a seek then plays, and the
+ *   next command that loads a track (play, retry, skip, next, previous, load, a new queue) plays.
+ * - [Kind.RESUMES_AFTER_SEEK]: a seek holds the player paused after a failure, playback requested:
+ *   the player waits paused and plays once the latest seek completed (any number of seeks in a
+ *   row: a scrubber drag). The app reads play-when-ready true and, as crossfade's seek, LOADING.
  *
- * A pause or stop ends it; a seek that cancelled a command's wait (crossfade's cancelled
- * operation) stays paused.
+ * A pause or stop (a clear is crossfade's stop) ends it; a seek that cancelled a command's wait
+ * (crossfade's cancelled operation) or a natural advance stays paused.
  */
 internal class StandardSeekResume {
-    enum class Kind { NONE, KEPT_BY_GIVE_UP, RESUMES_AFTER_SEEK }
+    enum class Kind { NONE, KEPT_AFTER_FAILURE, RESUMES_AFTER_SEEK }
 
     var kind: Kind = Kind.NONE
         private set
@@ -193,9 +197,16 @@ internal class StandardSeekResume {
     /** The latest seek's token ([seekBegan]): only its end resumes. */
     private var latestSeek = 0L
 
-    /** A load or seek gave up while the player's own request was [playing]. */
+    /** A failure kept the module's play request: the app reads play-when-ready true. */
+    val requestsPlay: Boolean
+        get() = requestsPlay(kind)
+
+    /** The state the app reads for the player's [physical] one ([reportedState] in [kind]). */
+    fun reportedState(physical: AudioPlayerState): AudioPlayerState = reportedState(kind, physical)
+
+    /** A load or seek gave up while the player's own request was [playing] (or a failure kept it). */
     fun gaveUp(playing: Boolean) {
-        kind = if (playing || kind == Kind.RESUMES_AFTER_SEEK) Kind.KEPT_BY_GIVE_UP else Kind.NONE
+        kind = if (playing || requestsPlay) Kind.KEPT_AFTER_FAILURE else Kind.NONE
     }
 
     /** A pause or stop ends any request to resume. */
@@ -204,23 +215,35 @@ internal class StandardSeekResume {
     }
 
     /**
+     * A command that loads a track (play, retry, skip, next, previous, load, a new queue) takes the
+     * request over: returns whether a failure kept it (the command then plays, as crossfade's skip
+     * with playWhenReady kept); nothing is kept any more (the player's own request is the request).
+     */
+    fun handedToPlayer(): Boolean {
+        val kept = requestsPlay
+        kind = Kind.NONE
+        return kept
+    }
+
+    /**
      * A seek began. [returnsToActiveTrack]: it moved the player back to the active track;
      * [afterFailedLoad]: the player's track had failed to load (not a natural advance, not a
-     * command's wait); [cancelledWait]: it cancelled a command's wait; [inGiveUp]: the player is in
-     * a give-up's error; [playerPlaying]: the player's own request. Returns the seek's token.
+     * command's wait); [cancelledWait]: it cancelled a command's wait; [playerPlaying]: the
+     * player's own request. Returns the seek's token.
      */
     fun seekBegan(
         returnsToActiveTrack: Boolean,
         afterFailedLoad: Boolean,
         cancelledWait: Boolean,
-        inGiveUp: Boolean,
         playerPlaying: Boolean
     ): Long {
-        val playing = if (inGiveUp) kind == Kind.KEPT_BY_GIVE_UP else playerPlaying || kind == Kind.RESUMES_AFTER_SEEK
+        val playing = playerPlaying || requestsPlay
         kind = when {
-            cancelledWait -> Kind.NONE
-            returnsToActiveTrack -> if (afterFailedLoad && playing) Kind.RESUMES_AFTER_SEEK else Kind.NONE
-            kind == Kind.RESUMES_AFTER_SEEK -> Kind.RESUMES_AFTER_SEEK
+            cancelledWait || !playing -> Kind.NONE
+            returnsToActiveTrack -> if (afterFailedLoad) Kind.RESUMES_AFTER_SEEK else Kind.NONE
+            // On the player's track with a request a failure kept (a give-up's error, a failed
+            // seek, a seek in progress): the player is held, the seek plays once done.
+            requestsPlay -> Kind.RESUMES_AFTER_SEEK
             else -> Kind.NONE
         }
         latestSeek += 1
@@ -229,11 +252,32 @@ internal class StandardSeekResume {
 
     /**
      * The seek [seek] ended ([succeeded]): whether the player plays now (the latest seek, which
-     * succeeded, after a failed load with playback requested). An older seek's end changes nothing.
+     * succeeded, holding the player). The latest one that failed keeps the request
+     * ([Kind.KEPT_AFTER_FAILURE]). An older seek's end changes nothing.
      */
     fun seekEnded(seek: Long, succeeded: Boolean): Boolean {
         if (seek != latestSeek || kind != Kind.RESUMES_AFTER_SEEK) return false
-        kind = Kind.NONE
+        kind = if (succeeded) Kind.NONE else Kind.KEPT_AFTER_FAILURE
         return succeeded
+    }
+
+    companion object {
+        /** The paused player's states while a seek holds it (KotlinAudio's). */
+        private val HELD_STATES = setOf(
+            AudioPlayerState.LOADING,
+            AudioPlayerState.BUFFERING,
+            AudioPlayerState.READY,
+            AudioPlayerState.PAUSED
+        )
+
+        fun requestsPlay(kind: Kind): Boolean = kind != Kind.NONE
+
+        /**
+         * The state the app reads for the player's [physical] one in [kind]: while a seek holds
+         * the player paused, LOADING, crossfade's state during a seek (its SEEKING), not the
+         * paused player's loading, buffering, ready or paused.
+         */
+        fun reportedState(kind: Kind, physical: AudioPlayerState): AudioPlayerState =
+            if (kind == Kind.RESUMES_AFTER_SEEK && physical in HELD_STATES) AudioPlayerState.LOADING else physical
     }
 }
