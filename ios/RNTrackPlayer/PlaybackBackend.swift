@@ -109,7 +109,8 @@ struct StallWatch: Equatable {
 
 /// One reading of an AVPlayerItem's loading, as a crossfade wait sees it. Measured on the iOS
 /// 26.5 simulator with a real AVPlayer and a local HLS server (packed AAC and AES-128 CMAF/fMP4):
-/// - the loaded time ranges grow while a segment arrives, partial bytes included;
+/// - the loaded time ranges grow while a segment arrives, partial bytes included, on the loads
+///   measured; after a CMAF seek they did not grow until the target's segment had arrived;
 /// - the access log's bytes are media only (playlists and error bodies never count). They can be
 ///   posted late: a packed-audio segment's bytes when it completes, and the partial bytes of a
 ///   variant's failed requests when the player leaves that variant;
@@ -173,10 +174,10 @@ struct BufferedTimeSeen: Equatable {
 enum ItemByteCounting: Equatable {
     /// The posted bytes are progress, with new buffered time.
     case counting
-    /// A request failed, the player switched variant, or a seek opened a new access-log event:
-    /// the bytes posted now (the left variant's failed transfers, segments downloaded again) are
-    /// not progress. New buffered time is, and it resumes the count, unless the same reading
-    /// brings another failure or event.
+    /// A request failed, or a new access-log event opened that is neither the first variant's
+    /// nor that of a seek the wait noted (a switch): the bytes posted now (the left variant's
+    /// failed transfers, segments downloaded again) are not progress. New buffered time is, and
+    /// it resumes the count, unless the same reading brings another failure or event.
     case pausedUntilMedia
 }
 
@@ -190,12 +191,32 @@ struct ItemLoadProgress {
     private var previous: ItemLoadSnapshot?
     private var buffered = BufferedTimeSeen()
     private var countedBytes: Double = 0
-    /// Seeks issued whose access-log event has not appeared yet.
+    /// Seeks the wait issued whose access-log event has not appeared yet.
     private var seeksAwaitingEvent = 0
 
-    /// The wait issues a seek: a seek past the buffer opens an access-log event, not a switch.
-    mutating func noteSeek() {
+    /// The wait is about to issue a seek; `snapshot` is its item just before it. A seek past the
+    /// buffer opens an access-log event (about 0.1 s later on the simulator), which is not a
+    /// switch. When the wait has no reading yet, this one is its baseline, so the seek's event
+    /// comes after it and is matched however many polls later it appears. When it already has
+    /// one (the load's seek to its start position), the note takes none: an event or bytes since
+    /// the last poll are judged in the next reading together with the seek's event, so a switch
+    /// just before the seek counts as a switch and the bytes posted with it are not progress.
+    mutating func noteSeek(before snapshot: ItemLoadSnapshot) {
         seeksAwaitingEvent += 1
+        if previous == nil {
+            _ = readings(for: snapshot)
+        }
+    }
+
+    /// The seek completed; `snapshot` is its item now. A seek past the buffer usually opens its
+    /// event before completing, and this reading then matches it; what is left of the allowance
+    /// (a seek inside the buffer opens no event) is dropped. On packed AAC the event was first
+    /// seen in the poll just after the completion: it then counts as a switch, the bytes posted
+    /// with it are not progress (they are not counted later either), and progress comes from
+    /// the new buffered time the moved buffer brings at once.
+    mutating func seekFinished(after snapshot: ItemLoadSnapshot) {
+        _ = readings(for: snapshot)
+        seeksAwaitingEvent = 0
     }
 
     /// The readings for this snapshot. The first one only sets the baseline.
@@ -239,9 +260,14 @@ final class ItemLoadReader<Item> {
         return progress.readings(for: snapshot(item))
     }
 
-    /// The wait issues a seek (see `ItemLoadProgress.noteSeek`).
-    func noteSeek() {
-        progress.noteSeek()
+    /// The wait is about to seek `item` (see `ItemLoadProgress.noteSeek`).
+    func noteSeek(before item: Item) {
+        progress.noteSeek(before: snapshot(item))
+    }
+
+    /// The wait's seek of `item` completed (see `ItemLoadProgress.seekFinished`).
+    func seekFinished(after item: Item) {
+        progress.seekFinished(after: snapshot(item))
     }
 }
 
@@ -3239,10 +3265,22 @@ final class StandardLoadBytes {
         self.url = url
     }
 
-    /// The backend issues a seek on the player's item: the access-log event a seek past the
-    /// buffer opens is not a switch (`ItemLoadProgress.noteSeek`).
-    func noteSeek() {
-        itemProgress.noteSeek()
+    /// The backend is about to issue a seek on the load's item (`snapshot`:
+    /// `standardItemLoadSnapshot`): the access-log event a seek past the buffer opens is not a
+    /// switch (`ItemLoadProgress.noteSeek(before:)`). Nothing to note while the load has no item
+    /// (its first reading is then a baseline that includes the event).
+    func noteSeek(_ snapshot: (AnyObject) -> ItemLoadSnapshot?) {
+        guard let item = item, let read = snapshot(item) else { return }
+        itemProgress.noteSeek(before: read)
+    }
+
+    /// The backend's issued seek completed (its native callback, finished or not): what is left
+    /// of the seeks' allowance is dropped (`ItemLoadProgress.seekFinished(after:)`), so a seek
+    /// inside the buffer, which opens no access-log event, does not leave a later switch counted
+    /// as that seek's event. Its bytes are counted at the next `read`.
+    func seekFinished(_ snapshot: (AnyObject) -> ItemLoadSnapshot?) {
+        guard let item = item, let read = snapshot(item) else { return }
+        itemProgress.seekFinished(after: read)
     }
 
     /// The player's own current item (`standardPlayerItem`): the load's item (a reload within the
@@ -3299,5 +3337,46 @@ final class StandardLoadBytes {
         itemProgress = ItemLoadProgress()
         itemBytes = 0
         buffered = nil
+    }
+}
+
+/// A standard seek's progress once issued, read as crossfade's waits read theirs: the wait's own
+/// `ItemLoadProgress` of the player's AVPlayerItem, [seconds of time buffered, counted bytes].
+/// The seek is noted with the item just before it is issued (`ItemLoadProgress.noteSeek(before:)`,
+/// the wait's baseline), so the access-log event a seek past the buffer opens is not a switch and
+/// the media bytes that follow count; after a failed request or a rendition switch the bytes
+/// posted are not progress until new time is buffered, and a buffer that empties and fills again
+/// with the same time adds nothing. Before, the wait read SwiftAudioEx's buffered position (the end
+/// of the last loaded range), which counted such a refill and no media bytes. Another item (the
+/// track reloaded) is read from its own start. When SwiftAudioEx's item cannot be read (another
+/// layout, no item) the buffered position is read, as before. Main.
+final class StandardSeekProgress {
+    private let snapshot: (AnyObject) -> ItemLoadSnapshot?
+    private weak var item: AnyObject?
+    private var progress = ItemLoadProgress()
+
+    /// `snapshot`: `standardItemLoadSnapshot`.
+    init(snapshot: @escaping (AnyObject) -> ItemLoadSnapshot?) {
+        self.snapshot = snapshot
+    }
+
+    /// The backend is about to issue the seek; `player` is SwiftAudioEx's item now
+    /// (`standardPlayerItem`).
+    func issuing(on player: StandardPlayerItemLookup) {
+        guard case let .item(current?) = player, let read = snapshot(current) else { return }
+        item = current
+        progress = ItemLoadProgress()
+        progress.noteSeek(before: read)
+    }
+
+    /// The wait's readings: the player's item (`player`) read by this wait's rule, else
+    /// SwiftAudioEx's `buffered` position.
+    func readings(_ player: StandardPlayerItemLookup, buffered: Double) -> [Double] {
+        guard case let .item(current?) = player, let read = snapshot(current) else { return [buffered] }
+        if current !== item {
+            item = current
+            progress = ItemLoadProgress()
+        }
+        return progress.readings(for: read)
     }
 }

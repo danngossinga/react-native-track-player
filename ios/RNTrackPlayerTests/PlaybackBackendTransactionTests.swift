@@ -774,7 +774,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         h.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 1, errors: 0)
         XCTAssertNil(h.observe())
         h.watch.now = 1
-        h.bytes.noteSeek()
+        h.bytes.noteSeek { [unowned h] in h.snapshots[ObjectIdentifier($0)] }
         h.snapshots[key] = itemReading([0...1], bytes: 1_000, events: 2, errors: 0)
         XCTAssertNil(h.observe(owned: true))
         h.watch.now = 2
@@ -791,6 +791,124 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         unnoted.snapshots[key] = itemReading([0...1], bytes: 4_000, events: 2, errors: 0)
         XCTAssertNil(unnoted.observe())
         XCTAssertEqual(unnoted.bytes.progress, 1 + 1_000)
+    }
+
+    func testStandardLoadBytesASeekThatCompletedLeavesNoAllowanceForALaterSwitch() {
+        // A seek inside the buffer opens no access-log event. Once it completed (its native
+        // callback: seekFinished), a later lone event is a switch: the late bytes posted with it
+        // and the segments downloaded again are not progress (the fifth review's IP5).
+        let bytes = StandardLoadBytes()
+        let item = NSObject()
+        var reading = itemReading([0...12], bytes: 100_000, events: 1, errors: 0)
+        let read: (AnyObject) -> ItemLoadSnapshot? = { _ in reading }
+        bytes.startLoad(url: nil)
+        bytes.playerItem(item)
+        XCTAssertEqual(bytes.read(read), 1 + 100_000)
+        bytes.noteSeek(read)
+        bytes.seekFinished(read)
+        reading = itemReading([0...12], bytes: 180_000, events: 2, errors: 0)
+        XCTAssertEqual(bytes.read(read), 1 + 100_000, "a switch after the seek: its bytes are not progress")
+        reading = itemReading([0...12], bytes: 260_000, events: 2, errors: 0)
+        XCTAssertEqual(bytes.read(read), 1 + 100_000, "segments downloaded again")
+        // A seek past the buffer whose event comes before its completion: the bytes after it count.
+        let past = StandardLoadBytes()
+        reading = itemReading([0...12], bytes: 100_000, events: 1, errors: 0)
+        past.startLoad(url: nil)
+        past.playerItem(item)
+        XCTAssertEqual(past.read(read), 1 + 100_000)
+        past.noteSeek(read)
+        reading = itemReading([24...36], bytes: 150_000, events: 2, errors: 0)
+        past.seekFinished(read)
+        XCTAssertEqual(past.read(read), 1 + 150_000)
+        reading = itemReading([24...36], bytes: 170_000, events: 2, errors: 0)
+        XCTAssertEqual(past.read(read), 1 + 170_000)
+        // With no item yet, nothing is noted: its first reading is the baseline.
+        let none = StandardLoadBytes()
+        none.startLoad(url: nil)
+        none.noteSeek(read)
+        none.seekFinished(read)
+        none.playerItem(item)
+        XCTAssertEqual(none.read(read), 1 + 170_000)
+    }
+
+    // A standard seek's wait reads its item as crossfade's waits do (StandardSeekProgress).
+
+    func testStandardSeekProgressReadsItsItemByCrossfadesRule() {
+        let item = AVPlayerItem(url: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("seek.mp3"))
+        var reading = itemReading([0...12], bytes: 100_000, events: 1, errors: 0)
+        // A seek issued at 0 s on a 10 s stall timeout, its wait polled every 250 ms.
+        func run(
+            until stopAt: TimeInterval,
+            _ itemAt: @escaping (TimeInterval) -> ItemLoadSnapshot,
+            readable: Bool = true,
+            buffered: @escaping (TimeInterval) -> Double = { _ in 0 }
+        ) -> (StallVerdict?, TimeInterval) {
+            let clock = ManualWaitClock()
+            let progress = StandardSeekProgress(snapshot: { _ in reading })
+            let player: StandardPlayerItemLookup = readable ? .item(item) : .unavailable
+            reading = itemAt(0)
+            progress.issuing(on: player)
+            var verdicts: [StallVerdict] = []
+            let driver = makeDriver(clock, stallMs: 10_000, totalMs: 60_000, readings: {
+                reading = itemAt(clock.now)
+                return progress.readings(player, buffered: buffered(clock.now))
+            }, gaveUp: { verdicts.append($0) })
+            driver.start()
+            while clock.step(), clock.now < stopAt {}
+            return (verdicts.first, clock.now)
+        }
+        // A seek past the buffer (CMAF): its event opens, then the target's segment arrives with
+        // bytes in flight while the loaded ranges do not move (as on a CMAF load), for 20 s: those
+        // media bytes are progress (Android counts them too), the wait goes on.
+        let slow = run(until: 25) { time in
+            if time < 0.3 { return self.itemReading([0...12], bytes: 100_000, events: 1, errors: 0) }
+            let inFlight = min(time, 20) * 2_000
+            return self.itemReading([24...24.5], bytes: 150_000 + inFlight, events: 2, errors: 0)
+        }
+        XCTAssertNil(slow.0, "media bytes in flight keep the seek going")
+        // When they stop (at 20 s), it gives up one stall timeout later.
+        let stops = run(until: 40) { time in
+            if time < 0.3 { return self.itemReading([0...12], bytes: 100_000, events: 1, errors: 0) }
+            return self.itemReading([24...24.5], bytes: 150_000 + min(time, 20) * 2_000, events: 2, errors: 0)
+        }
+        XCTAssertEqual(stops.0, .stalled)
+        XCTAssertEqual(stops.1, 30, accuracy: 0.001)
+        // A switch during the seek: the buffer dips and fills again with the same time, with the
+        // late bytes of the rendition left. Neither is progress: it gives up one stall timeout
+        // after its last new time (0.5 s), where SwiftAudioEx's buffered position (the end of the
+        // last range: 24.5, 0, 24.5) would have counted the refill.
+        let dip = run(until: 40, { time in
+            if time < 0.3 { return self.itemReading([0...12], bytes: 100_000, events: 1, errors: 0) }
+            if time < 0.5 { return self.itemReading([24...24.5], bytes: 150_000, events: 2, errors: 0) }
+            if time < 2 { return self.itemReading([24...24.5], bytes: 150_000, events: 2, errors: 0) }
+            if time < 2.25 { return self.itemReading([], bytes: 160_000, events: 3, errors: 1) }
+            return self.itemReading([24...24.5], bytes: 160_000 + (time - 2.25) * 1_000, events: 3, errors: 1)
+        }, buffered: { time in time >= 2 && time < 2.25 ? 0 : 24.5 })
+        XCTAssertEqual(dip.0, .stalled)
+        XCTAssertEqual(dip.1, 10.5, accuracy: 0.001)
+        // SwiftAudioEx's item unreadable (another layout): its buffered position, as before.
+        let unreadable = run(until: 40, { _ in self.itemReading([0...12], bytes: 100_000, events: 1, errors: 0) },
+                             readable: false, buffered: { time in time < 5 ? 12 : 13 })
+        XCTAssertEqual(unreadable.0, .stalled)
+        XCTAssertEqual(unreadable.1, 15, accuracy: 0.001)
+    }
+
+    func testStandardSeekProgressReadsAnotherItemFromItsOwnStart() {
+        // The track reloaded during the seek (a new item): that item's first reading is its
+        // baseline, so its bytes and time so far are not taken for progress of the first one.
+        let one = AVPlayerItem(url: URL(fileURLWithPath: "/one.mp3")), two = AVPlayerItem(url: URL(fileURLWithPath: "/two.mp3"))
+        var readings: [ObjectIdentifier: ItemLoadSnapshot] = [
+            ObjectIdentifier(one): itemReading([0...12], bytes: 100_000, events: 1, errors: 0),
+            ObjectIdentifier(two): itemReading([0...2], bytes: 5_000, events: 2, errors: 1),
+        ]
+        let progress = StandardSeekProgress(snapshot: { readings[ObjectIdentifier($0)] })
+        progress.issuing(on: .item(one))
+        XCTAssertEqual(progress.readings(.item(one), buffered: 0), [12, 100_000])
+        XCTAssertEqual(progress.readings(.item(two), buffered: 0), [2, 5_000])
+        readings[ObjectIdentifier(two)] = itemReading([0...2], bytes: 7_000, events: 2, errors: 1)
+        XCTAssertEqual(progress.readings(.item(two), buffered: 0), [2, 7_000], "its own count goes on")
+        XCTAssertEqual(progress.readings(.item(nil), buffered: 3), [3], "no item: the buffered position")
+        XCTAssertEqual(progress.readings(.unavailable, buffered: 4), [4])
     }
 
     func testStandardLoadBytesEachItemOfALoadIsReadFromItsOwnStart() {
@@ -2255,6 +2373,12 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         var afterSwitch = ItemLoadProgress()
         _ = afterSwitch.readings(for: snapshot(loaded: 8, bytes: 20_000, events: 1, errors: 0))
         XCTAssertEqual(afterSwitch.readings(for: snapshot(loaded: 8, bytes: 23_000, events: 2, errors: 0)), [8, 20_000])
+        // Even when the switch's reading has no bytes yet (as measured: the event first appears
+        // with 0 bytes), the bytes posted in the next reading do not count.
+        var emptySwitch = ItemLoadProgress()
+        _ = emptySwitch.readings(for: snapshot(loaded: 8, bytes: 20_000, events: 1, errors: 0))
+        XCTAssertEqual(emptySwitch.readings(for: snapshot(loaded: 8, bytes: 20_000, events: 2, errors: 0)), [8, 20_000])
+        XCTAssertEqual(emptySwitch.readings(for: snapshot(loaded: 8, bytes: 23_000, events: 2, errors: 0)), [8, 20_000])
         // Media of a time not buffered before is new: it counts and resumes the byte count.
         XCTAssertEqual(progress.readings(for: snapshot(loaded: 4, bytes: 3_000, events: 1, errors: 2)), [4, 0])
         XCTAssertEqual(progress.byteCounting, .counting)
@@ -2289,7 +2413,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
     }
 
     func testAWaitThroughABufferDipGivesUpOneStallTimeoutAfterItStarted() {
-        // A seek or play-start wait started at several moments of that sequence, some of whose
+        // A wait on the item's loading (a seek's, for example; not the engine's play wait, which
+        // ends once playback runs) started at several moments of that sequence, some of whose
         // polls fall inside the dip (12.55 s): nothing after its first reading is new media, so
         // each gives up one stall timeout after it started.
         for (startsAt, stallMs) in [(1.05, 10_000), (3.1, 10_000), (6.05, 10_000), (9.05, 10_000), (1.05, 15_000)] {
@@ -2309,7 +2434,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         // A healthy fallback (the simulator: r0's segment answers 503, r1 and r2 serve theirs):
         // the error lands one poll before the switch, whose reading brings three access-log
         // events at once (a switch, though the log had none), new media and the bytes posted with
-        // the switch. The media is progress; the bytes wait for a later reading.
+        // the switch. The media is progress; those bytes are not, for good: only bytes posted in
+        // later readings count.
         var progress = ItemLoadProgress()
         XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 0)), [0, 0])
         XCTAssertEqual(progress.readings(for: snapshot(loaded: 0, bytes: 0, events: 0, errors: 1)), [0, 0])
@@ -2336,39 +2462,147 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testASeekTheWaitIssuedIsNotASwitch() {
         // A seek past the buffer (the simulator, CMAF): the buffer moves to the target's
-        // segments and a new access-log event opens. If the next segment's bytes then grow in
-        // flight while the buffer does not (as measured on a CMAF load; not seen after a seek),
-        // they must count: the wait noted its seek, so that event is the seek's, not a switch.
+        // segments and an access-log event opens about 0.1 s after the seek. In the engine's
+        // order the wait notes its seek with the item just before seeking (its baseline, since
+        // its first poll comes 250 ms after it starts), then reads the item with the event.
         var seek = ItemLoadProgress()
-        XCTAssertEqual(seek.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0)), [12, 147_440])
-        seek.noteSeek()
+        seek.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
         XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [24, 294_336])
-        XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 310_000, events: 2, errors: 0)), [24, 310_000])
         XCTAssertEqual(seek.byteCounting, .counting)
+        // If the segment's bytes then grow in flight while the buffer does not (as measured on a
+        // CMAF load; not seen after a seek), they count.
+        XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 310_000, events: 2, errors: 0)), [24, 310_000])
         // The seek's event is matched: a later event is a switch again.
         XCTAssertEqual(seek.readings(for: snapshot(ranges: [24...36], bytes: 320_000, events: 3, errors: 0)), [24, 310_000])
         XCTAssertEqual(seek.byteCounting, .pausedUntilMedia)
-        // Its first reading may come after the event: then the event is part of the baseline,
-        // and the seek noted stays unmatched (a later lone event is taken for the seek's).
-        var late = ItemLoadProgress()
-        late.noteSeek()
-        XCTAssertEqual(late.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [12, 294_336])
-        XCTAssertEqual(late.readings(for: snapshot(ranges: [24...36], bytes: 310_000, events: 2, errors: 0)), [12, 310_000])
+
+        // The event may appear several polls after the note: it is still the seek's.
+        var slow = ItemLoadProgress()
+        slow.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        XCTAssertEqual(slow.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0)), [12, 147_440])
+        XCTAssertEqual(slow.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0)), [12, 147_440])
+        XCTAssertEqual(slow.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [24, 294_336])
+        XCTAssertEqual(slow.byteCounting, .counting)
+
+        // The load's seek past the buffer: the event and the completion fall between two polls
+        // (the seek took 0.1 s). The completion's reading matches the event, so the bytes count,
+        // and the allowance is used up: a later lone event is a switch.
+        var load = ItemLoadProgress()
+        _ = load.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        load.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        load.seekFinished(after: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0))
+        XCTAssertEqual(load.byteCounting, .counting)
+        XCTAssertEqual(load.readings(for: snapshot(ranges: [24...36], bytes: 344_192, events: 2, errors: 0)), [24, 344_192])
+        XCTAssertEqual(load.readings(for: snapshot(ranges: [24...36], bytes: 400_000, events: 3, errors: 0)), [24, 344_192])
+        XCTAssertEqual(load.byteCounting, .pausedUntilMedia)
+
+        // A request failing during the load's seek: the completion does not undo the pause.
+        var failing = ItemLoadProgress()
+        _ = failing.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        failing.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        XCTAssertEqual(failing.readings(for: snapshot(ranges: [0...12], bytes: 150_000, events: 2, errors: 1)), [12, 147_440])
+        failing.seekFinished(after: snapshot(ranges: [0...12], bytes: 160_000, events: 2, errors: 1))
+        XCTAssertEqual(failing.byteCounting, .pausedUntilMedia)
+        XCTAssertEqual(failing.readings(for: snapshot(ranges: [0...12], bytes: 170_000, events: 2, errors: 1)), [12, 147_440])
+
+        // A completed seek that opened no event (inside the buffer, or the load's seek to its
+        // start) leaves no allowance: a later lone event is a switch.
+        var inside = ItemLoadProgress()
+        inside.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        inside.seekFinished(after: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        XCTAssertEqual(inside.readings(for: snapshot(ranges: [0...12], bytes: 200_000, events: 2, errors: 0)), [12, 147_440])
+        XCTAssertEqual(inside.byteCounting, .pausedUntilMedia)
+
+        // A noted seek covers its event, never a failure: an error entry with it pauses.
+        var failed = ItemLoadProgress()
+        failed.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
+        XCTAssertEqual(failed.readings(for: snapshot(ranges: [0...12], bytes: 150_000, events: 2, errors: 1)), [12, 147_440])
+        XCTAssertEqual(failed.byteCounting, .pausedUntilMedia)
+
         // A seek back to a time not buffered in this wait adds its seconds to the time seen.
-        late.noteSeek()
-        XCTAssertEqual(late.readings(for: snapshot(ranges: [0...12], bytes: 320_000, events: 3, errors: 0)), [24, 320_000])
-        // A seek the wait did not issue (an event with no error) is a switch: bytes wait for new
-        // buffered time, which the moved buffer brings at once.
+        var back = ItemLoadProgress()
+        back.noteSeek(before: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0))
+        XCTAssertEqual(back.readings(for: snapshot(ranges: [0...12], bytes: 320_000, events: 3, errors: 0)), [24, 320_000])
+
+        // A seek the wait did not note (an event with no error) is a switch: the bytes posted with
+        // it are not progress, and progress comes from the new buffered time the moved buffer
+        // brings at once.
         var unnoted = ItemLoadProgress()
         _ = unnoted.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
         XCTAssertEqual(unnoted.readings(for: snapshot(ranges: [24...36], bytes: 294_336, events: 2, errors: 0)), [24, 147_440])
         XCTAssertEqual(unnoted.byteCounting, .pausedUntilMedia)
         // Two events with one seek noted: one is a switch.
         var both = ItemLoadProgress()
-        _ = both.readings(for: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
-        both.noteSeek()
+        both.noteSeek(before: snapshot(ranges: [0...12], bytes: 147_440, events: 1, errors: 0))
         XCTAssertEqual(both.readings(for: snapshot(ranges: [0...12], bytes: 200_000, events: 3, errors: 0)), [12, 147_440])
         XCTAssertEqual(both.byteCounting, .pausedUntilMedia)
+    }
+
+    func testTheLoadsSeekNoteDoesNotReadAnItemItsWaitAlreadyReads() {
+        // The load's wait has polled before its seek to the start position. A switch (an event,
+        // no error) lands between that poll and the note: it is judged in the next reading
+        // together with the seek's event, two events for one seek, so it is a switch and the
+        // bytes posted with it never count.
+        var switched = ItemLoadProgress()
+        XCTAssertEqual(switched.readings(for: snapshot(ranges: [0...12], bytes: 100, events: 1, errors: 0)), [12, 100])
+        switched.noteSeek(before: snapshot(ranges: [0...12], bytes: 200, events: 2, errors: 0))
+        XCTAssertEqual(switched.readings(for: snapshot(ranges: [24...36], bytes: 300, events: 3, errors: 0)), [24, 100])
+        XCTAssertEqual(switched.byteCounting, .pausedUntilMedia)
+        XCTAssertEqual(switched.readings(for: snapshot(ranges: [24...36], bytes: 400, events: 3, errors: 0)), [24, 100])
+        // Bytes (no event) between that poll and the note, then a failure with the seek's event:
+        // those bytes are judged with the failure and do not count either.
+        var failed = ItemLoadProgress()
+        XCTAssertEqual(failed.readings(for: snapshot(ranges: [0...12], bytes: 100, events: 1, errors: 0)), [12, 100])
+        failed.noteSeek(before: snapshot(ranges: [0...12], bytes: 200, events: 1, errors: 0))
+        XCTAssertEqual(failed.readings(for: snapshot(ranges: [0...12], bytes: 300, events: 2, errors: 1)), [12, 100])
+        XCTAssertEqual(failed.byteCounting, .pausedUntilMedia)
+
+        // Through a real wait (10 s stall): ready at 1.0 s, an up-switch at 1.05 s, the load's
+        // seek at 1.1 s moving the buffer past it and completing by 1.2 s, then a slow segment's
+        // bytes growing in flight while the buffer does not. The switch keeps those bytes from
+        // counting: the load gives up one stall timeout after the moved buffer's reading.
+        let clock = ManualWaitClock()
+        var verdicts: [StallVerdict] = []
+        func item(at time: TimeInterval) -> ItemLoadSnapshot {
+            if time < 0.5 { return snapshot(ranges: [], bytes: 0, events: 0, errors: 0) }
+            if time < 1.05 { return snapshot(ranges: [0...12], bytes: 100_000, events: 1, errors: 0) }
+            if time < 1.1 { return snapshot(ranges: [0...12], bytes: 100_000, events: 2, errors: 0) }
+            let inFlight = Double(Int(time - 1.1)) * 4_000
+            return snapshot(ranges: [24...36], bytes: 200_000 + inFlight, events: 3, errors: 0)
+        }
+        let reader = ItemLoadReader(item(at:))
+        let driver = makeDriver(clock, stallMs: 10_000, totalMs: 60_000, readings: { reader.readings(clock.now) }, gaveUp: { verdicts.append($0) })
+        driver.start()
+        var seekIssued = false
+        while clock.step() {
+            if !seekIssued, clock.now >= 1.0 {
+                seekIssued = true
+                reader.noteSeek(before: 1.099)
+                reader.seekFinished(after: 1.2)
+            }
+            if clock.now >= 40 { break }
+        }
+        XCTAssertEqual(verdicts, [.stalled])
+        XCTAssertEqual(clock.now, 11.25, accuracy: 0.001)
+    }
+
+    func testBufferedTimeCountsEachSecondOnce() {
+        // The union of the ranges seen: ranges that overlap or touch merge; a gap, however
+        // small, stays out of it (no threshold: a gap is time not buffered).
+        var seen = BufferedTimeSeen()
+        XCTAssertEqual(seen.add([0...12]), 12)
+        XCTAssertEqual(seen.add([12.5...13]), 0.5)
+        XCTAssertEqual(seen.seconds, 12.5)
+        XCTAssertEqual(seen.add([13...14]), 1)
+        XCTAssertEqual(seen.ranges, [0...12, 12.5...14])
+        // Time seen before, or within a range seen before, adds nothing.
+        XCTAssertEqual(seen.add([0...12]), 0)
+        XCTAssertEqual(seen.add([5...6]), 0)
+        XCTAssertEqual(seen.ranges, [0...12, 12.5...14])
+        // A range before the others, then one bridging the gap.
+        XCTAssertEqual(seen.add([-2...(-1)]), 1)
+        XCTAssertEqual(seen.add([11...13]), 0.5)
+        XCTAssertEqual(seen.ranges, [-2...(-1), 0...14])
     }
 
     func testItemLoadProgressCountsPostedBytesWithoutAnErrorOrASwitch() {

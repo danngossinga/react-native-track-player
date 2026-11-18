@@ -327,8 +327,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         var completion: ((Result<Void, Error>) -> Void)?
         /// The seek's wait (stallTimeoutMs once issued, standardSeekTimeoutMs in all).
         var wait: StallWaitDriver?
-        /// Issued to the player: from then on, a stall of the buffered position fails it.
+        /// Issued to the player: from then on, a stall of its item's progress fails it.
         var issued = false
+        /// Its item's progress once issued (StandardSeekProgress, its own for this wait).
+        let progress = StandardSeekProgress(snapshot: standardItemLoadSnapshot)
 
         init(track: Track, position: Double, completion: @escaping (Result<Void, Error>) -> Void) {
             self.track = track
@@ -712,9 +714,8 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         let request = PendingSeek(track: track, position: max(0, position), completion: completion)
         // Until the seek is issued (queued behind another seek, or waiting for the item to load,
         // for example after a stop) only standardSeekTimeoutMs bounds it; once issued, it also
-        // fails when the player's buffered position does not grow for stallTimeoutMs. That
-        // position (the end of the last loaded range) is the only signal SwiftAudioEx exposes:
-        // a seek far from the loaded range shows no growth until its first data arrives.
+        // fails when its item makes no progress for stallTimeoutMs: new buffered time or media
+        // bytes, read by crossfade's rule (StandardSeekProgress, tested).
         let stallMs = stallTimeoutMs()
         // Its progress is sampled every stallTimeoutMs / 10 (as the load watch and Android); the
         // seek itself ends at its native callback (event-driven).
@@ -724,7 +725,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             intervalMs: standardLoadSampleIntervalMs(stallMs),
             readings: { [weak self, weak request] in
                 guard let self = self, let request = request, request.issued else { return nil }
-                return [self.player.bufferedPosition]
+                return request.progress.readings(standardPlayerItem(of: self.player), buffered: self.player.bufferedPosition)
             }
         ) { [weak self, weak request] verdict, watch in
             guard let self = self, let request = request, request.completion != nil else { return }
@@ -796,8 +797,10 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 return
             }
             pendingSeeks.removeFirst()
-            // Its access-log event is not a rendition switch for the load's progress.
-            loadBytes.noteSeek()
+            // Its access-log event is not a rendition switch for the load's progress, nor for its
+            // own wait's (its baseline: the item just before the seek).
+            loadBytes.noteSeek(standardItemLoadSnapshot)
+            request.progress.issuing(on: standardPlayerItem(of: player))
             issuedSeek = request
             request.issued = true
             request.wait?.noteProgress()
@@ -817,7 +820,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         // Matched by the seek it completes, not by position alone (A, B, then A again).
         guard let request = nativeSeeks.completed(at: position) else { return }
         let wasIssued = issuedSeek === request
-        if wasIssued { issuedSeek = nil }
+        if wasIssued {
+            issuedSeek = nil
+            // The latest issued seek completed: the load's allowance for its event ends.
+            loadBytes.seekFinished(standardItemLoadSnapshot)
+        }
         let sameTrack = (player.currentItem as? Track) === request.track
         // On an item AVPlayer cannot seek in, an unfinished seek completes where the player is
         // (Android: where ExoPlayer lands).

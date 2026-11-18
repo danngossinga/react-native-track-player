@@ -333,6 +333,41 @@ assert(
       .every((name) => transactionTests.includes(`func ${name}()`)),
   'The iOS wait driver must stay in the tested core with its tests.'
 );
+
+// After a failed request or a variant switch, the bytes AVFoundation posts with it (the left
+// variant's failed transfers, segments downloaded again) are not progress until media of a new
+// time is buffered; buffered time counts once (a buffer that empties and refills adds nothing).
+// One explicit state.
+const itemProgress = section(facade, 'struct ItemLoadProgress {', 'final class ItemLoadReader<Item> {');
+assert(
+  facade.includes('enum ItemByteCounting: Equatable {') &&
+    facade.includes('    case counting\n') &&
+    facade.includes('    case pausedUntilMedia\n}') &&
+    itemProgress.includes('let failedOrSwitched = snapshot.errorLogEntries > previous.errorLogEntries\n            || newEvents > seekEvents') &&
+    itemProgress.includes('let newTime = buffered.add(snapshot.loadedRanges)') &&
+    itemProgress.includes('if failedOrSwitched {\n            byteCounting = .pausedUntilMedia\n        } else if byteCounting == .pausedUntilMedia, newTime > 0 {\n            byteCounting = .counting\n        }') &&
+    itemProgress.includes('if byteCounting == .counting {\n            countedBytes += newBytes') &&
+    itemProgress.includes('return [buffered.seconds, countedBytes]') &&
+    !/private var \w+: Bool/.test(itemProgress) &&
+    facade.includes('accessLogEvents = events.count') &&
+    facade.includes('errorLogEntries = item.errorLog()?.events.count ?? 0') &&
+    [
+      'testItemLoadProgressPausesTheByteCountAfterAnErrorOrASwitchUntilNewMediaIsBuffered',
+      'testABufferDipAndRefillAtASwitchIsNotProgress',
+      'testAWaitThroughABufferDipGivesUpOneStallTimeoutAfterItStarted',
+      'testMediaInTheSameReadingAsASwitchCountsButDoesNotResumeTheBytes',
+      'testAFirstAccessLogEventThatComesWithASwitchDoesNotCount',
+      'testASeekTheWaitIssuedIsNotASwitch',
+      'testTheLoadsSeekNoteDoesNotReadAnItemItsWaitAlreadyReads',
+      'testBufferedTimeCountsEachSecondOnce',
+      'testItemLoadProgressCountsPostedBytesWithoutAnErrorOrASwitch',
+      'testEachWaitReadsItsOwnItemProgress',
+      'testFailingSegmentsGiveUpAtTheStallTimeoutThoughThePlayerFallsBackToOtherRenditions',
+      'testASlowButHealthyFallbackAfterFailedSegmentsKeepsLoading',
+      'testARealPlayerWhoseSegmentsFailPartWayGivesUpAtTheStallTimeoutDespiteTheLateBytesOfItsSwitch',
+    ].every((name) => transactionTests.includes(`func ${name}()`)),
+  'iOS crossfade waits must stop counting the bytes posted with an error or a switch, and a buffer refill, until new media is buffered, with its tests.'
+);
 // The crossfade fallback grace is the app's incomingStallGraceMs, never a number.
 assert(
   orchestrator.includes('var incomingStallGraceMs: () -> Int = { incomingStallGraceDefaultMs }') &&
@@ -417,7 +452,11 @@ assert(
     standardBackend2.includes('let stallMs = stallTimeoutMs()') &&
     standardBackend2.includes('let wait = StallWaitDriver(\n            stallTimeoutMs: stallMs,\n            totalTimeoutMs: seekTimeoutMs(),') &&
     standardBackend2.includes('guard let self = self, let request = request, request.issued else { return nil }') &&
-    standardBackend2.includes('return [self.player.bufferedPosition]') &&
+    // Once issued, the seek's own progress of its item, by crossfade's rule (StandardSeekProgress,
+    // tested), noted with the item just before the seek.
+    standardBackend2.includes('return request.progress.readings(standardPlayerItem(of: self.player), buffered: self.player.bufferedPosition)') &&
+    standardBackend2.includes('let progress = StandardSeekProgress(snapshot: standardItemLoadSnapshot)') &&
+    !standardBackend2.includes('return [self.player.bufferedPosition]') &&
     standardBackend2.includes('request.issued = true\n            request.wait?.noteProgress()\n            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
     standardBackend2.includes('request.wait = wait\n        // A newer seek ends the older ones at once (standard_seek_cancelled), as on Android.') &&
     standardBackend2.includes('        pendingSeeks.append(request)\n        wait.start()\n        pumpSeeks()') &&
@@ -544,7 +583,7 @@ assert(
   standardBackend.includes('        let superseded = pendingSeeks\n        pendingSeeks.removeAll()\n        superseded.forEach {\n            $0.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
     standardBackend.includes('        if let issued = issuedSeek {\n            // Its native callback still comes (NativeSeekLedger) but resolves nothing.\n            issuedSeek = nil\n            nativeSeeks.release(issued)\n            issued.finish(.failure(seekError("standard_seek_cancelled", "A newer seek replaced this one.")))\n        }') &&
     standardBackend.includes('            nativeSeeks.issued(request, at: request.position)\n            player.seek(to: request.position)') &&
-    standardBackend.includes('        guard let request = nativeSeeks.completed(at: position) else { return }\n        let wasIssued = issuedSeek === request\n        if wasIssued { issuedSeek = nil }') &&
+    standardBackend.includes('        guard let request = nativeSeeks.completed(at: position) else { return }\n        let wasIssued = issuedSeek === request\n        if wasIssued {\n            issuedSeek = nil\n') &&
     !standardBackend.includes('request.position == position') &&
     read('ios/RNTrackPlayerTests/PlaybackBackendTransactionTests.swift').includes('func testANativeSeekCallbackResolvesOnlyTheSeekItCompletes()') &&
     // The module's request follows every playWhenReady it sets (restore, a cancelled handoff,
@@ -712,9 +751,14 @@ assert(
       poll.includes('let progress = loadBytes.read(standardItemLoadSnapshot)') &&
       poll.includes('readings: standardLoadReadings(playerItem, bytes: progress, buffered: loadBytes.buffered ?? player.bufferedPosition),') &&
       facade.includes('func standardItemLoadSnapshot(_ item: AnyObject) -> ItemLoadSnapshot? {\n    return (item as? AVPlayerItem).map(ItemLoadSnapshot.init(of:))') &&
-      // A seek the backend issues is noted, so its access-log event is not a switch (tested
-      // through StandardLoadBytes.noteSeek).
-      section(backendSource, 'private func pumpSeeks() {', '\n    }\n').includes('pendingSeeks.removeFirst()\n            // Its access-log event is not a rendition switch for the load\'s progress.\n            loadBytes.noteSeek()\n            issuedSeek = request') &&
+      // A seek the backend issues is noted with its item just before it, so its access-log event
+      // is not a switch, for the load and for the seek's own wait (tested through
+      // StandardLoadBytes.noteSeek and StandardSeekProgress.issuing); the latest issued seek's
+      // completion drops what is left of the load's allowance (StandardLoadBytes.seekFinished).
+      section(backendSource, 'private func pumpSeeks() {', '\n    }\n').includes('pendingSeeks.removeFirst()\n            // Its access-log event is not a rendition switch for the load\'s progress, nor for its\n            // own wait\'s (its baseline: the item just before the seek).\n            loadBytes.noteSeek(standardItemLoadSnapshot)\n            request.progress.issuing(on: standardPlayerItem(of: player))\n            issuedSeek = request') &&
+      section(backendSource, 'private func didCompleteNativeSeek(', '\n    }\n').includes('let wasIssued = issuedSeek === request\n        if wasIssued {\n            issuedSeek = nil\n            // The latest issued seek completed: the load\'s allowance for its event ends.\n            loadBytes.seekFinished(standardItemLoadSnapshot)\n        }') &&
+      (backendSource.match(/loadBytes\.seekFinished\(/g) || []).length === 1 &&
+      (backendSource.match(/loadBytes\.noteSeek\(/g) || []).length === 1 &&
       section(backendSource, 'private func currentAssetURL() -> URL? {', '\n    }\n').includes('return standardAssetURL(source: track.getSourceUrl(), isFile: track.getSourceType() == .file)') &&
       // AVFoundation's item events check the load at once when they are its item's.
       backendSource.includes('itemObservers = [.AVPlayerItemNewAccessLogEntry, .AVPlayerItemNewErrorLogEntry, .AVPlayerItemFailedToPlayToEndTime].map { name in') &&
@@ -820,6 +864,9 @@ assert(
         'testStandardLoadBytesAfterASwitchTheLateBytesAreNotProgress',
         'testStandardLoadBytesNewTimeBufferedAfterASwitchResumesTheBytes',
         'testStandardLoadBytesASeekTheBackendIssuedIsNotASwitch',
+        'testStandardLoadBytesASeekThatCompletedLeavesNoAllowanceForALaterSwitch',
+        'testStandardSeekProgressReadsItsItemByCrossfadesRule',
+        'testStandardSeekProgressReadsAnotherItemFromItsOwnStart',
         'testStandardLoadBytesEachItemOfALoadIsReadFromItsOwnStart',
         'testStandardPlayerItemIsReadThroughSwiftAudioExsPrivateWrapper',
         'testStandardLoadWatchStartsALoadWhereItsCheckBeginsWatching',
