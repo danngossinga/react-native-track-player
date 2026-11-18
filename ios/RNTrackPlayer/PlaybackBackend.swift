@@ -2662,6 +2662,52 @@ func standardCancelledLoad(cancelledWait: Bool, playerItem: ObjectIdentifier?, r
     return cancelledWait || actsOnReportedTrack ? .returnsTo(reported) : .stays
 }
 
+/// Whether the standard player has an active track: one explicit state (rule 12, ADR 0042 form 3),
+/// moved only by `after`. The same states and moves as Android's `StandardActivity`
+/// (KotlinAudioPlaybackBackend.kt).
+enum StandardActivity: Equatable {
+    /// A track is active: every reader reads the player.
+    case active
+    /// No active track (a restored snapshot with none, or a rolled-back activation): state none.
+    case idle
+    /// No active track after a cancel stopped the player (`StandardActivityEvent.cancelled`): its
+    /// state is SwiftAudioEx's own (stopped, as its event says), not none, so every reader agrees
+    /// with the state event the stop emitted (rule 13).
+    case idleFollowingPlayer
+
+    var isIdle: Bool { return self != .active }
+
+    func after(_ event: StandardActivityEvent) -> StandardActivity {
+        switch event {
+        case let .restored(idle):
+            return idle ? .idle : .active
+        case .activated:
+            return .active
+        case .activationRolledBack:
+            // Back to idle; an idle state stays as it is.
+            return self == .active ? .idle : self
+        case .queueEmptied:
+            return .active
+        case .cancelled:
+            return .idleFollowingPlayer
+        }
+    }
+}
+
+/// What moves `StandardActivity`; the same events as Android's `StandardActivityEvent`.
+enum StandardActivityEvent: Equatable {
+    /// A backend snapshot restored: idle when its queue has tracks and none is active.
+    case restored(idle: Bool)
+    /// A play, skip, next or load selects a track.
+    case activated
+    /// That selection failed: no active track again.
+    case activationRolledBack
+    /// The queue is empty: nothing to be idle on.
+    case queueEmptied
+    /// A cancel stopped the player with no reported track, the queue staying.
+    case cancelled
+}
+
 /// The track a play, load or retry from the logical idle (no active track) selects first: the
 /// queue's first one when the player is elsewhere, as Android (selectFirstPhysicalItemIfNeeded)
 /// and crossfade's play with no active track. Nil: the player is on it, or the queue is empty.

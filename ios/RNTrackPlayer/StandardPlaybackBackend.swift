@@ -309,13 +309,12 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private let stallTimeoutMs: () -> Int
     private let queueState = PlaybackBackendQueueState<Track>()
     private var pendingSnapshot = PlaybackBackendSnapshot.empty
-    private var idleWithoutActiveTrack = false {
-        didSet { if !idleWithoutActiveTrack { idleStateFollowsPlayer = false } }
+    /// Whether a track is active (StandardActivity, tested; Android: the same, in
+    /// KotlinAudioLogicalPlaybackStateSidecar), moved only through `move`.
+    private var activity = StandardActivity.active
+    private func move(_ event: StandardActivityEvent) {
+        activity = activity.after(event)
     }
-    /// The idle a cancel entered (`enterIdle`): its state is SwiftAudioEx's own (stopped, as its
-    /// event says), not none, so every reader agrees with the state event the stop emitted (rule
-    /// 13). As Android (KotlinAudioLogicalPlaybackStateSidecar.stateFollowsPlayer).
-    private var idleStateFollowsPlayer = false
     private var isAuthoritative: Bool
     private var controlSurfaceRelinquished = false
     private var disposed = false
@@ -858,7 +857,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     var playbackState: State {
         if hostFailure != nil { return .error }
-        return idleWithoutActiveTrack && !idleStateFollowsPlayer ? .none : State.fromPlayerState(state: player.playerState)
+        return activity == .idle ? .none : State.fromPlayerState(state: player.playerState)
     }
     var publicPlaybackError: IOSPlaybackErrorSnapshot? {
         return hostFailure ?? iosPlaybackErrorSnapshot(from: player.playbackError)
@@ -867,7 +866,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         if failedLoads.isPending((player.currentItem as AnyObject?).map(ObjectIdentifier.init)) {
             return indexOfItem(failedLoads.reported) ?? -1
         }
-        return idleWithoutActiveTrack ? -1 : player.currentIndex
+        return activity.isIdle ? -1 : player.currentIndex
     }
     // The reported track's progress, as currentIndex (rule 13): while another track loads, the
     // reported one's as the player left it (ReportedTrackProgress).
@@ -879,9 +878,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     private func liveProgress() -> TrackProgress {
         return TrackProgress(
             // A failed seek keeps its target (SwiftAudioEx's stop reset its own position).
-            position: giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime),
-            duration: idleWithoutActiveTrack ? 0 : player.duration,
-            buffered: idleWithoutActiveTrack ? 0 : player.bufferedPosition
+            position: giveUps.position(live: activity.isIdle ? 0 : player.currentTime),
+            duration: activity.isIdle ? 0 : player.duration,
+            buffered: activity.isIdle ? 0 : player.bufferedPosition
         )
     }
 
@@ -894,7 +893,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     }
     var publicVolume: Float { return player.volume }
     var publicRate: Float { return player.rate }
-    var publicPlayWhenReady: Bool { return !idleWithoutActiveTrack && player.playWhenReady }
+    var publicPlayWhenReady: Bool { return !activity.isIdle && player.playWhenReady }
     /// The module's last request, not SwiftAudioEx's own pause at the interruption (see
     /// RequestedPlayback).
     /// Read on main, where the player and `requested` change.
@@ -959,8 +958,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 player.clear()
                 try player.add(items: queue)
             }
-            idleWithoutActiveTrack = snapshot.activeIndex == nil && !queue.isEmpty
-            idleStateFollowsPlayer = false
+            move(.restored(idle: snapshot.activeIndex == nil && !queue.isEmpty))
             player.rate = snapshot.rate
             player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
             player.playWhenReady = false
@@ -1069,14 +1067,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         pendingSnapshot = snapshot
         _ = queueState.commit()
         // A backend switch restored this track, ready (the readiness gate): the app has it.
-        failedLoads.adopted(idleWithoutActiveTrack ? nil : (player.currentItem as AnyObject?).map(ObjectIdentifier.init))
+        failedLoads.adopted(activity.isIdle ? nil : (player.currentItem as AnyObject?).map(ObjectIdentifier.init))
         isAuthoritative = true
         loadDriver?.poke()
     }
 
     func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {
         player.automaticallyUpdateNowPlayingInfo = automaticallyUpdateNowPlayingInfo()
-        player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady
+        player.playWhenReady = !activity.isIdle && snapshot.playWhenReady
         requested.request(player.playWhenReady)
         if player.playWhenReady {
             player.play()
@@ -1101,9 +1099,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             // A new load: a failure of it no command waits for is reported again.
             commandLoads.failureCleared()
             let kept = clearHostFailure()
-            let wasIdle = idleWithoutActiveTrack
+            let wasIdle = activity.isIdle
             beginIdleTrackActivationIfNeeded(wasIdle)
-            if wasIdle { idleWithoutActiveTrack = false }
+            if wasIdle { move(.activated) }
             selectFirstTrackIfIdle(wasIdle)
             // A failed seek's target is its own track's: not the active track's the play loads.
             if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
@@ -1169,7 +1167,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             cancelCommandLoadOfRemovedTrack()
             if player.items.isEmpty {
-                idleWithoutActiveTrack = false
+                move(.queueEmptied)
                 failedLoads.reset()
             } else {
                 reportRemovedTrack(before)
@@ -1187,7 +1185,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func removeUpcomingTracks() {
         onMain {
-            guard !idleWithoutActiveTrack else { return }
+            guard !activity.isIdle else { return }
             let before = player.items
             player.removeUpcomingItems()
             cancelCommandLoadOfRemovedTrack()
@@ -1204,7 +1202,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             cancelPendingSeeks()
             player.clear()
             try player.add(items: tracks)
-            if tracks.isEmpty { idleWithoutActiveTrack = false }
+            if tracks.isEmpty { move(.queueEmptied) }
             // With no active track a new queue has none either and loads nothing, as crossfade's
             // setQueue with no active track (SwiftAudioEx loaded its first item: stopped).
             loads.queueChanged()
@@ -1218,7 +1216,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             failedLoads.reset()
             cancelPendingSeeks()
             player.clear()
-            idleWithoutActiveTrack = false
+            move(.queueEmptied)
         }
     }
 
@@ -1228,9 +1226,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             failedLoads.skipped()
             commandLoads.cancel()
             cancelPendingSeeks()
-            let wasIdle = idleWithoutActiveTrack
+            let wasIdle = activity.isIdle
             beginIdleTrackActivationIfNeeded(wasIdle)
-            if wasIdle { idleWithoutActiveTrack = false }
+            if wasIdle { move(.activated) }
             selectFirstTrackIfIdle(wasIdle)
             player.load(item: track)
             publishIdleTrackActivationIfNeeded(wasIdle)
@@ -1245,7 +1243,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         onMain {
             clearHostFailure()
             failedLoads.skipped()
-            let wasIdle = idleWithoutActiveTrack
+            let wasIdle = activity.isIdle
             beginIdleTrackActivationIfNeeded(wasIdle)
             do {
                 guard player.items.indices.contains(index) else {
@@ -1253,7 +1251,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 }
                 commandLoads.cancel()
                 cancelPendingSeeks()
-                if wasIdle { idleWithoutActiveTrack = false }
+                if wasIdle { move(.activated) }
                 let sameIndex = player.currentIndex == index
                 if !sameIndex {
                     try player.jumpToItem(atIndex: index, playWhenReady: player.playWhenReady)
@@ -1267,7 +1265,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                     completion: completion
                 )
             } catch {
-                if wasIdle { idleWithoutActiveTrack = true }
+                if wasIdle { move(.activationRolledBack) }
                 cancelIdleTrackActivationIfNeeded(wasIdle)
                 completion(.failure(error))
             }
@@ -1279,17 +1277,17 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             clearHostFailure()
             commandLoads.cancel()
             cancelPendingSeeks()
-            if idleWithoutActiveTrack {
+            if activity.isIdle {
                 beginIdleTrackActivationIfNeeded(true)
                 do {
-                    idleWithoutActiveTrack = false
+                    move(.activated)
                     if player.currentIndex != 0 {
                         try player.jumpToItem(atIndex: 0, playWhenReady: false)
                     }
                     publishIdleTrackActivationIfNeeded(true)
                     finishCommandLoad(seekTo: initialTime >= 0 ? initialTime : nil, completion: completion)
                 } catch {
-                    idleWithoutActiveTrack = true
+                    move(.activationRolledBack)
                     cancelIdleTrackActivationIfNeeded(true)
                     completion(.failure(error))
                 }
@@ -1309,7 +1307,7 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
 
     func skipToPrevious(initialTime: Double, completion: @escaping (Result<Void, Error>) -> Void) {
         onMain {
-            guard !idleWithoutActiveTrack else {
+            guard !activity.isIdle else {
                 completion(.failure(playbackBackendError(
                     code: "index_out_of_bounds",
                     message: "The previous track index is out of bounds."
@@ -1357,9 +1355,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
             }
             let kept = clearHostFailure()
             commandLoads.failureCleared()
-            let wasIdle = idleWithoutActiveTrack
+            let wasIdle = activity.isIdle
             beginIdleTrackActivationIfNeeded(wasIdle)
-            if wasIdle { idleWithoutActiveTrack = false }
+            if wasIdle { move(.activated) }
             selectFirstTrackIfIdle(wasIdle)
             // A failed seek's target is its own track's: not the active track's the play loads.
             if !loadActiveTrackAfterFailedLoad() { reloadAtKeptPosition(kept) }
@@ -1384,9 +1382,9 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     func retry() {
         onMain { commandLoads.failureCleared() }
         let kept = clearHostFailure()
-        let wasIdle = idleWithoutActiveTrack
+        let wasIdle = activity.isIdle
         beginIdleTrackActivationIfNeeded(wasIdle)
-        if wasIdle { idleWithoutActiveTrack = false }
+        if wasIdle { move(.activated) }
         selectFirstTrackIfIdle(wasIdle)
         let jumped = loadActiveTrackAfterFailedLoad()
         // A failed seek's target is its own track's: not the active track's the retry loads.
@@ -1461,7 +1459,7 @@ extension StandardPlaybackBackend: StandardLoadPlayer {
     func reportActiveTrack(_ change: FailedLoadRule.Report) { report(change) }
     func showAfterFailedLoad(_ reported: ObjectIdentifier?) { onLoadFailed(player, indexOfItem(reported)) }
     var reportedPosition: Double { return reportedProgress().position }
-    var isIdle: Bool { return idleWithoutActiveTrack }
+    var isIdle: Bool { return activity.isIdle }
     var isPlayerStopped: Bool { return player.playerState == .stopped }
     func requestPlayback(_ playing: Bool) { requested.request(playing) }
     var playbackRequested: Bool { return requested.playWhenReady }
@@ -1480,8 +1478,7 @@ extension StandardPlaybackBackend: StandardLoadPlayer {
     func stopPlayer() { player.stop() }
     func enterIdle() {
         guard !player.items.isEmpty else { return }
-        idleWithoutActiveTrack = true
-        idleStateFollowsPlayer = true
+        move(.cancelled)
     }
     func logFailedLoad(active: ObjectIdentifier?) {
         IOSPlaybackLog.log("standard load failed index=\(player.currentIndex) activeIndex=\(indexOfItem(active).map(String.init) ?? "none")")

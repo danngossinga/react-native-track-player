@@ -893,6 +893,28 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertEqual(unreadable.1, 15, accuracy: 0.001)
     }
 
+    func testStandardActivityMovesBetweenActiveIdleAndIdleFollowingThePlayer() {
+        // Every state and event: the same table as Android's
+        // theStandardActivityMovesBetweenActiveIdleAndIdleFollowingThePlayer.
+        let states: [StandardActivity] = [.active, .idle, .idleFollowingPlayer]
+        let expected: [(StandardActivityEvent, [StandardActivity])] = [
+            (.restored(idle: true), [.idle, .idle, .idle]),
+            (.restored(idle: false), [.active, .active, .active]),
+            (.activated, [.active, .active, .active]),
+            (.activationRolledBack, [.idle, .idle, .idleFollowingPlayer]),
+            (.queueEmptied, [.active, .active, .active]),
+            (.cancelled, [.idleFollowingPlayer, .idleFollowingPlayer, .idleFollowingPlayer]),
+        ]
+        for (event, after) in expected {
+            for (index, from) in states.enumerated() {
+                XCTAssertEqual(from.after(event), after[index], "\(from) after \(event)")
+            }
+        }
+        XCTAssertEqual(states.map(\.isIdle), [false, true, true])
+        // A failed activation after a cancel rolls back to plain idle (the activation left it first).
+        XCTAssertEqual(StandardActivity.idleFollowingPlayer.after(.activated).after(.activationRolledBack), .idle)
+    }
+
     func testStandardSeekProgressReadsAnotherItemFromItsOwnStart() {
         // The track reloaded during the seek (a new item): that item's first reading is its
         // baseline, so its bytes and time so far are not taken for progress of the first one.

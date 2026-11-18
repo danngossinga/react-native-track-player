@@ -79,83 +79,123 @@ internal fun AndroidPlaybackBackendRouting.readSnapshot() =
         repeatMode = repeatMode
     )
 
-internal class KotlinAudioLogicalPlaybackStateSidecar {
-    private var idleWithoutActiveItem = false
-        set(value) {
-            field = value
-            if (!value) stateFollowsPlayer = false
-        }
+/**
+ * Whether the standard player has an active track: one explicit state (rule 12, ADR 0042 form 3),
+ * moved only by [after]. The same states and moves as iOS's `StandardActivity`
+ * (PlaybackBackend.swift).
+ */
+internal enum class StandardActivity {
+    /** A track is active: every reader reads the player. */
+    ACTIVE,
+    /** No active track (a restored snapshot with none, or a rolled-back activation): state IDLE. */
+    IDLE,
     /**
-     * The idle a cancel entered ([enterIdle]): its state is the player's own (stopped, as its event
-     * says), not IDLE, so every reader agrees with the state event the stop emitted (rule 13).
+     * No active track after a cancel stopped the player ([StandardActivityEvent.Cancelled]): its
+     * state is the player's own (stopped, as its event says), not IDLE, so every reader agrees
+     * with the state event the stop emitted (rule 13).
      */
-    private var stateFollowsPlayer = false
+    IDLE_FOLLOWING_PLAYER;
+
+    val isIdle: Boolean get() = this != ACTIVE
+
+    fun after(event: StandardActivityEvent): StandardActivity = when (event) {
+        is StandardActivityEvent.Restored -> if (event.idle) IDLE else ACTIVE
+        StandardActivityEvent.Activated -> ACTIVE
+        // Back to idle; an idle state stays as it is.
+        StandardActivityEvent.ActivationRolledBack -> if (this == ACTIVE) IDLE else this
+        StandardActivityEvent.QueueEmptied -> ACTIVE
+        StandardActivityEvent.Cancelled -> IDLE_FOLLOWING_PLAYER
+    }
+}
+
+/** What moves [StandardActivity]; the same events as iOS's `StandardActivityEvent`. */
+internal sealed class StandardActivityEvent {
+    /** A backend snapshot restored: idle when its queue has tracks and none is active. */
+    data class Restored(val idle: Boolean) : StandardActivityEvent()
+    /** A play, skip, next or load selects a track. */
+    object Activated : StandardActivityEvent()
+    /** That selection failed: no active track again. */
+    object ActivationRolledBack : StandardActivityEvent()
+    /** The queue is empty: nothing to be idle on. */
+    object QueueEmptied : StandardActivityEvent()
+    /** A cancel stopped the player with no reported track, the queue staying. */
+    object Cancelled : StandardActivityEvent()
+}
+
+internal class KotlinAudioLogicalPlaybackStateSidecar {
+    var activity = StandardActivity.ACTIVE
+        private set
+
+    private fun move(event: StandardActivityEvent) {
+        activity = activity.after(event)
+    }
 
     fun restore(snapshot: PlaybackBackendSnapshot) {
-        idleWithoutActiveItem = snapshot.queueIds.isNotEmpty() &&
-            (snapshot.activeIndex == null || snapshot.activeIndex < 0)
-        stateFollowsPlayer = false
+        move(
+            StandardActivityEvent.Restored(
+                snapshot.queueIds.isNotEmpty() && (snapshot.activeIndex == null || snapshot.activeIndex < 0)
+            )
+        )
     }
 
     fun activate(): Boolean {
-        val wasIdle = idleWithoutActiveItem
-        idleWithoutActiveItem = false
+        val wasIdle = activity.isIdle
+        move(StandardActivityEvent.Activated)
         return wasIdle
     }
 
     fun consumeIdleForNext(): Boolean = activate()
 
-    fun shouldIgnorePrevious(): Boolean = idleWithoutActiveItem
+    fun shouldIgnorePrevious(): Boolean = activity.isIdle
 
     fun rollbackActivation(wasIdle: Boolean) {
-        if (wasIdle) idleWithoutActiveItem = true
+        if (wasIdle) move(StandardActivityEvent.ActivationRolledBack)
     }
 
     fun hasLogicalActiveItem(physicalIndex: Int): Boolean =
-        !idleWithoutActiveItem && physicalIndex >= 0
+        !activity.isIdle && physicalIndex >= 0
 
     fun onQueueCleared() {
-        idleWithoutActiveItem = false
+        move(StandardActivityEvent.QueueEmptied)
     }
 
     /**
      * No active track any more (a cancelled load with none reported, the player stopped); the
-     * queue stays. Its state is the player's ([stateFollowsPlayer]).
+     * queue stays. Its state is the player's ([StandardActivity.IDLE_FOLLOWING_PLAYER]).
      */
     fun enterIdle(queueSize: Int) {
         if (queueSize == 0) return
-        idleWithoutActiveItem = true
-        stateFollowsPlayer = true
+        move(StandardActivityEvent.Cancelled)
     }
 
     /** Whether no track is active (a play, skip or load selects one). */
     val isIdle: Boolean
-        get() = idleWithoutActiveItem
+        get() = activity.isIdle
 
     fun onQueueSizeChanged(queueSize: Int) {
-        if (queueSize == 0) idleWithoutActiveItem = false
+        if (queueSize == 0) move(StandardActivityEvent.QueueEmptied)
     }
 
     fun currentIndex(physicalIndex: Int): Int =
-        if (idleWithoutActiveItem) -1 else physicalIndex
+        if (activity.isIdle) -1 else physicalIndex
 
     fun activeIndex(physicalIndex: Int, queueSize: Int): Int? =
         currentIndex(physicalIndex).takeIf { it in 0 until queueSize }
 
     fun playbackState(physicalState: AudioPlayerState): AudioPlayerState =
-        if (idleWithoutActiveItem && !stateFollowsPlayer) AudioPlayerState.IDLE else physicalState
+        if (activity == StandardActivity.IDLE) AudioPlayerState.IDLE else physicalState
 
     fun playWhenReady(physicalPlayWhenReady: Boolean): Boolean =
-        !idleWithoutActiveItem && physicalPlayWhenReady
+        !activity.isIdle && physicalPlayWhenReady
 
     fun positionMs(physicalPositionMs: Long): Long =
-        if (idleWithoutActiveItem) 0L else physicalPositionMs
+        if (activity.isIdle) 0L else physicalPositionMs
 
     fun durationMs(physicalDurationMs: Long): Long =
-        if (idleWithoutActiveItem) 0L else physicalDurationMs
+        if (activity.isIdle) 0L else physicalDurationMs
 
     fun bufferedMs(physicalBufferedMs: Long): Long =
-        if (idleWithoutActiveItem) 0L else physicalBufferedMs
+        if (activity.isIdle) 0L else physicalBufferedMs
 }
 
 internal class KotlinAudioPlaybackBackend(

@@ -108,6 +108,45 @@ class PlaybackBackendRuntimePrimitivesTest {
     }
 
     @Test
+    fun theStandardActivityMovesBetweenActiveIdleAndIdleFollowingThePlayer() {
+        // Every state and event: the same table as iOS's
+        // testStandardActivityMovesBetweenActiveIdleAndIdleFollowingThePlayer.
+        val active = StandardActivity.ACTIVE
+        val idle = StandardActivity.IDLE
+        val following = StandardActivity.IDLE_FOLLOWING_PLAYER
+        val expected = mapOf(
+            StandardActivityEvent.Restored(idle = true) to listOf(idle, idle, idle),
+            StandardActivityEvent.Restored(idle = false) to listOf(active, active, active),
+            StandardActivityEvent.Activated to listOf(active, active, active),
+            StandardActivityEvent.ActivationRolledBack to listOf(idle, idle, following),
+            StandardActivityEvent.QueueEmptied to listOf(active, active, active),
+            StandardActivityEvent.Cancelled to listOf(following, following, following)
+        )
+        for ((event, after) in expected) {
+            listOf(active, idle, following).forEachIndexed { index, from ->
+                assertEquals("$from after $event", after[index], from.after(event))
+            }
+        }
+        // What each state reads: idle hides the player; following the player shows its state.
+        val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
+        sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first")))
+        assertEquals(idle, sidecar.activity)
+        sidecar.enterIdle(queueSize = 1)
+        assertEquals(following, sidecar.activity)
+        assertEquals(AudioPlayerState.STOPPED, sidecar.playbackState(AudioPlayerState.STOPPED))
+        assertEquals(-1, sidecar.currentIndex(physicalIndex = 0))
+        // A failed activation from there rolls back to plain idle (activate leaves it first).
+        sidecar.rollbackActivation(sidecar.activate())
+        assertEquals(idle, sidecar.activity)
+        assertEquals(AudioPlayerState.IDLE, sidecar.playbackState(AudioPlayerState.STOPPED))
+        // An empty queue is never idle.
+        sidecar.enterIdle(queueSize = 0)
+        assertEquals(idle, sidecar.activity)
+        sidecar.onQueueSizeChanged(queueSize = 0)
+        assertEquals(active, sidecar.activity)
+    }
+
+    @Test
     fun standardActivationValidatorAcceptsOnlyCoherentIdleOrActiveSnapshots() {
         val idle = PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first"))
         StandardPlaybackActivationSnapshotValidator.validate(idle)

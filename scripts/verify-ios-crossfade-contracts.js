@@ -590,7 +590,7 @@ assert(
     // the activation after a switch).
     section(standardBackend, '    func restore(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = false\n            requested.request(false)\n            player.pause()') &&
     section(standardBackend, '    func cancelHandoffQuiescence(_ snapshot: PlaybackBackendSnapshot) throws {', '    func ').includes('            player.playWhenReady = snapshot.playWhenReady\n            requested.request(snapshot.playWhenReady)') &&
-    section(standardBackend, '    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {', '    func ').includes('        player.playWhenReady = !idleWithoutActiveTrack && snapshot.playWhenReady\n        requested.request(player.playWhenReady)') &&
+    section(standardBackend, '    func activateAfterCommit(_ snapshot: PlaybackBackendSnapshot) {', '    func ').includes('        player.playWhenReady = !activity.isIdle && snapshot.playWhenReady\n        requested.request(player.playWhenReady)') &&
     // The crossfade engine gives up at once with crossfade_engine_error when the player fails.
     engine.includes('                if let failure = self.player.currentItem?.error ?? self.player.error,\n                   self.player.currentItem?.status == .failed || self.player.status == .failed {\n                    DispatchQueue.main.async {\n                        guard self.generation == generation, !didComplete else { return }\n                        self.state = .failed\n                        finish(.failure(NSError(') &&
     // The ping-pong backend reads the orchestrator on main.
@@ -820,9 +820,20 @@ assert(
       section(backendSource, '    func skip(to index: Int, initialTime: Double,', '                let sameIndex = player.currentIndex == index').includes('            clearHostFailure()\n            failedLoads.skipped()') &&
       backendSource.includes('    func jumpPaused(to item: ObjectIdentifier) -> Bool {\n        guard let index = indexOfItem(item) else { return false }\n        try? player.jumpToItem(atIndex: index, playWhenReady: false)\n        return true') &&
       backendSource.includes('    func seekPlayer(to position: Double) { player.seek(to: position) }') &&
-      backendSource.includes('    var isIdle: Bool { return idleWithoutActiveTrack }') &&
-      backendSource.includes('    func enterIdle() {\n        guard !player.items.isEmpty else { return }\n        idleWithoutActiveTrack = true\n        idleStateFollowsPlayer = true') &&
-      backendSource.includes('return idleWithoutActiveTrack && !idleStateFollowsPlayer ? .none : State.fromPlayerState(state: player.playerState)') &&
+      // Whether a track is active is one explicit state, moved only by StandardActivity.after
+      // (tested; Android: the same moves).
+      backendSource.includes('    var isIdle: Bool { return activity.isIdle }') &&
+      backendSource.includes('    func enterIdle() {\n        guard !player.items.isEmpty else { return }\n        move(.cancelled)') &&
+      backendSource.includes('return activity == .idle ? .none : State.fromPlayerState(state: player.playerState)') &&
+      backendSource.includes('    private var activity = StandardActivity.active\n    private func move(_ event: StandardActivityEvent) {\n        activity = activity.after(event)\n    }') &&
+      (backendSource.match(/activity = /g) || []).length === 2 &&
+      backendSource.includes("move(.restored(idle: snapshot.activeIndex == nil && !queue.isEmpty))") &&
+      (backendSource.match(/            let wasIdle = activity\.isIdle\n/g) || []).length === 4 &&
+      (backendSource.match(/if wasIdle \{ move\(\.activated\) \}/g) || []).length === 5 &&
+      (backendSource.match(/move\(\.queueEmptied\)/g) || []).length === 3 &&
+      (backendSource.match(/move\(\.activationRolledBack\)/g) || []).length === 2 &&
+      !/idleWithoutActiveTrack|idleStateFollowsPlayer/.test(backendSource) &&
+      ['testStandardActivityMovesBetweenActiveIdleAndIdleFollowingThePlayer'].every((t) => tests.includes(`func ${t}()`)) &&
       // The load watch looks only while StandardLoadCoordinator.watchesLoads (tested: not after a
       // give-up, not in the idle).
       backendSource.includes('guard isAuthoritative, loads.watchesLoads, let watch = loadWatch else {') &&
@@ -836,7 +847,7 @@ assert(
       !section(backendSource, '    func setPlayWhenReady(_ value: Bool, completion: @escaping (Result<Void, Error>) -> Void) {', '            let kept = clearHostFailure()').includes('clearHostFailure') &&
       section(facade, '    func stop() {', '    func beginSeek(').includes('let ended = giveUps.stopped(playerStopped: player.isPlayerStopped)') &&
       section(facade, '    func stop() {', '    func beginSeek(').includes('player.stopPlayer()\n        if let ended = ended { player.emitGiveUp(ended) }') &&
-      backendSource.includes('position: giveUps.position(live: idleWithoutActiveTrack ? 0 : player.currentTime),') &&
+      backendSource.includes('position: giveUps.position(live: activity.isIdle ? 0 : player.currentTime),') &&
       backendSource.includes('return giveUps.clear()') &&
       giveUp.includes('IOSPlaybackLog.log("standard load abandoned (\\(log))")') &&
       giveUp.includes('requested.request(false)\n        player.stop()') &&
