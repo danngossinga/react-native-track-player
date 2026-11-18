@@ -281,7 +281,13 @@ Added fork surface:
     service stays (as crossfade's), and the end of the error's grace period
     no longer lets it go while the notification is ongoing (before: they read
     the player's own `false`, the session showed paused and the foreground
-    service could go while the app read playing). The lock screen (iOS) shows
+    service could go while the app read playing). In the give-up's error with
+    the request kept, the end of the grace period (`stopForegroundGracePeriod`)
+    ends the foreground service and keeps the notification, as crossfade's
+    surface in its error (before: it removed the notification while the app
+    read playing); crossfade's leaves the foreground at once, with no grace
+    period. Once a pause ended the request, the error removes the
+    notification at the grace period's end, as before. The lock screen (iOS) shows
     rate 0 in the error and while a seek holds the player, as crossfade's
     (`nowPlayingPlaybackRate` is 0 outside playing): no change there;
   - a backend switch carries the request the app reads (a kept one: `true`)
@@ -290,8 +296,8 @@ Added fork surface:
     Android the player's own item, the track that failed). A switch that
     rolls back leaves the request kept and the player stopped or held.
 - Remaining differences of the standard backend's failure handling from
-  crossfade's (the same on both platforms unless said otherwise). The first
-  four are pending the owner's confirmation:
+  crossfade's (the same on both platforms unless said otherwise), each
+  pending the owner's confirmation:
   - crossfade's `load` (on iOS always: it loads paused; on Android when the
     track is not in the queue, or when it cancels a seek) and a `setQueue`
     without the active track end the play request; the standard backend's
@@ -316,11 +322,28 @@ Added fork surface:
     foreground service and the app agree with crossfade's (Android 13 and
     later build their media controls from the media session's state, which
     agrees). Closing it needs a change to the vendored notification manager
-    (owner's choice);
+    (owner's choice); pending the owner's confirmation;
+  - Android's notification in an error once the request ended (a pause in
+    the give-up's error): the standard backend removes it at the grace
+    period's end; crossfade's keeps it in every error. Pending the owner's
+    confirmation;
   - removing a track that is not the active one (the one that failed, say)
-    keeps the request; with no active track (the first load failed) only an
-    empty queue ends it;
+    keeps the request, as crossfade's queue change that keeps the active
+    track, except that crossfade's ends it when the change interrupts an
+    operation in progress (a seek: its operation is invalidated,
+    `AndroidPlaybackOrchestrator.setQueue`, `IOSPlaybackOrchestrator.setQueue`
+    through `stabilizeCancelledOperation`), where the standard backend keeps
+    the request and its seek; with no active track (the first load failed)
+    only an empty queue ends it. Pending the owner's confirmation;
   - on iOS a queue change with no active track may send one request (above).
+    Pending the owner's confirmation.
+  Known differences older than this branch, outside the failure handling,
+  pending the owner: during normal playback (no failure) an empty new queue or
+  the removal of the active track leaves the standard backend's request as the
+  player has it (Android: `true` while it was playing), where crossfade's ends
+  it; and Android rejects a switch from crossfade to standard with no active
+  track while crossfade keeps the request (the standard target accepts an idle
+  snapshot only without a request; iOS accepts it and drops the request).
   Known limits, unchanged by this branch: the race of a failed state already
   delivered (or dropped by its token) before a later non-failed one, which can
   hold a failure in iOS's `StandardFailureOrder`, has no test; iOS's reload at a
@@ -333,11 +356,13 @@ Added fork surface:
   ExoPlayer 2.19.0's connector and notification read of the session player
   (their rules, read with javap), and MusicService's glue (its foreground
   service, which the Robolectric build does not compile) by the shared
-  `StandardReportedSink` and `StandardForegroundRule` the tests drive and by
+  `StandardReportedSink` and `StandardForegroundRule` (its `Release`: stay, keep
+  the notification, remove it) the tests drive and by
   `verify-android-crossfade-contracts.js`; on iOS the standard backend has no
   XCTest with a real SwiftAudioEx player: which command takes the request
   over, the module's request it sets, and the end of the request at an empty
-  queue or a removal are tested in `StandardLoadCoordinator`, the reading
+  queue or a removal (which removal ends it, `tracksRemoved`; a new queue,
+  `queueReplaced`) are tested in `StandardLoadCoordinator`, the reading
   events through `StandardReadingSink`; their use in the commands (the
   jump's play-when-ready, a play's hand-off, the backend switch's carried
   request and its rollback) is pinned by `verify-ios-crossfade-contracts.js`
