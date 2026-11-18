@@ -94,9 +94,11 @@ Added fork surface:
   and any growth of the buffered position counted, so each switch restarted
   the countdown; a standard seek read only the buffered position, the end of
   the last loaded range). Android counts every media byte, so there bytes
-  downloaded again at a switch count; iOS is stricter on that point. Android's
-  standard seek reads ExoPlayer's buffered position, which grows as media
-  arrives and counts a refill after a drop. The
+  downloaded again at a switch count; iOS is stricter on that point. Parity
+  gap: Android's standard seek reads only ExoPlayer's buffered position (no
+  media bytes, and any growth counts, a refill after a drop included; how that
+  position moves during a segment was not measured here), so the two
+  platforms' standard seeks do not read the same signal. The
   iOS standard backend reads the item's access log from SwiftAudioEx's AVPlayer
   item, which SwiftAudioEx 1.1.0 keeps private (`AudioPlayer.wrapper` →
   `AVPlayerWrapper.avPlayer`): it is read by reflection (`standardPlayerItem`),
@@ -126,9 +128,9 @@ Added fork surface:
   of a load is progress. Remaining gap: a seek into an HLS CMAF (fMP4) segment
   shows no progress on iOS until that segment is buffered (in the measured
   run neither its bytes nor the loaded ranges moved while it arrived), while
-  Android counts media bytes in flight: a CMAF segment slower than
-  `stallTimeoutMs` fails a seek on iOS (both backends) though its bytes keep
-  coming. Keep `stallTimeoutMs` above the longest expected download time of
+  Android's crossfade seek counts media bytes in flight: a CMAF segment slower
+  than `stallTimeoutMs` fails a seek on iOS (both backends) though its bytes
+  keep coming. Keep `stallTimeoutMs` above the longest expected download time of
   one segment. (An earlier measurement with AVFoundation on macOS, 4 s TS
   segments sent over 8 s each, saw no change of any signal until a segment's
   last byte; the simulator runs above are the iOS behaviour.) On Android the

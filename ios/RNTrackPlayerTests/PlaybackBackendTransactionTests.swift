@@ -859,7 +859,7 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         }
         // A seek past the buffer (CMAF): its event opens, then the target's segment arrives with
         // bytes in flight while the loaded ranges do not move (as on a CMAF load), for 20 s: those
-        // media bytes are progress (Android counts them too), the wait goes on.
+        // media bytes are progress (as Android's crossfade seek counts them), the wait goes on.
         let slow = run(until: 25) { time in
             if time < 0.3 { return self.itemReading([0...12], bytes: 100_000, events: 1, errors: 0) }
             let inFlight = min(time, 20) * 2_000
