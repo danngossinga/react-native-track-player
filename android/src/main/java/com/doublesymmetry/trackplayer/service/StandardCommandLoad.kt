@@ -168,3 +168,72 @@ internal fun standardCancelledLoad(
  */
 internal fun standardCommandLoadMustStart(targetLoaded: Boolean, exoState: Int): Boolean =
     !targetLoaded && exoState == Player.STATE_IDLE
+
+/**
+ * Whether playback resumes after a load failed: one explicit state (rule 12, ADR 0042 form 3),
+ * moved only by its events; the same states, events and moves as iOS's `StandardSeekResume`
+ * (PlaybackBackend.swift).
+ *
+ * - [Kind.NONE]: nothing to resume.
+ * - [Kind.KEPT_BY_GIVE_UP]: a give-up stopped the player (its stop ends the player's own request)
+ *   while playback was requested: a seek after it plays, as crossfade's seek after a failed skip.
+ * - [Kind.RESUMES_AFTER_SEEK]: a seek went back to the active track after a failed load, playback
+ *   requested: the player waits paused and plays once the latest seek completed (any number of
+ *   seeks in a row: a scrubber drag), as crossfade's seek after a failed skip.
+ *
+ * A pause or stop ends it; a seek that cancelled a command's wait (crossfade's cancelled
+ * operation) stays paused.
+ */
+internal class StandardSeekResume {
+    enum class Kind { NONE, KEPT_BY_GIVE_UP, RESUMES_AFTER_SEEK }
+
+    var kind: Kind = Kind.NONE
+        private set
+
+    /** The latest seek's token ([seekBegan]): only its end resumes. */
+    private var latestSeek = 0L
+
+    /** A load or seek gave up while the player's own request was [playing]. */
+    fun gaveUp(playing: Boolean) {
+        kind = if (playing || kind == Kind.RESUMES_AFTER_SEEK) Kind.KEPT_BY_GIVE_UP else Kind.NONE
+    }
+
+    /** A pause or stop ends any request to resume. */
+    fun paused() {
+        kind = Kind.NONE
+    }
+
+    /**
+     * A seek began. [returnsToActiveTrack]: it moved the player back to the active track;
+     * [afterFailedLoad]: the player's track had failed to load (not a natural advance, not a
+     * command's wait); [cancelledWait]: it cancelled a command's wait; [inGiveUp]: the player is in
+     * a give-up's error; [playerPlaying]: the player's own request. Returns the seek's token.
+     */
+    fun seekBegan(
+        returnsToActiveTrack: Boolean,
+        afterFailedLoad: Boolean,
+        cancelledWait: Boolean,
+        inGiveUp: Boolean,
+        playerPlaying: Boolean
+    ): Long {
+        val playing = if (inGiveUp) kind == Kind.KEPT_BY_GIVE_UP else playerPlaying || kind == Kind.RESUMES_AFTER_SEEK
+        kind = when {
+            cancelledWait -> Kind.NONE
+            returnsToActiveTrack -> if (afterFailedLoad && playing) Kind.RESUMES_AFTER_SEEK else Kind.NONE
+            kind == Kind.RESUMES_AFTER_SEEK -> Kind.RESUMES_AFTER_SEEK
+            else -> Kind.NONE
+        }
+        latestSeek += 1
+        return latestSeek
+    }
+
+    /**
+     * The seek [seek] ended ([succeeded]): whether the player plays now (the latest seek, which
+     * succeeded, after a failed load with playback requested). An older seek's end changes nothing.
+     */
+    fun seekEnded(seek: Long, succeeded: Boolean): Boolean {
+        if (seek != latestSeek || kind != Kind.RESUMES_AFTER_SEEK) return false
+        kind = Kind.NONE
+        return succeeded
+    }
+}

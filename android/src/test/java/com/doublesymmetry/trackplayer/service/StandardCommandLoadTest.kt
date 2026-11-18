@@ -197,4 +197,59 @@ class StandardCommandLoadTest {
         assertEquals("crossfade_prepare_timeout", PREPARE_TIMEOUT_CODE)
         assertEquals("crossfade_engine_error", STANDARD_LOAD_ERROR_CODE)
     }
+
+    @Test
+    fun theStandardSeekResumeMovesByItsEvents() {
+        // Every move of the explicit state: the same table as iOS's
+        // testStandardSeekResumeMovesByItsEvents. Sixth review, I6: a seek that cancelled a
+        // command's wait stays paused even after a failure (unreachable from the backend today:
+        // every command that waits clears a failed load first, FailedLoadRule.skipped, and a failure
+        // of the waited load settles the wait).
+        val none = StandardSeekResume.Kind.NONE
+        val kept = StandardSeekResume.Kind.KEPT_BY_GIVE_UP
+        val resumes = StandardSeekResume.Kind.RESUMES_AFTER_SEEK
+        val kinds = listOf(none, kept, resumes)
+        fun machine(kind: StandardSeekResume.Kind) = StandardSeekResume().apply {
+            when (kind) {
+                StandardSeekResume.Kind.NONE -> Unit
+                StandardSeekResume.Kind.KEPT_BY_GIVE_UP -> gaveUp(playing = true)
+                StandardSeekResume.Kind.RESUMES_AFTER_SEEK -> seekBegan(returnsToActiveTrack = true, afterFailedLoad = true, cancelledWait = false, inGiveUp = false, playerPlaying = true)
+            }
+            assertEquals(kind, this.kind)
+        }
+        assertEquals(listOf(kept, kept, kept), kinds.map { machine(it).apply { gaveUp(playing = true) }.kind })
+        assertEquals(listOf(none, none, kept), kinds.map { machine(it).apply { gaveUp(playing = false) }.kind })
+        assertEquals(listOf(none, none, none), kinds.map { machine(it).apply { paused() }.kind })
+        // seekBegan: (returns, afterFailed, cancelledWait, inGiveUp, playerPlaying) -> after each kind.
+        val table = listOf(
+            listOf(true, true, false, true, false) to listOf(none, resumes, none),
+            listOf(true, true, false, false, true) to listOf(resumes, resumes, resumes),
+            listOf(true, true, false, false, false) to listOf(none, none, resumes),
+            listOf(true, false, false, false, true) to listOf(none, none, none),
+            listOf(true, true, true, true, true) to listOf(none, none, none),
+            listOf(true, true, true, false, true) to listOf(none, none, none),
+            listOf(false, false, false, false, true) to listOf(none, none, resumes),
+            listOf(false, true, false, true, true) to listOf(none, none, resumes)
+        )
+        for ((input, after) in table) {
+            val got = kinds.map {
+                machine(it).apply { seekBegan(input[0], input[1], input[2], input[3], input[4]) }.kind
+            }
+            assertEquals("$input", after, got)
+        }
+        // seekEnded: only the latest seek, only once, only when it succeeded.
+        val m = machine(resumes)
+        val first = m.seekBegan(false, false, false, false, false)
+        val second = m.seekBegan(false, false, false, false, false)
+        assertFalse("an older seek", m.seekEnded(first, succeeded = true))
+        assertEquals(resumes, m.kind)
+        assertTrue(m.seekEnded(second, succeeded = true))
+        assertFalse("once", m.seekEnded(second, succeeded = true))
+        val failed = machine(resumes)
+        assertFalse(failed.seekEnded(failed.seekBegan(false, false, false, false, false), succeeded = false))
+        assertEquals(none, failed.kind)
+        val keptMachine = machine(kept)
+        assertFalse(keptMachine.seekEnded(0L, succeeded = true))
+        assertEquals("a give-up's request waits for the next seek", kept, keptMachine.kind)
+    }
 }

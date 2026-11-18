@@ -120,7 +120,9 @@ class PlaybackBackendRuntimePrimitivesTest {
             StandardActivityEvent.Activated to listOf(active, active, active),
             StandardActivityEvent.ActivationRolledBack to listOf(idle, idle, following),
             StandardActivityEvent.QueueEmptied to listOf(active, active, active),
-            StandardActivityEvent.Cancelled to listOf(following, following, following)
+            // Changed deliberately (sixth review, restored idle): a restored idle stays one (iOS: a
+            // queue change there stops the player and keeps state none).
+            StandardActivityEvent.Cancelled to listOf(following, idle, following)
         )
         for ((event, after) in expected) {
             listOf(active, idle, following).forEachIndexed { index, from ->
@@ -131,6 +133,9 @@ class PlaybackBackendRuntimePrimitivesTest {
         val sidecar = KotlinAudioLogicalPlaybackStateSidecar()
         sidecar.restore(PlaybackBackendSnapshot.empty().copy(queueIds = listOf("first")))
         assertEquals(idle, sidecar.activity)
+        sidecar.enterIdle(queueSize = 1)
+        assertEquals("a restored idle stays one", idle, sidecar.activity)
+        sidecar.activate()
         sidecar.enterIdle(queueSize = 1)
         assertEquals(following, sidecar.activity)
         assertEquals(AudioPlayerState.STOPPED, sidecar.playbackState(AudioPlayerState.STOPPED))

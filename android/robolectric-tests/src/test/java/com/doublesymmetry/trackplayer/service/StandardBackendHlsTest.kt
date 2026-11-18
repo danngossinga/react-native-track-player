@@ -775,6 +775,62 @@ class StandardBackendHlsTest {
         assertFalse("still paused", backed.player.playerState == AudioPlayerState.PLAYING)
     }
 
+    // Sixth review, 1: a scrubber drag is several seeks. After a failed skip the first seek goes
+    // back to A paused, the next ones act there, and the player plays once the latest seek is done
+    // (as iOS: StandardSeekResume; crossfade's seek after a failed skip plays). iOS:
+    // testStandardLoadCoordinatorSeveralSeeksAfterAFailedSkipPlayOnceTheLatestIsDone.
+
+    @Test
+    fun severalSeeksAfterASkipThatGaveUpPlayOnceTheLatestIsDone() {
+        val playable = server(LADDER, segmentCount = 8, stalledFrom = 8)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(playable, 1L), item(stalled, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+        val captured = backed.backend.positionMs - CAPTURE_LAG_MS
+        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+        val first = launchCommand { backed.backend.seekTo(captured) }
+        val second = launchCommand { backed.backend.seekTo(captured + 100) }
+        val last = command { backed.backend.seekTo(captured + 200) }
+        assertNull("the latest seek completes", last)
+        awaitTrue("the older seeks end") { first() != null && second() != null }
+        assertEquals("standard_seek_cancelled", (first()!!.exceptionOrNull() as RejectionException).code)
+        assertEquals("standard_seek_cancelled", (second()!!.exceptionOrNull() as RejectionException).code)
+        assertEquals("the track the seeks acted on", 0, backed.player.currentIndex)
+        assertTrue("playing once the latest seek is done", backed.backend.playWhenReady)
+        awaitTrue("A plays after the seeks, with no play") { backed.player.currentIndex == 0 && backed.player.playerState == AudioPlayerState.PLAYING }
+        assertTrue("from the latest seek's target: ${backed.player.position}", backed.player.position >= captured + 200)
+        assertEquals("the failed track is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
+    // Sixth review, A4: a seek while a natural advance loads goes back to the track that ended,
+    // paused, though playback was requested (the seek cancels the advance, crossfade's cancelled
+    // operation; only a seek after a failed load plays). iOS:
+    // testStandardLoadCoordinatorASeekDuringANaturalAdvanceStaysPausedThoughPlaybackWasRequested.
+
+    @Test
+    fun aSeekDuringANaturalAdvanceGoesBackToTheEndedTrackPaused() {
+        // A: one segment (4 s), which arrives; B: its first segment never arrives (it loads until
+        // the give-up, stallTimeoutMs after the advance).
+        val shortA = server(LADDER, segmentCount = 1, stalledFrom = 1)
+        val stalled = server(LADDER)
+        val backed = backed()
+        backed.backend.add(listOf(item(shortA, 1L), item(stalled, 2L)))
+        command { backed.backend.play() }
+        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+        awaitTrue("the natural advance to B") { backed.player.currentIndex == 1 }
+        assertTrue("no give-up yet: B loads", backed.gaveUpAtMs.isEmpty())
+        assertTrue("playback requested", backed.player.playWhenReady)
+        assertNull("the seek acts on A", command { backed.backend.seekTo(PLAYED_MS) })
+        assertEquals("back on A, the track that ended", 0, backed.player.currentIndex)
+        assertEquals(0, backed.backend.currentIndex)
+        assertFalse("paused: the seek cancelled the advance", backed.backend.playWhenReady)
+        pump(STALL_TIMEOUT_MS * 2)
+        assertFalse("still paused", backed.player.playerState == AudioPlayerState.PLAYING)
+        assertEquals("B is never reported", listOf<Int?>(0), backed.activeTrackChanges.map { it.first })
+    }
+
     // A skip or next to the track that failed, which the player is still on (no move: ExoPlayer
     // stays on its item), loads it again and ends once it loaded and is reported (FailedLoadRule
     // .skipped, LOAD-16); a seek or stop goes back to the active track instead (command).
@@ -1211,6 +1267,56 @@ class StandardBackendHlsTest {
         awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING }
         assertEquals("A reported once it loaded", listOf<Pair<Int?, Int?>>(0 to null), backed.activeTrackChanges)
         assertEquals(0, backed.backend.currentIndex)
+    }
+
+    // Sixth review, 2: the restored idle loads nothing, as iOS and the cancel's idle: neither the
+    // restore (before: ExoPlayer prepared the restored queue and loaded its first track) nor a new
+    // queue or a queue change after it (before: the prepared player loaded the new queue's first
+    // track, or the next one when its item left, and emitted LOADING/BUFFERING/READY while the app
+    // read IDLE with no active track). Every reader stays IDLE (rule 13).
+
+    @Test
+    fun aRestoreWithNoActiveTrackAndTheQueueChangesAfterItLoadNothing() {
+        for (op in listOf("replace", "removeTheCurrent", "add", "move")) {
+            val a = slowServer()
+            val b = slowServer()
+            val items = listOf(item(a, 1L), item(b, 2L))
+            val backed = backed(candidateQueue = items)
+            val snapshot = PlaybackBackendSnapshot.empty().copy(queueIds = items.map { it.track.queueId.toString() })
+            assertNull(command {
+                backed.backend.prepareSilently(snapshot)
+                backed.backend.restore(snapshot)
+                backed.backend.commitQueue(snapshot)
+                backed.backend.activateAfterCommit(snapshot)
+            })
+            pump(STALL_TIMEOUT_MS)
+            assertEquals("$op: the restore loads nothing", listOf(0, 0), listOf(a, b).map { it.requests.size })
+            assertEquals(op, com.google.android.exoplayer2.Player.STATE_IDLE, backed.analytics.player!!.playbackState)
+            assertEquals(op, AudioPlayerState.IDLE, backed.backend.playbackState)
+            val c = server(LADDER, segmentCount = 8, stalledFrom = 8)
+            val d = slowServer()
+            val events = backed.events.size
+            when (op) {
+                "replace" -> backed.backend.replaceQueue(listOf(item(c, 3L), item(d, 4L)))
+                "removeTheCurrent" -> backed.backend.remove(listOf(0))
+                "add" -> backed.backend.add(listOf(item(c, 3L)), 0)
+                else -> backed.backend.move(0, 1)
+            }
+            pump(STALL_TIMEOUT_MS * 3)
+            assertEquals("$op: the queue change loads nothing", listOf(0, 0, 0, 0), listOf(a, b, c, d).map { it.requests.size })
+            assertEquals(op, com.google.android.exoplayer2.Player.STATE_IDLE, backed.analytics.player!!.playbackState)
+            assertEquals("$op: no state event", emptyList<String>(), backed.events.drop(events))
+            assertEquals(op, -1, backed.backend.currentIndex)
+            assertEquals("$op: every reader IDLE", AudioPlayerState.IDLE, backed.backend.playbackState)
+            assertEquals("$op: nothing reported", emptyList<Pair<Int?, Int?>>(), backed.activeTrackChanges)
+            if (op == "replace") {
+                val returned = backed.commandReading { backed.backend.play() }
+                assertEquals("not reported before it loaded", emptyList<Int?>(), returned.reported)
+                awaitTrue("the new queue's first track plays") { backed.player.playerState == AudioPlayerState.PLAYING }
+                assertEquals(listOf<Pair<Int?, Int?>>(0 to null), backed.activeTrackChanges)
+                assertTrue("C loaded", c.requests.isNotEmpty())
+            }
+        }
     }
 
     // An add to a queue the player stopped on loads nothing (wider than the idle: a stop, a

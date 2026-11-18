@@ -697,9 +697,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
         // does not take effect: the seek acts on the active track (none: nothing to seek in).
         // No active track (the logical idle): it resolves, nothing to seek in (crossfade's).
         guard loads.beginSeek(to: position, completion: completion) else { return }
-        // After a failed load it plays once done, as requested (StandardLoadCoordinator.seekFinished).
+        // After a failed load the latest seek plays once done, as requested
+        // (StandardLoadCoordinator.seekFinished).
+        let seek = loads.latestSeek
         let completion: (Result<Void, Error>) -> Void = { [weak self] result in
-            if case .success = result { self?.loads.seekFinished(succeeded: true) } else { self?.loads.seekFinished(succeeded: false) }
+            if case .success = result { self?.loads.seekFinished(seek, succeeded: true) } else { self?.loads.seekFinished(seek, succeeded: false) }
             completion(result)
         }
         guard !disposed, let track = player.currentItem as? Track else {
@@ -958,7 +960,11 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
                 player.clear()
                 try player.add(items: queue)
             }
-            move(.restored(idle: snapshot.activeIndex == nil && !queue.isEmpty))
+            let idle = snapshot.activeIndex == nil && !queue.isEmpty
+            // No active track: the player loads nothing (SwiftAudioEx's add loaded the new queue's
+            // first item: stopped at once, its asset's loading cancelled), as Android and crossfade.
+            if idle { player.stop() }
+            move(.restored(idle: idle))
             player.rate = snapshot.rate
             player.repeatMode = SwiftAudioEx.RepeatMode(rawValue: snapshot.repeatMode) ?? .off
             player.playWhenReady = false
@@ -1460,6 +1466,7 @@ extension StandardPlaybackBackend: StandardLoadPlayer {
     func showAfterFailedLoad(_ reported: ObjectIdentifier?) { onLoadFailed(player, indexOfItem(reported)) }
     var reportedPosition: Double { return reportedProgress().position }
     var isIdle: Bool { return activity.isIdle }
+    var idleReadsNone: Bool { return activity == .idle }
     var isPlayerStopped: Bool { return player.playerState == .stopped }
     func requestPlayback(_ playing: Bool) { requested.request(playing) }
     var playbackRequested: Bool { return requested.playWhenReady }

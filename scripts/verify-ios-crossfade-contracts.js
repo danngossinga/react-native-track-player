@@ -797,9 +797,13 @@ assert(
       // With no active track the seek resolves and does nothing, as crossfade's (the coordinator
       // resolves it, tested: ...ACancelWithNoReportedTrack...).
       section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('guard loads.beginSeek(to: position, completion: completion) else { return }\n') &&
-      // After a failed load the seek plays once done, as requested before the failure
-      // (StandardLoadCoordinator.seekFinished, tested: ...ASeekOrStopAfterAFailedSkipActsOnTheActiveTrack).
-      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('if case .success = result { self?.loads.seekFinished(succeeded: true) } else { self?.loads.seekFinished(succeeded: false) }\n            completion(result)\n        }\n        guard !disposed, let track = player.currentItem as? Track else {') &&
+      // After a failed load the latest seek plays once done, as requested before the failure
+      // (StandardLoadCoordinator.seekFinished, StandardSeekResume, tested:
+      // ...SeveralSeeksAfterAFailedSkipPlayOnceTheLatestIsDone).
+      section(backendSource, 'private func enqueueSeek(', 'let request = PendingSeek(').includes('let seek = loads.latestSeek\n        let completion: (Result<Void, Error>) -> Void = { [weak self] result in\n            if case .success = result { self?.loads.seekFinished(seek, succeeded: true) } else { self?.loads.seekFinished(seek, succeeded: false) }\n            completion(result)\n        }\n        guard !disposed, let track = player.currentItem as? Track else {') &&
+      // A restore with no active track loads nothing and stays a restored idle (sixth review, 2).
+      section(backendSource, 'func restore(_ snapshot: PlaybackBackendSnapshot) throws {', 'func prepareActivation(').includes('if idle { player.stop() }\n            move(.restored(idle: idle))') &&
+      backendSource.includes('    var idleReadsNone: Bool { return activity == .idle }') &&
       backendSource.includes('    func resumePlayback() {\n        requested.request(true)\n        player.play()\n    }') &&
       backendSource.includes('    var playbackRequested: Bool { return requested.playWhenReady }') &&
       // With no active track a queue change loads nothing and its item change reports nothing;
@@ -827,7 +831,7 @@ assert(
       backendSource.includes('return activity == .idle ? .none : State.fromPlayerState(state: player.playerState)') &&
       backendSource.includes('    private var activity = StandardActivity.active\n    private func move(_ event: StandardActivityEvent) {\n        activity = activity.after(event)\n    }') &&
       (backendSource.match(/activity = /g) || []).length === 2 &&
-      backendSource.includes("move(.restored(idle: snapshot.activeIndex == nil && !queue.isEmpty))") &&
+      backendSource.includes("let idle = snapshot.activeIndex == nil && !queue.isEmpty\n            // No active track: the player loads nothing") && backendSource.includes("move(.restored(idle: idle))") &&
       (backendSource.match(/            let wasIdle = activity\.isIdle\n/g) || []).length === 4 &&
       (backendSource.match(/if wasIdle \{ move\(\.activated\) \}/g) || []).length === 5 &&
       (backendSource.match(/move\(\.queueEmptied\)/g) || []).length === 3 &&
@@ -899,6 +903,10 @@ assert(
         'testStandardLoadCoordinatorAQueueChangeWithNoActiveTrackLoadsNothing',
         'testStandardLoadCoordinatorAnIdleActivationIsReportedOnceItsTrackLoaded',
         'testStandardLoadCoordinatorASeekAfterAFailedSkipPlaysOnlyAsRequestedBeforeTheFailure',
+        'testStandardLoadCoordinatorSeveralSeeksAfterAFailedSkipPlayOnceTheLatestIsDone',
+        'testStandardLoadCoordinatorASeekDuringANaturalAdvanceStaysPausedThoughPlaybackWasRequested',
+        'testStandardSeekResumeMovesByItsEvents',
+        'testStandardLoadCoordinatorARestoredIdleEmitsOnlyNoneAndStaysOneAcrossQueueChanges',
         'testStandardSeekAndLoadLimitsAreIndependent',
         'testStandardLoadCoordinatorASeekByIsRelativeToThePositionTheAppReads',
         'testStandardCommandLoadResultIsTheCommandsResolution']
