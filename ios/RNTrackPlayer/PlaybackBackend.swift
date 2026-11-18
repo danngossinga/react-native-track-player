@@ -3263,9 +3263,11 @@ func standardItemLoadSnapshot(_ item: AnyObject) -> ItemLoadSnapshot? {
 /// - Nothing is observable before SwiftAudioEx creates the AVPlayerItem, once the asset's
 ///   `playable` key loaded (a progressive file's first range requests; an HLS master and media
 ///   playlist): no item, no access log, no loaded range.
-/// - The access log counts media only: an HLS entry appears once the first segment has
-///   completely arrived, with that segment's bytes (playlist bytes are not counted), and grows
-///   per completed segment; a progressive file's entry exists from the item's creation (with the
+/// - The access log counts media only (playlist bytes are not counted). A packed-AAC HLS
+///   segment's bytes are posted once it has completely arrived; a CMAF (fMP4) entry opens with
+///   the first segment request and its bytes grow in flight (the device-fix measurements on the
+///   iOS 26.5 simulator, see `ItemLoadSnapshot`); while a segment arrives on a load, the loaded
+///   time ranges grow too. A progressive file's entry exists from the item's creation (with the
 ///   asset's first requests, `numberOfMediaRequests` > 0 from the start) and grows with every
 ///   chunk. `AVPlayerItemNewAccessLogEntry` comes only at playback start or a completed
 ///   segment, and the log grows without it: the load is read at each check.
@@ -3274,7 +3276,8 @@ func standardItemLoadSnapshot(_ item: AnyObject) -> ItemLoadSnapshot? {
 /// request), then the bytes of its item's access log (media, which Android counts always), read
 /// as crossfade's waits read theirs (`ItemLoadProgress`, one per item of the load): after a
 /// failed request or a rendition switch (a new error-log entry, or an access-log event that is
-/// neither the first one nor that of a seek the backend issued: `noteSeek`), the bytes posted
+/// neither the first one nor that of a seek the backend issued and that has not completed yet:
+/// `noteSeek`, `seekFinished`), the bytes posted
 /// (the left rendition's failed transfers, segments downloaded again) stop counting until new
 /// time is buffered. Its buffered reading is the item's time buffered in the load
 /// (`buffered`: a buffer that empties and fills again with the same time adds nothing).

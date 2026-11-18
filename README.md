@@ -81,17 +81,22 @@ Added fork surface:
   so only `prepareTimeoutMs` ends that stage (a playlist slower than
   `stallTimeoutMs` does not fail the track, as on Android, where its bytes are
   progress); from the item's creation the no-progress countdown starts again,
-  and progress on the standard backend is new buffered time (time a buffer
-  that empties and fills again does not count twice) and the media bytes of
-  the item's access log (AVFoundation never counts playlists there). After a
-  failed request or a rendition switch (a new error-log entry, or an
-  access-log event that is neither the first one nor that of a seek the
-  backend issued), those bytes stop counting until new time is buffered: the
-  bytes posted with a switch (the failed transfers of the rendition left, the
-  new rendition's segments downloaded again) are not progress (before, every
-  access-log byte and any growth of the buffered position counted, so each
-  switch restarted the countdown). Android counts every media byte, so there
-  bytes downloaded again at a switch count; iOS is stricter on that point. The
+  and progress on the standard backend, for a load and for a seek once
+  issued, is new buffered time (time a buffer that empties and fills again
+  does not count twice) and the media bytes of the item's access log
+  (AVFoundation never counts playlists there), each wait reading its own, as
+  crossfade's waits. After a failed request or a rendition switch (a new
+  error-log entry, or an access-log event that is neither the first one nor
+  that of a seek the backend issued and that has not completed yet), those
+  bytes stop counting until new time is buffered: the bytes posted with a
+  switch (the failed transfers of the rendition left, the new rendition's
+  segments downloaded again) are not progress (before, every access-log byte
+  and any growth of the buffered position counted, so each switch restarted
+  the countdown; a standard seek read only the buffered position, the end of
+  the last loaded range). Android counts every media byte, so there bytes
+  downloaded again at a switch count; iOS is stricter on that point. Android's
+  standard seek reads ExoPlayer's buffered position, which grows as media
+  arrives and counts a refill after a drop. The
   iOS standard backend reads the item's access log from SwiftAudioEx's AVPlayer
   item, which SwiftAudioEx 1.1.0 keeps private (`AudioPlayer.wrapper` →
   `AVPlayerWrapper.avPlayer`): it is read by reflection (`standardPlayerItem`),
@@ -106,15 +111,23 @@ Added fork surface:
   CI runs only the XCTest on a fake of that layout, as the test target cannot
   build SwiftAudioEx).
   (Before, the iOS standard backend also applied `stallTimeoutMs` from the
-  start of the load, so a playlist slower than it failed the track.) Remaining gap: on iOS an HLS
-  segment counts only once it has completely arrived. AVFoundation updates neither
-  the access log nor the loaded time ranges (the buffered position) while a
-  segment downloads, nor any other public signal of the item (measured with
-  AVFoundation on macOS: a 4 s segment sent over 8 s showed no change until its
-  last byte). A segment whose download takes longer than `stallTimeoutMs` therefore
-  gives up on iOS (both backends) though its bytes keep coming, while Android counts
-  them as they arrive and keeps loading. Keep `stallTimeoutMs` above the longest
-  expected download time of one segment. On Android the
+  start of the load, so a playlist slower than it failed the track.) What
+  AVFoundation shows while an HLS segment arrives was measured on the iOS 26.5
+  simulator with a real AVPlayer and a local HLS server, packed AAC and
+  AES-128 CMAF/fMP4 (2026-11-17, the iOS rendition-fallback measurements of
+  `fix/device-proof-stalls`, summarised in its README at 1c78b91): on loads,
+  the loaded time ranges grow while a segment arrives, partial bytes
+  included, and a CMAF segment's access-log bytes grow in flight too (a
+  packed-AAC segment's bytes are posted once it completes), so a slow segment
+  of a load is progress. Remaining gap: a seek into an HLS CMAF (fMP4) segment
+  shows no progress on iOS until that segment is buffered (in the measured
+  run neither its bytes nor the loaded ranges moved while it arrived), while
+  Android counts media bytes in flight: a CMAF segment slower than
+  `stallTimeoutMs` fails a seek on iOS (both backends) though its bytes keep
+  coming. Keep `stallTimeoutMs` above the longest expected download time of
+  one segment. (An earlier measurement with AVFoundation on macOS, 4 s TS
+  segments sent over 8 s each, saw no change of any signal until a segment's
+  last byte; the simulator runs above are the iOS behaviour.) On Android the
   no-progress countdown of a crossfade load runs from the start of the load:
   until its first segment is requested, playlist and key bytes reset it; after
   that only media bytes (and buffered media) do. When it reaches

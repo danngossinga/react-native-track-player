@@ -163,8 +163,9 @@ export interface PlayerOptions {
   backendSwitchPositionToleranceMs?: number;
   /**
    * Standard backend (iOS and Android): the total limit, in milliseconds, for a seek
-   * (`standard_seek_timeout`); a seek whose buffered position does not grow for `stallTimeoutMs`
-   * fails sooner. Defaults to 60000. Same bounds as `stallTimeoutMs`.
+   * (`standard_seek_timeout`); a seek that makes no progress for `stallTimeoutMs` fails sooner
+   * (Android: ExoPlayer's buffered position; iOS: new buffered time and the media bytes of its
+   * item, as the crossfade waits). Defaults to 60000. Same bounds as `stallTimeoutMs`.
    */
   standardSeekTimeoutMs?: number;
   /**
