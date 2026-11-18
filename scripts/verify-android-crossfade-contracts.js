@@ -480,7 +480,7 @@ assert(
     (standardBackend.match(/seekResume\.gaveUp\(playing = player\.playWhenReady\)\n {8,20}player\.failLoad\(/g) || []).length === 2 &&
     // A pause, a stop and a clear (crossfade's stop) end a failure's kept request; every command
     // that loads a track takes it over and plays (eighth round: StandardBackendHlsTest
-    // .aSkipNextOrLoadDuringASeekAfterAFailedSkip*, aNewQueueDuringASeekAfterAFailedSkip*).
+    // .aSkipNextPreviousOrLoadDuringASeekAfterAFailedSkip*, aNewQueueDuringASeekAfterAFailedSkip*).
     (standardBackend.match(/seekResume\.paused\(\)/g) || []).length === 3 &&
     (standardBackend.match(/seekResume\.handedToPlayer\(\)/g) || []).length === 7 &&
     section(standardBackend, 'override fun clearQueue() {', '\n    }\n').includes('seekResume.paused()') &&

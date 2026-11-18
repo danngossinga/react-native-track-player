@@ -2070,8 +2070,8 @@ final class PlaybackBackendTransactionTests: XCTestCase {
 
     func testStandardLoadCoordinatorACommandThatLoadsATrackTakesAFailuresRequestOver() {
         // Eighth round (review 7, blocking 1; Android:
-        // aSkipNextOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack,
-        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAndAClearEndsTheRequest): after a
+        // aSkipNextPreviousOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack,
+        // aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAClearEndsTheRequestAndARemovalKeepsIt): after a
         // failure the module's request stays, as crossfade's, until a pause or stop. A skip, next,
         // previous, load or new queue (StandardPlaybackBackend.takeOverRequest) issued while a
         // seek holds the player paused, or in a give-up's error, takes it over and plays its track
@@ -2190,6 +2190,25 @@ final class PlaybackBackendTransactionTests: XCTestCase {
         XCTAssertTrue(g.loads.beginSeek(to: 5) { _ in XCTFail("the seek goes on") })
         g.loads.seekFinished(g.loads.latestSeek, succeeded: true)
         XCTAssertEqual(g.player.calls.last, "resume")
+    }
+
+    func testStandardLoadCoordinatorTheSeekThatRetriesAFirstTrackThatGaveUpPlaysOnceDone() {
+        // Eighth round (owner question, LOAD-14; Android:
+        // theSeekThatRetriesAFirstTrackThatGaveUpPlaysOnceDone): the first track gives up while
+        // playing (no active track, the request kept); the seek retries it there (no move) and
+        // plays once done.
+        let h = CoordinatorHarness()
+        h.player.currentLoadItem = h.ia
+        h.player.requested = true
+        h.loads.giveUpLoad(.stalled, stallTimeoutMs: 10_000, totalTimeoutMs: 60_000)
+        XCTAssertNil(h.loads.failedLoads.reported, "none active")
+        XCTAssertTrue(h.player.reading(h.loads.seekResume.kind).playWhenReady, "the request stays")
+        h.player.calls.removeAll()
+        XCTAssertTrue(h.loads.beginSeek(to: 5) { _ in XCTFail("the seek goes on") })
+        XCTAssertEqual(h.player.calls, [], "the seek retries A, the player's track")
+        XCTAssertEqual(h.loads.seekResume.kind, .resumesAfterSeek)
+        h.loads.seekFinished(h.loads.latestSeek, succeeded: true)
+        XCTAssertEqual(h.player.calls.last, "resume")
     }
 
     func testStandardLoadCoordinatorARestoredIdleEmitsOnlyNoneAndStaysOneAcrossQueueChanges() {

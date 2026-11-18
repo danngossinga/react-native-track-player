@@ -908,13 +908,14 @@ final class StandardPlaybackBackend: IOSPlaybackBackendRouting {
     var publicRate: Float { return player.rate }
     var publicPlayWhenReady: Bool { return reading(loads.seekResume.kind).playWhenReady }
     /// The play-when-ready event the app gets for SwiftAudioEx's own `playWhenReady` event.
+    /// SwiftAudioEx delivers its events on its own queue: read on main, where `loads` changes.
     func reportedPlayWhenReady(of playerPlayWhenReady: Bool) -> Bool {
-        return playerPlayWhenReady || loads.seekResume.requestsPlay
+        return onMain { playerPlayWhenReady || loads.seekResume.requestsPlay }
     }
-    /// The state event the app gets for SwiftAudioEx's own `state` event.
+    /// The state event the app gets for SwiftAudioEx's own `state` event. Read on main.
     func reportedState(of state: AVPlayerWrapperState) -> State {
         let physical = State.fromPlayerState(state: state)
-        return State(rawValue: loads.seekResume.reportedState(physical.rawValue)) ?? physical
+        return onMain { State(rawValue: loads.seekResume.reportedState(physical.rawValue)) ?? physical }
     }
     /// The module's last request, not SwiftAudioEx's own pause at the interruption (see
     /// RequestedPlayback).

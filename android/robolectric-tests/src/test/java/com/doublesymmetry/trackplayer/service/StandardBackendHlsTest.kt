@@ -815,13 +815,16 @@ class StandardBackendHlsTest {
     // testStandardLoadCoordinatorACommandThatLoadsATrackTakesAFailuresRequestOver.
 
     @Test
-    fun aSkipNextOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack() {
-        for (op in listOf("skip", "next", "load")) {
+    fun aSkipNextPreviousOrLoadDuringASeekAfterAFailedSkipPlaysTheNewTrack() {
+        for (op in listOf("skip", "next", "previous", "load")) {
             val a = slowServer()
             val c = server(LADDER, segmentCount = 8, stalledFrom = 8)
             val stalled = server(LADDER)
             val backed = backed()
-            backed.backend.add(listOf(item(a, 1L), item(c, 3L), item(stalled, 2L)))
+            // A, C, B; for previous C, A, B (A's previous is C).
+            val first = if (op == "previous") 1 else 0
+            backed.backend.add(if (op == "previous") listOf(item(c, 3L), item(a, 1L), item(stalled, 2L)) else listOf(item(a, 1L), item(c, 3L), item(stalled, 2L)))
+            if (first == 1) assertNull(command { backed.backend.skip(1) })
             command { backed.backend.play() }
             awaitTrue("$op: A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
             val captured = backed.backend.positionMs - CAPTURE_LAG_MS
@@ -835,14 +838,16 @@ class StandardBackendHlsTest {
             val error = when (op) {
                 "skip" -> command { backed.backend.skip(1) }
                 "next" -> command { backed.backend.skipToNext() }
+                "previous" -> command { backed.backend.skipToPrevious() }
                 else -> command { backed.backend.load(loaded) }
             }
             assertNull("$op: it loads its track", error)
             awaitTrue("$op: the seek ended") { seek() != null }
             awaitTrue("$op: the new track plays, with no play") { backed.player.playerState == AudioPlayerState.PLAYING }
             // A load replaces the player's item (A, where the seek went back), as KotlinAudio's.
-            val expected = if (op == "load") 0 else 1
+            val expected = when (op) { "load" -> 0; "previous" -> 0; else -> 1 }
             assertEquals("$op: on the new track", expected, backed.player.currentIndex)
+            if (op == "previous") assertEquals("on C", 3L, (backed.player.currentItem as TrackAudioItem).track.queueId)
             assertEquals(expected, backed.backend.currentIndex)
             if (op == "load") assertSame(loaded, backed.player.currentItem)
             assertTrue("$op: the request was kept", backed.backend.playWhenReady)
@@ -857,40 +862,48 @@ class StandardBackendHlsTest {
 
     @Test
     fun aSeekAfterASkipThatGaveUpReadsPlayingAndLoadingWhileItHoldsThePlayerPaused() {
-        val a = slowServer()
-        val stalled = server(LADDER)
-        val backed = backed()
-        backed.backend.add(listOf(item(a, 1L), item(stalled, 2L)))
-        command { backed.backend.play() }
-        awaitTrue("A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
-        val captured = backed.backend.positionMs - CAPTURE_LAG_MS
-        val beforeSkip = backed.playWhenReadyEvents.size
-        assertEquals(PREPARE_TIMEOUT_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
-        pump(STALL_TIMEOUT_MS / 3)
-        assertTrue("the give-up keeps the request, as crossfade's failure", backed.backend.playWhenReady)
-        assertFalse("the give-up stopped the player's own", backed.player.playWhenReady)
-        val beforeSeek = backed.events.size
-        val seek = launchCommand { backed.backend.seekTo(captured) }
-        val samples = mutableListOf<String>()
-        var heldPaused = 0
-        while (seek() == null) {
-            shadowOf(Looper.getMainLooper()).idle()
-            if (seek() != null) break
-            assertTrue("the request reads true during the seek", backed.backend.playWhenReady)
-            assertFalse("the player waits paused until the seek is done", backed.player.playWhenReady)
-            heldPaused++
-            samples += "${backed.backend.playbackState}"
-            Thread.sleep(CLOCK_TICK_MS)
+        // A give-up (whose stop ends the player's own play-when-ready) or a player error (the
+        // player's stays true until the seek holds it paused at A).
+        for (failure in listOf("giveUp", "error")) {
+            val a = slowServer()
+            val failing = if (failure == "giveUp") server(LADDER) else HlsTestServer(LADDER, masterBody = "not a playlist").also { servers += it }
+            val backed = backed()
+            backed.backend.add(listOf(item(a, 1L), item(failing, 2L)))
+            command { backed.backend.play() }
+            awaitTrue("$failure: A plays") { backed.player.playerState == AudioPlayerState.PLAYING && backed.player.position >= PLAYED_MS }
+            val captured = backed.backend.positionMs - CAPTURE_LAG_MS
+            val beforeSkip = backed.playWhenReadyEvents.size
+            assertEquals(if (failure == "giveUp") PREPARE_TIMEOUT_CODE else STANDARD_LOAD_ERROR_CODE, (command { backed.backend.skip(1) } as RejectionException).code)
+            pump(STALL_TIMEOUT_MS / 3)
+            assertTrue("$failure: the failure keeps the request, as crossfade's", backed.backend.playWhenReady)
+            assertEquals("$failure: the player's own", failure == "error", backed.player.playWhenReady)
+            val beforeSeek = backed.events.size
+            val seek = launchCommand { backed.backend.seekTo(captured) }
+            val samples = mutableListOf<String>()
+            var heldPaused = 0
+            var duringSeek = listOf<String>()
+            while (seek() == null) {
+                shadowOf(Looper.getMainLooper()).idle()
+                if (seek() != null) break
+                // The events the app got while the seek held the player (none after its end).
+                duringSeek = backed.events.drop(beforeSeek).toList()
+                assertTrue("$failure: the request reads true during the seek", backed.backend.playWhenReady)
+                assertFalse("$failure: the player waits paused until the seek is done", backed.player.playWhenReady)
+                heldPaused++
+                samples += "${backed.backend.playbackState}"
+                Thread.sleep(CLOCK_TICK_MS)
+            }
+            assertNull("$failure: the seek completes", seek()!!.exceptionOrNull())
+            assertTrue("$failure: the seek held the player for a while (A's segments are slow): $heldPaused", heldPaused > 1)
+            assertEquals("$failure: LOADING throughout, as crossfade's seek", setOf("LOADING"), samples.toSet())
+            val states = duringSeek.filter { it.startsWith("state:") }
+            assertTrue("$failure: the player's loading was sent: $duringSeek", states.isNotEmpty())
+            assertEquals("$failure: only LOADING was sent while the seek held the player: $duringSeek", setOf("state:LOADING"), states.toSet())
+            awaitTrue("$failure: A plays after the seek") { backed.player.playerState == AudioPlayerState.PLAYING }
+            pump(STALL_TIMEOUT_MS / 3)
+            assertEquals("$failure: never play-when-ready false since the failure", listOf<Boolean>(), backed.playWhenReadyEvents.drop(beforeSkip).filter { !it })
+            assertEquals("state:PLAYING", backed.events.last { it.startsWith("state:") })
         }
-        assertNull("the seek completes", seek()!!.exceptionOrNull())
-        assertTrue("the seek held the player for a while (A's segments are slow): $heldPaused", heldPaused > 1)
-        assertEquals("LOADING throughout, as crossfade's seek", setOf("LOADING"), samples.toSet())
-        val duringSeek = backed.events.drop(beforeSeek).toList()
-        awaitTrue("A plays after the seek") { backed.player.playerState == AudioPlayerState.PLAYING }
-        pump(STALL_TIMEOUT_MS / 3)
-        assertEquals("never play-when-ready false since the failure", listOf<Boolean>(), backed.playWhenReadyEvents.drop(beforeSkip).filter { !it })
-        assertTrue("no paused state during the seek: $duringSeek", duringSeek.none { it == "state:PAUSED" })
-        assertEquals("state:PLAYING", backed.events.last { it.startsWith("state:") })
         // A pause while a seek holds the player ends the request; the app is told at once though
         // the player sends nothing (it already waits paused).
         val b = slowServer()
@@ -919,8 +932,8 @@ class StandardBackendHlsTest {
     // testStandardLoadCoordinatorACommandThatLoadsATrackTakesAFailuresRequestOver.
 
     @Test
-    fun aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAndAClearEndsTheRequest() {
-        for (op in listOf("replace", "clear")) {
+    fun aNewQueueDuringASeekAfterAFailedSkipPlaysItsFirstTrackAClearEndsTheRequestAndARemovalKeepsIt() {
+        for (op in listOf("replace", "clear", "removeCurrent")) {
             val a = slowServer()
             val stalled = server(LADDER)
             val c = server(LADDER, segmentCount = 8, stalledFrom = 8)
@@ -939,12 +952,20 @@ class StandardBackendHlsTest {
                 awaitTrue("the new queue's first track plays, with no play") { backed.player.playerState == AudioPlayerState.PLAYING }
                 assertEquals(0, backed.backend.currentIndex)
                 assertTrue(backed.backend.playWhenReady)
-            } else {
+            } else if (op == "clear") {
                 backed.backend.clearQueue()
                 awaitTrue("the seek ended") { seek() != null }
                 pump(STALL_TIMEOUT_MS)
                 assertFalse("the clear ends the request", backed.backend.playWhenReady)
                 assertEquals(false, backed.playWhenReadyEvents.lastOrNull())
+            } else {
+                // Removing the active track does not end the request (crossfade's queue change
+                // without its active track does: README, remaining differences).
+                backed.backend.remove(listOf(0))
+                awaitTrue("the seek ended") { seek() != null }
+                pump(STALL_TIMEOUT_MS)
+                assertTrue("a removal keeps the request", backed.backend.playWhenReady)
+                assertFalse("the player does not play", backed.player.playerState == AudioPlayerState.PLAYING)
             }
         }
     }
@@ -1002,6 +1023,27 @@ class StandardBackendHlsTest {
         assertTrue("the request stays", backed.backend.playWhenReady)
         assertNull(command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
         awaitTrue("plays once the seek is done, with no play") { backed.player.playerState == AudioPlayerState.PLAYING }
+        assertEquals(0, backed.player.currentIndex)
+    }
+
+    // Eighth round (owner question, LOAD-14): the first track gives up while playing (no active
+    // track, the request kept); the seek that retries it (LOAD-14) holds it paused and plays once
+    // done, as every seek with a kept request (before: it stayed paused; after a player error it
+    // played, the player's own request being true). iOS:
+    // testStandardLoadCoordinatorTheSeekThatRetriesAFirstTrackThatGaveUpPlaysOnceDone.
+
+    @Test
+    fun theSeekThatRetriesAFirstTrackThatGaveUpPlaysOnceDone() {
+        val first = server(LADDER, segmentCount = 2, stalledFrom = 0)
+        val backed = backed()
+        backed.backend.add(listOf(item(first, 1L)))
+        command { backed.backend.play() }
+        awaitTrue("the first load gives up", AWAIT_MS) { backed.gaveUpAtMs.isNotEmpty() }
+        assertEquals("none active", -1, backed.backend.currentIndex)
+        assertTrue("the request stays", backed.backend.playWhenReady)
+        first.recovered = true
+        assertNull("the seek retries the failed track", command { backed.backend.seekTo(LOADABLE_TARGET_MS) })
+        awaitTrue("it plays once the seek is done, with no play") { backed.player.playerState == AudioPlayerState.PLAYING }
         assertEquals(0, backed.player.currentIndex)
     }
 

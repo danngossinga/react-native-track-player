@@ -271,11 +271,21 @@ Added fork surface:
     clear ends it, as crossfade's clear (its stop).
 - Remaining differences of the standard backend's failure handling from
   crossfade's (the same on both platforms unless said otherwise):
-  - crossfade's `load` and a `setQueue` without the active track end the play
-    request in every case (iOS: `load` does not play; both: a queue without
-    the current track stops); the standard backend's `load` and new queue keep
-    the player's request in every case, so after a failure they play (above).
-    This difference is older than the failure handling (owner question);
+  - crossfade's `load` (on iOS always: it loads paused; on Android when the
+    track is not in the queue, or when it cancels a seek) and a `setQueue`
+    without the active track end the play request; the standard backend's
+    `load` and new queue keep the player's request, so after a failure they
+    play (above). This difference is older than the failure handling (owner
+    question);
+  - several seeks in a row: crossfade's newer seek cancels the older one, whose
+    cancelled operation ends the play request, so a scrubber drag after a
+    failure ends paused; the standard backend plays once the latest seek is
+    done (sixth review);
+  - the media session and notification (Android) and the lock screen (iOS)
+    read the standard player's own play-when-ready: paused from a give-up on
+    and while a seek holds the player, though the app reads the request kept
+    (owner question; Android's foreground service follows the player's own
+    value, unchanged);
   - a play while a seek holds the player starts it at once; crossfade's play
     during a seek waits for the seek's end;
   - removing the active track while the request is kept does not end it (a
